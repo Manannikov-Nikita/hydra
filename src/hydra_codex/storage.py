@@ -7,11 +7,13 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
-import re
 import sqlite3
 from typing import Iterator
 
 from .contracts import AnnotationRecord, ConflictRecord, ThreadSessionRecord, TurnRecord
+from .migration_support import V2_TRIGGER_STATEMENTS
+from .migrations_b2 import B2_MIGRATIONS
+from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
     """Raised when the configured database cannot safely be opened."""
@@ -25,50 +27,6 @@ class WriteResult:
 def default_database_path(home: Path | None = None) -> Path:
     base = Path.home() if home is None else Path(home)
     return base / "Library" / "Application Support" / "Hydra" / "hydra.sqlite3"
-
-
-def redact_note(note: str) -> str:
-    """Return a normalized safe note, failing closed when it contains secret-like data."""
-    normalized = " ".join("".join(
-        " " if ord(character) < 32 or ord(character) == 127 else character
-        for character in note
-    ).split())
-    sensitive_patterns = (
-        r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b",
-        r"\bauthorization\s*:\s*(?:bearer|basic)\s+\S+",
-        r"\bbearer\s+[A-Za-z0-9._~+/=-]+",
-        r"\b(?:authorization|cookie|credential|passwd|password|secret|token|api[-_ ]?key|x[-_ ]?auth[-_ ]?token|access[-_ ]?key)\b\s*(?::|=)?\s*\S+",
-        r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s]+@\S+",
-        r"(?<!\w)/(?:Users|home|private|var|etc|tmp|opt|Volumes)(?:/\S*)?",
-        r"(?<![\w-])[A-Za-z0-9+/=_-]{20,}(?![\w-])",
-    )
-    if not normalized or any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in sensitive_patterns):
-        return "[redacted]"
-    return normalized
-
-
-V2_TRIGGER_STATEMENTS = (
-    """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_insert
-        BEFORE INSERT ON annotations
-        FOR EACH ROW
-        WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
-        BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
-    """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_insert
-        BEFORE INSERT ON annotations
-        FOR EACH ROW
-        WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
-        BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
-    """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_update
-        BEFORE UPDATE OF project_id, session_id ON annotations
-        FOR EACH ROW
-        WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
-        BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
-    """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_update
-        BEFORE UPDATE OF session_id, turn_id ON annotations
-        FOR EACH ROW
-        WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
-        BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
-)
 
 
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -294,7 +252,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-)
+) + B2_MIGRATIONS
 
 
 class HydraStore:
@@ -335,19 +293,27 @@ class HydraStore:
             self.connection.execute("BEGIN IMMEDIATE")
             yield self.connection
             self.connection.commit()
-        except sqlite3.Error:
+        except BaseException:
             self.connection.rollback()
             raise
 
     @contextmanager
     def rollout_transaction(self) -> Iterator[sqlite3.Connection]:
         """Atomic, idempotent persistence boundary for safe normalized rollout facts."""
+        if self.connection.in_transaction:
+            yield self.connection
+            return
         with self._transaction() as connection:
             yield connection
 
     def _migrate(self) -> None:
         try:
             current_version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+            latest = MIGRATIONS[-1][0]
+            if current_version > latest:
+                raise StorageUnavailable(
+                    f"Hydra database schema {current_version} is newer than supported {latest}"
+                )
             for version, statements in MIGRATIONS:
                 if version <= current_version:
                     continue
@@ -363,8 +329,30 @@ class HydraStore:
                         (version,),
                     )
                     connection.execute(f"PRAGMA user_version = {version}")
+            self._validate_schema(latest)
         except sqlite3.Error as error:
             raise StorageUnavailable(f"cannot migrate Hydra database: {self.database_path}") from error
+
+    def _validate_schema(self, latest: int) -> None:
+        versions = [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
+        if versions != list(range(1, latest + 1)):
+            raise StorageUnavailable("Hydra schema migration history is inconsistent")
+        required = {
+            "rollout_sources": {"source_digest", "logical_source_key", "relation", "materialized"},
+            "rollout_logical_sources": {"logical_source_key", "project_id", "lineage_state"},
+            "rollout_events": {"event_key", "logical_source_key", "source_ordinal", "timestamp_quality"},
+            "turn_lifecycle_events": {"event_key", "session_key", "turn_key", "source_digest"},
+            "turn_attempts": {"attempt_ordinal", "timing_provenance"},
+            "token_snapshots": {"epoch", "input_tokens", "cached_input_tokens", "observed_at"},
+        }
+        for table, columns in required.items():
+            actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+            if not columns.issubset(actual):
+                raise StorageUnavailable(f"Hydra schema is missing required columns for {table}")
+        if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise StorageUnavailable("Hydra schema has foreign-key violations")
+        if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise StorageUnavailable("Hydra database integrity check failed")
 
     @staticmethod
     def _sanitize_and_quarantine_v1_annotations(connection: sqlite3.Connection) -> None:
@@ -493,7 +481,9 @@ class HydraStore:
             "token_snapshots", "session_edges", "turn_attempts", "tool_spans",
             "file_observations", "rollout_test_runs", "metric_facts", "semantic_conflicts",
             "fork_baselines",
-            "rollout_event_keys",
+            "rollout_event_keys", "rollout_logical_sources", "rollout_events",
+            "rollout_revision_lines", "rollout_revision_events", "rollout_session_segments",
+            "turn_lifecycle_events",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")

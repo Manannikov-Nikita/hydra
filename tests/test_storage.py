@@ -92,12 +92,36 @@ class SQLiteStorageTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_migrates_a_fresh_database_and_reopens_at_the_same_version(self) -> None:
-        self.assertEqual(self.store.schema_version(), 11)
+        self.assertEqual(self.store.schema_version(), 12)
         self.store.close()
         reopened = HydraStore(self.database)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.schema_version(), 11)
+        self.assertEqual(reopened.schema_version(), 12)
         self.assertEqual(reopened.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+
+    def test_migrates_version_eleven_tool_spans_without_losing_existing_rows(self) -> None:
+        legacy_path = Path(self.temporary_directory.name) / "version-eleven.sqlite3"
+        legacy = sqlite3.connect(legacy_path)
+        for version, statements in MIGRATIONS[:11]:
+            for statement in statements:
+                legacy.execute(statement)
+            legacy.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, '2026-07-20T00:00:00Z')", (version,))
+            legacy.execute(f"PRAGMA user_version = {version}")
+        legacy.execute(
+            "INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments, conversation_key) VALUES ('s', 'p', 'safe', 1, 'c')"
+        )
+        legacy.execute("INSERT INTO tool_spans(session_key, call_key, category, terminal_state) VALUES ('s', 'c', 'tool', 'success')")
+        legacy.commit()
+        legacy.close()
+
+        migrated = HydraStore(legacy_path)
+        self.addCleanup(migrated.close)
+
+        row = migrated.connection.execute(
+            "SELECT terminal_state, completeness, provenance, tool_name, started_at, finished_at FROM tool_spans"
+        ).fetchone()
+        self.assertEqual(migrated.schema_version(), 12)
+        self.assertEqual(tuple(row), ("success", "incomplete", "exact", None, None, None))
 
     def test_second_migration_sanitizes_and_quarantines_actual_version_one_rows(self) -> None:
         legacy_path = Path(self.temporary_directory.name) / "legacy.sqlite3"
@@ -158,7 +182,7 @@ class SQLiteStorageTests(unittest.TestCase):
             "SELECT * FROM conflicts WHERE record_id = 'legacy-invalid'"
         ).fetchone()
 
-        self.assertEqual(migrated.schema_version(), 11)
+        self.assertEqual(migrated.schema_version(), 12)
         self.assertIn("task_family", columns)
         self.assertEqual(len(safe_rows), len(SECRET_FORM_MATRIX))
         self.assertTrue(all(row[0] == "[redacted]" for row in safe_rows))

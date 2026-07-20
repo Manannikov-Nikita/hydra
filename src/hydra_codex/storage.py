@@ -260,6 +260,16 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "DROP TABLE token_snapshots_v9",
     )),
     (11, ("ALTER TABLE fork_baselines ADD COLUMN observed_at TEXT",)),
+    (12, (
+        "ALTER TABLE tool_spans ADD COLUMN tool_name TEXT",
+        "ALTER TABLE tool_spans ADD COLUMN started_at TEXT",
+        "ALTER TABLE tool_spans ADD COLUMN finished_at TEXT",
+        "ALTER TABLE tool_spans ADD COLUMN turn_key TEXT",
+        "ALTER TABLE tool_spans ADD COLUMN source_digest TEXT",
+        "ALTER TABLE tool_spans ADD COLUMN source_ordinal INTEGER",
+        "ALTER TABLE tool_spans ADD COLUMN completeness TEXT NOT NULL DEFAULT 'incomplete'",
+        "ALTER TABLE tool_spans ADD COLUMN provenance TEXT NOT NULL DEFAULT 'exact'",
+    )),
 )
 
 

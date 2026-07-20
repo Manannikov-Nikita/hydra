@@ -18,6 +18,7 @@ from .classifier import classify_test_command, classify_test_outcome
 from .project import ProjectNotFound, resolve_project
 from .storage import HydraStore
 from .tool_normalization import scan_custom_exec
+from .tool_spans import persist_tool_end, persist_tool_start
 
 
 KNOWN_ENVELOPES = {"session_meta", "turn_context", "event_msg", "response_item"}
@@ -376,9 +377,11 @@ def _parse_source(
                 name = payload.get("name") if isinstance(payload.get("name"), str) else "unknown"
                 category = "instrumentation" if "hydra" in name.lower() else "tool"
                 call_key = opaque("call", payload["call_id"])
-                connection.execute(
-                    """INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
-                       VALUES (?, ?, ?, 'unknown', NULL) ON CONFLICT DO NOTHING""", (session_key, call_key, category))
+                persist_tool_start(
+                    connection, session_key=session_key, call_key=call_key, category=category, tool_name="function",
+                    started_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
+                    turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
+                )
                 arguments = _parse_arguments(payload.get("arguments"))
                 if "path" in arguments:
                     operation = "read" if "read" in name.lower() else "write"
@@ -391,6 +394,13 @@ def _parse_source(
                 continue
             if kind == "response_item" and payload.get("type") == "function_call_output":
                 call_id = payload.get("call_id")
+                if session_key is not None and isinstance(call_id, str):
+                    persist_tool_end(
+                        connection, session_key=session_key, call_key=opaque("call", call_id), category="tool", tool_name="function",
+                        finished_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
+                        terminal_state="success", latency_ms=None, turn_key=opaque("turn", current_turn) if current_turn else None,
+                        source_digest=source, source_ordinal=line_number,
+                    )
                 pending = test_calls.get(call_id) if isinstance(call_id, str) else None
                 if pending is None or session_key is None:
                     continue
@@ -422,9 +432,13 @@ def _parse_source(
             if kind == "event_msg" and event_type in {"mcp_tool_call_end", "patch_apply_end", "web_search_end"}:
                 call_id = payload.get("call_id")
                 if session_key is not None and isinstance(call_id, str):
-                    connection.execute(
-                        """UPDATE tool_spans SET terminal_state = ?, latency_ms = ? WHERE session_key = ? AND call_key = ?""",
-                        (_tool_end_state(payload), _duration_ms(payload.get("duration")), session_key, opaque("call", call_id)),
+                    kind_name = {"mcp_tool_call_end": "mcp", "patch_apply_end": "patch", "web_search_end": "web"}[event_type]
+                    persist_tool_end(
+                        connection, session_key=session_key, call_key=opaque("call", call_id),
+                        category="web" if kind_name == "web" else "tool", tool_name=kind_name,
+                        finished_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
+                        terminal_state=_tool_end_state(payload), latency_ms=_duration_ms(payload.get("duration")),
+                        turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
                     )
                 if event_type == "patch_apply_end" and session_key is not None:
                     changes = payload.get("changes")

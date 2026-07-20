@@ -187,6 +187,33 @@ class RolloutIngestTests(unittest.TestCase):
         self.assertIn(("read", "src/read.py"), [tuple(row) for row in self.store.connection.execute("SELECT operation, relative_path FROM file_observations")])
         self.assertNotIn(private_text, "\n".join(self.store.connection.iterdump()))
 
+    def test_tool_span_persistence_joins_both_event_orders_and_creates_end_only_rows(self) -> None:
+        write_jsonl(self.root / "rollouts" / "tool-orders.jsonl", [
+            v1("session_meta", {"id": "anon-tool-orders", "cwd": str(self.project)}),
+            v1("turn_context", {"turn_id": "turn-tools"}, 1),
+            v1("response_item", {"type": "function_call_output", "call_id": "late-start", "output": "safe"}, 2),
+            v1("response_item", {"type": "function_call", "call_id": "late-start", "name": "exec_command", "arguments": "{}"}, 3),
+            v1("event_msg", {"type": "mcp_tool_call_end", "call_id": "mcp-only", "result": {"Ok": {}}}, 4),
+            v1("event_msg", {"type": "patch_apply_end", "call_id": "patch-only", "success": False}, 5),
+            v1("event_msg", {"type": "web_search_end", "call_id": "web-only", "result": {"Ok": {}}}, 6),
+            v1("response_item", {"type": "function_call_output", "call_id": "patch-only", "output": "safe"}, 7),
+        ])
+
+        ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic", hash_key=b"j" * 32)
+
+        rows = self.store.connection.execute(
+            "SELECT tool_name, started_at, finished_at, turn_key, category, terminal_state, completeness, provenance "
+            "FROM tool_spans ORDER BY source_ordinal"
+        ).fetchall()
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([(row[0], row[1], row[2], row[4], row[5], row[6], row[7]) for row in rows], [
+            ("function", "2026-07-20T00:00:03Z", "2026-07-20T00:00:02Z", "tool", "success", "complete", "exact"),
+            ("mcp", None, "2026-07-20T00:00:04Z", "tool", "success", "incomplete", "exact"),
+            ("patch", None, "2026-07-20T00:00:05Z", "tool", "failed", "incomplete", "exact"),
+            ("web", None, "2026-07-20T00:00:06Z", "web", "success", "incomplete", "exact"),
+        ])
+        self.assertEqual(len({row[3] for row in rows}), 1)
+
     def test_test_detection_and_model_cause_conflict_use_deterministic_evidence(self) -> None:
         self.assertEqual(classify_test_command("python -m pytest"), ("pytest", "full"))
         self.assertEqual(classify_test_command("npm test -- ui.spec.ts"), ("npm", "targeted"))

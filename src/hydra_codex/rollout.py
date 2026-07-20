@@ -13,6 +13,7 @@ import secrets
 from typing import Any, Iterable
 
 from .classifier import classify_test_command, classify_test_outcome
+from .project import ProjectNotFound, resolve_project
 from .storage import HydraStore
 
 
@@ -194,11 +195,23 @@ def _parse_source(
                 continue
             if kind == "session_meta":
                 identity = payload.get("session_id", payload.get("id"))
+                identity = payload.get("id", payload.get("session_id"))
                 if not isinstance(identity, str) or not identity:
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "session_meta", payload)
                     continue
                 next_key = opaque(identity)
+                conversation = payload.get("session_id", identity)
+                try:
+                    resolved = resolve_project(payload.get("cwd"))
+                except (ProjectNotFound, TypeError, ValueError, OSError):
+                    diagnostics += 1
+                    _insert_diagnostic(connection, source, line_number, "unresolved_project", payload)
+                    continue
+                if resolved.project_id != project_id:
+                    diagnostics += 1
+                    _insert_diagnostic(connection, source, line_number, "unrelated_project", payload)
+                    continue
                 if seen_session and next_key != session_key:
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "multiple_sessions", payload)
@@ -206,10 +219,10 @@ def _parse_source(
                 existing = connection.execute("SELECT resume_segments FROM rollout_sessions WHERE session_key = ?", (session_key,)).fetchone()
                 path_key = _path_key(payload.get("cwd"), project_root)
                 connection.execute(
-                    """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments)
-                       VALUES (?, ?, ?, 1) ON CONFLICT(session_key) DO UPDATE SET
+                    """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments, conversation_key)
+                       VALUES (?, ?, ?, 1, ?) ON CONFLICT(session_key) DO UPDATE SET
                          resume_segments = rollout_sessions.resume_segments + 1""",
-                    (session_key, project_id, path_key),
+                    (session_key, project_id, path_key, opaque(conversation) if isinstance(conversation, str) else next_key),
                 )
                 if existing is None:
                     parent = payload.get("parent_thread_id")

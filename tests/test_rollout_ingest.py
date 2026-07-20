@@ -66,6 +66,8 @@ class RolloutIngestTests(unittest.TestCase):
         self.root = Path(self.temporary_directory.name)
         self.project = self.root / "project"
         self.project.mkdir()
+        (self.project / ".hydra").mkdir()
+        (self.project / ".hydra" / "project.toml").write_text('project_id = "project-synthetic"\n', encoding="utf-8")
         self.store = HydraStore(self.root / "hydra.sqlite3")
 
     def tearDown(self) -> None:
@@ -219,6 +221,8 @@ class HistoricalFixtureAcceptanceTests(unittest.TestCase):
             store = HydraStore(base / "hydra.sqlite3")
             self.addCleanup(store.close)
             for filename, totals in expected.items():
+                (project / ".hydra").mkdir(exist_ok=True)
+                (project / ".hydra" / "project.toml").write_text(f'project_id = "project-{filename}"\n', encoding="utf-8")
                 manifest = json.loads((fixtures / filename).read_text(encoding="utf-8"))
                 root = base / manifest["root"]
                 for index, vector in enumerate(manifest["vectors"], start=1):

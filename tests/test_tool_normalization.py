@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 from hydra_codex.tool_normalization import scan_custom_exec
+from hydra_codex.rollout import ingest_rollouts
+from hydra_codex.storage import HydraStore
 
 
 class CustomExecScannerTests(unittest.TestCase):
@@ -21,3 +26,6 @@ class CustomExecScannerTests(unittest.TestCase):
             ("apply_patch", None, ("src/safe.py",)),
         ])
 
+    def test_const_patch_binding_is_resolved(self) -> None:
+        calls = scan_custom_exec('const patch = "*** Update File: src/a.py\\n+x"; text(await tools.apply_patch(patch));')
+        self.assertEqual(calls[0].paths, ("src/a.py",))

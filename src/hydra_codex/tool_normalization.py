@@ -20,6 +20,7 @@ def _literal(arguments: str, field: str) -> str | None:
 
 def scan_custom_exec(source: str) -> tuple[NestedToolCall, ...]:
     calls: list[NestedToolCall] = []
+    bindings = {name: value for name, _, value in re.findall(r"\bconst\s+([A-Za-z_]\w*)\s*=\s*(['\"])(.*?)\2", source, re.DOTALL)}
     index = 0
     quote: str | None = None
     while index < len(source):
@@ -47,7 +48,10 @@ def scan_custom_exec(source: str) -> tuple[NestedToolCall, ...]:
             cursor += 1
         if depth: break
         arguments = source[start:cursor - 1]
-        patch = (_literal(arguments, "patch") or "").replace("\\n", "\n")
+        patch = _literal(arguments, "patch")
+        if patch is None and name == "apply_patch":
+            patch = bindings.get(arguments.strip())
+        patch = (patch or "").replace("\\n", "\n")
         paths = tuple(re.findall(r"^\*\*\* (?:Update|Add|Delete) File: ([^\n]+)", patch, re.MULTILINE))
         calls.append(NestedToolCall(name, _literal(arguments, "cmd"), paths))
         index = cursor

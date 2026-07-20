@@ -17,6 +17,7 @@ from typing import Any, Iterable
 from .classifier import classify_test_command, classify_test_outcome
 from .project import ProjectNotFound, resolve_project
 from .storage import HydraStore
+from .tool_normalization import scan_custom_exec
 
 
 KNOWN_ENVELOPES = {"session_meta", "turn_context", "event_msg", "response_item"}
@@ -357,6 +358,13 @@ def _parse_source(
                            VALUES (?, ?, 'opaque_exec', 'unknown', NULL) ON CONFLICT DO NOTHING""",
                         (session_key, opaque("call", payload["call_id"])),
                     )
+                    if payload.get("name") == "exec" and isinstance(payload.get("input"), str):
+                        for index, nested in enumerate(scan_custom_exec(payload["input"])):
+                            nested_key = opaque("call", f"{payload['call_id']}:{index}:{nested.name}")
+                            connection.execute("""INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
+                              VALUES (?, ?, 'tool', 'unknown', NULL) ON CONFLICT DO NOTHING""", (session_key, nested_key))
+                            for nested_path in nested.paths:
+                                _persist_file(connection, source, line_number, session_key, "write", nested_path, project_root)
                 continue
             if kind == "response_item" and payload.get("type") == "custom_tool_call_output":
                 continue

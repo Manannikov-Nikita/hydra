@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from hydra_codex.rollout import ingest_rollouts
+from hydra_codex.metrics import aggregate_project
 from hydra_codex.storage import HydraStore
 
 
@@ -102,3 +103,16 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         edge = self.store.connection.execute("SELECT confidence_kind, confidence FROM session_edges").fetchone()
         self.assertEqual(tuple(edge), ("confirmed", 1.0))
         self.assertEqual(self.store.connection.execute("SELECT resume_segments FROM rollout_sessions WHERE path_key != 'unresolved'").fetchone()[0], 1)
+
+    def test_cross_source_timestamp_order_wins_and_counter_reset_creates_epoch(self) -> None:
+        old = self.base / "z-old.jsonl"
+        new = self.base / "a-new.jsonl"
+        write(old, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10}}}, 10)])
+        write(new, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 200, "cached_input_tokens": 40, "output_tokens": 20}}}, 20)])
+        ingest_rollouts(self.store, (new, old), self.project, "project-a", hash_key=b"f" * 32)
+        first = aggregate_project(self.store.connection, "project-a")
+        self.assertEqual(first.working_tokens, 180)
+        reset = self.base / "m-reset.jsonl"
+        write(reset, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 4}}}, 30)])
+        ingest_rollouts(self.store, (reset,), self.project, "project-a", hash_key=b"f" * 32)
+        self.assertEqual(aggregate_project(self.store.connection, "project-a").working_tokens, 209)

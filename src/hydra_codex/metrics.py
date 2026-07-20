@@ -111,10 +111,20 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
     rows = connection.execute(
         """SELECT session_key, line_number, epoch, input_tokens, cached_input_tokens,
                   output_tokens, reasoning_tokens, cache_write_tokens
-           FROM token_snapshots WHERE project_id = ?""", (project_id,)
+           FROM token_snapshots WHERE project_id = ? ORDER BY observed_at, source_digest, line_number""", (project_id,)
     ).fetchall()
     partial = int(connection.execute("SELECT COUNT(*) FROM token_snapshots WHERE project_id = ? AND completeness != 'complete'", (project_id,)).fetchone()[0])
-    recorded = aggregate_tokens(TokenSnapshot(*tuple(row)) for row in rows)
+    global_rows = []
+    last: dict[str, tuple[int, int, int, int, int]] = {}
+    epochs: dict[str, int] = {}
+    for row in rows:
+        vector = tuple(row[index] for index in range(3, 8))
+        session = row[0]
+        if session in last and any(now < before for now, before in zip(vector, last[session])):
+            epochs[session] = epochs.get(session, 0) + 1
+        last[session] = vector
+        global_rows.append(TokenSnapshot(session, len(global_rows), epochs.get(session, 0), *vector))
+    recorded = aggregate_tokens(global_rows)
     baselines = connection.execute(
         """SELECT fork_baselines.input_tokens, fork_baselines.cached_input_tokens,
                   fork_baselines.output_tokens, fork_baselines.reasoning_tokens

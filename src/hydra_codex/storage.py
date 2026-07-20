@@ -248,6 +248,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (6, ("ALTER TABLE rollout_sessions ADD COLUMN conversation_key TEXT NOT NULL DEFAULT ''",)),
     (7, ("CREATE TABLE IF NOT EXISTS rollout_event_keys (event_key TEXT PRIMARY KEY, source_digest TEXT NOT NULL, source_ordinal INTEGER NOT NULL)",)),
     (8, ("ALTER TABLE token_snapshots ADD COLUMN turn_key TEXT",)),
+    (9, ("ALTER TABLE token_snapshots ADD COLUMN observed_at TEXT",)),
 )
 
 

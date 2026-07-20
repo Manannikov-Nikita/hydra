@@ -266,10 +266,10 @@ def _parse_source(
                 completeness = "complete" if usage["complete"] else "partial"
                 connection.execute(
                     """INSERT INTO token_snapshots(source_digest, line_number, session_key, project_id, epoch, input_tokens,
-                       cached_input_tokens, output_tokens, reasoning_tokens, cache_write_tokens, vendor_total, context_window, completeness)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                       cached_input_tokens, output_tokens, reasoning_tokens, cache_write_tokens, vendor_total, context_window, completeness, observed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
                     (source, line_number, session_key, project_id, epoch, usage["input"], usage["cached"], usage["output"],
-                     usage["reasoning"], usage["cache_write"], usage["vendor_total"] or None, usage["context_window"] or None, completeness),
+                     usage["reasoning"], usage["cache_write"], usage["vendor_total"] or None, usage["context_window"] or None, completeness, envelope.get("timestamp")),
                 )
                 connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque(current_turn) if current_turn else None, source, line_number))
                 edge = connection.execute(

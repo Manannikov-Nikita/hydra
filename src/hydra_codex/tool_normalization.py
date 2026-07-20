@@ -13,6 +13,25 @@ class NestedToolCall:
     paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class JoinedToolSpan:
+    call_id: str
+    name: str | None
+    started_at: str | None
+    finished_at: str | None
+    terminal_state: str
+    completeness: str
+
+
+class ToolSpanJoin:
+    """Pure terminal-monotonic join used by storage adapters."""
+    def end(self, call_id: str, finished_at: str) -> JoinedToolSpan:
+        return JoinedToolSpan(call_id, None, None, finished_at, "success", "incomplete")
+
+    def start_after_end(self, span: JoinedToolSpan, name: str, started_at: str) -> JoinedToolSpan:
+        return JoinedToolSpan(span.call_id, name, started_at, span.finished_at, span.terminal_state, span.completeness)
+
+
 def _literal(arguments: str, field: str) -> str | None:
     match = re.search(rf"\b{re.escape(field)}\s*:\s*(['\"])(.*?)\1", arguments, re.DOTALL)
     return match.group(2) if match else None

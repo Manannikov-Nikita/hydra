@@ -29,3 +29,10 @@ class CustomExecScannerTests(unittest.TestCase):
     def test_const_patch_binding_is_resolved(self) -> None:
         calls = scan_custom_exec('const patch = "*** Update File: src/a.py\\n+x"; text(await tools.apply_patch(patch));')
         self.assertEqual(calls[0].paths, ("src/a.py",))
+
+    def test_end_only_span_can_be_enriched_without_regressing_terminal_state(self) -> None:
+        # Storage-facing join contract is implemented in the next RED/GREEN step.
+        from hydra_codex.tool_normalization import ToolSpanJoin
+        span = ToolSpanJoin().end("call", "2026-07-21T00:00:02Z")
+        enriched = ToolSpanJoin().start_after_end(span, "exec_command", "2026-07-21T00:00:01Z")
+        self.assertEqual((enriched.terminal_state, enriched.completeness), ("success", "incomplete"))

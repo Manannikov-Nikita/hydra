@@ -97,7 +97,8 @@ class RolloutIngestTests(unittest.TestCase):
 
     def test_subagent_activity_fallback_preserves_an_unresolved_child_edge(self) -> None:
         write_jsonl(self.root / "rollouts" / "parent.jsonl", [
-            v1("session_meta", {"id": "anon-parent", "cwd": str(self.project), "sub_agent_activity": {"agent_thread_id": "anon-child"}}),
+            v1("session_meta", {"id": "anon-parent", "cwd": str(self.project)}),
+            v1("event_msg", {"type": "sub_agent_activity", "agent_thread_id": "anon-child"}, 1),
         ])
 
         ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic")

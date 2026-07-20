@@ -47,7 +47,8 @@ def _safe_int(value: Any) -> int:
 def _fingerprint(value: Any) -> str:
     if not isinstance(value, dict):
         return type(value).__name__
-    return ",".join(f"{key}:{type(item).__name__}" for key, item in sorted(value.items()))[:240]
+    shape = ",".join(f"{key}:{type(item).__name__}" for key, item in sorted(value.items()))
+    return "shape/" + opaque(shape)[:32]
 
 
 def _path_key(value: Any, project_root: Path) -> str:
@@ -185,21 +186,8 @@ def _parse_source(
                         connection.execute(
                             """INSERT INTO session_edges(child_key, parent_key, baseline_working_tokens, confidence_kind, confidence)
                                VALUES (?, ?, ?, ?, ?) ON CONFLICT(child_key) DO NOTHING""",
-                            (session_key, opaque(parent), None, "inferred", 0.6),
+                            (session_key, opaque(parent), None, "confirmed", 1.0),
                         )
-                activity = payload.get("sub_agent_activity")
-                child_identity = activity.get("agent_thread_id") if isinstance(activity, dict) else None
-                if isinstance(child_identity, str):
-                    child_key = opaque(child_identity)
-                    connection.execute(
-                        """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments)
-                           VALUES (?, ?, 'unresolved', 1) ON CONFLICT DO NOTHING""", (child_key, project_id)
-                    )
-                    connection.execute(
-                        """INSERT INTO session_edges(child_key, parent_key, baseline_working_tokens, confidence_kind, confidence)
-                           VALUES (?, ?, NULL, 'inferred', 0.6) ON CONFLICT(child_key) DO NOTHING""",
-                        (child_key, session_key),
-                    )
                 seen_session = True
                 continue
             if kind == "event_msg" and payload.get("type") == "token_count":
@@ -226,7 +214,9 @@ def _parse_source(
                 edge = connection.execute(
                     "SELECT parent_key FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()
-                if edge is not None:
+                if edge is not None and connection.execute(
+                    "SELECT confidence_kind FROM session_edges WHERE child_key = ?", (session_key,)
+                ).fetchone()[0] == "confirmed":
                     connection.execute(
                         """INSERT INTO fork_baselines(child_key, source_digest, line_number, input_tokens, cached_input_tokens,
                            output_tokens, reasoning_tokens, cache_write_tokens, provenance)
@@ -235,6 +225,23 @@ def _parse_source(
                     )
                 continue
             event_type = payload.get("type") if kind == "event_msg" else None
+            if kind == "event_msg" and event_type == "sub_agent_activity":
+                child_identity = payload.get("agent_thread_id")
+                if session_key is None or not isinstance(child_identity, str):
+                    diagnostics += 1
+                    _insert_diagnostic(connection, source, line_number, "sub_agent_activity", payload)
+                    continue
+                child_key = opaque(child_identity)
+                connection.execute(
+                    """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments)
+                       VALUES (?, ?, 'unresolved', 1) ON CONFLICT DO NOTHING""", (child_key, project_id)
+                )
+                connection.execute(
+                    """INSERT INTO session_edges(child_key, parent_key, baseline_working_tokens, confidence_kind, confidence)
+                       VALUES (?, ?, NULL, 'inferred', 0.6) ON CONFLICT(child_key) DO NOTHING""",
+                    (child_key, session_key),
+                )
+                continue
             if kind == "event_msg" and event_type in {"task_started", "task_complete", "turn_aborted"}:
                 turn = payload.get("turn_id")
                 if not isinstance(turn, str):

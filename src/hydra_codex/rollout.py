@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import tempfile
 from typing import Any, Iterable
 
 from .classifier import classify_test_command, classify_test_outcome
@@ -43,22 +44,43 @@ class Pseudonymizer:
     def installation(cls, directory: Path) -> "Pseudonymizer":
         path = directory / "rollout-hmac.key"
         if path.exists():
-            return cls(path.read_bytes())
+            key = path.read_bytes()
+            if len(key) != 32:
+                raise ValueError("invalid installation pseudonymization key")
+            return cls(key)
         key = secrets.token_bytes(32)
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(key)
-        return cls(key)
+        descriptor, temporary = tempfile.mkstemp(prefix=".rollout-key-", dir=directory)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                pass
+            winner = path.read_bytes()
+            if len(winner) != 32:
+                raise ValueError("invalid installation pseudonymization key")
+            return cls(winner)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
-    def digest(self, value: str) -> str:
-        return hmac.new(self.key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+    def digest(self, domain: str, value: str) -> str:
+        if domain not in {"identity", "path", "command", "source", "event", "diagnostic", "capability"}:
+            raise ValueError("unsupported pseudonymization domain")
+        return hmac.new(self.key, f"hydra/{domain}/".encode("utf-8") + value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def opaque(value: str) -> str:
     hasher = _ACTIVE_HASHER.get()
     if hasher is None:
         raise RuntimeError("rollout pseudonymizer is required")
-    return hasher.digest(value)
+    return hasher.digest("identity", value)
 
 
 def discover_rollouts(roots: Iterable[Path | str | RolloutRoot]) -> tuple[Path, ...]:
@@ -408,7 +430,7 @@ def ingest_rollouts(
 ) -> IngestReport:
     """Ingest explicit v1 JSONL roots idempotently, storing only normalized safe facts."""
     root = Path(project_root)
-    _ACTIVE_HASHER.set(Pseudonymizer(hash_key) if hash_key is not None else Pseudonymizer.installation(store.database_path.parent))
+    hash_token = _ACTIVE_HASHER.set(Pseudonymizer(hash_key) if hash_key is not None else Pseudonymizer.installation(store.database_path.parent))
     root_specs = tuple(roots)
     files = discover_rollouts(root_specs)
     diagnostics = 0
@@ -427,4 +449,5 @@ def ingest_rollouts(
             )
         if not known:
             diagnostics += _parse_source(store, path, digest, root, project_id, model_causes or {})
+    _ACTIVE_HASHER.reset(hash_token)
     return IngestReport(len(files), len(unique), diagnostics)

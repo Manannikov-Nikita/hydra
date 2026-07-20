@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
-from hydra_codex.rollout import ingest_rollouts
+from hydra_codex.rollout import Pseudonymizer, ingest_rollouts, opaque
 from hydra_codex.metrics import aggregate_project, aggregate_project_facts
 from hydra_codex.storage import HydraStore
 
@@ -175,3 +178,27 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         facts = aggregate_project_facts(self.store.connection, "project-a")
         self.assertEqual(facts["recorded_working"].value, 15)
         self.assertEqual(facts["deduplicated_working"].caveats, ("inferred_parent_no_dedup",))
+
+    def test_installation_key_is_atomic_domain_separated_and_invalid_fails_closed(self) -> None:
+        key_dir = self.base / "keys"
+        key_dir.mkdir()
+        results: list[bytes] = []
+        errors: list[Exception] = []
+        def create() -> None:
+            try:
+                results.append(Pseudonymizer.installation(key_dir).key)
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=create) for _ in range(16)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        self.assertFalse(errors)
+        self.assertEqual({len(key) for key in results}, {32})
+        self.assertEqual(len(set(results)), 1)
+        hasher = Pseudonymizer(results[0])
+        self.assertEqual(len({hasher.digest(domain, "same") for domain in ("identity", "path", "command", "source", "event", "diagnostic", "capability")}), 7)
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE((key_dir / "rollout-hmac.key").stat().st_mode), 0o600)
+        (key_dir / "rollout-hmac.key").write_bytes(b"bad")
+        with self.assertRaises(ValueError):
+            Pseudonymizer.installation(key_dir)

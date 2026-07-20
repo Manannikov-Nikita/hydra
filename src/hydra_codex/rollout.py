@@ -17,21 +17,15 @@ from typing import Any, Iterable
 from .classifier import classify_test_command, classify_test_outcome
 from .project import ProjectNotFound, resolve_project
 from .storage import HydraStore
-from .tool_normalization import scan_custom_exec
+from .tool_normalization import custom_exec_outcome, nested_span_name, scan_custom_exec_details
 from .tool_spans import persist_tool_end, persist_tool_start
-
-
 KNOWN_ENVELOPES = {"session_meta", "turn_context", "event_msg", "response_item"}
 _ACTIVE_HASHER: ContextVar["Pseudonymizer | None"] = ContextVar("hydra_rollout_hasher", default=None)
-
-
 @dataclass(frozen=True)
 class IngestReport:
     files_seen: int
     unique_sources: int
     diagnostics: int
-
-
 @dataclass(frozen=True)
 class RolloutRoot:
     path: Path | str
@@ -354,20 +348,41 @@ def _parse_source(
                 continue
             if kind == "response_item" and payload.get("type") == "custom_tool_call":
                 if session_key is not None and isinstance(payload.get("call_id"), str):
-                    connection.execute(
-                        """INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
-                           VALUES (?, ?, 'opaque_exec', 'unknown', NULL) ON CONFLICT DO NOTHING""",
-                        (session_key, opaque("call", payload["call_id"])),
+                    call_key = opaque("call", payload["call_id"])
+                    persist_tool_start(
+                        connection, session_key=session_key, call_key=call_key, category="opaque_exec", tool_name="custom_exec",
+                        started_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
+                        turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
                     )
                     if payload.get("name") == "exec" and isinstance(payload.get("input"), str):
-                        for index, nested in enumerate(scan_custom_exec(payload["input"])):
-                            nested_key = opaque("call", f"{payload['call_id']}:{index}:{nested.name}")
-                            connection.execute("""INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
-                              VALUES (?, ?, 'tool', 'unknown', NULL) ON CONFLICT DO NOTHING""", (session_key, nested_key))
+                        scan = scan_custom_exec_details(payload["input"])
+                        for reason in scan.diagnostics:
+                            diagnostics += 1
+                            _insert_diagnostic(connection, source, line_number, "custom_exec_" + reason, {"reason": reason})
+                        for index, nested in enumerate(scan.calls):
                             for nested_path in nested.paths:
                                 _persist_file(connection, source, line_number, session_key, "write", nested_path, project_root)
+                            tool_name = nested_span_name(nested)
+                            if tool_name is None:
+                                continue
+                            nested_key = opaque("call", f"{payload['call_id']}:{index}:{nested.name}")
+                            persist_tool_start(
+                                connection, session_key=session_key, call_key=nested_key, category="tool", tool_name=tool_name,
+                                started_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
+                                turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
+                                provenance="lower_bound",
+                            )
                 continue
             if kind == "response_item" and payload.get("type") == "custom_tool_call_output":
+                call_id = payload.get("call_id")
+                if session_key is not None and isinstance(call_id, str):
+                    terminal, latency = custom_exec_outcome(payload.get("output"))
+                    persist_tool_end(
+                        connection, session_key=session_key, call_key=opaque("call", call_id), category="opaque_exec", tool_name="custom_exec",
+                        finished_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
+                        terminal_state=terminal, latency_ms=latency, turn_key=opaque("turn", current_turn) if current_turn else None,
+                        source_digest=source, source_ordinal=line_number,
+                    )
                 continue
             if kind == "response_item" and payload.get("type") == "function_call":
                 if session_key is None or not isinstance(payload.get("call_id"), str):
@@ -398,7 +413,7 @@ def _parse_source(
                     persist_tool_end(
                         connection, session_key=session_key, call_key=opaque("call", call_id), category="tool", tool_name="function",
                         finished_at=envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None,
-                        terminal_state="success", latency_ms=None, turn_key=opaque("turn", current_turn) if current_turn else None,
+                        terminal_state="unknown", latency_ms=None, turn_key=opaque("turn", current_turn) if current_turn else None,
                         source_digest=source, source_ordinal=line_number,
                     )
                 pending = test_calls.get(call_id) if isinstance(call_id, str) else None

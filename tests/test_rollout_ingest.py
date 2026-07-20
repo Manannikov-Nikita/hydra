@@ -207,12 +207,48 @@ class RolloutIngestTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(rows), 4)
         self.assertEqual([(row[0], row[1], row[2], row[4], row[5], row[6], row[7]) for row in rows], [
-            ("function", "2026-07-20T00:00:03Z", "2026-07-20T00:00:02Z", "tool", "success", "complete", "exact"),
+            ("function", "2026-07-20T00:00:03Z", "2026-07-20T00:00:02Z", "tool", "unknown", "complete", "exact"),
             ("mcp", None, "2026-07-20T00:00:04Z", "tool", "success", "incomplete", "exact"),
             ("patch", None, "2026-07-20T00:00:05Z", "tool", "failed", "incomplete", "exact"),
             ("web", None, "2026-07-20T00:00:06Z", "web", "success", "incomplete", "exact"),
         ])
         self.assertEqual(len({row[3] for row in rows}), 1)
+
+    def test_custom_exec_wrapper_joins_in_both_orders_without_promoting_nested_spans(self) -> None:
+        raw_program = ('tools.exec_command({"cmd": "pytest tests/safe.py"}); '
+                       'tools.exec_command({"cmd": "pytest tests/also-safe.py"}); '
+                       'tools.apply_patch("*** Update File: src/safe.py\\n+safe");')
+        raw_output = "Script completed\nWall time: 0.025 seconds"
+        write_jsonl(self.root / "rollouts" / "custom-exec.jsonl", [
+            v1("session_meta", {"id": "anon-custom", "cwd": str(self.project)}),
+            v1("turn_context", {"turn_id": "turn-custom"}, 1),
+            v1("response_item", {"type": "custom_tool_call", "call_id": "exec-first", "name": "exec", "input": raw_program}, 2),
+            v1("response_item", {"type": "custom_tool_call_output", "call_id": "exec-first", "output": raw_output}, 3),
+            v1("response_item", {"type": "custom_tool_call_output", "call_id": "output-first", "output": [{"type": "input_text", "text": "Script completed\nWall time: 0.010 seconds"}]}, 4),
+            v1("response_item", {"type": "custom_tool_call", "call_id": "output-first", "name": "exec", "input": 'tools.exec_command({"cmd": "pytest tests/other.py"});'}, 5),
+            v1("response_item", {"type": "custom_tool_call", "call_id": "failed", "name": "exec", "input": 'tools.exec_command({"cmd": "pytest tests/fail.py"});'}, 6),
+            v1("response_item", {"type": "custom_tool_call_output", "call_id": "failed", "output": [{"type": "input_text", "text": "Script failed with exit code 1"}]}, 7),
+        ])
+
+        ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic", hash_key=b"n" * 32)
+
+        rows = self.store.connection.execute(
+            "SELECT tool_name, terminal_state, latency_ms, completeness, provenance FROM tool_spans ORDER BY source_ordinal, tool_name"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("custom_exec", "unknown", None, "complete", "exact"),
+            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+            ("custom_exec", "success", 10, "complete", "exact"),
+            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+            ("custom_exec", "failed", None, "complete", "exact"),
+            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+        ])
+        self.assertNotIn(raw_program, "\n".join(self.store.connection.iterdump()))
+        self.assertNotIn(raw_output, "\n".join(self.store.connection.iterdump()))
+        self.assertIn(("write", "src/safe.py"), [tuple(row) for row in self.store.connection.execute(
+            "SELECT operation, relative_path FROM file_observations"
+        )])
 
     def test_test_detection_and_model_cause_conflict_use_deterministic_evidence(self) -> None:
         self.assertEqual(classify_test_command("python -m pytest"), ("pytest", "full"))

@@ -189,6 +189,15 @@ def _parse_source(
                 _insert_diagnostic(connection, source, line_number, "malformed", envelope)
                 continue
             kind, payload = envelope.get("type"), envelope["payload"]
+            event_key = opaque("event/" + (session_key or "") + "/" + json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+            known_event = connection.execute("SELECT 1 FROM rollout_event_keys WHERE event_key = ?", (event_key,)).fetchone()
+            if known_event is not None and kind != "session_meta":
+                continue
+            if known_event is None:
+                connection.execute(
+                    "INSERT INTO rollout_event_keys(event_key, source_digest, source_ordinal) VALUES (?, ?, ?)",
+                    (event_key, source, line_number),
+                )
             if kind not in KNOWN_ENVELOPES:
                 diagnostics += 1
                 _insert_diagnostic(connection, source, line_number, str(kind), payload)

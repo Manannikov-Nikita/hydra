@@ -59,3 +59,18 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"b" * 32)
 
         self.assertEqual((self.store.count("rollout_sessions"), self.store.count("token_snapshots")), (1, 1))
+
+    def test_archive_copy_and_appended_prefix_do_not_duplicate_token_events(self) -> None:
+        active = self.base / "active" / "thread-uuid.jsonl"
+        archive = self.base / "archive" / "thread-uuid.jsonl"
+        rows = [
+            record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0),
+            record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3}}}, 1),
+        ]
+        write(active, rows)
+        ingest_rollouts(self.store, (active,), self.project, "project-a", hash_key=b"c" * 32)
+        write(active, rows + [record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 20, "cached_input_tokens": 4, "output_tokens": 5}}}, 2)])
+        write(archive, rows)
+        ingest_rollouts(self.store, (active, archive), self.project, "project-a", hash_key=b"c" * 32)
+
+        self.assertEqual(self.store.count("token_snapshots"), 2)

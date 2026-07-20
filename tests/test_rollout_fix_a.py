@@ -35,12 +35,10 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_thread_id_is_distinct_from_shared_conversation_and_unrelated_cwd_is_quarantined(self) -> None:
-        source = self.base / "rollouts" / "threads.jsonl"
-        write(source, [
-            record("session_meta", {"id": "root-thread", "session_id": "conversation", "cwd": str(self.project)}, 0),
-            record("session_meta", {"id": "child-thread", "session_id": "conversation", "cwd": str(self.project), "parent_thread_id": "root-thread"}, 1),
-            record("session_meta", {"id": "other-thread", "session_id": "conversation", "cwd": str(self.other)}, 2),
-        ])
+        source = self.base / "rollouts"
+        write(source / "root.jsonl", [record("session_meta", {"id": "root-thread", "session_id": "conversation", "cwd": str(self.project)}, 0)])
+        write(source / "child.jsonl", [record("session_meta", {"id": "child-thread", "session_id": "conversation", "cwd": str(self.project), "parent_thread_id": "root-thread"}, 1)])
+        write(source / "other.jsonl", [record("session_meta", {"id": "other-thread", "session_id": "conversation", "cwd": str(self.other)}, 2)])
 
         ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"a" * 32)
 
@@ -74,3 +72,19 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         ingest_rollouts(self.store, (active, archive), self.project, "project-a", hash_key=b"c" * 32)
 
         self.assertEqual(self.store.count("token_snapshots"), 2)
+
+    def test_replayed_parent_meta_does_not_switch_child_thread_and_completed_turn_stays_completed(self) -> None:
+        source = self.base / "rollouts" / "child.jsonl"
+        write(source, [
+            record("session_meta", {"id": "child", "session_id": "conversation", "cwd": str(self.project), "parent_thread_id": "parent"}, 0),
+            record("turn_context", {"turn_id": "turn-child"}, 1),
+            record("event_msg", {"type": "task_complete", "turn_id": "turn-child", "duration_ms": 9}, 2),
+            record("session_meta", {"id": "parent", "session_id": "conversation", "cwd": str(self.project)}, 3),
+            record("event_msg", {"type": "task_started", "turn_id": "turn-child"}, 4),
+            record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 8, "cached_input_tokens": 1, "output_tokens": 2}}}, 5),
+        ])
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"d" * 32)
+
+        self.assertEqual(self.store.count("rollout_sessions"), 1)
+        self.assertEqual(self.store.connection.execute("SELECT state FROM turn_attempts").fetchone()[0], "completed")
+        self.assertEqual(self.store.connection.execute("SELECT turn_key FROM token_snapshots").fetchone()[0], self.store.connection.execute("SELECT turn_key FROM turn_attempts").fetchone()[0])

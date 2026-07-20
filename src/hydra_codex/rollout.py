@@ -123,7 +123,7 @@ def _upsert_turn(connection: Any, session: str, turn: str, state: str, timestamp
         """INSERT INTO turn_attempts(session_key, turn_key, attempt_ordinal, state, emitted_duration_ms, wall_duration_ms, started_at, finished_at)
            VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
            ON CONFLICT(session_key, turn_key, attempt_ordinal) DO UPDATE SET
-             state = excluded.state, emitted_duration_ms = COALESCE(excluded.emitted_duration_ms, turn_attempts.emitted_duration_ms),
+             state = CASE WHEN turn_attempts.state IN ('completed', 'aborted') THEN turn_attempts.state ELSE excluded.state END, emitted_duration_ms = COALESCE(excluded.emitted_duration_ms, turn_attempts.emitted_duration_ms),
              started_at = COALESCE(turn_attempts.started_at, excluded.started_at), finished_at = COALESCE(excluded.finished_at, turn_attempts.finished_at)""",
         (session, opaque(turn), state, duration, timestamp if state == "open" else None, timestamp if state != "open" else None),
     )
@@ -172,6 +172,7 @@ def _parse_source(
 ) -> int:
     diagnostics = 0
     session_key: str | None = None
+    current_turn: str | None = None
     seen_session = False
     epochs: dict[str, tuple[int, tuple[int, int, int, int, int]]] = {}
     failed_commands: set[str] = set()
@@ -224,6 +225,7 @@ def _parse_source(
                 if seen_session and next_key != session_key:
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "multiple_sessions", payload)
+                    continue
                 session_key = next_key
                 existing = connection.execute("SELECT resume_segments FROM rollout_sessions WHERE session_key = ?", (session_key,)).fetchone()
                 path_key = _path_key(payload.get("cwd"), project_root)
@@ -242,6 +244,9 @@ def _parse_source(
                             (session_key, opaque(parent), None, "confirmed", 1.0),
                         )
                 seen_session = True
+                continue
+            if kind == "turn_context" and isinstance(payload.get("turn_id"), str):
+                current_turn = payload["turn_id"]
                 continue
             if kind == "event_msg" and payload.get("type") == "token_count":
                 usage = _usage(payload)
@@ -264,6 +269,7 @@ def _parse_source(
                     (source, line_number, session_key, project_id, epoch, usage["input"], usage["cached"], usage["output"],
                      usage["reasoning"], usage["cache_write"], usage["vendor_total"] or None, usage["context_window"] or None, completeness),
                 )
+                connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque(current_turn) if current_turn else None, source, line_number))
                 edge = connection.execute(
                     "SELECT parent_key FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()

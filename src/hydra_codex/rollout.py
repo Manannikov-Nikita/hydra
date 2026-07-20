@@ -14,9 +14,9 @@ import secrets
 import tempfile
 from typing import Any, Iterable
 
-from .classifier import classify_test_command, classify_test_outcome
 from .project import ProjectNotFound, resolve_project
 from .storage import HydraStore
+from .test_evidence import TestEvidenceBuffer
 from .tool_normalization import custom_exec_outcome, nested_span_name, scan_custom_exec_details
 from .tool_spans import persist_tool_end, persist_tool_start
 KNOWN_ENVELOPES = {"session_meta", "turn_context", "event_msg", "response_item"}
@@ -177,14 +177,18 @@ def _parse_arguments(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _persist_file(connection: Any, source: str, line: int, session: str, operation: str, value: Any, project_root: Path) -> None:
+def _persist_file(
+    connection: Any, source: str, line: int, session: str, operation: str, value: Any,
+    project_root: Path, observed_at: str | None, turn_key: str | None,
+) -> None:
     path = _path_key(value, project_root)
     if path == "unknown":
         return
     connection.execute(
-        """INSERT INTO file_observations(source_digest, line_number, session_key, operation, relative_path, path_hash)
-           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-        (source, line, session, operation, path, opaque("path", path)),
+        """INSERT INTO file_observations(
+               source_digest, line_number, session_key, operation, relative_path, path_hash, observed_at, turn_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+        (source, line, session, operation, path, opaque("path", path), observed_at, turn_key),
     )
 
 
@@ -198,9 +202,8 @@ def _parse_source(
     current_turn: str | None = None
     seen_session = False
     epochs: dict[str, tuple[int, tuple[int, int, int, int, int]]] = {}
-    failed_commands: set[str] = set()
-    test_calls: dict[str, tuple[str, str, str]] = {}
     with store.rollout_transaction() as connection, path.open("r", encoding="utf-8", errors="replace") as handle:
+        test_evidence = TestEvidenceBuffer(connection, source, model_causes, opaque)
         for line_number, raw_line in enumerate(handle, start=1):
             try:
                 envelope = json.loads(raw_line)
@@ -361,7 +364,18 @@ def _parse_source(
                             _insert_diagnostic(connection, source, line_number, "custom_exec_" + reason, {"reason": reason})
                         for index, nested in enumerate(scan.calls):
                             for nested_path in nested.paths:
-                                _persist_file(connection, source, line_number, session_key, "write", nested_path, project_root)
+                                _persist_file(
+                                    connection, source, line_number, session_key, "write", nested_path, project_root,
+                                    envelope.get("timestamp"), opaque("turn", current_turn) if current_turn else None,
+                                )
+                            if nested.command is not None:
+                                test_evidence.intent(
+                                    logical_call_id=f"{payload['call_id']}:{index}", model_call_id=payload["call_id"],
+                                    command=nested.command, session_key=session_key, line_number=line_number,
+                                    observed_at=envelope.get("timestamp"),
+                                    turn_key=opaque("turn", current_turn) if current_turn else None,
+                                    tool_call_key=call_key,
+                                )
                             tool_name = nested_span_name(nested)
                             if tool_name is None:
                                 continue
@@ -400,12 +414,17 @@ def _parse_source(
                 arguments = _parse_arguments(payload.get("arguments"))
                 if "path" in arguments:
                     operation = "read" if "read" in name.lower() else "write"
-                    _persist_file(connection, source, line_number, session_key, operation, arguments["path"], project_root)
+                    _persist_file(
+                        connection, source, line_number, session_key, operation, arguments["path"], project_root,
+                        envelope.get("timestamp"), opaque("turn", current_turn) if current_turn else None,
+                    )
                 command = arguments.get("cmd")
                 if name == "exec_command" and isinstance(command, str):
-                    runner, scope = classify_test_command(command)
-                    if runner != "unknown":
-                        test_calls[payload["call_id"]] = (opaque("command", command), runner, scope)
+                    test_evidence.intent(
+                        logical_call_id=payload["call_id"], model_call_id=payload["call_id"], command=command,
+                        session_key=session_key, line_number=line_number, observed_at=envelope.get("timestamp"),
+                        turn_key=opaque("turn", current_turn) if current_turn else None, tool_call_key=call_key,
+                    )
                 continue
             if kind == "response_item" and payload.get("type") == "function_call_output":
                 call_id = payload.get("call_id")
@@ -416,33 +435,8 @@ def _parse_source(
                         terminal_state="unknown", latency_ms=None, turn_key=opaque("turn", current_turn) if current_turn else None,
                         source_digest=source, source_ordinal=line_number,
                     )
-                pending = test_calls.get(call_id) if isinstance(call_id, str) else None
-                if pending is None or session_key is None:
-                    continue
-                try:
-                    result = json.loads(payload.get("output", ""))
-                except (TypeError, json.JSONDecodeError):
-                    result = {}
-                result = result if isinstance(result, dict) else {}
-                command_hash, runner, scope = pending
-                text = " ".join(str(result.get(field, "")) for field in ("stdout", "stderr", "message"))
-                classification, outcome = classify_test_outcome(
-                    result.get("exit_code"), text, (command_hash,) if command_hash in failed_commands else ()
-                )
-                if outcome != "success":
-                    failed_commands.add(command_hash)
-                connection.execute(
-                    """INSERT INTO rollout_test_runs(source_digest, line_number, session_key, command_hash, runner, scope, classification, outcome)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-                    (source, line_number, session_key, command_hash, runner, scope, classification, outcome),
-                )
-                model_cause = model_causes.get(call_id) if isinstance(call_id, str) else None
-                if isinstance(model_cause, str) and model_cause != classification:
-                    connection.execute(
-                        """INSERT INTO semantic_conflicts(conflict_key, source_digest, line_number, deterministic_cause, model_cause)
-                           VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-                        (opaque("diagnostic", f"{source}:{line_number}"), source, line_number, classification, model_cause),
-                    )
+                if isinstance(call_id, str):
+                    test_evidence.result(call_id, payload.get("output"), envelope.get("timestamp"))
                 continue
             if kind == "event_msg" and event_type in {"mcp_tool_call_end", "patch_apply_end", "web_search_end"}:
                 call_id = payload.get("call_id")
@@ -459,8 +453,12 @@ def _parse_source(
                     changes = payload.get("changes")
                     if isinstance(changes, dict):
                         for changed_path in changes:
-                            _persist_file(connection, source, line_number, session_key, "write", changed_path, project_root)
+                            _persist_file(
+                                connection, source, line_number, session_key, "write", changed_path, project_root,
+                                envelope.get("timestamp"), opaque("turn", current_turn) if current_turn else None,
+                            )
                 continue
+        test_evidence.flush()
     return diagnostics
 
 

@@ -92,11 +92,11 @@ class SQLiteStorageTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_migrates_a_fresh_database_and_reopens_at_the_same_version(self) -> None:
-        self.assertEqual(self.store.schema_version(), 12)
+        self.assertEqual(self.store.schema_version(), MIGRATIONS[-1][0])
         self.store.close()
         reopened = HydraStore(self.database)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.schema_version(), 12)
+        self.assertEqual(reopened.schema_version(), MIGRATIONS[-1][0])
         self.assertEqual(reopened.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_migrates_version_eleven_tool_spans_without_losing_existing_rows(self) -> None:
@@ -120,7 +120,7 @@ class SQLiteStorageTests(unittest.TestCase):
         row = migrated.connection.execute(
             "SELECT terminal_state, completeness, provenance, tool_name, started_at, finished_at FROM tool_spans"
         ).fetchone()
-        self.assertEqual(migrated.schema_version(), 12)
+        self.assertEqual(migrated.schema_version(), MIGRATIONS[-1][0])
         self.assertEqual(tuple(row), ("success", "incomplete", "exact", None, None, None))
 
     def test_second_migration_sanitizes_and_quarantines_actual_version_one_rows(self) -> None:
@@ -182,7 +182,7 @@ class SQLiteStorageTests(unittest.TestCase):
             "SELECT * FROM conflicts WHERE record_id = 'legacy-invalid'"
         ).fetchone()
 
-        self.assertEqual(migrated.schema_version(), 12)
+        self.assertEqual(migrated.schema_version(), MIGRATIONS[-1][0])
         self.assertIn("task_family", columns)
         self.assertEqual(len(safe_rows), len(SECRET_FORM_MATRIX))
         self.assertTrue(all(row[0] == "[redacted]" for row in safe_rows))

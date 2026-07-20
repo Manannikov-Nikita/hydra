@@ -13,10 +13,8 @@ from typing import Iterator
 
 from .contracts import AnnotationRecord, ConflictRecord, ThreadSessionRecord, TurnRecord
 
-
 class StorageUnavailable(RuntimeError):
     """Raised when the configured database cannot safely be opened."""
-
 
 @dataclass(frozen=True)
 class WriteResult:
@@ -269,6 +267,32 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE tool_spans ADD COLUMN source_ordinal INTEGER",
         "ALTER TABLE tool_spans ADD COLUMN completeness TEXT NOT NULL DEFAULT 'incomplete'",
         "ALTER TABLE tool_spans ADD COLUMN provenance TEXT NOT NULL DEFAULT 'exact'",
+    )),
+    (13, (
+        "ALTER TABLE rollout_test_runs RENAME TO rollout_test_runs_v12",
+        """CREATE TABLE rollout_test_runs (
+            evidence_key TEXT PRIMARY KEY, source_digest TEXT NOT NULL,
+            line_number INTEGER NOT NULL, session_key TEXT NOT NULL,
+            observed_at TEXT, turn_key TEXT, tool_call_key TEXT NOT NULL,
+            command_hash TEXT NOT NULL, runner TEXT NOT NULL, scope TEXT NOT NULL,
+            exit_status INTEGER, outcome TEXT NOT NULL, failure_cause TEXT NOT NULL,
+            retry_kind TEXT NOT NULL DEFAULT 'none', attempt_ordinal INTEGER NOT NULL DEFAULT 1,
+            provenance TEXT NOT NULL, completeness TEXT NOT NULL
+        )""",
+        """INSERT INTO rollout_test_runs(
+               evidence_key, source_digest, line_number, session_key, tool_call_key,
+               command_hash, runner, scope, outcome, failure_cause, provenance, completeness)
+           SELECT source_digest || ':' || line_number, source_digest, line_number, session_key,
+                  source_digest || ':' || line_number, command_hash, runner, scope, outcome,
+                  CASE classification
+                    WHEN 'product_failure' THEN 'product_failure' WHEN 'infra_retry' THEN 'infra_failure'
+                    ELSE 'unknown'
+                  END,
+                  'derived', 'legacy'
+             FROM rollout_test_runs_v12""",
+        "DROP TABLE rollout_test_runs_v12",
+        "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
+        "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
 )
 

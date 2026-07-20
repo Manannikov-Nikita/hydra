@@ -74,6 +74,14 @@ class TurnTotals:
     provenance: str
 
 
+@dataclass(frozen=True)
+class MetricFact:
+    value: int | None
+    known_lower_bound: int
+    provenance: str
+    caveats: tuple[str, ...] = ()
+
+
 def aggregate_turns(attempts: Iterable[TurnAttempt]) -> TurnTotals:
     intervals = []
     agent = 0
@@ -144,3 +152,29 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
         recorded.full_context, recorded.reasoning_tokens, sessions,
         0.0 if not annotations else 1.0, "derived" if baselines else "exact",
     )
+
+
+def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> dict[str, MetricFact]:
+    """Per-component final cumulative facts; absent parts never become zero."""
+    rows = connection.execute(
+        """SELECT session_key,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,observed_at
+           FROM token_snapshots WHERE project_id=? ORDER BY observed_at,source_digest,line_number""", (project_id,)
+    ).fetchall()
+    final: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        final[row[0]] = row
+    vectors = tuple(final.values())
+    def component(index: int) -> MetricFact:
+        known = sum(row[index] or 0 for row in vectors)
+        missing = any(row[index] is None for row in vectors)
+        return MetricFact(None if missing else known, known, "estimated" if missing else "exact", ("missing_component",) if missing else ())
+    inputs, cached, outputs, reasoning = component(1), component(2), component(3), component(4)
+    working_ready = all(row[1] is not None and row[2] is not None and row[3] is not None for row in vectors)
+    full_ready = all(row[1] is not None and row[3] is not None for row in vectors)
+    working_lower = sum((row[1] or 0) - (row[2] or 0) + (row[3] or 0) for row in vectors)
+    full_lower = sum((row[1] or 0) + (row[3] or 0) for row in vectors)
+    return {
+        "input": inputs, "cached_input": cached, "output": outputs, "reasoning": reasoning,
+        "working": MetricFact(working_lower if working_ready else None, working_lower, "exact" if working_ready else "estimated", () if working_ready else ("missing_core_component",)),
+        "full": MetricFact(full_lower if full_ready else None, full_lower, "exact" if full_ready else "estimated", () if full_ready else ("missing_core_component",)),
+    }

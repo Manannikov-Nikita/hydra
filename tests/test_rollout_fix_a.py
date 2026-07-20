@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from hydra_codex.rollout import ingest_rollouts
-from hydra_codex.metrics import aggregate_project
+from hydra_codex.metrics import aggregate_project, aggregate_project_facts
 from hydra_codex.storage import HydraStore
 
 
@@ -144,3 +144,11 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         write(late, [meta, vector(1)])
         ingest_rollouts(self.store, (late, early), self.project, "project-a", hash_key=b"i" * 32)
         self.assertEqual(self.store.connection.execute("SELECT input_tokens FROM fork_baselines").fetchone()[0], 1)
+
+    def test_metric_facts_keep_working_full_exact_when_reasoning_missing(self) -> None:
+        source = self.base / "facts.jsonl"
+        write(source, [record("session_meta", {"id": "facts", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3}}}, 1)])
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"j" * 32)
+        facts = aggregate_project_facts(self.store.connection, "project-a")
+        self.assertEqual((facts["working"].value, facts["full"].value, facts["reasoning"].value), (11, 13, None))
+        self.assertEqual(facts["reasoning"].provenance, "estimated")

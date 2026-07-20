@@ -236,13 +236,14 @@ class RolloutIngestTests(unittest.TestCase):
             "SELECT tool_name, terminal_state, latency_ms, completeness, provenance FROM tool_spans ORDER BY source_ordinal, tool_name"
         ).fetchall()
         self.assertEqual([tuple(row) for row in rows], [
+            ("apply_patch", "unknown", None, "incomplete", "lower_bound"),
             ("custom_exec", "unknown", None, "complete", "exact"),
-            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
-            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+            ("exec_command", "unknown", None, "incomplete", "lower_bound"),
+            ("exec_command", "unknown", None, "incomplete", "lower_bound"),
             ("custom_exec", "success", 10, "complete", "exact"),
-            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+            ("exec_command", "unknown", None, "incomplete", "lower_bound"),
             ("custom_exec", "failed", None, "complete", "exact"),
-            ("nested_exec", "unknown", None, "incomplete", "lower_bound"),
+            ("exec_command", "unknown", None, "incomplete", "lower_bound"),
         ])
         self.assertNotIn(raw_program, "\n".join(self.store.connection.iterdump()))
         self.assertNotIn(raw_output, "\n".join(self.store.connection.iterdump()))

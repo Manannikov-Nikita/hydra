@@ -7,7 +7,10 @@ from typing import Any
 from .tool_normalization import JoinedToolSpan, ToolSpanJoin
 
 _CATEGORIES = frozenset({"instrumentation", "opaque_exec", "tool", "web"})
-_TOOL_NAMES = frozenset({"custom_exec", "function", "mcp", "nested_exec", "patch", "web"})
+_TOOL_NAMES = frozenset({
+    "apply_patch", "custom_exec", "exec_command", "function", "hydra", "mcp",
+    "nested_exec", "patch", "view_image", "web",
+})
 _TERMINAL_STATES = frozenset({"unknown", "success", "failed"})
 _PROVENANCE = frozenset({"exact", "lower_bound"})
 

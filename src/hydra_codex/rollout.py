@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from .custom_tool_persistence import persist_custom_tool_call
 from .project import ProjectNotFound, resolve_project
 from .rollout_identity import ACTIVE_HASHER, IngestReport, Pseudonymizer, RolloutRoot, discover_rollouts, opaque
 from .rollout_observations import fingerprint as observation_fingerprint
@@ -22,7 +23,7 @@ from .rollout_reconcile import reconcile_token_epochs, reconcile_turn_attempts
 from .rollout_sources import line_fingerprint, located_lineage, prefix_lineage, relation_to, revision_lines, scan_source
 from .storage import HydraStore
 from .test_evidence import TestEvidenceBuffer
-from .tool_normalization import custom_exec_outcome, nested_span_name, scan_custom_exec_details
+from .tool_normalization import custom_exec_outcome
 from .tool_spans import persist_tool_end, persist_tool_start
 
 
@@ -263,42 +264,16 @@ def _parse_source(
                 )
                 continue
             if kind == "response_item" and payload.get("type") == "custom_tool_call":
-                if session_key is not None and isinstance(payload.get("call_id"), str):
-                    call_key = opaque("call", payload["call_id"])
-                    persist_tool_start(
-                        connection, session_key=session_key, call_key=call_key, category="opaque_exec", tool_name="custom_exec",
-                        started_at=observed_at,
-                        turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
+                if session_key is not None:
+                    diagnostics += persist_custom_tool_call(
+                        connection, payload=payload, session_key=session_key,
+                        source_digest=source, source_ordinal=line_number,
+                        observed_at=observed_at, current_turn=current_turn,
+                        project_root=project_root, test_evidence=test_evidence,
+                        diagnose=lambda reason: _insert_diagnostic(
+                            connection, source, line_number, reason, {}, unsafe_value=reason,
+                        ),
                     )
-                    if payload.get("name") == "exec" and isinstance(payload.get("input"), str):
-                        scan = scan_custom_exec_details(payload["input"])
-                        for reason in scan.diagnostics:
-                            diagnostics += 1
-                            _insert_diagnostic(connection, source, line_number, "custom_exec_" + reason, {"reason": reason})
-                        for index, nested in enumerate(scan.calls):
-                            for nested_path in nested.paths:
-                                _persist_file(
-                                    connection, source, line_number, session_key, "write", nested_path, project_root,
-                                    observed_at, opaque("turn", current_turn) if current_turn else None,
-                                )
-                            if nested.command is not None:
-                                test_evidence.intent(
-                                    logical_call_id=f"{payload['call_id']}:{index}", model_call_id=payload["call_id"],
-                                    command=nested.command, session_key=session_key, line_number=line_number,
-                                    observed_at=observed_at,
-                                    turn_key=opaque("turn", current_turn) if current_turn else None,
-                                    tool_call_key=call_key,
-                                )
-                            tool_name = nested_span_name(nested)
-                            if tool_name is None:
-                                continue
-                            nested_key = opaque("call", f"{payload['call_id']}:{index}:{nested.name}")
-                            persist_tool_start(
-                                connection, session_key=session_key, call_key=nested_key, category="tool", tool_name=tool_name,
-                                started_at=observed_at,
-                                turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
-                                provenance="lower_bound",
-                            )
                 continue
             if kind == "response_item" and payload.get("type") == "custom_tool_call_output":
                 call_id = payload.get("call_id")

@@ -20,7 +20,7 @@ from .rollout_persistence import duration_ms as _duration_ms
 from .rollout_persistence import insert_diagnostic as _persist_diagnostic
 from .rollout_persistence import persist_file as _persist_file
 from .rollout_persistence import tool_end_state as _tool_end_state
-from .rollout_reconcile import reconcile_token_epochs, reconcile_turn_attempts
+from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
 from .rollout_sources import line_fingerprint, located_lineage, prefix_lineage, relation_to, revision_lines, scan_source
 from .storage import HydraStore
 from .test_evidence import TestEvidenceBuffer
@@ -43,7 +43,6 @@ def _parse_source(
     diagnostics = 0
     session_key: str | None = None
     session_meta_at: str | None = None
-    session_meta_epoch: float | None = None
     current_turn: str | None = None
     seen_session = False
     with store.rollout_transaction() as connection, path.open("rb") as handle:
@@ -134,7 +133,6 @@ def _parse_source(
                 payload_time = canonical_timestamp(payload.get("timestamp"))
                 if not seen_session:
                     session_meta_at = payload_time.text or observed_at
-                    session_meta_epoch = payload_time.epoch if payload_time.epoch is not None else timestamp.epoch
                 session_path = path_key(payload.get("cwd"), project_root, opaque)
                 connection.execute(
                     """INSERT INTO rollout_sessions(
@@ -152,7 +150,6 @@ def _parse_source(
                         "SELECT started_at FROM rollout_sessions WHERE session_key=?", (session_key,),
                     ).fetchone()[0]
                     session_meta_at = persisted_start
-                    session_meta_epoch = canonical_timestamp(persisted_start).epoch
                 connection.execute(
                     "UPDATE rollout_logical_sources SET session_key=?,project_id=? WHERE logical_source_key=?",
                     (session_key, project_id, logical),
@@ -199,26 +196,6 @@ def _parse_source(
                      usage["reasoning"], usage["cache_write"], usage["vendor_total"], usage["context_window"], completeness, observed_at),
                 )
                 connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque("turn", current_turn) if current_turn else None, source, line_number))
-                edge = connection.execute(
-                    "SELECT parent_key FROM session_edges WHERE child_key = ?", (session_key,)
-                ).fetchone()
-                timely = (
-                    session_meta_epoch is not None and timestamp.epoch is not None
-                    and 0 <= timestamp.epoch - session_meta_epoch <= 1
-                )
-                if usage["complete"] and timely and edge is not None and connection.execute(
-                    "SELECT confidence_kind FROM session_edges WHERE child_key = ?", (session_key,)
-                ).fetchone()[0] == "confirmed":
-                    connection.execute(
-                        """INSERT INTO fork_baselines(child_key, source_digest, line_number, input_tokens, cached_input_tokens,
-                           output_tokens, reasoning_tokens, cache_write_tokens, provenance, observed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'exact', ?) ON CONFLICT(child_key) DO UPDATE SET
-                             source_digest=excluded.source_digest,line_number=excluded.line_number,input_tokens=excluded.input_tokens,
-                             cached_input_tokens=excluded.cached_input_tokens,output_tokens=excluded.output_tokens,
-                             reasoning_tokens=excluded.reasoning_tokens,cache_write_tokens=excluded.cache_write_tokens,observed_at=excluded.observed_at
-                           WHERE excluded.observed_at > fork_baselines.observed_at""",
-                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"], observed_at),
-                    )
                 continue
             event_type = payload.get("type") if kind == "event_msg" else None
             if kind == "event_msg" and event_type == "sub_agent_activity":
@@ -473,6 +450,9 @@ def ingest_rollouts(
                         (digest, logical),
                     )
                 connection.execute("UPDATE rollout_sources SET materialized=1 WHERE source_digest=?", (digest,))
+                reconcile_fork_baselines(connection, project_id)
+        with store.rollout_transaction() as connection:
+            reconcile_fork_baselines(connection, project_id)
         return IngestReport(len(files), len(unique), diagnostics)
     finally:
         ACTIVE_HASHER.reset(hash_token)

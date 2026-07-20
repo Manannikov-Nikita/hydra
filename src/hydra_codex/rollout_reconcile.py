@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import sqlite3
 from typing import Callable
 
+from .rollout_privacy import canonical_timestamp
+
 
 @dataclass
 class _Attempt:
@@ -121,3 +123,63 @@ def reconcile_token_epochs(
                 "UPDATE token_snapshots SET epoch=? WHERE source_digest=? AND line_number=?",
                 (epoch, row[0], row[1]),
             )
+
+
+def reconcile_fork_baselines(connection: sqlite3.Connection, project_id: str) -> None:
+    """Rebuild exact replay baselines against each session's global earliest start."""
+    sessions = list(connection.execute(
+        """SELECT sessions.session_key,sessions.started_at
+             FROM rollout_sessions AS sessions
+             JOIN session_edges AS edges ON edges.child_key=sessions.session_key
+            WHERE sessions.project_id=? AND edges.confidence_kind='confirmed'
+              AND edges.parent_key IS NOT NULL""",
+        (project_id,),
+    ))
+    connection.execute(
+        """DELETE FROM fork_baselines WHERE child_key IN (
+               SELECT session_key FROM rollout_sessions WHERE project_id=?
+           )""",
+        (project_id,),
+    )
+    for session_key, started_at in sessions:
+        started_epoch = canonical_timestamp(started_at).epoch
+        if started_epoch is None:
+            continue
+        candidates: list[tuple[tuple[float, str, int], sqlite3.Row]] = []
+        for row in connection.execute(
+            """SELECT source_digest,line_number,input_tokens,cached_input_tokens,
+                      output_tokens,reasoning_tokens,cache_write_tokens,observed_at
+                 FROM token_snapshots
+                WHERE session_key=? AND project_id=? AND completeness='complete'""",
+            (session_key, project_id),
+        ):
+            observed_epoch = canonical_timestamp(row[7]).epoch
+            required = (row[2], row[3], row[4], row[5])
+            valid_required = all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in required
+            )
+            cache_write = row[6]
+            valid_cache_write = (
+                cache_write is None
+                or isinstance(cache_write, int) and not isinstance(cache_write, bool) and cache_write >= 0
+            )
+            if (
+                observed_epoch is None or not valid_required or not valid_cache_write
+                or row[3] > row[2] or not 0 <= observed_epoch - started_epoch <= 1
+            ):
+                continue
+            candidates.append(((observed_epoch, row[0], int(row[1])), row))
+        if not candidates:
+            continue
+        selected = max(candidates, key=lambda item: item[0])[1]
+        connection.execute(
+            """INSERT INTO fork_baselines(
+                   child_key,source_digest,line_number,input_tokens,cached_input_tokens,
+                   output_tokens,reasoning_tokens,cache_write_tokens,provenance,observed_at)
+               VALUES (?,?,?,?,?,?,?,?, 'exact', ?)""",
+            (
+                session_key, selected[0], selected[1], selected[2], selected[3],
+                selected[4], selected[5], selected[6], selected[7],
+            ),
+        )

@@ -111,12 +111,12 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         old = self.base / "z-old.jsonl"
         new = self.base / "a-new.jsonl"
         write(old, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 0}}}, 10)])
-        write(new, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 200, "cached_input_tokens": 40, "output_tokens": 20, "reasoning_output_tokens": 0}}}, 20)])
+        write(new, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 1), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 200, "cached_input_tokens": 40, "output_tokens": 20, "reasoning_output_tokens": 0}}}, 20)])
         ingest_rollouts(self.store, (new, old), self.project, "project-a", hash_key=b"f" * 32)
         first = aggregate_project(self.store.connection, "project-a")
         self.assertEqual(first.working_tokens, 180)
         reset = self.base / "m-reset.jsonl"
-        write(reset, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 0}}}, 30)])
+        write(reset, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 29), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 0}}}, 30)])
         ingest_rollouts(self.store, (reset,), self.project, "project-a", hash_key=b"f" * 32)
         self.assertEqual(aggregate_project(self.store.connection, "project-a").working_tokens, 209)
 
@@ -141,10 +141,14 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
     def test_last_eligible_baseline_candidate_wins_independent_of_root_order(self) -> None:
         early = self.base / "early.jsonl"
         late = self.base / "late.jsonl"
-        meta = record("session_meta", {"id": "child", "cwd": str(self.project), "parent_thread_id": "parent"}, 0)
+        meta = lambda second: record(
+            "session_meta",
+            {"id": "child", "cwd": str(self.project), "parent_thread_id": "parent"},
+            second,
+        )
         vector = lambda value: record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": value, "cached_input_tokens": 1, "output_tokens": 2, "reasoning_output_tokens": 3}}}, value)
-        write(early, [meta, vector(0)])
-        write(late, [meta, vector(1)])
+        write(early, [meta(0), vector(0)])
+        write(late, [meta(1), vector(1)])
         ingest_rollouts(self.store, (late, early), self.project, "project-a", hash_key=b"i" * 32)
         self.assertEqual(self.store.connection.execute("SELECT input_tokens FROM fork_baselines").fetchone()[0], 1)
 
@@ -171,9 +175,10 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
     def test_fact_epochs_are_global_and_inferred_edge_is_not_exact_dedup(self) -> None:
         first = self.base / "first.jsonl"
         second = self.base / "second.jsonl"
-        meta = record("session_meta", {"id": "child", "cwd": str(self.project)}, 0)
-        write(first, [meta, record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "reasoning_output_tokens": 0}}}, 2)])
-        write(second, [meta, record("event_msg", {"type": "sub_agent_activity", "agent_thread_id": "child"}, 1), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 4, "cached_input_tokens": 1, "output_tokens": 1, "reasoning_output_tokens": 0}}}, 3)])
+        first_meta = record("session_meta", {"id": "child", "cwd": str(self.project)}, 0)
+        second_meta = record("session_meta", {"id": "child", "cwd": str(self.project)}, 1)
+        write(first, [first_meta, record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "reasoning_output_tokens": 0}}}, 2)])
+        write(second, [second_meta, record("event_msg", {"type": "sub_agent_activity", "agent_thread_id": "child"}, 1), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 4, "cached_input_tokens": 1, "output_tokens": 1, "reasoning_output_tokens": 0}}}, 3)])
         ingest_rollouts(self.store, (first, second), self.project, "project-a", hash_key=b"l" * 32)
         facts = aggregate_project_facts(self.store.connection, "project-a")
         self.assertEqual(facts["recorded_working"].value, 15)

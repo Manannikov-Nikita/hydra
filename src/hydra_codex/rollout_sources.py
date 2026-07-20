@@ -38,8 +38,7 @@ def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str])
     chain = hmac.new(key, b"hydra/source-chain/", hashlib.sha256)
     fingerprints: list[str] = []
     first_meta: tuple[str, str | None, str | None, str | None, str] | None = None
-    matched_meta: tuple[str, str | None, str | None, str | None, str] | None = None
-    first_observation_marker: str | None = None
+    matched_meta: tuple[int, tuple[str, str | None, str | None, str | None, str]] | None = None
     byte_count = 0
     with path.open("rb") as handle:
         for raw_line in handle:
@@ -56,9 +55,6 @@ def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str])
             if not isinstance(envelope, dict):
                 continue
             if envelope.get("type") != "session_meta":
-                if first_observation_marker is None:
-                    observed = canonical_timestamp(envelope.get("timestamp")).text
-                    first_observation_marker = observed or fingerprint
                 continue
             payload = envelope.get("payload")
             if not isinstance(payload, dict):
@@ -77,11 +73,14 @@ def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str])
             )
             if first_meta is None:
                 first_meta = candidate_meta
-            if candidate in path.name:
-                matched_meta = candidate_meta
-    identity, conversation, cwd, meta_timestamp, meta_marker = matched_meta or first_meta or (None, None, None, None, "missing")
+            suffix = f"{candidate}.jsonl"
+            exact_suffix = path.name == suffix or path.name.endswith("-" + suffix)
+            if exact_suffix and (matched_meta is None or len(candidate) > matched_meta[0]):
+                matched_meta = (len(candidate), candidate_meta)
+    selected_meta = matched_meta[1] if matched_meta is not None else first_meta
+    identity, conversation, cwd, meta_timestamp, meta_marker = selected_meta or (None, None, None, None, "missing")
     first = fingerprints[0] if fingerprints else pseudonymize("source", "empty")
-    marker = f"{meta_marker}/{first_observation_marker or 'meta-only'}" if identity is not None else first
+    marker = meta_marker if identity is not None else first
     return SourceScan(
         revision.hexdigest(), tuple(fingerprints), len(fingerprints), byte_count,
         chain.hexdigest(), identity, conversation, cwd, meta_timestamp, marker,

@@ -87,7 +87,7 @@ class RolloutReviewFixTests(unittest.TestCase):
         write(active, [self.meta(), self.token(10, "2026-07-21T00:00:01Z")])
         ingest_rollouts(self.store, (active,), self.project_a, "project-a", hash_key=self.key)
 
-        write(renamed, [self.meta(), self.token(99, "2026-07-21T00:00:01Z")])
+        write(renamed, [self.meta(), self.token(99, "2026-07-21T00:00:02Z")])
         ingest_rollouts(self.store, (renamed,), self.project_a, "project-a", hash_key=self.key)
 
         self.assertEqual(self.store.count("rollout_logical_sources"), 1)
@@ -97,6 +97,40 @@ class RolloutReviewFixTests(unittest.TestCase):
                 "SELECT lineage_state FROM rollout_logical_sources"
             ).fetchone()[0],
             "conflicted",
+        )
+
+    def test_rollout_filename_selects_exact_child_suffix_before_replayed_parent(self) -> None:
+        source = (
+            self.base / "rollouts" /
+            "rollout-2026-07-21T00-00-00.000Z-parent-child.jsonl"
+        )
+        write(source, [
+            record("session_meta", {
+                "id": "parent-child", "cwd": str(self.project_a),
+                "parent_thread_id": "parent",
+            }, "2026-07-21T00:00:00Z"),
+            record("session_meta", {
+                "id": "parent", "cwd": str(self.project_a),
+            }, "2026-07-21T00:00:01Z"),
+            self.token(10, "2026-07-21T00:00:02Z"),
+        ])
+
+        ingest_rollouts(self.store, (source,), self.project_a, "project-a", hash_key=self.key)
+
+        hasher = Pseudonymizer(self.key)
+        child_key = hasher.digest("identity", "parent-child")
+        parent_key = hasher.digest("identity", "parent")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT session_key FROM token_snapshots"
+            ).fetchone()[0],
+            child_key,
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                "SELECT child_key,parent_key,confidence_kind FROM session_edges"
+            ).fetchone()),
+            (child_key, parent_key, "confirmed"),
         )
 
     def test_same_timestamp_remains_separate_for_distinct_session_identities(self) -> None:

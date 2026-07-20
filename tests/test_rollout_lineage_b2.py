@@ -250,6 +250,92 @@ class RolloutLineageB2Tests(unittest.TestCase):
         ingest_rollouts(self.store, (first, resumed), self.project, "project-b2", hash_key=self.key)
         self.assertEqual(self.store.count("fork_baselines"), 0)
 
+    def test_reverse_resume_replaces_stale_baseline_from_global_earliest_start(self) -> None:
+        first = self.base / "rollouts" / "thread-first.jsonl"
+        resumed = self.base / "rollouts" / "thread-resumed.jsonl"
+        write(first, [
+            self.meta(parent_thread_id="parent"),
+            self.token(10, "2026-07-21T00:00:00.500000Z"),
+        ])
+        write(resumed, [
+            self.meta(
+                timestamp="2026-07-21T01:00:00Z",
+                payload_timestamp="2026-07-21T01:00:00Z",
+                parent_thread_id="parent",
+            ),
+            self.token(999, "2026-07-21T01:00:00.500000Z"),
+        ])
+
+        ingest_rollouts(self.store, (resumed,), self.project, "project-b2", hash_key=self.key)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT input_tokens FROM fork_baselines"
+            ).fetchone()[0],
+            999,
+        )
+        ingest_rollouts(self.store, (first,), self.project, "project-b2", hash_key=self.key)
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT input_tokens FROM fork_baselines"
+            ).fetchone()[0],
+            10,
+        )
+
+    def test_reverse_resume_deletes_stale_baseline_without_earliest_candidate(self) -> None:
+        first = self.base / "rollouts" / "thread-first.jsonl"
+        resumed = self.base / "rollouts" / "thread-resumed.jsonl"
+        write(first, [
+            self.meta(parent_thread_id="parent"),
+            self.token(10, "2026-07-21T00:00:02Z"),
+        ])
+        write(resumed, [
+            self.meta(
+                timestamp="2026-07-21T01:00:00Z",
+                payload_timestamp="2026-07-21T01:00:00Z",
+                parent_thread_id="parent",
+            ),
+            self.token(999, "2026-07-21T01:00:00.500000Z"),
+        ])
+
+        ingest_rollouts(self.store, (resumed,), self.project, "project-b2", hash_key=self.key)
+        self.assertEqual(self.store.count("fork_baselines"), 1)
+        ingest_rollouts(self.store, (first,), self.project, "project-b2", hash_key=self.key)
+
+        self.assertEqual(self.store.count("fork_baselines"), 0)
+
+    def test_known_sources_reconcile_a_preexisting_stale_baseline(self) -> None:
+        first = self.base / "rollouts" / "thread-first.jsonl"
+        resumed = self.base / "rollouts" / "thread-resumed.jsonl"
+        write(first, [
+            self.meta(parent_thread_id="parent"),
+            self.token(10, "2026-07-21T00:00:00.500000Z"),
+        ])
+        write(resumed, [
+            self.meta(
+                timestamp="2026-07-21T01:00:00Z",
+                payload_timestamp="2026-07-21T01:00:00Z",
+                parent_thread_id="parent",
+            ),
+            self.token(999, "2026-07-21T01:00:00.500000Z"),
+        ])
+        ingest_rollouts(
+            self.store, (first, resumed), self.project, "project-b2", hash_key=self.key,
+        )
+        self.store.connection.execute("UPDATE fork_baselines SET input_tokens=999")
+        self.store.connection.commit()
+
+        ingest_rollouts(
+            self.store, (first, resumed), self.project, "project-b2", hash_key=self.key,
+        )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT input_tokens FROM fork_baselines"
+            ).fetchone()[0],
+            10,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

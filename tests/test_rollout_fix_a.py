@@ -152,3 +152,15 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         facts = aggregate_project_facts(self.store.connection, "project-a")
         self.assertEqual((facts["working"].value, facts["full"].value, facts["reasoning"].value), (11, 13, None))
         self.assertEqual(facts["reasoning"].provenance, "estimated")
+
+    def test_metric_facts_sum_epochs_and_report_missing_confirmed_baseline(self) -> None:
+        source = self.base / "epochs.jsonl"
+        write(source, [
+            record("session_meta", {"id": "child", "cwd": str(self.project), "parent_thread_id": "parent"}, 0),
+            record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "reasoning_output_tokens": 1}}}, 2),
+            record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 4, "cached_input_tokens": 1, "output_tokens": 1, "reasoning_output_tokens": 2}}}, 3),
+        ])
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"k" * 32)
+        facts = aggregate_project_facts(self.store.connection, "project-a")
+        self.assertEqual(facts["recorded_working"].value, 15)
+        self.assertEqual(facts["deduplicated_working"].caveats, ("zero_no_observation",))

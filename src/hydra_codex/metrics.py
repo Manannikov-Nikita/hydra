@@ -157,24 +157,36 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
 def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> dict[str, MetricFact]:
     """Per-component final cumulative facts; absent parts never become zero."""
     rows = connection.execute(
-        """SELECT session_key,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,observed_at
+        """SELECT session_key,epoch,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,observed_at
            FROM token_snapshots WHERE project_id=? ORDER BY observed_at,source_digest,line_number""", (project_id,)
     ).fetchall()
-    final: dict[str, sqlite3.Row] = {}
+    final: dict[tuple[str, int], sqlite3.Row] = {}
     for row in rows:
-        final[row[0]] = row
+        final[(row[0], row[1])] = row
     vectors = tuple(final.values())
     def component(index: int) -> MetricFact:
         known = sum(row[index] or 0 for row in vectors)
         missing = any(row[index] is None for row in vectors)
         return MetricFact(None if missing else known, known, "estimated" if missing else "exact", ("missing_component",) if missing else ())
-    inputs, cached, outputs, reasoning = component(1), component(2), component(3), component(4)
-    working_ready = all(row[1] is not None and row[2] is not None and row[3] is not None for row in vectors)
-    full_ready = all(row[1] is not None and row[3] is not None for row in vectors)
-    working_lower = sum((row[1] or 0) - (row[2] or 0) + (row[3] or 0) for row in vectors)
-    full_lower = sum((row[1] or 0) + (row[3] or 0) for row in vectors)
-    return {
+    inputs, cached, outputs, reasoning = component(2), component(3), component(4), component(5)
+    working_ready = all(row[2] is not None and row[3] is not None and row[4] is not None for row in vectors)
+    full_ready = all(row[2] is not None and row[4] is not None for row in vectors)
+    working_lower = sum((row[2] or 0) - (row[3] or 0) + (row[4] or 0) for row in vectors)
+    full_lower = sum((row[2] or 0) + (row[4] or 0) for row in vectors)
+    working = MetricFact(working_lower if working_ready else None, working_lower, "exact" if working_ready else "estimated", () if working_ready else ("missing_core_component",))
+    full = MetricFact(full_lower if full_ready else None, full_lower, "exact" if full_ready else "estimated", () if full_ready else ("missing_core_component",))
+    confirmed_missing = int(connection.execute("""SELECT COUNT(*) FROM session_edges e JOIN rollout_sessions s ON s.session_key=e.child_key
+       WHERE s.project_id=? AND e.confidence_kind='confirmed' AND NOT EXISTS (SELECT 1 FROM fork_baselines b WHERE b.child_key=e.child_key)""", (project_id,)).fetchone()[0])
+    baseline = connection.execute("""SELECT SUM(input_tokens-cached_input_tokens+output_tokens),SUM(input_tokens+output_tokens)
+       FROM fork_baselines b JOIN session_edges e ON e.child_key=b.child_key JOIN rollout_sessions s ON s.session_key=b.child_key
+       WHERE s.project_id=? AND e.confidence_kind='confirmed'""", (project_id,)).fetchone()
+    baseline_working, baseline_full = baseline[0] or 0, baseline[1] or 0
+    caveat = ("zero_no_observation",) if confirmed_missing else ()
+    dedup_working = MetricFact(None if working.value is None else working.value-baseline_working, working.known_lower_bound-baseline_working, "derived" if baseline_working else ("estimated" if caveat else working.provenance), caveat)
+    dedup_full = MetricFact(None if full.value is None else full.value-baseline_full, full.known_lower_bound-baseline_full, "derived" if baseline_full else ("estimated" if caveat else full.provenance), caveat)
+    facts = {
         "input": inputs, "cached_input": cached, "output": outputs, "reasoning": reasoning,
-        "working": MetricFact(working_lower if working_ready else None, working_lower, "exact" if working_ready else "estimated", () if working_ready else ("missing_core_component",)),
-        "full": MetricFact(full_lower if full_ready else None, full_lower, "exact" if full_ready else "estimated", () if full_ready else ("missing_core_component",)),
+        "working": working, "full": full,
     }
+    facts.update({"recorded_working": working, "recorded_full": full, "deduplicated_working": dedup_working, "deduplicated_full": dedup_full})
+    return facts

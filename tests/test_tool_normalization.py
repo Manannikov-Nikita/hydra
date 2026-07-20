@@ -51,7 +51,7 @@ class CustomExecScannerTests(unittest.TestCase):
         ''')
 
         self.assertEqual(result.calls, ())
-        self.assertEqual(result.diagnostics, ("conditional_or_dead", "conditional_or_dead", "unresolved_arguments"))
+        self.assertEqual(result.diagnostics, ("conditional", "dead_code", "dead_code"))
 
     def test_end_only_span_stays_unknown_until_a_structured_result_exists(self) -> None:
         span = ToolSpanJoin().end("call", "2026-07-21T00:00:02Z")

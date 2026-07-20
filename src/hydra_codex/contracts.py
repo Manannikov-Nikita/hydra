@@ -84,6 +84,20 @@ def _note(value: str) -> str:
     return value
 
 
+def _task_family(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("task_family must be non-empty text")
+    if len(value) > 80:
+        raise ValueError("task_family must not exceed 80 characters")
+    return value
+
+
+def _non_negative_integer(value: int, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
 def _confidence(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
         raise ValueError("confidence must be a number from 0 to 1")
@@ -106,6 +120,7 @@ class ModelAnnotationInput:
     phase: AnnotationPhase
     cause: AnnotationCause
     scope_change: ScopeChange
+    task_family: str
     confidence: float
     note: str
     outcome: Outcome | None = None
@@ -115,6 +130,7 @@ class ModelAnnotationInput:
         object.__setattr__(self, "phase", _enum(self.phase, AnnotationPhase, "phase"))
         object.__setattr__(self, "cause", _enum(self.cause, AnnotationCause, "cause"))
         object.__setattr__(self, "scope_change", _enum(self.scope_change, ScopeChange, "scope_change"))
+        object.__setattr__(self, "task_family", _task_family(self.task_family))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         if self.outcome is not None:
             object.__setattr__(self, "outcome", _enum(self.outcome, Outcome, "outcome"))
@@ -123,7 +139,7 @@ class ModelAnnotationInput:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ModelAnnotationInput":
-        allowed = {"kind", "phase", "cause", "scope_change", "confidence", "note", "outcome"}
+        allowed = {"kind", "phase", "cause", "scope_change", "task_family", "confidence", "note", "outcome"}
         forbidden = {
             "tokens", "token_count", "input_tokens", "output_tokens",
             "duration_ms", "elapsed_ms", "timing", "file_count", "files_changed",
@@ -158,8 +174,7 @@ class AnnotationContext:
     def __post_init__(self) -> None:
         for field in ("annotation_id", "project_id", "session_id", "turn_id", "observed_at"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
-        if not isinstance(self.sequence, int) or self.sequence < 0:
-            raise ValueError("sequence must be a non-negative integer")
+        object.__setattr__(self, "sequence", _non_negative_integer(self.sequence, "sequence"))
         object.__setattr__(self, "provenance", _enum(self.provenance, Provenance, "provenance"))
 
 
@@ -188,8 +203,7 @@ class TurnRecord:
     def __post_init__(self) -> None:
         for field in ("turn_id", "session_id", "observed_at"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
-        if not isinstance(self.ordinal, int) or self.ordinal < 0:
-            raise ValueError("ordinal must be a non-negative integer")
+        object.__setattr__(self, "ordinal", _non_negative_integer(self.ordinal, "ordinal"))
         object.__setattr__(self, "provenance", _enum(self.provenance, Provenance, "provenance"))
 
 
@@ -205,6 +219,7 @@ class AnnotationRecord:
     phase: AnnotationPhase
     cause: AnnotationCause
     scope_change: ScopeChange
+    task_family: str
     confidence: float
     note: str
     outcome: Outcome | None = None
@@ -213,8 +228,7 @@ class AnnotationRecord:
     def __post_init__(self) -> None:
         for field in ("annotation_id", "project_id", "session_id", "turn_id", "observed_at"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
-        if not isinstance(self.sequence, int) or self.sequence < 0:
-            raise ValueError("sequence must be a non-negative integer")
+        object.__setattr__(self, "sequence", _non_negative_integer(self.sequence, "sequence"))
         for field, enum_type in (
             ("kind", AnnotationKind), ("phase", AnnotationPhase), ("cause", AnnotationCause),
             ("scope_change", ScopeChange), ("provenance", Provenance),
@@ -222,6 +236,7 @@ class AnnotationRecord:
             object.__setattr__(self, field, _enum(getattr(self, field), enum_type, field))
         if self.outcome is not None:
             object.__setattr__(self, "outcome", _enum(self.outcome, Outcome, "outcome"))
+        object.__setattr__(self, "task_family", _task_family(self.task_family))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "note", _note(self.note))
         _outcome_for_kind(self.kind, self.outcome)
@@ -242,6 +257,7 @@ def materialize_annotation(model: ModelAnnotationInput, context: AnnotationConte
         phase=model.phase,
         cause=model.cause,
         scope_change=model.scope_change,
+        task_family=model.task_family,
         confidence=model.confidence,
         outcome=model.outcome,
         note=model.note,
@@ -261,8 +277,8 @@ class TokenSampleRecord:
     def __post_init__(self) -> None:
         for field in ("sample_id", "session_id", "turn_id", "observed_at"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
-        if min(self.input_tokens, self.output_tokens) < 0:
-            raise ValueError("token counts must be non-negative")
+        object.__setattr__(self, "input_tokens", _non_negative_integer(self.input_tokens, "input_tokens"))
+        object.__setattr__(self, "output_tokens", _non_negative_integer(self.output_tokens, "output_tokens"))
         object.__setattr__(self, "provenance", _enum(self.provenance, Provenance, "provenance"))
 
 

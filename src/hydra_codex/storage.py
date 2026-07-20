@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -29,9 +30,23 @@ def default_database_path(home: Path | None = None) -> Path:
 
 
 def redact_note(note: str) -> str:
-    """Keep a short operational note while removing common direct identifiers."""
-    redacted = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[email]", note)
-    return re.sub(r"\b(?:sk|api|token)[_-][A-Za-z0-9_-]{8,}\b", "[secret]", redacted, flags=re.I)
+    """Return a normalized safe note, failing closed when it contains secret-like data."""
+    normalized = " ".join("".join(
+        " " if ord(character) < 32 or ord(character) == 127 else character
+        for character in note
+    ).split())
+    sensitive_patterns = (
+        r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b",
+        r"\bauthorization\s*:\s*(?:bearer|basic)\s+\S+",
+        r"\bbearer\s+[A-Za-z0-9._~+/=-]+",
+        r"\b(?:password|secret|token|api[_-]?key)\s*(?:=|:)\s*\S+",
+        r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s]+@\S+",
+        r"(?<!\w)/(?:Users|home|private|var|etc|tmp|opt|Volumes)(?:/\S*)?",
+        r"(?<![\w-])[A-Za-z0-9+/=_-]{20,}(?![\w-])",
+    )
+    if not normalized or any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in sensitive_patterns):
+        return "[redacted]"
+    return normalized
 
 
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -125,6 +140,32 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
         ),
     ),
+    (
+        2,
+        (
+            "ALTER TABLE annotations ADD COLUMN task_family TEXT NOT NULL DEFAULT 'legacy'",
+            """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_insert
+                BEFORE INSERT ON annotations
+                FOR EACH ROW
+                WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
+                BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
+            """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_insert
+                BEFORE INSERT ON annotations
+                FOR EACH ROW
+                WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
+                BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
+            """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_update
+                BEFORE UPDATE OF project_id, session_id ON annotations
+                FOR EACH ROW
+                WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
+                BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
+            """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_update
+                BEFORE UPDATE OF session_id, turn_id ON annotations
+                FOR EACH ROW
+                WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
+                BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
+        ),
+    ),
 )
 
 
@@ -133,17 +174,21 @@ class HydraStore:
 
     def __init__(self, path: Path | str | None = None) -> None:
         self.database_path = default_database_path() if path is None else Path(path)
-        if path is None:
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        elif not self.database_path.parent.is_dir():
-            raise StorageUnavailable(f"database parent does not exist: {self.database_path.parent}")
         try:
+            if path is None:
+                self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if os.name == "posix":
+                    os.chmod(self.database_path.parent, 0o700)
+            elif not self.database_path.parent.is_dir():
+                raise StorageUnavailable(f"database parent does not exist: {self.database_path.parent}")
             self.connection = sqlite3.connect(self.database_path)
             self.connection.row_factory = sqlite3.Row
+            if os.name == "posix":
+                os.chmod(self.database_path, 0o600)
             self.connection.execute("PRAGMA foreign_keys = ON")
             self.connection.execute("PRAGMA journal_mode = WAL")
             self._migrate()
-        except sqlite3.Error as error:
+        except (OSError, sqlite3.Error) as error:
             try:
                 self.connection.close()
             except AttributeError:
@@ -209,7 +254,7 @@ class HydraStore:
         return (
             record.annotation_id, record.project_id, record.session_id, record.turn_id,
             record.sequence, record.observed_at, record.kind.value, record.phase.value,
-            record.cause.value, record.scope_change.value, record.confidence,
+            record.cause.value, record.scope_change.value, record.task_family, record.confidence,
             None if record.outcome is None else record.outcome.value, record.provenance.value,
             redact_note(record.note), hashlib.sha256(record.note.encode("utf-8")).hexdigest(), len(record.note),
         )
@@ -224,15 +269,15 @@ class HydraStore:
                 connection.execute(
                     """INSERT INTO annotations(
                         annotation_id, project_id, session_id, turn_id, sequence, observed_at, kind,
-                        phase, cause, scope_change, confidence, outcome, provenance, note_redacted,
+                        phase, cause, scope_change, task_family, confidence, outcome, provenance, note_redacted,
                         note_hash, note_length
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     values,
                 )
                 return WriteResult(inserted=True, conflicted=False)
             persisted = tuple(existing[column] for column in (
                 "annotation_id", "project_id", "session_id", "turn_id", "sequence", "observed_at", "kind",
-                "phase", "cause", "scope_change", "confidence", "outcome", "provenance", "note_redacted",
+                "phase", "cause", "scope_change", "task_family", "confidence", "outcome", "provenance", "note_redacted",
                 "note_hash", "note_length",
             ))
             if persisted == values:
@@ -259,7 +304,7 @@ class HydraStore:
                 annotation_id=row["annotation_id"], project_id=row["project_id"], session_id=row["session_id"],
                 turn_id=row["turn_id"], sequence=row["sequence"], observed_at=row["observed_at"],
                 kind=row["kind"], phase=row["phase"], cause=row["cause"], scope_change=row["scope_change"],
-                confidence=row["confidence"], outcome=row["outcome"], note=row["note_redacted"],
+                task_family=row["task_family"], confidence=row["confidence"], outcome=row["outcome"], note=row["note_redacted"],
                 provenance=row["provenance"],
             )
             for row in rows

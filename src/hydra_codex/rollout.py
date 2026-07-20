@@ -231,16 +231,18 @@ def _parse_source(
                 path_key = _path_key(payload.get("cwd"), project_root)
                 connection.execute(
                     """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments, conversation_key)
-                       VALUES (?, ?, ?, 1, ?) ON CONFLICT(session_key) DO UPDATE SET
-                         resume_segments = rollout_sessions.resume_segments + 1""",
+                       VALUES (?, ?, ?, 1, ?) ON CONFLICT(session_key) DO NOTHING""",
                     (session_key, project_id, path_key, opaque(conversation) if isinstance(conversation, str) else next_key),
                 )
-                if existing is None:
+                if payload.get("parent_thread_id") is not None:
                     parent = payload.get("parent_thread_id")
                     if isinstance(parent, str):
                         connection.execute(
                             """INSERT INTO session_edges(child_key, parent_key, baseline_working_tokens, confidence_kind, confidence)
-                               VALUES (?, ?, ?, ?, ?) ON CONFLICT(child_key) DO NOTHING""",
+                               VALUES (?, ?, ?, ?, ?) ON CONFLICT(child_key) DO UPDATE SET
+                                 parent_key = excluded.parent_key, baseline_working_tokens = NULL,
+                                 confidence_kind = 'confirmed', confidence = 1.0
+                               WHERE session_edges.confidence_kind != 'confirmed'""",
                             (session_key, opaque(parent), None, "confirmed", 1.0),
                         )
                 seen_session = True

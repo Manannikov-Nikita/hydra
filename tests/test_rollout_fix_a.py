@@ -88,3 +88,17 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         self.assertEqual(self.store.count("rollout_sessions"), 1)
         self.assertEqual(self.store.connection.execute("SELECT state FROM turn_attempts").fetchone()[0], "completed")
         self.assertEqual(self.store.connection.execute("SELECT turn_key FROM token_snapshots").fetchone()[0], self.store.connection.execute("SELECT turn_key FROM turn_attempts").fetchone()[0])
+
+    def test_confirmed_parent_metadata_upgrades_inferred_edge_without_resume_inflation(self) -> None:
+        source = self.base / "rollouts" / "child.jsonl"
+        write(source, [
+            record("session_meta", {"id": "child", "cwd": str(self.project)}, 0),
+            record("event_msg", {"type": "sub_agent_activity", "agent_thread_id": "child"}, 1),
+            record("session_meta", {"id": "child", "cwd": str(self.project), "parent_thread_id": "parent"}, 2),
+        ])
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"e" * 32)
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"e" * 32)
+
+        edge = self.store.connection.execute("SELECT confidence_kind, confidence FROM session_edges").fetchone()
+        self.assertEqual(tuple(edge), ("confirmed", 1.0))
+        self.assertEqual(self.store.connection.execute("SELECT resume_segments FROM rollout_sessions WHERE path_key != 'unresolved'").fetchone()[0], 1)

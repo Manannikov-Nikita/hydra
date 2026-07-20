@@ -209,6 +209,161 @@ class StoredTaskTreeTests(unittest.TestCase):
             self.assertIn("timestamp_missing_token:1", metrics.recorded.caveats)
             self.assertNotIn("missing_final_token:1", metrics.recorded.caveats)
 
+    def test_timestampless_snapshot_after_completion_is_excluded_by_source_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            (project / ".hydra").mkdir(parents=True)
+            (project / ".hydra" / "project.toml").write_text(
+                'project_id = "project-source-cutoff"\n', encoding="utf-8",
+            )
+            source = base / "root.jsonl"
+            write_rollout(source, [
+                {"timestamp": stamp(0), "type": "session_meta", "payload": {"id": "root", "cwd": str(project)}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10,
+                    "reasoning_output_tokens": 5,
+                }}}},
+                {"timestamp": stamp(10), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn"}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 900, "cached_input_tokens": 100, "output_tokens": 90,
+                    "reasoning_output_tokens": 50,
+                }}}},
+            ])
+            store = HydraStore(base / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            ingest_rollouts(
+                store, (source,), project, "project-source-cutoff", hash_key=b"s" * 32,
+            )
+
+            metrics = aggregate_stored_task_tree(
+                store.connection, project_id="project-source-cutoff",
+                root_id=Pseudonymizer(b"s" * 32).digest("identity", "root"),
+            )
+
+            self.assertIsNone(metrics.recorded.input.value)
+            self.assertEqual(metrics.recorded.input.known_lower_bound, 100)
+            self.assertEqual(metrics.recorded.working.known_lower_bound, 90)
+            self.assertIn("timestamp_missing_token:1", metrics.recorded.caveats)
+
+    def test_timestampless_snapshot_from_another_source_is_not_claimed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            connection = store.connection
+            connection.execute(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,conversation_key,started_at)
+                   VALUES ('root','project-cross-source','worktree',1,'',?)""",
+                (stamp(0),),
+            )
+            connection.executemany(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,session_key,canonical_revision_digest,lineage_state)
+                   VALUES (?, 'project-cross-source', 'root', NULL, 'clean')""",
+                (("logical-a",), ("logical-b",)),
+            )
+            connection.executemany(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,line_count,
+                       byte_count,chain_digest,materialized)
+                   VALUES (?, 'explicit', ?, 'canonical', 3, 3, 'chain', 1)""",
+                (("source-a", "logical-a"), ("source-b", "logical-b")),
+            )
+            connection.executemany(
+                """INSERT INTO token_snapshots(
+                       source_digest,line_number,session_key,project_id,epoch,input_tokens,
+                       cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,
+                       completeness,observed_at)
+                   VALUES (?,?, 'root','project-cross-source',0,?,?,?,?,0,'complete',?)""",
+                (
+                    ("source-a", 1, 50, 10, 5, 2, stamp(5)),
+                    ("source-b", 2, 100, 20, 10, 5, None),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO rollout_events(
+                       event_key,logical_source_key,source_ordinal,envelope_kind,observed_at,
+                       timestamp_quality,fingerprint)
+                   VALUES ('complete','logical-a',3,'event_msg',?,'valid','complete')""",
+                (stamp(10),),
+            )
+            connection.execute(
+                """INSERT INTO turn_lifecycle_events(
+                       event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+                       emitted_duration_ms,source_digest,logical_source_key,source_ordinal)
+                   VALUES ('complete','root','turn','completed',?,10,NULL,
+                           'source-a','logical-a',3)""",
+                (stamp(10),),
+            )
+            connection.commit()
+
+            metrics = aggregate_stored_task_tree(
+                connection, project_id="project-cross-source", root_id="root",
+            )
+
+            self.assertIsNone(metrics.recorded.input.value)
+            self.assertEqual(metrics.recorded.input.known_lower_bound, 50)
+            self.assertEqual(metrics.recorded.working.known_lower_bound, 45)
+            self.assertIn("ambiguous_timestamp_token:1", metrics.recorded.caveats)
+
+    def test_activity_history_uses_last_event_before_cutoff_not_global_last_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            connection = store.connection
+            connection.executemany(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,conversation_key,
+                       started_at,last_activity_at)
+                   VALUES (?, 'project-activity', 'worktree', 1, '', ?, ?)""",
+                (("root", stamp(0), stamp(10)), ("child", stamp(2), stamp(20))),
+            )
+            connection.execute(
+                """INSERT INTO session_edges(
+                       child_key,parent_key,baseline_working_tokens,confidence_kind,confidence)
+                   VALUES ('child','root',NULL,'inferred',0.5)"""
+            )
+            connection.executemany(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,session_key,canonical_revision_digest,lineage_state)
+                   VALUES (?, 'project-activity', ?, NULL, 'clean')""",
+                (("logical-root", "root"), ("logical-child", "child")),
+            )
+            connection.executemany(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,line_count,
+                       byte_count,chain_digest,materialized)
+                   VALUES (?, 'explicit', ?, 'canonical', 3, 3, 'chain', 1)""",
+                (("source-root", "logical-root"), ("source-child", "logical-child")),
+            )
+            connection.executemany(
+                """INSERT INTO rollout_events(
+                       event_key,logical_source_key,source_ordinal,envelope_kind,observed_at,
+                       timestamp_quality,fingerprint)
+                   VALUES (?, ?, ?, 'event_msg', ?, 'valid', ?)""",
+                (
+                    ("child-before", "logical-child", 1, stamp(5), "before"),
+                    ("root-complete", "logical-root", 2, stamp(10), "complete"),
+                    ("child-after", "logical-child", 2, stamp(20), "after"),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO turn_lifecycle_events(
+                       event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+                       emitted_duration_ms,source_digest,logical_source_key,source_ordinal)
+                   VALUES ('root-complete','root','turn','completed',?,10,NULL,
+                           'source-root','logical-root',2)""",
+                (stamp(10),),
+            )
+            connection.commit()
+
+            metrics = aggregate_stored_task_tree(
+                connection, project_id="project-activity", root_id="root",
+            )
+
+            self.assertEqual(metrics.agent_time_ms.value, 13_000)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import sqlite3
 from typing import Iterable
 
@@ -164,6 +164,15 @@ class MetricFact:
             raise ValueError("unavailable metric value must use estimated provenance")
 
 
+@dataclass(frozen=True)
+class _FinalEpochVector:
+    vector: tuple[int | None, ...]
+    component_lower_bounds: tuple[int, ...]
+    working_lower_bound: int
+    full_lower_bound: int
+    timestamp_ambiguous: bool
+
+
 def aggregate_turns(attempts: Iterable[TurnAttempt]) -> TurnTotals:
     intervals = []
     agent = 0
@@ -200,20 +209,75 @@ def tree_contribution(totals: TokenTotals, edge: SessionEdge | None) -> TreeCont
     return TreeContribution(max(0, totals.working_tokens - edge.baseline_working_tokens), totals.full_context, "derived", edge.confidence)
 
 
-def _final_epoch_vectors(connection: sqlite3.Connection, project_id: str) -> tuple[tuple[int | None, ...], ...]:
+def _aware_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _final_epoch_vectors(
+    connection: sqlite3.Connection, project_id: str,
+) -> tuple[_FinalEpochVector, ...]:
     rows = connection.execute(
-        """SELECT session_key,epoch,input_tokens,cached_input_tokens,output_tokens,
-                  reasoning_tokens,cache_write_tokens
-             FROM token_snapshots WHERE project_id=?
-             ORDER BY observed_at,source_digest,line_number""", (project_id,),
+        """SELECT t.session_key,t.epoch,t.input_tokens,t.cached_input_tokens,t.output_tokens,
+                  t.reasoning_tokens,t.cache_write_tokens,t.observed_at,
+                  COALESCE(s.logical_source_key,t.source_digest),t.line_number
+             FROM token_snapshots t
+             LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
+            WHERE t.project_id=?
+            ORDER BY t.session_key,t.epoch,t.source_digest,t.line_number""", (project_id,),
     ).fetchall()
-    final: dict[tuple[str, int], list[int | None]] = {}
+    grouped: dict[tuple[str, int], list[tuple[object, ...]]] = {}
     for row in rows:
-        vector = final.setdefault((row[0], int(row[1])), [None, None, None, None, None])
-        for index in range(5):
-            if row[index + 2] is not None:
-                vector[index] = int(row[index + 2])
-    return tuple(tuple(vector) for vector in final.values())
+        grouped.setdefault((str(row[0]), int(row[1])), []).append(tuple(row))
+    result: list[_FinalEpochVector] = []
+    for key in sorted(grouped):
+        observations = grouped[key]
+        parsed = [(_aware_timestamp(row[7]), str(row[8]), int(row[9]), row) for row in observations]
+        ambiguous = any(item[0] is None for item in parsed)
+        ordered = sorted(
+            parsed,
+            key=lambda item: (
+                item[0] is None,
+                item[0].timestamp() if item[0] is not None else 0.0,
+                item[1], item[2],
+            ),
+        )
+        vector: list[int | None] = [None, None, None, None, None]
+        for _, _, _, row in ordered:
+            for index in range(5):
+                if row[index + 2] is not None:
+                    vector[index] = int(row[index + 2])
+        if ambiguous:
+            component_lower = tuple(
+                max((int(row[index + 2]) for row in observations if row[index + 2] is not None), default=0)
+                for index in range(5)
+            )
+            working_lower = max((
+                (int(row[2]) - int(row[3]) if row[2] is not None and row[3] is not None else 0)
+                + (int(row[4]) if row[4] is not None else 0)
+                for row in observations
+            ), default=0)
+            full_lower = max((
+                (int(row[2]) if row[2] is not None else 0)
+                + (int(row[4]) if row[4] is not None else 0)
+                for row in observations
+            ), default=0)
+        else:
+            component_lower = tuple(value or 0 for value in vector)
+            working_lower = (
+                (vector[0] - vector[1] if vector[0] is not None and vector[1] is not None else 0)
+                + (vector[2] or 0)
+            )
+            full_lower = (vector[0] or 0) + (vector[2] or 0)
+        result.append(_FinalEpochVector(
+            tuple(vector), component_lower, working_lower, full_lower, ambiguous,
+        ))
+    return tuple(result)
 
 
 def aggregate_project(connection: sqlite3.Connection, project_id: str) -> ProjectMetrics:
@@ -243,30 +307,90 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
 
 def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> dict[str, MetricFact]:
     """Per-component final cumulative facts; absent parts never become zero."""
-    vectors = tuple(vector[:4] for vector in _final_epoch_vectors(connection, project_id))
+    epochs = _final_epoch_vectors(connection, project_id)
+    vectors = tuple(epoch.vector[:4] for epoch in epochs)
+    timestamp_ambiguous = any(epoch.timestamp_ambiguous for epoch in epochs)
     def component(index: int) -> MetricFact:
-        known = sum(row[index] or 0 for row in vectors)
+        known = sum(epoch.component_lower_bounds[index] for epoch in epochs)
         missing = any(row[index] is None for row in vectors)
-        return MetricFact(None if missing else known, known, "estimated" if missing else "exact", ("missing_component",) if missing else ())
+        caveats = tuple(
+            caveat for caveat, present in (
+                ("missing_component", missing),
+                ("timestamp_ambiguous", timestamp_ambiguous),
+            ) if present
+        )
+        unavailable = missing or timestamp_ambiguous
+        return MetricFact(
+            None if unavailable else known, known,
+            "estimated" if unavailable else "exact", caveats,
+        )
     inputs, cached, outputs, reasoning = component(0), component(1), component(2), component(3)
-    working_ready = all(row[0] is not None and row[1] is not None and row[2] is not None for row in vectors)
-    full_ready = all(row[0] is not None and row[2] is not None for row in vectors)
-    working_lower = sum(
-        (max(0, row[0] - row[1]) if row[0] is not None and row[1] is not None else 0)
-        + (row[2] or 0) for row in vectors
+    working_ready = (
+        not timestamp_ambiguous
+        and all(row[0] is not None and row[1] is not None and row[2] is not None for row in vectors)
     )
-    full_lower = sum((row[0] or 0) + (row[2] or 0) for row in vectors)
-    working = MetricFact(working_lower if working_ready else None, working_lower, "exact" if working_ready else "estimated", () if working_ready else ("missing_core_component",))
-    full = MetricFact(full_lower if full_ready else None, full_lower, "exact" if full_ready else "estimated", () if full_ready else ("missing_core_component",))
-    confirmed_missing = int(connection.execute("""SELECT COUNT(*) FROM session_edges e JOIN rollout_sessions s ON s.session_key=e.child_key
-       WHERE s.project_id=? AND e.confidence_kind='confirmed' AND e.confidence=1.0
-         AND NOT EXISTS (SELECT 1 FROM fork_baselines b WHERE b.child_key=e.child_key)""", (project_id,)).fetchone()[0])
-    baseline = connection.execute("""SELECT SUM(input_tokens),SUM(cached_input_tokens),SUM(output_tokens),SUM(reasoning_tokens)
-       FROM fork_baselines b JOIN session_edges e ON e.child_key=b.child_key JOIN rollout_sessions s ON s.session_key=b.child_key
-       WHERE s.project_id=? AND e.confidence_kind='confirmed' AND e.confidence=1.0""", (project_id,)).fetchone()
-    baseline_input, baseline_cached, baseline_output, baseline_reasoning = tuple(value or 0 for value in baseline)
+    full_ready = (
+        not timestamp_ambiguous
+        and all(row[0] is not None and row[2] is not None for row in vectors)
+    )
+    working_lower = sum(epoch.working_lower_bound for epoch in epochs)
+    full_lower = sum(epoch.full_lower_bound for epoch in epochs)
+    working_caveats = tuple(
+        caveat for caveat, present in (
+            ("missing_core_component", not all(
+                row[0] is not None and row[1] is not None and row[2] is not None for row in vectors
+            )),
+            ("timestamp_ambiguous", timestamp_ambiguous),
+        ) if present
+    )
+    full_caveats = tuple(
+        caveat for caveat, present in (
+            ("missing_core_component", not all(
+                row[0] is not None and row[2] is not None for row in vectors
+            )),
+            ("timestamp_ambiguous", timestamp_ambiguous),
+        ) if present
+    )
+    working = MetricFact(
+        working_lower if working_ready else None, working_lower,
+        "exact" if working_ready else "estimated", working_caveats,
+    )
+    full = MetricFact(
+        full_lower if full_ready else None, full_lower,
+        "exact" if full_ready else "estimated", full_caveats,
+    )
+    baseline_rows = connection.execute(
+        """SELECT e.child_key,s.started_at,b.observed_at,b.input_tokens,
+                  b.cached_input_tokens,b.output_tokens,b.reasoning_tokens
+             FROM session_edges e
+            JOIN rollout_sessions s ON s.session_key=e.child_key
+             LEFT JOIN fork_baselines b ON b.child_key=e.child_key
+            WHERE s.project_id=? AND e.parent_key IS NOT NULL
+              AND e.confidence_kind='confirmed' AND e.confidence=1.0""",
+        (project_id,),
+    ).fetchall()
+    confirmed_missing = ineligible_baseline = 0
+    eligible_baselines: list[tuple[int, int, int, int]] = []
+    for row in baseline_rows:
+        if row[2] is None and row[3] is None:
+            confirmed_missing += 1
+            continue
+        started_at = _aware_timestamp(row[1])
+        observed_at = _aware_timestamp(row[2])
+        if (
+            started_at is None or observed_at is None
+            or not started_at <= observed_at <= started_at + timedelta(seconds=1)
+        ):
+            ineligible_baseline += 1
+            continue
+        eligible_baselines.append(tuple(int(value) for value in row[3:7]))
+    baseline_input, baseline_cached, baseline_output, baseline_reasoning = (
+        sum(row[index] for row in eligible_baselines) for index in range(4)
+    )
     uncertain_edges = int(connection.execute("""SELECT COUNT(*) FROM session_edges e JOIN rollout_sessions s ON s.session_key=e.child_key
-       WHERE s.project_id=? AND (e.confidence_kind!='confirmed' OR e.confidence!=1.0)""", (project_id,)).fetchone()[0])
+       WHERE s.project_id=? AND (
+             e.parent_key IS NULL OR e.confidence_kind!='confirmed' OR e.confidence!=1.0
+       )""", (project_id,)).fetchone()[0])
     invalid_baseline = (
         any(value < 0 for value in (baseline_input, baseline_cached, baseline_output, baseline_reasoning))
         or baseline_cached > baseline_input
@@ -276,15 +400,16 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
     caveat = tuple(
         item for item, present in (
             ("zero_no_observation", confirmed_missing),
+            ("ineligible_replay_baseline", ineligible_baseline),
             ("inferred_parent_no_dedup", uncertain_edges),
             ("invalid_replay_baseline", invalid_baseline),
         ) if present
     )
 
     def deduplicate(recorded: MetricFact, baseline_value: int) -> MetricFact:
-        local_caveats = caveat
+        local_caveats = tuple(dict.fromkeys(recorded.caveats + caveat))
         value = (
-            None if recorded.value is None or invalid_baseline
+            None if recorded.value is None or invalid_baseline or local_caveats
             else recorded.value - baseline_value
         )
         if value is not None and value < 0:

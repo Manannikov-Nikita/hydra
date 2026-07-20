@@ -167,6 +167,8 @@ class TokenObservation:
     vector: TokenVector
     epoch: int | None = None
     placement_provenance: Provenance = "exact"
+    logical_source_key: str | None = None
+    source_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         if self.observed_at is not None:
@@ -178,6 +180,14 @@ class TokenObservation:
             raise ValueError("sequence must be a non-negative integer")
         if self.epoch is not None and (isinstance(self.epoch, bool) or self.epoch < 0):
             raise ValueError("epoch must be a non-negative integer or null")
+        if self.source_ordinal is not None and (
+            isinstance(self.source_ordinal, bool)
+            or not isinstance(self.source_ordinal, int)
+            or self.source_ordinal < 0
+        ):
+            raise ValueError("source ordinal must be a non-negative integer or null")
+        if (self.logical_source_key is None) != (self.source_ordinal is None):
+            raise ValueError("token source lineage must provide both key and ordinal")
 
 
 @dataclass(frozen=True)
@@ -195,9 +205,19 @@ class LifecycleObservation:
     session_id: str
     kind: Literal["task_complete", "task_started", "turn_aborted"]
     observed_at: datetime
+    logical_source_key: str | None = None
+    source_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
+        if self.source_ordinal is not None and (
+            isinstance(self.source_ordinal, bool)
+            or not isinstance(self.source_ordinal, int)
+            or self.source_ordinal < 0
+        ):
+            raise ValueError("source ordinal must be a non-negative integer or null")
+        if (self.logical_source_key is None) != (self.source_ordinal is None):
+            raise ValueError("lifecycle source lineage must provide both key and ordinal")
 
 
 @dataclass(frozen=True)

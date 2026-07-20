@@ -271,7 +271,7 @@ def reconcile_semantics(deltas: Iterable[TokenDelta], marks: Iterable[SemanticMa
     phase_full: dict[str, int] = {}
     phase_reasoning: dict[str, int] = {}
     unclassified = [0, 0, 0]
-    exact_timestamped_total = 0
+    known_working_total = 0
     classified_total = 0
     keyed: dict[str, list[TokenDelta]] = {}
     normalized_deltas: list[TokenDelta] = []
@@ -309,14 +309,13 @@ def reconcile_semantics(deltas: Iterable[TokenDelta], marks: Iterable[SemanticMa
         diagnostics.add("out_of_order_token_delta")
 
     for delta in normalized_deltas:
+        known_working_total += delta.working_tokens
         observed = _timestamp(delta.observed_at)
         if observed is None:
             diagnostics.add("missing_timestamp" if delta.observed_at is None else "invalid_token_timestamp")
         if delta.provenance != "exact":
             diagnostics.add("inexact_token_delta")
         usable = observed is not None and delta.provenance == "exact"
-        if usable:
-            exact_timestamped_total += delta.working_tokens
         position = None if observed is None else (observed, delta.ordinal)
         interval = next((candidate for candidate in bounded if position is not None and candidate.start <= position and (candidate.end is None or position < candidate.end)), None)
         if usable and interval is not None:
@@ -335,10 +334,15 @@ def reconcile_semantics(deltas: Iterable[TokenDelta], marks: Iterable[SemanticMa
     }))
     if unclassified[0] and not unclassified_caveats:
         unclassified_caveats = ("outside_labeled_interval",)
-    if exact_timestamped_total == 0:
+    if known_working_total == 0:
         coverage = NumericMetric(None, "estimated", ("coverage_denominator_unavailable",))
     else:
-        coverage = NumericMetric(classified_total / exact_timestamped_total, "derived", ("working_token_delta_weighted",))
+        coverage_caveats = ["working_token_delta_weighted"]
+        if diagnostics & {"missing_timestamp", "invalid_token_timestamp"}:
+            coverage_caveats.append("unusable_timestamp_in_coverage_denominator")
+        if "inexact_token_delta" in diagnostics:
+            coverage_caveats.append("inexact_token_delta_in_coverage_denominator")
+        coverage = NumericMetric(classified_total / known_working_total, "derived", tuple(coverage_caveats))
     return SemanticResult(
         tuple(item.result for item in bounded),
         _metric_map(phase_working),
@@ -358,7 +362,7 @@ def _unavailable_trend(*caveats: str) -> TrendResult:
 
 
 def evaluate_trend(current: ComparableTask, history: Iterable[ComparableTask]) -> TrendResult:
-    """Warn only on exact token growth plus one exact independent signal."""
+    """Warn only on deterministic token growth plus one exact independent signal."""
     if not current.completed:
         return _unavailable_trend("current_task_incomplete")
     comparable = [item for item in history if item.completed and item.task_family == current.task_family]
@@ -368,7 +372,10 @@ def evaluate_trend(current: ComparableTask, history: Iterable[ComparableTask]) -
     cohort = [*baseline, current]
     if not all(item.metrics_complete for item in cohort):
         return _unavailable_trend("incomplete_metrics")
-    if any(item.working_tokens is None or item.working_tokens_provenance != "exact" for item in cohort):
+    if any(
+        item.working_tokens is None or item.working_tokens_provenance not in {"exact", "derived"}
+        for item in cohort
+    ):
         return _unavailable_trend("incomparable_working_tokens")
 
     baseline_tokens = median(item.working_tokens for item in baseline if item.working_tokens is not None)

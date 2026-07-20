@@ -145,12 +145,16 @@ def aggregate_task_tree(
         raise ValueError("root session is missing")
     lifecycle_items = tuple(lifecycle)
     completions = tuple(
-        item.observed_at for item in lifecycle_items
+        item for item in lifecycle_items
         if item.session_id == root_id and item.kind == "task_complete"
     )
     if not completions:
         raise ValueError("root task_complete observation is required")
-    cutoff = max(completions)
+    completion = max(
+        completions,
+        key=lambda item: (item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1),
+    )
+    cutoff = completion.observed_at
     if root.started_at is None:
         raise ValueError("root session start is required")
     if root.started_at > cutoff:
@@ -159,11 +163,26 @@ def aggregate_task_tree(
     included = set(session_ids)
 
     token_by_session: dict[str, list[TokenObservation]] = defaultdict(list)
+    ambiguous_timestamp_tokens = 0
+    ambiguous_timestamp_sessions: set[str] = set()
     for item in tokens:
         if item.session_id not in included:
             continue
         started_at = session_map[item.session_id].started_at
-        if item.observed_at is None or (
+        if item.observed_at is None:
+            same_source_order = (
+                item.logical_source_key is not None
+                and completion.logical_source_key is not None
+                and item.logical_source_key == completion.logical_source_key
+                and item.source_ordinal is not None
+                and completion.source_ordinal is not None
+            )
+            if same_source_order and item.source_ordinal <= completion.source_ordinal:
+                token_by_session[item.session_id].append(item)
+            elif not same_source_order:
+                ambiguous_timestamp_tokens += 1
+                ambiguous_timestamp_sessions.add(item.session_id)
+        elif (
             (started_at is None or started_at <= item.observed_at) and item.observed_at <= cutoff
         ):
             token_by_session[item.session_id].append(item)
@@ -176,7 +195,10 @@ def aggregate_task_tree(
     for session_id in session_ids:
         items = token_by_session.get(session_id, [])
         amount = _session_amount(items)
-        if any(item.observed_at is None or item.placement_provenance == "estimated" for item in items):
+        if (
+            session_id in ambiguous_timestamp_sessions
+            or any(item.observed_at is None or item.placement_provenance == "estimated" for item in items)
+        ):
             amount = _Amount(TokenVector.unknown(), amount.bounds)
         recorded_by_session[session_id] = amount
     recorded = _combine(recorded_by_session.values())
@@ -243,13 +265,17 @@ def aggregate_task_tree(
     recorded_caveats = (f"missing_final_token:{missing_finals}",) if missing_finals else ()
     if timestamp_missing:
         recorded_caveats += (f"timestamp_missing_token:{timestamp_missing}",)
+    if ambiguous_timestamp_tokens:
+        recorded_caveats += (f"ambiguous_timestamp_token:{ambiguous_timestamp_tokens}",)
     baseline_caveats = (f"zero_no_observation:{zero_baselines}",) if zero_baselines else ()
     unique_caveats = list(baseline_caveats + recorded_caveats)
     unique_caveats.extend(uncertainty)
     if cycle_edges:
         unique_caveats.append(f"cycle_edges:{cycle_edges}")
     baseline_uncertain = bool(zero_baselines or unconfirmed_edges)
-    unique_uncertain = bool(baseline_uncertain or missing_finals or timestamp_missing)
+    unique_uncertain = bool(
+        baseline_uncertain or missing_finals or timestamp_missing or ambiguous_timestamp_tokens
+    )
 
     last_activity = {
         session_id: session_map[session_id].started_at
@@ -305,7 +331,11 @@ def aggregate_task_tree(
 
     return TaskTreeMetrics(
         root_id, cutoff, session_ids,
-        _token_fact(recorded, "estimated" if missing_finals or timestamp_missing else "exact", recorded_caveats),
+        _token_fact(
+            recorded,
+            "estimated" if missing_finals or timestamp_missing or ambiguous_timestamp_tokens else "exact",
+            recorded_caveats,
+        ),
         _token_fact(replay, "estimated" if baseline_uncertain else "exact", baseline_caveats + uncertainty),
         _token_fact(unique, "estimated" if unique_uncertain else "derived", tuple(unique_caveats)),
         ScalarFact(len(session_ids), "exact"), ScalarFact(max(0, len(session_ids) - 1), "derived"),

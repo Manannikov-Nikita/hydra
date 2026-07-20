@@ -49,11 +49,13 @@ def _sessions(connection: sqlite3.Connection, project_id: str) -> tuple[Normaliz
 
 def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObservation, ...]:
     rows = connection.execute(
-        """SELECT session_key,observed_at,epoch,input_tokens,cached_input_tokens,
-                  output_tokens,reasoning_tokens
-             FROM token_snapshots WHERE project_id=?
+        """SELECT t.session_key,t.observed_at,t.epoch,t.input_tokens,t.cached_input_tokens,
+                  t.output_tokens,t.reasoning_tokens,s.logical_source_key,t.line_number
+             FROM token_snapshots t
+             LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
+            WHERE t.project_id=?
             ORDER BY CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END,
-                     observed_at,source_digest,line_number""",
+                     observed_at,t.source_digest,t.line_number""",
         (project_id,),
     )
     observations: list[TokenObservation] = []
@@ -63,6 +65,8 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
             str(row[0]), observed_at, sequence,
             TokenVector(row[3], row[4], row[5], row[6]), int(row[2]),
             "estimated" if observed_at is None else "exact",
+            str(row[7]) if row[7] is not None else None,
+            int(row[8]) if row[7] is not None else None,
         ))
     return tuple(observations)
 
@@ -88,7 +92,8 @@ def _baselines(connection: sqlite3.Connection, project_id: str) -> tuple[ReplayB
 def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[LifecycleObservation, ...]:
     mapping = {"started": "task_started", "completed": "task_complete", "aborted": "turn_aborted"}
     rows = connection.execute(
-        """SELECT e.session_key,e.event_kind,e.observed_at
+        """SELECT e.session_key,e.event_kind,e.observed_at,
+                  e.logical_source_key,e.source_ordinal
              FROM turn_lifecycle_events e
              JOIN rollout_sessions s ON s.session_key=e.session_key
             WHERE s.project_id=? ORDER BY e.source_digest,e.source_ordinal""",
@@ -98,14 +103,40 @@ def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[Lifecyc
     for row in rows:
         observed_at = _optional_timestamp(row[2])
         if observed_at is not None:
-            observations.append(LifecycleObservation(str(row[0]), mapping[str(row[1])], observed_at))
+            observations.append(LifecycleObservation(
+                str(row[0]), mapping[str(row[1])], observed_at,
+                str(row[3]), int(row[4]),
+            ))
     return tuple(observations)
 
 
 def _activities(connection: sqlite3.Connection, project_id: str) -> tuple[ActivityObservation, ...]:
     rows = connection.execute(
-        "SELECT session_key,last_activity_at FROM rollout_sessions WHERE project_id=?",
-        (project_id,),
+        """SELECT ls.session_key,e.observed_at
+             FROM rollout_events e
+             JOIN rollout_logical_sources ls ON ls.logical_source_key=e.logical_source_key
+            WHERE ls.project_id=? AND ls.session_key IS NOT NULL
+            UNION ALL
+           SELECT e.session_key,e.observed_at
+             FROM turn_lifecycle_events e
+             JOIN rollout_sessions s ON s.session_key=e.session_key
+            WHERE s.project_id=?
+            UNION ALL
+           SELECT t.session_key,t.observed_at
+             FROM token_snapshots t WHERE t.project_id=?
+            UNION ALL
+           SELECT t.session_key,COALESCE(t.finished_at,t.started_at)
+             FROM tool_spans t JOIN rollout_sessions s ON s.session_key=t.session_key
+            WHERE s.project_id=?
+            UNION ALL
+           SELECT f.session_key,f.observed_at
+             FROM file_observations f JOIN rollout_sessions s ON s.session_key=f.session_key
+            WHERE s.project_id=?
+            UNION ALL
+           SELECT t.session_key,t.observed_at
+             FROM rollout_test_runs t JOIN rollout_sessions s ON s.session_key=t.session_key
+            WHERE s.project_id=?""",
+        (project_id,) * 6,
     )
     return tuple(
         ActivityObservation(str(row[0]), observed_at)

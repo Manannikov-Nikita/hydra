@@ -4,11 +4,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from typing import Literal
 
 
 Provenance = Literal["exact", "derived", "model_reported", "estimated"]
 EdgeConfidence = Literal["confirmed", "inferred", "ambiguous"]
+PROVENANCE_VALUES = frozenset({"exact", "derived", "model_reported", "estimated"})
+
+
+def validate_provenance(value: object, field: str = "provenance") -> None:
+    if value not in PROVENANCE_VALUES:
+        raise ValueError(f"invalid {field}: {value!r}")
+
+
+def validate_nonnegative(value: object, field: str, *, allow_none: bool = False) -> None:
+    if value is None and allow_none:
+        return
+    if (
+        not isinstance(value, (int, float)) or isinstance(value, bool)
+        or not math.isfinite(value) or value < 0
+    ):
+        suffix = " or null" if allow_none else ""
+        raise ValueError(f"{field} must be a non-negative number{suffix}")
+
+
+def _validate_caveats(caveats: tuple[str, ...]) -> None:
+    if not isinstance(caveats, tuple) or any(
+        not isinstance(item, str) or not item for item in caveats
+    ):
+        raise ValueError("metric caveats must be non-empty strings")
 
 
 def _require_aware(value: datetime, field: str) -> None:
@@ -108,14 +133,15 @@ class TokenVector:
 class NormalizedSession:
     session_id: str
     parent_id: str | None
-    started_at: datetime
+    started_at: datetime | None
     edge_confidence_kind: EdgeConfidence = "confirmed"
     edge_confidence: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.session_id:
             raise ValueError("session_id must not be empty")
-        _require_aware(self.started_at, "started_at")
+        if self.started_at is not None:
+            _require_aware(self.started_at, "started_at")
         if self.edge_confidence_kind not in ("confirmed", "inferred", "ambiguous"):
             raise ValueError("invalid edge confidence kind")
         if not isinstance(self.edge_confidence, (int, float)) or isinstance(self.edge_confidence, bool):
@@ -127,6 +153,7 @@ class NormalizedSession:
     def replay_eligible(self) -> bool:
         return (
             self.parent_id is not None
+            and self.started_at is not None
             and self.edge_confidence_kind == "confirmed"
             and float(self.edge_confidence) == 1.0
         )
@@ -135,13 +162,18 @@ class NormalizedSession:
 @dataclass(frozen=True)
 class TokenObservation:
     session_id: str
-    observed_at: datetime
+    observed_at: datetime | None
     sequence: int
     vector: TokenVector
     epoch: int | None = None
+    placement_provenance: Provenance = "exact"
 
     def __post_init__(self) -> None:
-        _require_aware(self.observed_at, "observed_at")
+        if self.observed_at is not None:
+            _require_aware(self.observed_at, "observed_at")
+        validate_provenance(self.placement_provenance, "placement provenance")
+        if self.observed_at is None and self.placement_provenance != "estimated":
+            raise ValueError("timestamp-missing token placement must be estimated")
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) or self.sequence < 0:
             raise ValueError("sequence must be a non-negative integer")
         if self.epoch is not None and (isinstance(self.epoch, bool) or self.epoch < 0):
@@ -232,8 +264,16 @@ class ScalarFact:
     known_lower_bound: int | float | None = None
 
     def __post_init__(self) -> None:
+        validate_provenance(self.provenance)
+        validate_nonnegative(self.value, "metric value", allow_none=True)
         if self.known_lower_bound is None:
             object.__setattr__(self, "known_lower_bound", self.value if self.value is not None else 0)
+        validate_nonnegative(self.known_lower_bound, "metric lower bound")
+        if self.value is not None and self.known_lower_bound > self.value:
+            raise ValueError("metric lower bound cannot exceed its value")
+        if self.value is None and self.provenance != "estimated":
+            raise ValueError("unavailable metric value must use estimated provenance")
+        _validate_caveats(self.caveats)
 
 
 @dataclass(frozen=True)
@@ -244,6 +284,13 @@ class _Bounds:
     reasoning: int
     working: int
     full: int
+
+    def __post_init__(self) -> None:
+        for field, value in zip(
+            ("input", "cached", "output", "reasoning", "working", "full"),
+            (self.input, self.cached, self.output, self.reasoning, self.working, self.full),
+        ):
+            validate_nonnegative(value, f"{field} lower bound")
 
 
 @dataclass(frozen=True)
@@ -263,6 +310,25 @@ class TokenVectorFact:
     full: ScalarFact
     provenance: Provenance
     caveats: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_provenance(self.provenance)
+        _validate_caveats(self.caveats)
+        expected = (
+            self.vector.input_tokens, self.vector.cached_input_tokens,
+            self.vector.output_tokens, self.vector.reasoning_output_tokens,
+            self.vector.working_tokens, self.vector.full_context,
+        )
+        observed = (
+            self.input.value, self.cached_input.value, self.output.value,
+            self.reasoning.value, self.working.value, self.full.value,
+        )
+        if observed != expected:
+            raise ValueError("token facts must match their vector")
+        if self.provenance != "estimated" and any(item.provenance == "estimated" for item in (
+            self.input, self.cached_input, self.output, self.reasoning, self.working, self.full,
+        )):
+            raise ValueError("token vector provenance cannot exceed component provenance")
 
     @property
     def working_tokens(self) -> int | None:
@@ -302,3 +368,15 @@ class TaskTreeMetrics:
     zero_no_observation: int
     unconfirmed_replay_edges: int
     cycle_edges: int
+
+    def __post_init__(self) -> None:
+        _require_aware(self.cutoff_at, "cutoff_at")
+        if not self.root_id or self.root_id not in self.session_ids:
+            raise ValueError("task-tree root must be included")
+        for field, value in (
+            ("observed replay baselines", self.observed_replay_baselines),
+            ("zero observations", self.zero_no_observation),
+            ("unconfirmed replay edges", self.unconfirmed_replay_edges),
+            ("cycle edges", self.cycle_edges),
+        ):
+            validate_nonnegative(value, field)

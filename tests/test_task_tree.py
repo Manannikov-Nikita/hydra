@@ -8,9 +8,11 @@ from hydra_codex.task_tree import (
     FileObservation,
     LifecycleObservation,
     NormalizedSession,
+    ScalarFact,
     TestRunObservation,
     TokenObservation,
     TokenVector,
+    TokenVectorFact,
     ToolObservation,
     aggregate_task_tree,
 )
@@ -243,6 +245,20 @@ class TaskTreeMetricTests(unittest.TestCase):
         self.assertEqual(metrics.test_retries.value, 1)
         self.assertEqual(metrics.file_reads.provenance, "estimated")
         self.assertIn("observed_file_lower_bound", metrics.file_reads.caveats)
+
+    def test_exposed_task_facts_reject_invalid_provenance_and_bounds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            ScalarFact(1, "unsafe")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            ScalarFact(-1, "exact")
+        with self.assertRaisesRegex(ValueError, "lower bound"):
+            ScalarFact(1, "exact", known_lower_bound=2)
+        exact = ScalarFact(0, "exact")
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            TokenVectorFact(
+                TokenVector.zero(), exact, exact, exact, exact, exact, exact,
+                "unsafe",  # type: ignore[arg-type]
+            )
 
 
 if __name__ == "__main__":

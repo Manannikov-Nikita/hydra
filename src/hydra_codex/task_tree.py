@@ -114,7 +114,7 @@ def _descendants(
             cycle_edges += 1
             continue
         session = sessions.get(current)
-        if session is None or session.started_at > cutoff:
+        if session is None or (session.started_at is not None and session.started_at > cutoff):
             continue
         visited.add(current)
         queue.extend(sorted(children.get(current, ())))
@@ -151,6 +151,8 @@ def aggregate_task_tree(
     if not completions:
         raise ValueError("root task_complete observation is required")
     cutoff = max(completions)
+    if root.started_at is None:
+        raise ValueError("root session start is required")
     if root.started_at > cutoff:
         raise ValueError("root starts after its task_complete observation")
     session_ids, cycle_edges = _descendants(root_id, session_map, cutoff)
@@ -158,14 +160,25 @@ def aggregate_task_tree(
 
     token_by_session: dict[str, list[TokenObservation]] = defaultdict(list)
     for item in tokens:
-        if item.session_id in included and session_map[item.session_id].started_at <= item.observed_at <= cutoff:
+        if item.session_id not in included:
+            continue
+        started_at = session_map[item.session_id].started_at
+        if item.observed_at is None or (
+            (started_at is None or started_at <= item.observed_at) and item.observed_at <= cutoff
+        ):
             token_by_session[item.session_id].append(item)
     for items in token_by_session.values():
-        items.sort(key=lambda item: (item.observed_at, item.sequence))
-    recorded_by_session = {
-        session_id: _session_amount(token_by_session.get(session_id, []))
-        for session_id in session_ids
-    }
+        items.sort(key=lambda item: (item.observed_at is None, item.observed_at or cutoff, item.sequence))
+    timestamp_missing = sum(
+        item.observed_at is None for items in token_by_session.values() for item in items
+    )
+    recorded_by_session: dict[str, _Amount] = {}
+    for session_id in session_ids:
+        items = token_by_session.get(session_id, [])
+        amount = _session_amount(items)
+        if any(item.observed_at is None or item.placement_provenance == "estimated" for item in items):
+            amount = _Amount(TokenVector.unknown(), amount.bounds)
+        recorded_by_session[session_id] = amount
     recorded = _combine(recorded_by_session.values())
     missing_finals = sum(not token_by_session.get(session_id) for session_id in session_ids)
 
@@ -192,7 +205,7 @@ def aggregate_task_tree(
             threshold = session.started_at + timedelta(seconds=1)
             candidates = tuple(
                 item for item in token_by_session.get(session_id, ())
-                if session.started_at <= item.observed_at <= threshold
+                if item.observed_at is not None and session.started_at <= item.observed_at <= threshold
             )
             baseline_vector = candidates[-1].vector if candidates else None
         else:
@@ -228,25 +241,34 @@ def aggregate_task_tree(
         for kind in sorted(unconfirmed_kinds)
     )
     recorded_caveats = (f"missing_final_token:{missing_finals}",) if missing_finals else ()
+    if timestamp_missing:
+        recorded_caveats += (f"timestamp_missing_token:{timestamp_missing}",)
     baseline_caveats = (f"zero_no_observation:{zero_baselines}",) if zero_baselines else ()
     unique_caveats = list(baseline_caveats + recorded_caveats)
     unique_caveats.extend(uncertainty)
     if cycle_edges:
         unique_caveats.append(f"cycle_edges:{cycle_edges}")
     baseline_uncertain = bool(zero_baselines or unconfirmed_edges)
-    unique_uncertain = bool(baseline_uncertain or missing_finals)
+    unique_uncertain = bool(baseline_uncertain or missing_finals or timestamp_missing)
 
-    last_activity = {session_id: session_map[session_id].started_at for session_id in session_ids}
+    last_activity = {
+        session_id: session_map[session_id].started_at
+        for session_id in session_ids if session_map[session_id].started_at is not None
+    }
     all_activity = list(activities)
     all_activity.extend(ActivityObservation(item.session_id, item.observed_at) for item in lifecycle_items)
-    all_activity.extend(ActivityObservation(item.session_id, item.observed_at) for item in tokens)
-    for item in all_activity:
-        if item.session_id in included and item.observed_at <= cutoff:
-            last_activity[item.session_id] = max(last_activity[item.session_id], item.observed_at)
-    agent_time_ms = sum(
-        max(0, int((last_activity[key] - session_map[key].started_at).total_seconds() * 1000))
-        for key in session_ids
+    all_activity.extend(
+        ActivityObservation(item.session_id, item.observed_at)
+        for item in tokens if item.observed_at is not None
     )
+    for item in all_activity:
+        if item.session_id in last_activity and item.observed_at <= cutoff:
+            last_activity[item.session_id] = max(last_activity[item.session_id], item.observed_at)
+    agent_time_lower = sum(
+        max(0, int((last_activity[key] - session_map[key].started_at).total_seconds() * 1000))
+        for key in last_activity
+    )
+    missing_starts = sum(session_map[key].started_at is None for key in session_ids)
     wall_clock_ms = int((cutoff - root.started_at).total_seconds() * 1000)
 
     if isinstance(classified_working_tokens, bool) or classified_working_tokens < 0:
@@ -263,7 +285,11 @@ def aggregate_task_tree(
             item for item in items
             if getattr(item, "session_id") in included
             and getattr(item, "observed_at") is not None
-            and session_map[getattr(item, "session_id")].started_at <= getattr(item, "observed_at") <= cutoff
+            and (
+                session_map[getattr(item, "session_id")].started_at is None
+                or session_map[getattr(item, "session_id")].started_at <= getattr(item, "observed_at")
+            )
+            and getattr(item, "observed_at") <= cutoff
         )
     tool_items = observed(tools)
     file_items = observed(files)
@@ -279,11 +305,17 @@ def aggregate_task_tree(
 
     return TaskTreeMetrics(
         root_id, cutoff, session_ids,
-        _token_fact(recorded, "estimated" if missing_finals else "exact", recorded_caveats),
+        _token_fact(recorded, "estimated" if missing_finals or timestamp_missing else "exact", recorded_caveats),
         _token_fact(replay, "estimated" if baseline_uncertain else "exact", baseline_caveats + uncertainty),
         _token_fact(unique, "estimated" if unique_uncertain else "derived", tuple(unique_caveats)),
         ScalarFact(len(session_ids), "exact"), ScalarFact(max(0, len(session_ids) - 1), "derived"),
-        ScalarFact(wall_clock_ms, "derived"), ScalarFact(agent_time_ms, "derived"),
+        ScalarFact(wall_clock_ms, "derived"),
+        ScalarFact(
+            None if missing_starts else agent_time_lower,
+            "estimated" if missing_starts else "derived",
+            (f"missing_session_start:{missing_starts}",) if missing_starts else (),
+            agent_time_lower,
+        ),
         ScalarFact(coverage, "derived" if coverage is not None else "estimated", () if coverage is not None else ("unknown_working_tokens",)),
         _fact_count(len(tool_keys), "observed_normalized_tool_spans"),
         _fact_count(len(instrumentation), "observed_instrumentation_spans"),

@@ -20,15 +20,6 @@ from .task_tree_types import (
 )
 
 
-def _timestamp(value: object, field: str) -> datetime:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{field} is missing")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{field} must be timezone-aware")
-    return parsed
-
-
 def _optional_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -48,7 +39,7 @@ def _sessions(connection: sqlite3.Connection, project_id: str) -> tuple[Normaliz
     )
     return tuple(
         NormalizedSession(
-            str(row[0]), row[1], _timestamp(row[2], "rollout_sessions.started_at"),
+            str(row[0]), row[1], _optional_timestamp(row[2]),
             edge_confidence_kind=str(row[3] or "confirmed"),
             edge_confidence=float(row[4] if row[4] is not None else 1.0),
         )
@@ -61,17 +52,17 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
         """SELECT session_key,observed_at,epoch,input_tokens,cached_input_tokens,
                   output_tokens,reasoning_tokens
              FROM token_snapshots WHERE project_id=?
-            ORDER BY COALESCE(observed_at,''),source_digest,line_number""",
+            ORDER BY CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END,
+                     observed_at,source_digest,line_number""",
         (project_id,),
     )
     observations: list[TokenObservation] = []
     for sequence, row in enumerate(rows):
         observed_at = _optional_timestamp(row[1])
-        if observed_at is None:
-            continue
         observations.append(TokenObservation(
             str(row[0]), observed_at, sequence,
             TokenVector(row[3], row[4], row[5], row[6]), int(row[2]),
+            "estimated" if observed_at is None else "exact",
         ))
     return tuple(observations)
 

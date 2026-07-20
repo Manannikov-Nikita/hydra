@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from hydra_codex.storage import HydraStore
+from hydra_codex.rollout import Pseudonymizer, ingest_rollouts
 from hydra_codex.task_tree import TokenVector
 from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 
 
 def stamp(second: int) -> str:
     return datetime(2026, 7, 21, 0, 0, second, tzinfo=timezone.utc).isoformat()
+
+
+def write_rollout(path: Path, rows: list[dict]) -> None:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
 class StoredTaskTreeTests(unittest.TestCase):
@@ -121,6 +127,87 @@ class StoredTaskTreeTests(unittest.TestCase):
             self.assertEqual(metrics.file_reads.known_lower_bound, 1)
             self.assertEqual(metrics.full_test_runs.value, 1)
             self.assertEqual(metrics.test_retries.value, 1)
+
+    def test_ephemeral_child_without_started_at_is_retained_as_uncertain_lower_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            (project / ".hydra").mkdir(parents=True)
+            (project / ".hydra" / "project.toml").write_text(
+                'project_id = "project-ephemeral"\n', encoding="utf-8",
+            )
+            source = base / "root.jsonl"
+            write_rollout(source, [
+                {"timestamp": stamp(0), "type": "session_meta", "payload": {"id": "root", "cwd": str(project)}},
+                {"timestamp": stamp(1), "type": "event_msg", "payload": {"type": "sub_agent_activity", "agent_thread_id": "ephemeral"}},
+                {"timestamp": stamp(2), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3,
+                    "reasoning_output_tokens": 1,
+                }}}},
+                {"timestamp": stamp(10), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn"}},
+            ])
+            store = HydraStore(base / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            ingest_rollouts(
+                store, (source,), project, "project-ephemeral", hash_key=b"e" * 32,
+            )
+            keys = Pseudonymizer(b"e" * 32)
+            child = keys.digest("identity", "ephemeral")
+            self.assertIsNone(store.connection.execute(
+                "SELECT started_at FROM rollout_sessions WHERE session_key=?", (child,),
+            ).fetchone()[0])
+
+            metrics = aggregate_stored_task_tree(
+                store.connection, project_id="project-ephemeral",
+                root_id=keys.digest("identity", "root"),
+            )
+
+            self.assertEqual(metrics.sessions.value, 2)
+            self.assertIn(child, metrics.session_ids)
+            self.assertIsNone(metrics.recorded.input.value)
+            self.assertEqual(metrics.recorded.input.known_lower_bound, 10)
+            self.assertIsNone(metrics.agent_time_ms.value)
+            self.assertEqual(metrics.agent_time_ms.known_lower_bound, 10_000)
+            self.assertIn("missing_session_start:1", metrics.agent_time_ms.caveats)
+            self.assertEqual(metrics.unique.provenance, "estimated")
+
+    def test_snapshot_without_timestamp_contributes_as_estimated_lower_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            (project / ".hydra").mkdir(parents=True)
+            (project / ".hydra" / "project.toml").write_text(
+                'project_id = "project-timestampless"\n', encoding="utf-8",
+            )
+            source = base / "root.jsonl"
+            write_rollout(source, [
+                {"timestamp": stamp(0), "type": "session_meta", "payload": {"id": "root", "cwd": str(project)}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10,
+                    "reasoning_output_tokens": 5,
+                }}}},
+                {"timestamp": stamp(10), "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn"}},
+            ])
+            store = HydraStore(base / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            ingest_rollouts(
+                store, (source,), project, "project-timestampless", hash_key=b"m" * 32,
+            )
+            self.assertEqual(tuple(store.connection.execute(
+                "SELECT observed_at,completeness FROM token_snapshots"
+            ).fetchone()), (None, "complete"))
+
+            metrics = aggregate_stored_task_tree(
+                store.connection, project_id="project-timestampless",
+                root_id=Pseudonymizer(b"m" * 32).digest("identity", "root"),
+            )
+
+            self.assertIsNone(metrics.recorded.input.value)
+            self.assertEqual(metrics.recorded.input.known_lower_bound, 100)
+            self.assertEqual(metrics.recorded.working.known_lower_bound, 90)
+            self.assertEqual(metrics.recorded.provenance, "estimated")
+            self.assertIn("timestamp_missing_token:1", metrics.recorded.caveats)
+            self.assertNotIn("missing_final_token:1", metrics.recorded.caveats)
 
 
 if __name__ == "__main__":

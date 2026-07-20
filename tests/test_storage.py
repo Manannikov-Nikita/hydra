@@ -23,6 +23,16 @@ from hydra_codex.contracts import (
 from hydra_codex.storage import MIGRATIONS, HydraStore, StorageUnavailable, default_database_path
 
 
+SECRET_FORM_MATRIX = (
+    "token VALUE", "token:VALUE", "token=VALUE",
+    "api key VALUE", "api_key VALUE", "api_key:VALUE", "api_key=VALUE",
+    "Authorization VALUE", "Authorization:VALUE", "Authorization=VALUE",
+    "Cookie VALUE", "Cookie:VALUE", "Cookie=VALUE",
+    "X-Auth-Token VALUE", "X-Auth-Token:VALUE", "X-Auth-Token=VALUE",
+    "password VALUE", "password:VALUE", "password=VALUE",
+)
+
+
 def annotation(
     annotation_id: str,
     sequence: int,
@@ -109,20 +119,23 @@ class SQLiteStorageTests(unittest.TestCase):
                 ("legacy-turn-2", "legacy-session-2", 1, "2026-07-20T09:01:00Z", "exact"),
             ),
         )
+        safe_legacy_rows = tuple(
+            (
+                f"legacy-safe-{sequence}", "project-one", "legacy-session-1", "legacy-turn-1", sequence,
+                "2026-07-20T09:02:00Z", "finish", "implement", "prompt", "none", 0.9,
+                "success", "model_reported", note, f"legacy-safe-hash-{sequence}", len(note),
+            )
+            for sequence, note in enumerate(SECRET_FORM_MATRIX, start=1)
+        )
         legacy.executemany(
             """INSERT INTO annotations(
                 annotation_id, project_id, session_id, turn_id, sequence, observed_at, kind,
                 phase, cause, scope_change, confidence, outcome, provenance, note_redacted,
                 note_hash, note_length
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
+            safe_legacy_rows + (
                 (
-                    "legacy-safe", "project-one", "legacy-session-1", "legacy-turn-1", 1,
-                    "2026-07-20T09:02:00Z", "finish", "implement", "prompt", "none", 0.9,
-                    "success", "model_reported", "token VALUE", "legacy-safe-hash", 11,
-                ),
-                (
-                    "legacy-invalid", "project-one", "legacy-session-1", "legacy-turn-2", 2,
+                    "legacy-invalid", "project-one", "legacy-session-1", "legacy-turn-2", 99,
                     "2026-07-20T09:03:00Z", "finish", "implement", "prompt", "none", 0.9,
                     "success", "model_reported", "Cookie legacy-secret", "legacy-invalid-hash", 20,
                 ),
@@ -135,9 +148,9 @@ class SQLiteStorageTests(unittest.TestCase):
         migrated = HydraStore(legacy_path)
         self.addCleanup(migrated.close)
         columns = {row[1] for row in migrated.connection.execute("PRAGMA table_info(annotations)")}
-        safe_row = migrated.connection.execute(
-            "SELECT note_redacted FROM annotations WHERE annotation_id = 'legacy-safe'"
-        ).fetchone()
+        safe_rows = migrated.connection.execute(
+            "SELECT note_redacted FROM annotations WHERE annotation_id LIKE 'legacy-safe-%' ORDER BY annotation_id"
+        ).fetchall()
         invalid_row = migrated.connection.execute(
             "SELECT annotation_id FROM annotations WHERE annotation_id = 'legacy-invalid'"
         ).fetchone()
@@ -147,7 +160,8 @@ class SQLiteStorageTests(unittest.TestCase):
 
         self.assertEqual(migrated.schema_version(), 2)
         self.assertIn("task_family", columns)
-        self.assertEqual(safe_row[0], "[redacted]")
+        self.assertEqual(len(safe_rows), len(SECRET_FORM_MATRIX))
+        self.assertTrue(all(row[0] == "[redacted]" for row in safe_rows))
         self.assertIsNone(invalid_row)
         self.assertIsNotNone(conflict)
         self.assertNotIn("legacy-secret", repr(tuple(conflict)))
@@ -225,16 +239,7 @@ class SQLiteStorageTests(unittest.TestCase):
         self.assertFalse({"raw_note", "prompt", "message", "tool_output"} & columns)
 
     def test_keyword_and_header_secret_forms_are_fail_closed(self) -> None:
-        risky_notes = (
-            "token VALUE",
-            "api key VALUE",
-            "X-Auth-Token VALUE",
-            "Authorization VALUE",
-            "Cookie VALUE",
-            "credential VALUE",
-            "passwd VALUE",
-            "access-key VALUE",
-        )
+        risky_notes = SECRET_FORM_MATRIX + ("credential VALUE", "passwd VALUE", "access-key VALUE")
         for sequence, note in enumerate(risky_notes, start=1):
             with self.subTest(note=note):
                 annotation_id = f"ann-header-{sequence}"

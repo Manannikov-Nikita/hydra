@@ -52,6 +52,13 @@ class TokenAggregationTests(unittest.TestCase):
         ))
         self.assertEqual((totals.wall_clock_ms, totals.agent_time_ms, totals.provenance), (3000, 2000, "derived"))
 
+    def test_overlapping_turns_use_root_wall_span_and_summed_agent_time(self) -> None:
+        totals = aggregate_turns((
+            TurnAttempt("a", "2026-07-20T00:00:00Z", "2026-07-20T00:00:04Z", 4000),
+            TurnAttempt("b", "2026-07-20T00:00:02Z", "2026-07-20T00:00:05Z", 3000),
+        ))
+        self.assertEqual((totals.wall_clock_ms, totals.agent_time_ms), (5000, 7000))
+
 
 class RolloutIngestTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -130,6 +137,19 @@ class RolloutIngestTests(unittest.TestCase):
         self.assertEqual(self.store.connection.execute("SELECT location_type FROM rollout_source_locations").fetchone()[0], "archived")
         turn = self.store.connection.execute("SELECT started_at, finished_at, emitted_duration_ms FROM turn_attempts").fetchone()
         self.assertEqual(tuple(turn), ("2026-07-20T00:00:00Z", "2026-07-20T00:00:04Z", 50))
+        metrics = aggregate_project(self.store.connection, "project-synthetic")
+        self.assertEqual((metrics.working_tokens, metrics.full_context, metrics.provenance), (None, None, "estimated"))
+
+    def test_injected_keys_are_stable_per_key_and_distinct_across_keys(self) -> None:
+        source = self.root / "rollouts" / "keyed.jsonl"
+        write_jsonl(source, [v1("session_meta", {"id": "anon-keyed", "cwd": str(self.project)})])
+        stores = [HydraStore(self.root / f"key-{index}.sqlite3") for index in range(3)]
+        self.addCleanup(lambda: [store.close() for store in stores])
+        for store, key in zip(stores, (b"same-key", b"same-key", b"other-key")):
+            ingest_rollouts(store, (source,), self.project, "project-synthetic", hash_key=key)
+        keys = [store.connection.execute("SELECT session_key FROM rollout_sessions").fetchone()[0] for store in stores]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
 
     def test_malformed_out_of_order_events_are_diagnostic_and_reingest_is_idempotent(self) -> None:
         source = self.root / "rollouts" / "broken.jsonl"
@@ -160,7 +180,7 @@ class RolloutIngestTests(unittest.TestCase):
         ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic")
 
         spans = self.store.connection.execute("SELECT category, terminal_state FROM tool_spans ORDER BY call_key").fetchall()
-        self.assertEqual([tuple(row) for row in spans], [("tool", "unknown"), ("tool", "success"), ("instrumentation", "success")])
+        self.assertEqual(sorted(tuple(row) for row in spans), [("instrumentation", "success"), ("tool", "success"), ("tool", "unknown")])
         self.assertEqual(tuple(self.store.connection.execute("SELECT operation, relative_path FROM file_observations").fetchone()), ("write", "src/safe.py"))
         self.assertIn(("read", "src/read.py"), [tuple(row) for row in self.store.connection.execute("SELECT operation, relative_path FROM file_observations")])
         self.assertNotIn(private_text, "\n".join(self.store.connection.iterdump()))

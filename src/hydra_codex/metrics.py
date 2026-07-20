@@ -48,12 +48,12 @@ class TreeContribution:
 
 @dataclass(frozen=True)
 class ProjectMetrics:
-    working_tokens: int
-    full_context: int
-    reasoning_tokens: int
-    recorded_working_tokens: int
-    recorded_full_context: int
-    recorded_reasoning_tokens: int
+    working_tokens: int | None
+    full_context: int | None
+    reasoning_tokens: int | None
+    recorded_working_tokens: int | None
+    recorded_full_context: int | None
+    recorded_reasoning_tokens: int | None
     sessions: int
     semantic_coverage: float
     provenance: str = "exact"
@@ -75,12 +75,13 @@ class TurnTotals:
 
 
 def aggregate_turns(attempts: Iterable[TurnAttempt]) -> TurnTotals:
-    wall = 0
+    intervals = []
     agent = 0
     for item in attempts:
         agent += item.emitted_duration_ms or 0
         if item.started_at and item.finished_at:
-            wall += int((datetime.fromisoformat(item.finished_at.replace("Z", "+00:00")) - datetime.fromisoformat(item.started_at.replace("Z", "+00:00"))).total_seconds() * 1000)
+            intervals.append((datetime.fromisoformat(item.started_at.replace("Z", "+00:00")), datetime.fromisoformat(item.finished_at.replace("Z", "+00:00"))))
+    wall = int((max(end for _, end in intervals) - min(start for start, _ in intervals)).total_seconds() * 1000) if intervals else 0
     return TurnTotals(wall, agent, "derived")
 
 
@@ -112,6 +113,7 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
                   output_tokens, reasoning_tokens, cache_write_tokens
            FROM token_snapshots WHERE project_id = ?""", (project_id,)
     ).fetchall()
+    partial = int(connection.execute("SELECT COUNT(*) FROM token_snapshots WHERE project_id = ? AND completeness != 'complete'", (project_id,)).fetchone()[0])
     recorded = aggregate_tokens(TokenSnapshot(*tuple(row)) for row in rows)
     baselines = connection.execute(
         """SELECT fork_baselines.input_tokens, fork_baselines.cached_input_tokens,
@@ -124,6 +126,8 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
     baseline_reasoning = sum(row[3] for row in baselines)
     sessions = int(connection.execute("SELECT COUNT(*) FROM rollout_sessions WHERE project_id = ?", (project_id,)).fetchone()[0])
     annotations = int(connection.execute("SELECT COUNT(*) FROM annotations WHERE project_id = ?", (project_id,)).fetchone()[0])
+    if partial:
+        return ProjectMetrics(None, None, None, None, None, None, sessions, 0.0 if not annotations else 1.0, "estimated")
     return ProjectMetrics(
         recorded.working_tokens - baseline_working, recorded.full_context - baseline_full,
         recorded.reasoning_tokens - baseline_reasoning, recorded.working_tokens,

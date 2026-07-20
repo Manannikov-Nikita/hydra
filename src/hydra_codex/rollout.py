@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextvars import ContextVar
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
+import secrets
 from typing import Any, Iterable
 
 from .classifier import classify_test_command, classify_test_outcome
 from .storage import HydraStore
 
 
-HASH_KEY = b"hydra.codex-rollout/v1"
 KNOWN_ENVELOPES = {"session_meta", "turn_context", "event_msg", "response_item"}
+_ACTIVE_HASHER: ContextVar["Pseudonymizer | None"] = ContextVar("hydra_rollout_hasher", default=None)
 
 
 @dataclass(frozen=True)
@@ -30,8 +33,30 @@ class RolloutRoot:
     label: str = "explicit_root"
 
 
+@dataclass(frozen=True)
+class Pseudonymizer:
+    key: bytes
+
+    @classmethod
+    def installation(cls, directory: Path) -> "Pseudonymizer":
+        path = directory / "rollout-hmac.key"
+        if path.exists():
+            return cls(path.read_bytes())
+        key = secrets.token_bytes(32)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(key)
+        return cls(key)
+
+    def digest(self, value: str) -> str:
+        return hmac.new(self.key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def opaque(value: str) -> str:
-    return hmac.new(HASH_KEY, value.encode("utf-8"), hashlib.sha256).hexdigest()
+    hasher = _ACTIVE_HASHER.get()
+    if hasher is None:
+        raise RuntimeError("rollout pseudonymizer is required")
+    return hasher.digest(value)
 
 
 def discover_rollouts(roots: Iterable[Path | str | RolloutRoot]) -> tuple[Path, ...]:
@@ -343,6 +368,7 @@ def ingest_rollouts(
 ) -> IngestReport:
     """Ingest explicit v1 JSONL roots idempotently, storing only normalized safe facts."""
     root = Path(project_root)
+    _ACTIVE_HASHER.set(Pseudonymizer(hash_key) if hash_key is not None else Pseudonymizer.installation(store.database_path.parent))
     root_specs = tuple(roots)
     files = discover_rollouts(root_specs)
     diagnostics = 0

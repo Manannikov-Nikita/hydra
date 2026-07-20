@@ -161,8 +161,14 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
            FROM token_snapshots WHERE project_id=? ORDER BY observed_at,source_digest,line_number""", (project_id,)
     ).fetchall()
     final: dict[tuple[str, int], sqlite3.Row] = {}
+    last: dict[str, tuple[int, int, int, int]] = {}
+    epochs: dict[str, int] = {}
     for row in rows:
-        final[(row[0], row[1])] = row
+        vector = tuple(0 if row[index] is None else row[index] for index in range(2, 6))
+        if row[0] in last and any(now < before for now, before in zip(vector, last[row[0]])):
+            epochs[row[0]] = epochs.get(row[0], 0) + 1
+        last[row[0]] = vector
+        final[(row[0], epochs.get(row[0], 0))] = row
     vectors = tuple(final.values())
     def component(index: int) -> MetricFact:
         known = sum(row[index] or 0 for row in vectors)
@@ -181,7 +187,9 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
        FROM fork_baselines b JOIN session_edges e ON e.child_key=b.child_key JOIN rollout_sessions s ON s.session_key=b.child_key
        WHERE s.project_id=? AND e.confidence_kind='confirmed'""", (project_id,)).fetchone()
     baseline_working, baseline_full = baseline[0] or 0, baseline[1] or 0
-    caveat = ("zero_no_observation",) if confirmed_missing else ()
+    inferred = int(connection.execute("""SELECT COUNT(*) FROM session_edges e JOIN rollout_sessions s ON s.session_key=e.child_key
+       WHERE s.project_id=? AND e.confidence_kind='inferred'""", (project_id,)).fetchone()[0])
+    caveat = ("zero_no_observation",) if confirmed_missing else (("inferred_parent_no_dedup",) if inferred else ())
     dedup_working = MetricFact(None if working.value is None else working.value-baseline_working, working.known_lower_bound-baseline_working, "derived" if baseline_working else ("estimated" if caveat else working.provenance), caveat)
     dedup_full = MetricFact(None if full.value is None else full.value-baseline_full, full.known_lower_bound-baseline_full, "derived" if baseline_full else ("estimated" if caveat else full.provenance), caveat)
     facts = {

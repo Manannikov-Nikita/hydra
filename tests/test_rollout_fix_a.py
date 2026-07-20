@@ -164,3 +164,14 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         facts = aggregate_project_facts(self.store.connection, "project-a")
         self.assertEqual(facts["recorded_working"].value, 15)
         self.assertEqual(facts["deduplicated_working"].caveats, ("zero_no_observation",))
+
+    def test_fact_epochs_are_global_and_inferred_edge_is_not_exact_dedup(self) -> None:
+        first = self.base / "first.jsonl"
+        second = self.base / "second.jsonl"
+        meta = record("session_meta", {"id": "child", "cwd": str(self.project)}, 0)
+        write(first, [meta, record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "reasoning_output_tokens": 0}}}, 2)])
+        write(second, [meta, record("event_msg", {"type": "sub_agent_activity", "agent_thread_id": "child"}, 1), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 4, "cached_input_tokens": 1, "output_tokens": 1, "reasoning_output_tokens": 0}}}, 3)])
+        ingest_rollouts(self.store, (first, second), self.project, "project-a", hash_key=b"l" * 32)
+        facts = aggregate_project_facts(self.store.connection, "project-a")
+        self.assertEqual(facts["recorded_working"].value, 15)
+        self.assertEqual(facts["deduplicated_working"].caveats, ("inferred_parent_no_dedup",))

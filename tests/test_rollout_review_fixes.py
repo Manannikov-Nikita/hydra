@@ -81,6 +81,43 @@ class RolloutReviewFixTests(unittest.TestCase):
         self.assertEqual(self.store.count("rollout_logical_sources"), 1)
         self.assertEqual(self.store.count("token_snapshots"), 2)
 
+    def test_renamed_divergent_relocation_quarantines_same_logical_segment(self) -> None:
+        active = self.base / "active" / "thread.jsonl"
+        renamed = self.base / "archive" / "renamed-thread.jsonl"
+        write(active, [self.meta(), self.token(10, "2026-07-21T00:00:01Z")])
+        ingest_rollouts(self.store, (active,), self.project_a, "project-a", hash_key=self.key)
+
+        write(renamed, [self.meta(), self.token(99, "2026-07-21T00:00:01Z")])
+        ingest_rollouts(self.store, (renamed,), self.project_a, "project-a", hash_key=self.key)
+
+        self.assertEqual(self.store.count("rollout_logical_sources"), 1)
+        self.assertEqual(self.store.count("token_snapshots"), 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT lineage_state FROM rollout_logical_sources"
+            ).fetchone()[0],
+            "conflicted",
+        )
+
+    def test_same_timestamp_remains_separate_for_distinct_session_identities(self) -> None:
+        first = self.base / "rollouts" / "first.jsonl"
+        second = self.base / "rollouts" / "second.jsonl"
+        common_time = "2026-07-21T00:00:00Z"
+        write(first, [
+            record("session_meta", {"id": "thread-a", "cwd": str(self.project_a)}, common_time),
+            self.token(10, "2026-07-21T00:00:01Z"),
+        ])
+        write(second, [
+            record("session_meta", {"id": "thread-b", "cwd": str(self.project_a)}, common_time),
+            self.token(20, "2026-07-21T00:00:01Z"),
+        ])
+
+        ingest_rollouts(self.store, (first, second), self.project_a, "project-a", hash_key=self.key)
+
+        self.assertEqual(self.store.count("rollout_sessions"), 2)
+        self.assertEqual(self.store.count("rollout_logical_sources"), 2)
+        self.assertEqual(self.store.count("token_snapshots"), 2)
+
     def test_missing_cache_write_baseline_stays_null(self) -> None:
         source = self.base / "rollouts" / "child.jsonl"
         write(source, [self.meta(parent="parent"), self.token(10, "2026-07-21T00:00:00.500000Z")])

@@ -9,10 +9,35 @@ import hmac
 import os
 from pathlib import Path
 import secrets
+import stat
 import tempfile
 from typing import Iterable
 
 from .rollout_privacy import LOCATION_TYPES
+
+
+def _read_private_key(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("installation pseudonymization key must be a regular file")
+        if hasattr(os, "getuid") and details.st_uid != os.getuid():
+            raise PermissionError("installation pseudonymization key has a different owner")
+        if os.name == "posix" and stat.S_IMODE(details.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+                raise PermissionError("installation pseudonymization key must be mode 0600")
+        key = os.read(descriptor, 33)
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (details.st_dev, details.st_ino):
+            raise RuntimeError("installation pseudonymization key changed while opening")
+        if len(key) != 32:
+            raise ValueError("invalid installation pseudonymization key")
+        return key
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -43,10 +68,7 @@ class Pseudonymizer:
             os.chmod(directory, 0o700)
         path = directory / "rollout-hmac.key"
         if path.exists():
-            key = path.read_bytes()
-            if len(key) != 32:
-                raise ValueError("invalid installation pseudonymization key")
-            return cls(key)
+            return cls(_read_private_key(path))
         key = secrets.token_bytes(32)
         descriptor, temporary = tempfile.mkstemp(prefix=".rollout-key-", dir=directory)
         try:
@@ -59,10 +81,7 @@ class Pseudonymizer:
                 os.link(temporary, path)
             except FileExistsError:
                 pass
-            winner = path.read_bytes()
-            if len(winner) != 32:
-                raise ValueError("invalid installation pseudonymization key")
-            return cls(winner)
+            return cls(_read_private_key(path))
         finally:
             try:
                 os.unlink(temporary)

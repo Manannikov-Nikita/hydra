@@ -96,3 +96,34 @@ def relation_to(canonical: tuple[str, ...], current: tuple[str, ...]) -> str:
     if canonical[:shared] != current[:shared]:
         return "rewrite"
     return "append" if len(current) > len(canonical) else "truncate"
+
+
+def prefix_lineage(
+    connection: sqlite3.Connection, session_key: str, project_id: str, current: tuple[str, ...],
+) -> str | None:
+    """Find the strongest clean prefix relation for a source observed at a new location."""
+    matches: list[tuple[int, str]] = []
+    rows = connection.execute(
+        """SELECT logical_source_key,canonical_revision_digest
+             FROM rollout_logical_sources
+            WHERE session_key=? AND project_id=? AND lineage_state='clean'
+              AND canonical_revision_digest IS NOT NULL""",
+        (session_key, project_id),
+    )
+    for logical, revision in rows:
+        canonical = revision_lines(connection, revision)
+        if relation_to(canonical, current) != "rewrite":
+            matches.append((min(len(canonical), len(current)), logical))
+    return max(matches, default=(0, None), key=lambda item: (item[0], item[1]))[1]
+
+
+def located_lineage(connection: sqlite3.Connection, location_key: str, project_id: str) -> str | None:
+    row = connection.execute(
+        """SELECT locations.logical_source_key
+             FROM rollout_source_locations AS locations
+             JOIN rollout_logical_sources AS sources
+               ON sources.logical_source_key=locations.logical_source_key
+            WHERE locations.location_key=? AND sources.project_id=?""",
+        (location_key, project_id),
+    ).fetchone()
+    return None if row is None else row[0]

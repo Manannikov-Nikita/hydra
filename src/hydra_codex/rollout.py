@@ -19,16 +19,14 @@ from .rollout_persistence import insert_diagnostic as _persist_diagnostic
 from .rollout_persistence import persist_file as _persist_file
 from .rollout_persistence import tool_end_state as _tool_end_state
 from .rollout_reconcile import reconcile_token_epochs, reconcile_turn_attempts
-from .rollout_sources import line_fingerprint, relation_to, revision_lines, scan_source
+from .rollout_sources import line_fingerprint, located_lineage, prefix_lineage, relation_to, revision_lines, scan_source
 from .storage import HydraStore
 from .test_evidence import TestEvidenceBuffer
 from .tool_normalization import custom_exec_outcome, nested_span_name, scan_custom_exec_details
 from .tool_spans import persist_tool_end, persist_tool_start
 
 
-def _insert_diagnostic(
-    connection: Any, source: str, line: int, kind: str, payload: Any, *, unsafe_value: Any = None,
-) -> None:
+def _insert_diagnostic(connection: Any, source: str, line: int, kind: str, payload: Any, *, unsafe_value: Any = None) -> None:
     _persist_diagnostic(
         connection, source, line, kind, payload,
         fingerprint=lambda value: observation_fingerprint(value, opaque), unsafe_value=unsafe_value,
@@ -46,7 +44,6 @@ def _parse_source(
     session_meta_epoch: float | None = None
     current_turn: str | None = None
     seen_session = False
-    epochs: dict[str, tuple[int, tuple[int, int, int, int, int]]] = {}
     with store.rollout_transaction() as connection, path.open("rb") as handle:
         test_evidence = TestEvidenceBuffer(connection, source, model_causes, opaque)
         parsed_lines = 0
@@ -218,7 +215,7 @@ def _parse_source(
                              cached_input_tokens=excluded.cached_input_tokens,output_tokens=excluded.output_tokens,
                              reasoning_tokens=excluded.reasoning_tokens,cache_write_tokens=excluded.cache_write_tokens,observed_at=excluded.observed_at
                            WHERE excluded.observed_at > fork_baselines.observed_at""",
-                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"] or 0, observed_at),
+                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"], observed_at),
                     )
                 continue
             event_type = payload.get("type") if kind == "event_msg" else None
@@ -387,7 +384,10 @@ def _parse_source(
         test_evidence.flush()
         if parsed_lines != len(line_fingerprints):
             raise RuntimeError("rollout source changed during ingest")
-        reconcile_token_epochs(connection, project_id)
+        reconcile_token_epochs(
+            connection, project_id,
+            lambda digest, ordinal, kind: _insert_diagnostic(connection, digest, ordinal, kind, {}),
+        )
         reconcile_turn_attempts(
             connection,
             lambda digest, ordinal, kind: _insert_diagnostic(connection, digest, ordinal, kind, {}),
@@ -412,7 +412,7 @@ def ingest_rollouts(
         unique: set[str] = set()
         for path in files:
             scan = scan_source(path, hasher.key, opaque)
-            digest = scan.revision_digest
+            digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
             unique.add(digest)
             location = opaque("source", str(path))
             label = next(
@@ -435,12 +435,13 @@ def ingest_rollouts(
                     if known[1]:
                         continue
                 identity_key = opaque("identity", scan.identity) if scan.identity else opaque("identity", "unresolved/" + digest)
-                located = connection.execute(
-                    "SELECT logical_source_key FROM rollout_source_locations WHERE location_key=?", (location,),
-                ).fetchone()
+                located = located_lineage(connection, location, project_id)
+                relocated = None if known is not None or located is not None else prefix_lineage(
+                    connection, identity_key, project_id, scan.line_fingerprints,
+                )
                 logical = known[0] if known is not None else (
-                    located[0] if located is not None else opaque(
-                        "source", f"segment/{identity_key}/{scan.segment_marker}",
+                    located if located is not None else relocated or opaque(
+                        "source", f"segment/{project_id}/{identity_key}/{scan.segment_marker}",
                     )
                 )
                 logical_row = connection.execute(

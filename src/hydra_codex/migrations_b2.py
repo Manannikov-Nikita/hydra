@@ -100,4 +100,25 @@ B2_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                   started_at,finished_at,timing_provenance FROM turn_attempts_v15""",
         "DROP TABLE turn_attempts_v15",
     )),
+    (17, (
+        "ALTER TABLE fork_baselines RENAME TO fork_baselines_v16",
+        """CREATE TABLE fork_baselines (
+            child_key TEXT PRIMARY KEY REFERENCES rollout_sessions(session_key),
+            source_digest TEXT NOT NULL,
+            line_number INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            reasoning_tokens INTEGER NOT NULL,
+            cache_write_tokens INTEGER,
+            provenance TEXT NOT NULL,
+            observed_at TEXT
+        )""",
+        """INSERT INTO fork_baselines(
+               child_key,source_digest,line_number,input_tokens,cached_input_tokens,output_tokens,
+               reasoning_tokens,cache_write_tokens,provenance,observed_at)
+           SELECT child_key,source_digest,line_number,input_tokens,cached_input_tokens,output_tokens,
+                  reasoning_tokens,cache_write_tokens,provenance,observed_at FROM fork_baselines_v16""",
+        "DROP TABLE fork_baselines_v16",
+    )),
 )

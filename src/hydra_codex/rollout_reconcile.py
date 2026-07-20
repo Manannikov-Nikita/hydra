@@ -89,7 +89,11 @@ def _timestamp_order(row: sqlite3.Row) -> tuple[int, str, str, int]:
     return (0 if value is not None else 1, value or "", row[0], int(row[1]))
 
 
-def reconcile_token_epochs(connection: sqlite3.Connection, project_id: str) -> None:
+def reconcile_token_epochs(
+    connection: sqlite3.Connection,
+    project_id: str,
+    diagnose: Callable[[str, int, str], None] | None = None,
+) -> None:
     rows = list(connection.execute(
         """SELECT source_digest,line_number,session_key,input_tokens,cached_input_tokens,
                   output_tokens,reasoning_tokens,observed_at,cache_write_tokens
@@ -108,6 +112,8 @@ def reconcile_token_epochs(connection: sqlite3.Connection, project_id: str) -> N
             if any(now is not None and before is not None and now < before for now, before in zip(current, last)):
                 epoch += 1
                 last = [None] * 5
+                if diagnose:
+                    diagnose(row[0], int(row[1]), "counter_reset")
             for index, value in enumerate(current):
                 if value is not None:
                     last[index] = value

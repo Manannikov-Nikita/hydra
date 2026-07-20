@@ -436,23 +436,25 @@ def ingest_rollouts(
     if hash_key is not None and len(hash_key) != 32:
         raise ValueError("hash_key must be exactly 32 bytes")
     hash_token = _ACTIVE_HASHER.set(Pseudonymizer(hash_key) if hash_key is not None else Pseudonymizer.installation(store.database_path.parent))
-    root_specs = tuple(roots)
-    files = discover_rollouts(root_specs)
-    diagnostics = 0
-    unique: set[str] = set()
-    for path in files:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        unique.add(digest)
-        location = opaque(str(path))
-        label = next((item.label for item in root_specs if isinstance(item, RolloutRoot) and path.is_relative_to(Path(item.path).resolve())), "explicit_root")
-        with store.rollout_transaction() as connection:
-            known = connection.execute("SELECT 1 FROM rollout_sources WHERE source_digest = ?", (digest,)).fetchone() is not None
-            connection.execute("INSERT INTO rollout_sources(source_digest, source_type) VALUES (?, 'jsonl') ON CONFLICT DO NOTHING", (digest,))
-            connection.execute(
-                """INSERT INTO rollout_source_locations(source_digest, location_key, location_type)
-                   VALUES (?, ?, ?) ON CONFLICT DO NOTHING""", (digest, location, label),
-            )
-        if not known:
-            diagnostics += _parse_source(store, path, digest, root, project_id, model_causes or {})
-    _ACTIVE_HASHER.reset(hash_token)
-    return IngestReport(len(files), len(unique), diagnostics)
+    try:
+        root_specs = tuple(roots)
+        files = discover_rollouts(root_specs)
+        diagnostics = 0
+        unique: set[str] = set()
+        for path in files:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            unique.add(digest)
+            location = opaque(str(path))
+            label = next((item.label for item in root_specs if isinstance(item, RolloutRoot) and path.is_relative_to(Path(item.path).resolve())), "explicit_root")
+            with store.rollout_transaction() as connection:
+                known = connection.execute("SELECT 1 FROM rollout_sources WHERE source_digest = ?", (digest,)).fetchone() is not None
+                connection.execute("INSERT INTO rollout_sources(source_digest, source_type) VALUES (?, 'jsonl') ON CONFLICT DO NOTHING", (digest,))
+                connection.execute(
+                    """INSERT INTO rollout_source_locations(source_digest, location_key, location_type)
+                       VALUES (?, ?, ?) ON CONFLICT DO NOTHING""", (digest, location, label),
+                )
+            if not known:
+                diagnostics += _parse_source(store, path, digest, root, project_id, model_causes or {})
+        return IngestReport(len(files), len(unique), diagnostics)
+    finally:
+        _ACTIVE_HASHER.reset(hash_token)

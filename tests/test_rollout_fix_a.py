@@ -202,3 +202,12 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         (key_dir / "rollout-hmac.key").write_bytes(b"bad")
         with self.assertRaises(ValueError):
             Pseudonymizer.installation(key_dir)
+
+    def test_ingest_resets_pseudonymizer_after_failure(self) -> None:
+        source = self.base / "failure.jsonl"
+        write(source, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0)])
+        self.store.close()
+        with self.assertRaises(Exception):
+            ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"z" * 32)
+        with self.assertRaises(RuntimeError):
+            opaque("outside")

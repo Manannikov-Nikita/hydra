@@ -210,4 +210,4 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         with self.assertRaises(Exception):
             ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"z" * 32)
         with self.assertRaises(RuntimeError):
-            opaque("outside")
+            opaque("identity", "outside")

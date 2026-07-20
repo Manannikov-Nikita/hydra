@@ -74,16 +74,16 @@ class Pseudonymizer:
                 pass
 
     def digest(self, domain: str, value: str) -> str:
-        if domain not in {"identity", "path", "command", "source", "event", "diagnostic", "capability"}:
+        if domain not in {"identity", "conversation", "turn", "call", "path", "command", "source", "event", "diagnostic", "capability"}:
             raise ValueError("unsupported pseudonymization domain")
         return hmac.new(self.key, f"hydra/{domain}/".encode("utf-8") + value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def opaque(value: str) -> str:
+def opaque(domain: str, value: str) -> str:
     hasher = _ACTIVE_HASHER.get()
     if hasher is None:
         raise RuntimeError("rollout pseudonymizer is required")
-    return hasher.digest("identity", value)
+    return hasher.digest(domain, value)
 
 
 def discover_rollouts(roots: Iterable[Path | str | RolloutRoot]) -> tuple[Path, ...]:
@@ -106,7 +106,7 @@ def _fingerprint(value: Any) -> str:
     if not isinstance(value, dict):
         return type(value).__name__
     shape = ",".join(f"{key}:{type(item).__name__}" for key, item in sorted(value.items()))
-    return "shape/" + opaque(shape)[:32]
+    return "shape/" + opaque("diagnostic", shape)[:32]
 
 
 def _path_key(value: Any, project_root: Path) -> str:
@@ -118,7 +118,7 @@ def _path_key(value: Any, project_root: Path) -> str:
     try:
         return candidate.resolve().relative_to(project_root.resolve()).as_posix()
     except ValueError:
-        return "external/" + opaque(value)[:20]
+        return "external/" + opaque("path", value)[:20]
 
 
 def _usage(payload: dict[str, Any]) -> dict[str, int] | None:
@@ -151,7 +151,7 @@ def _upsert_turn(connection: Any, session: str, turn: str, state: str, timestamp
            ON CONFLICT(session_key, turn_key, attempt_ordinal) DO UPDATE SET
              state = CASE WHEN turn_attempts.state IN ('completed', 'aborted') THEN turn_attempts.state ELSE excluded.state END, emitted_duration_ms = COALESCE(excluded.emitted_duration_ms, turn_attempts.emitted_duration_ms),
              started_at = COALESCE(turn_attempts.started_at, excluded.started_at), finished_at = COALESCE(excluded.finished_at, turn_attempts.finished_at)""",
-        (session, opaque(turn), state, duration, timestamp if state == "open" else None, timestamp if state != "open" else None),
+        (session, opaque("turn", turn), state, duration, timestamp if state == "open" else None, timestamp if state != "open" else None),
     )
 
 
@@ -188,7 +188,7 @@ def _persist_file(connection: Any, source: str, line: int, session: str, operati
     connection.execute(
         """INSERT INTO file_observations(source_digest, line_number, session_key, operation, relative_path, path_hash)
            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-        (source, line, session, operation, path, opaque(path)),
+        (source, line, session, operation, path, opaque("path", path)),
     )
 
 
@@ -217,7 +217,7 @@ def _parse_source(
                 _insert_diagnostic(connection, source, line_number, "malformed", envelope)
                 continue
             kind, payload = envelope.get("type"), envelope["payload"]
-            event_key = opaque("event/" + (session_key or "") + "/" + json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+            event_key = opaque("event", (session_key or "") + "/" + json.dumps(envelope, sort_keys=True, separators=(",", ":")))
             known_event = connection.execute("SELECT 1 FROM rollout_event_keys WHERE event_key = ?", (event_key,)).fetchone()
             if known_event is not None and kind != "session_meta":
                 continue
@@ -237,7 +237,7 @@ def _parse_source(
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "session_meta", payload)
                     continue
-                next_key = opaque(identity)
+                next_key = opaque("identity", identity)
                 conversation = payload.get("session_id", identity)
                 try:
                     resolved = resolve_project(payload.get("cwd"))
@@ -260,7 +260,7 @@ def _parse_source(
                 connection.execute(
                     """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments, conversation_key)
                        VALUES (?, ?, ?, 1, ?) ON CONFLICT(session_key) DO NOTHING""",
-                    (session_key, project_id, path_key, opaque(conversation) if isinstance(conversation, str) else next_key),
+                    (session_key, project_id, path_key, opaque("conversation", conversation) if isinstance(conversation, str) else next_key),
                 )
                 if payload.get("parent_thread_id") is not None:
                     parent = payload.get("parent_thread_id")
@@ -271,7 +271,7 @@ def _parse_source(
                                  parent_key = excluded.parent_key, baseline_working_tokens = NULL,
                                  confidence_kind = 'confirmed', confidence = 1.0
                                WHERE session_edges.confidence_kind != 'confirmed'""",
-                            (session_key, opaque(parent), None, "confirmed", 1.0),
+                            (session_key, opaque("identity", parent), None, "confirmed", 1.0),
                         )
                 seen_session = True
                 continue
@@ -299,7 +299,7 @@ def _parse_source(
                     (source, line_number, session_key, project_id, epoch, usage["input"], usage["cached"], usage["output"],
                      usage["reasoning"], usage["cache_write"], usage["vendor_total"], usage["context_window"], completeness, envelope.get("timestamp")),
                 )
-                connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque(current_turn) if current_turn else None, source, line_number))
+                connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque("turn", current_turn) if current_turn else None, source, line_number))
                 edge = connection.execute(
                     "SELECT parent_key FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()
@@ -327,7 +327,7 @@ def _parse_source(
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "sub_agent_activity", payload)
                     continue
-                child_key = opaque(child_identity)
+                child_key = opaque("identity", child_identity)
                 connection.execute(
                     """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments)
                        VALUES (?, ?, 'unresolved', 1) ON CONFLICT DO NOTHING""", (child_key, project_id)
@@ -355,7 +355,7 @@ def _parse_source(
                     connection.execute(
                         """INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
                            VALUES (?, ?, 'opaque_exec', 'unknown', NULL) ON CONFLICT DO NOTHING""",
-                        (session_key, opaque(payload["call_id"])),
+                        (session_key, opaque("call", payload["call_id"])),
                     )
                 continue
             if kind == "response_item" and payload.get("type") == "custom_tool_call_output":
@@ -367,7 +367,7 @@ def _parse_source(
                     continue
                 name = payload.get("name") if isinstance(payload.get("name"), str) else "unknown"
                 category = "instrumentation" if "hydra" in name.lower() else "tool"
-                call_key = opaque(payload["call_id"])
+                call_key = opaque("call", payload["call_id"])
                 connection.execute(
                     """INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
                        VALUES (?, ?, ?, 'unknown', NULL) ON CONFLICT DO NOTHING""", (session_key, call_key, category))
@@ -379,7 +379,7 @@ def _parse_source(
                 if name == "exec_command" and isinstance(command, str):
                     runner, scope = classify_test_command(command)
                     if runner != "unknown":
-                        test_calls[payload["call_id"]] = (opaque(command), runner, scope)
+                        test_calls[payload["call_id"]] = (opaque("command", command), runner, scope)
                 continue
             if kind == "response_item" and payload.get("type") == "function_call_output":
                 call_id = payload.get("call_id")
@@ -408,7 +408,7 @@ def _parse_source(
                     connection.execute(
                         """INSERT INTO semantic_conflicts(conflict_key, source_digest, line_number, deterministic_cause, model_cause)
                            VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-                        (opaque(f"{source}:{line_number}"), source, line_number, classification, model_cause),
+                        (opaque("diagnostic", f"{source}:{line_number}"), source, line_number, classification, model_cause),
                     )
                 continue
             if kind == "event_msg" and event_type in {"mcp_tool_call_end", "patch_apply_end", "web_search_end"}:
@@ -416,7 +416,7 @@ def _parse_source(
                 if session_key is not None and isinstance(call_id, str):
                     connection.execute(
                         """UPDATE tool_spans SET terminal_state = ?, latency_ms = ? WHERE session_key = ? AND call_key = ?""",
-                        (_tool_end_state(payload), _duration_ms(payload.get("duration")), session_key, opaque(call_id)),
+                        (_tool_end_state(payload), _duration_ms(payload.get("duration")), session_key, opaque("call", call_id)),
                     )
                 if event_type == "patch_apply_end" and session_key is not None:
                     changes = payload.get("changes")
@@ -444,7 +444,7 @@ def ingest_rollouts(
         for path in files:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             unique.add(digest)
-            location = opaque(str(path))
+            location = opaque("source", str(path))
             label = next((item.label for item in root_specs if isinstance(item, RolloutRoot) and path.is_relative_to(Path(item.path).resolve())), "explicit_root")
             with store.rollout_transaction() as connection:
                 known = connection.execute("SELECT 1 FROM rollout_sources WHERE source_digest = ?", (digest,)).fetchone() is not None

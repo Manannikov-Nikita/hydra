@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextvars import ContextVar
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -172,6 +173,7 @@ def _parse_source(
 ) -> int:
     diagnostics = 0
     session_key: str | None = None
+    session_meta_at: str | None = None
     current_turn: str | None = None
     seen_session = False
     epochs: dict[str, tuple[int, tuple[int, int, int, int, int]]] = {}
@@ -227,6 +229,7 @@ def _parse_source(
                     _insert_diagnostic(connection, source, line_number, "multiple_sessions", payload)
                     continue
                 session_key = next_key
+                session_meta_at = envelope.get("timestamp") if isinstance(envelope.get("timestamp"), str) else None
                 existing = connection.execute("SELECT resume_segments FROM rollout_sessions WHERE session_key = ?", (session_key,)).fetchone()
                 path_key = _path_key(payload.get("cwd"), project_root)
                 connection.execute(
@@ -275,7 +278,10 @@ def _parse_source(
                 edge = connection.execute(
                     "SELECT parent_key FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()
-                if usage["complete"] and edge is not None and connection.execute(
+                timely = False
+                if session_meta_at and isinstance(envelope.get("timestamp"), str):
+                    timely = (datetime.fromisoformat(envelope["timestamp"].replace("Z", "+00:00")) - datetime.fromisoformat(session_meta_at.replace("Z", "+00:00"))).total_seconds() <= 1
+                if usage["complete"] and timely and edge is not None and connection.execute(
                     "SELECT confidence_kind FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()[0] == "confirmed":
                     connection.execute(

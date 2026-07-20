@@ -125,3 +125,12 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         ])
         ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"g" * 32)
         self.assertEqual(tuple(self.store.connection.execute("SELECT input_tokens, cached_input_tokens, output_tokens, reasoning_tokens FROM token_snapshots").fetchone()), (0, None, None, None))
+
+    def test_late_child_token_is_not_a_replay_baseline(self) -> None:
+        source = self.base / "child-late.jsonl"
+        write(source, [
+            record("session_meta", {"id": "child", "cwd": str(self.project), "parent_thread_id": "parent"}, 0),
+            record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 1}}}, 5),
+        ])
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"h" * 32)
+        self.assertEqual(self.store.count("fork_baselines"), 0)

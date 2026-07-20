@@ -8,8 +8,9 @@ from .tool_normalization import JoinedToolSpan, ToolSpanJoin
 
 _CATEGORIES = frozenset({"instrumentation", "opaque_exec", "tool", "web"})
 _TOOL_NAMES = frozenset({
-    "apply_patch", "custom_exec", "exec_command", "function", "hydra", "mcp",
-    "nested_exec", "patch", "view_image", "web",
+    "apply_patch", "custom_exec", "exec_command", "file_read", "file_write",
+    "function", "hydra", "mcp", "nested_exec", "patch", "read_mcp_resource",
+    "unknown", "view_image", "web",
 })
 _TERMINAL_STATES = frozenset({"unknown", "success", "failed"})
 _PROVENANCE = frozenset({"exact", "lower_bound"})
@@ -43,9 +44,11 @@ def persist_tool_start(
         span = ToolSpanJoin().start_after_end(span, tool_name, started_at or "")
     connection.execute(
         """UPDATE tool_spans SET category = ?, tool_name = ?, started_at = COALESCE(started_at, ?),
-           turn_key = COALESCE(turn_key, ?), completeness = CASE WHEN finished_at IS NULL THEN completeness ELSE 'complete' END
+           turn_key = COALESCE(turn_key, ?), provenance = ?,
+           completeness = CASE WHEN finished_at IS NULL THEN completeness ELSE 'complete' END
            WHERE session_key = ? AND call_key = ?""",
-        (category, span.name or tool_name, span.started_at or started_at, turn_key, session_key, call_key),
+        (category, span.name or tool_name, span.started_at or started_at, turn_key,
+         provenance, session_key, call_key),
     )
 
 

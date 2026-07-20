@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .custom_tool_persistence import persist_custom_tool_call
+from .function_normalization import normalize_function_call
 from .project import ProjectNotFound, resolve_project
 from .rollout_identity import ACTIVE_HASHER, IngestReport, Pseudonymizer, RolloutRoot, discover_rollouts, opaque
 from .rollout_observations import fingerprint as observation_fingerprint
-from .rollout_observations import parse_arguments, path_key, safe_int, usage as parse_usage
+from .rollout_observations import path_key, safe_int, usage as parse_usage
 from .rollout_privacy import (
     KNOWN_ENVELOPES, KNOWN_EVENT_TYPES, KNOWN_RESPONSE_TYPES,
     canonical_timestamp, nonempty_string, safe_envelope_kind,
@@ -291,25 +292,28 @@ def _parse_source(
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "function_call", payload)
                     continue
-                name = payload.get("name") if isinstance(payload.get("name"), str) else "unknown"
-                category = "instrumentation" if "hydra" in name.lower() else "tool"
+                normalized = normalize_function_call(
+                    payload.get("name"), payload.get("arguments"), project_root=project_root,
+                )
                 call_key = opaque("call", payload["call_id"])
                 persist_tool_start(
-                    connection, session_key=session_key, call_key=call_key, category=category, tool_name="function",
+                    connection, session_key=session_key, call_key=call_key,
+                    category=normalized.category, tool_name=normalized.safe_name,
                     started_at=observed_at,
-                    turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
+                    turn_key=opaque("turn", current_turn) if current_turn else None,
+                    source_digest=source, source_ordinal=line_number,
+                    provenance=normalized.provenance,
                 )
-                arguments = parse_arguments(payload.get("arguments"))
-                if "path" in arguments:
-                    operation = "read" if "read" in name.lower() else "write"
+                for access in normalized.file_accesses:
                     _persist_file(
-                        connection, source, line_number, session_key, operation, arguments["path"], project_root,
+                        connection, source, line_number, session_key,
+                        access.operation, access.relative_path, project_root,
                         observed_at, opaque("turn", current_turn) if current_turn else None,
                     )
-                command = arguments.get("cmd")
-                if name == "exec_command" and isinstance(command, str):
+                if normalized.ephemeral_command is not None:
                     test_evidence.intent(
-                        logical_call_id=payload["call_id"], model_call_id=payload["call_id"], command=command,
+                        logical_call_id=payload["call_id"], model_call_id=payload["call_id"],
+                        command=normalized.ephemeral_command,
                         session_key=session_key, line_number=line_number, observed_at=observed_at,
                         turn_key=opaque("turn", current_turn) if current_turn else None, tool_call_key=call_key,
                     )

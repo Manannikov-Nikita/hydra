@@ -183,9 +183,79 @@ class RolloutIngestTests(unittest.TestCase):
 
         spans = self.store.connection.execute("SELECT category, terminal_state FROM tool_spans ORDER BY call_key").fetchall()
         self.assertEqual(sorted(tuple(row) for row in spans), [("instrumentation", "success"), ("tool", "success"), ("tool", "unknown")])
-        self.assertEqual(tuple(self.store.connection.execute("SELECT operation, relative_path FROM file_observations").fetchone()), ("write", "src/safe.py"))
-        self.assertIn(("read", "src/read.py"), [tuple(row) for row in self.store.connection.execute("SELECT operation, relative_path FROM file_observations")])
+        self.assertEqual(
+            {tuple(row) for row in self.store.connection.execute(
+                "SELECT operation, relative_path FROM file_observations"
+            )},
+            {("write", "src/safe.py"), ("read", "src/read.py")},
+        )
         self.assertNotIn(private_text, "\n".join(self.store.connection.iterdump()))
+
+    def test_direct_function_calls_persist_only_normalized_families_and_safe_accesses(self) -> None:
+        write_jsonl(self.root / "rollouts" / "direct-functions.jsonl", [
+            v1("session_meta", {"id": "anon-direct", "cwd": str(self.project)}),
+            v1("response_item", {"type": "function_call_output", "call_id": "unknown", "output": "safe"}, 1),
+            v1("response_item", {
+                "type": "function_call", "call_id": "unknown", "name": "dehydrate_cache",
+                "arguments": json.dumps({"path": "src/private-cache.py"}),
+            }, 2),
+            v1("response_item", {
+                "type": "function_call", "call_id": "image", "name": "view_image",
+                "arguments": json.dumps({"path": str(self.project / "assets" / "preview.png")}),
+            }, 3),
+            v1("response_item", {"type": "function_call_output", "call_id": "image", "output": "safe"}, 4),
+            v1("response_item", {
+                "type": "function_call", "call_id": "hydra", "name": "hydra_annotate",
+                "arguments": json.dumps({"path": "src/not-a-file.py"}),
+            }, 5),
+            v1("response_item", {"type": "function_call_output", "call_id": "hydra", "output": "safe"}, 6),
+            v1("response_item", {
+                "type": "function_call", "call_id": "mcp", "name": "mcp__private_server__private_tool",
+                "arguments": json.dumps({"path": "src/private-mcp.py"}),
+            }, 7),
+            v1("event_msg", {"type": "mcp_tool_call_end", "call_id": "mcp", "result": {"Ok": {}}}, 8),
+            v1("response_item", {
+                "type": "function_call", "call_id": "web", "name": "web__run",
+                "arguments": json.dumps({"path": "src/private-web.py"}),
+            }, 9),
+            v1("event_msg", {"type": "web_search_end", "call_id": "web", "result": {"Ok": {}}}, 10),
+            v1("response_item", {
+                "type": "function_call", "call_id": "exec", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "pytest tests/secret_direct.py"}),
+            }, 11),
+            v1("response_item", {
+                "type": "function_call_output", "call_id": "exec",
+                "output": json.dumps({"exit_code": 0}),
+            }, 12),
+        ])
+
+        ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic")
+
+        rows = self.store.connection.execute(
+            "SELECT tool_name,category,provenance,terminal_state,completeness "
+            "FROM tool_spans ORDER BY source_ordinal"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("unknown", "tool", "lower_bound", "unknown", "complete"),
+            ("view_image", "tool", "exact", "unknown", "complete"),
+            ("hydra", "instrumentation", "exact", "unknown", "complete"),
+            ("mcp", "tool", "exact", "success", "complete"),
+            ("web", "web", "exact", "success", "complete"),
+            ("exec_command", "tool", "exact", "unknown", "complete"),
+        ])
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                "SELECT operation,relative_path FROM file_observations ORDER BY relative_path"
+            )],
+            [("read", "assets/preview.png")],
+        )
+        self.assertEqual(self.store.count("rollout_test_runs"), 1)
+        persisted = "\n".join(self.store.connection.iterdump())
+        for private_value in (
+            "dehydrate_cache", "private_server", "private-cache.py", "not-a-file.py",
+            "private-mcp.py", "private-web.py", "secret_direct.py",
+        ):
+            self.assertNotIn(private_value, persisted)
 
     def test_tool_span_persistence_joins_both_event_orders_and_creates_end_only_rows(self) -> None:
         write_jsonl(self.root / "rollouts" / "tool-orders.jsonl", [
@@ -207,7 +277,7 @@ class RolloutIngestTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(rows), 4)
         self.assertEqual([(row[0], row[1], row[2], row[4], row[5], row[6], row[7]) for row in rows], [
-            ("function", "2026-07-20T00:00:03Z", "2026-07-20T00:00:02Z", "tool", "unknown", "complete", "exact"),
+            ("exec_command", "2026-07-20T00:00:03Z", "2026-07-20T00:00:02Z", "tool", "unknown", "complete", "exact"),
             ("mcp", None, "2026-07-20T00:00:04Z", "tool", "success", "incomplete", "exact"),
             ("patch", None, "2026-07-20T00:00:05Z", "tool", "failed", "incomplete", "exact"),
             ("web", None, "2026-07-20T00:00:06Z", "web", "success", "incomplete", "exact"),

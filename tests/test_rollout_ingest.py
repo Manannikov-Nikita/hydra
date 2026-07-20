@@ -132,7 +132,7 @@ class RolloutIngestTests(unittest.TestCase):
             v1("event_msg", {"type": "task_complete", "turn_id": "timed", "duration_ms": 50}, 4),
         ])
 
-        ingest_rollouts(self.store, (RolloutRoot(source, "archived"),), self.project, "project-synthetic", hash_key=b"test-install-key")
+        ingest_rollouts(self.store, (RolloutRoot(source, "archived"),), self.project, "project-synthetic", hash_key=b"t" * 32)
 
         self.assertEqual(tuple(self.store.connection.execute("SELECT completeness, context_window FROM token_snapshots").fetchone()), ("partial", 4096))
         self.assertEqual(tuple(self.store.connection.execute("SELECT category, terminal_state FROM tool_spans").fetchone()), ("opaque_exec", "unknown"))
@@ -147,7 +147,7 @@ class RolloutIngestTests(unittest.TestCase):
         write_jsonl(source, [v1("session_meta", {"id": "anon-keyed", "cwd": str(self.project)})])
         stores = [HydraStore(self.root / f"key-{index}.sqlite3") for index in range(3)]
         self.addCleanup(lambda: [store.close() for store in stores])
-        for store, key in zip(stores, (b"same-key", b"same-key", b"other-key")):
+        for store, key in zip(stores, (b"s" * 32, b"s" * 32, b"o" * 32)):
             ingest_rollouts(store, (source,), self.project, "project-synthetic", hash_key=key)
         keys = [store.connection.execute("SELECT session_key FROM rollout_sessions").fetchone()[0] for store in stores]
         self.assertEqual(keys[0], keys[1])

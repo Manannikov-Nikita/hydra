@@ -42,6 +42,9 @@ class Pseudonymizer:
 
     @classmethod
     def installation(cls, directory: Path) -> "Pseudonymizer":
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix":
+            os.chmod(directory, 0o700)
         path = directory / "rollout-hmac.key"
         if path.exists():
             key = path.read_bytes()
@@ -430,6 +433,8 @@ def ingest_rollouts(
 ) -> IngestReport:
     """Ingest explicit v1 JSONL roots idempotently, storing only normalized safe facts."""
     root = Path(project_root)
+    if hash_key is not None and len(hash_key) != 32:
+        raise ValueError("hash_key must be exactly 32 bytes")
     hash_token = _ACTIVE_HASHER.set(Pseudonymizer(hash_key) if hash_key is not None else Pseudonymizer.installation(store.database_path.parent))
     root_specs = tuple(roots)
     files = discover_rollouts(root_specs)

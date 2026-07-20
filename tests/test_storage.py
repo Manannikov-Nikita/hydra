@@ -20,7 +20,7 @@ from hydra_codex.contracts import (
     TurnRecord,
     materialize_annotation,
 )
-from hydra_codex.storage import HydraStore, StorageUnavailable, default_database_path
+from hydra_codex.storage import MIGRATIONS, HydraStore, StorageUnavailable, default_database_path
 
 
 def annotation(
@@ -89,14 +89,45 @@ class SQLiteStorageTests(unittest.TestCase):
         self.assertEqual(reopened.schema_version(), 2)
         self.assertEqual(reopened.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
-    def test_second_migration_adds_task_family_to_a_version_one_database(self) -> None:
+    def test_second_migration_sanitizes_and_quarantines_actual_version_one_rows(self) -> None:
         legacy_path = Path(self.temporary_directory.name) / "legacy.sqlite3"
         legacy = sqlite3.connect(legacy_path)
-        legacy.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        for statement in MIGRATIONS[0][1]:
+            legacy.execute(statement)
         legacy.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-07-20T00:00:00Z')")
-        legacy.execute("CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL)")
-        legacy.execute("CREATE TABLE turns (turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL)")
-        legacy.execute("CREATE TABLE annotations (annotation_id TEXT PRIMARY KEY)")
+        legacy.executemany(
+            "INSERT INTO sessions(session_id, project_id, worktree_path, started_at, provenance) VALUES (?, ?, ?, ?, ?)",
+            (
+                ("legacy-session-1", "project-one", "first", "2026-07-20T09:00:00Z", "exact"),
+                ("legacy-session-2", "project-two", "second", "2026-07-20T09:00:00Z", "exact"),
+            ),
+        )
+        legacy.executemany(
+            "INSERT INTO turns(turn_id, session_id, ordinal, observed_at, provenance) VALUES (?, ?, ?, ?, ?)",
+            (
+                ("legacy-turn-1", "legacy-session-1", 1, "2026-07-20T09:01:00Z", "exact"),
+                ("legacy-turn-2", "legacy-session-2", 1, "2026-07-20T09:01:00Z", "exact"),
+            ),
+        )
+        legacy.executemany(
+            """INSERT INTO annotations(
+                annotation_id, project_id, session_id, turn_id, sequence, observed_at, kind,
+                phase, cause, scope_change, confidence, outcome, provenance, note_redacted,
+                note_hash, note_length
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                (
+                    "legacy-safe", "project-one", "legacy-session-1", "legacy-turn-1", 1,
+                    "2026-07-20T09:02:00Z", "finish", "implement", "prompt", "none", 0.9,
+                    "success", "model_reported", "token VALUE", "legacy-safe-hash", 11,
+                ),
+                (
+                    "legacy-invalid", "project-one", "legacy-session-1", "legacy-turn-2", 2,
+                    "2026-07-20T09:03:00Z", "finish", "implement", "prompt", "none", 0.9,
+                    "success", "model_reported", "Cookie legacy-secret", "legacy-invalid-hash", 20,
+                ),
+            ),
+        )
         legacy.execute("PRAGMA user_version = 1")
         legacy.commit()
         legacy.close()
@@ -104,9 +135,22 @@ class SQLiteStorageTests(unittest.TestCase):
         migrated = HydraStore(legacy_path)
         self.addCleanup(migrated.close)
         columns = {row[1] for row in migrated.connection.execute("PRAGMA table_info(annotations)")}
+        safe_row = migrated.connection.execute(
+            "SELECT note_redacted FROM annotations WHERE annotation_id = 'legacy-safe'"
+        ).fetchone()
+        invalid_row = migrated.connection.execute(
+            "SELECT annotation_id FROM annotations WHERE annotation_id = 'legacy-invalid'"
+        ).fetchone()
+        conflict = migrated.connection.execute(
+            "SELECT * FROM conflicts WHERE record_id = 'legacy-invalid'"
+        ).fetchone()
 
         self.assertEqual(migrated.schema_version(), 2)
         self.assertIn("task_family", columns)
+        self.assertEqual(safe_row[0], "[redacted]")
+        self.assertIsNone(invalid_row)
+        self.assertIsNotNone(conflict)
+        self.assertNotIn("legacy-secret", repr(tuple(conflict)))
 
     def test_idempotent_upserts_do_not_duplicate_records(self) -> None:
         self.store.upsert_session(
@@ -179,6 +223,27 @@ class SQLiteStorageTests(unittest.TestCase):
         self.assertEqual(len(row[1]), 64)
         self.assertEqual(row[2], len(private_note))
         self.assertFalse({"raw_note", "prompt", "message", "tool_output"} & columns)
+
+    def test_keyword_and_header_secret_forms_are_fail_closed(self) -> None:
+        risky_notes = (
+            "token VALUE",
+            "api key VALUE",
+            "X-Auth-Token VALUE",
+            "Authorization VALUE",
+            "Cookie VALUE",
+            "credential VALUE",
+            "passwd VALUE",
+            "access-key VALUE",
+        )
+        for sequence, note in enumerate(risky_notes, start=1):
+            with self.subTest(note=note):
+                annotation_id = f"ann-header-{sequence}"
+                self.store.write_annotation(annotation(annotation_id, sequence, note))
+                stored = self.store.connection.execute(
+                    "SELECT note_redacted FROM annotations WHERE annotation_id = ?", (annotation_id,)
+                ).fetchone()[0]
+                self.assertEqual(stored, "[redacted]")
+                self.assertNotIn("VALUE", stored)
 
     def test_task_family_persists_and_round_trips(self) -> None:
         self.store.write_annotation(annotation("ann-family", 1, task_family="privacy-hardening"))

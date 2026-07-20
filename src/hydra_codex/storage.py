@@ -39,7 +39,7 @@ def redact_note(note: str) -> str:
         r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b",
         r"\bauthorization\s*:\s*(?:bearer|basic)\s+\S+",
         r"\bbearer\s+[A-Za-z0-9._~+/=-]+",
-        r"\b(?:password|secret|token|api[_-]?key)\s*(?:=|:)\s*\S+",
+        r"\b(?:authorization|cookie|credential|passwd|password|secret|token|api[-_ ]?key|x[-_ ]?auth[-_ ]?token|access[-_ ]?key)\b\s*(?::|=)?\s+\S+",
         r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s]+@\S+",
         r"(?<!\w)/(?:Users|home|private|var|etc|tmp|opt|Volumes)(?:/\S*)?",
         r"(?<![\w-])[A-Za-z0-9+/=_-]{20,}(?![\w-])",
@@ -47,6 +47,30 @@ def redact_note(note: str) -> str:
     if not normalized or any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in sensitive_patterns):
         return "[redacted]"
     return normalized
+
+
+V2_TRIGGER_STATEMENTS = (
+    """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_insert
+        BEFORE INSERT ON annotations
+        FOR EACH ROW
+        WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
+        BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
+    """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_insert
+        BEFORE INSERT ON annotations
+        FOR EACH ROW
+        WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
+        BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
+    """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_update
+        BEFORE UPDATE OF project_id, session_id ON annotations
+        FOR EACH ROW
+        WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
+        BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
+    """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_update
+        BEFORE UPDATE OF session_id, turn_id ON annotations
+        FOR EACH ROW
+        WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
+        BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
+)
 
 
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -144,26 +168,6 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         2,
         (
             "ALTER TABLE annotations ADD COLUMN task_family TEXT NOT NULL DEFAULT 'legacy'",
-            """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_insert
-                BEFORE INSERT ON annotations
-                FOR EACH ROW
-                WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
-                BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
-            """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_insert
-                BEFORE INSERT ON annotations
-                FOR EACH ROW
-                WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
-                BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
-            """CREATE TRIGGER IF NOT EXISTS annotations_project_matches_session_update
-                BEFORE UPDATE OF project_id, session_id ON annotations
-                FOR EACH ROW
-                WHEN COALESCE((SELECT project_id FROM sessions WHERE session_id = NEW.session_id), '') != NEW.project_id
-                BEGIN SELECT RAISE(ABORT, 'annotation project must match session project'); END""",
-            """CREATE TRIGGER IF NOT EXISTS annotations_turn_matches_session_update
-                BEFORE UPDATE OF session_id, turn_id ON annotations
-                FOR EACH ROW
-                WHEN COALESCE((SELECT session_id FROM turns WHERE turn_id = NEW.turn_id), '') != NEW.session_id
-                BEGIN SELECT RAISE(ABORT, 'annotation turn must belong to session'); END""",
         ),
     ),
 )
@@ -220,6 +224,10 @@ class HydraStore:
                 with self._transaction() as connection:
                     for statement in statements:
                         connection.execute(statement)
+                    if version == 2:
+                        self._sanitize_and_quarantine_v1_annotations(connection)
+                        for statement in V2_TRIGGER_STATEMENTS:
+                            connection.execute(statement)
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
                         (version,),
@@ -227,6 +235,44 @@ class HydraStore:
                     connection.execute(f"PRAGMA user_version = {version}")
         except sqlite3.Error as error:
             raise StorageUnavailable(f"cannot migrate Hydra database: {self.database_path}") from error
+
+    @staticmethod
+    def _sanitize_and_quarantine_v1_annotations(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """SELECT annotations.*, sessions.project_id AS session_project_id,
+                      turns.session_id AS turn_session_id
+               FROM annotations
+               LEFT JOIN sessions ON sessions.session_id = annotations.session_id
+               LEFT JOIN turns ON turns.turn_id = annotations.turn_id"""
+        ).fetchall()
+        for row in rows:
+            is_valid = (
+                row["session_project_id"] == row["project_id"]
+                and row["turn_session_id"] == row["session_id"]
+            )
+            if is_valid:
+                connection.execute(
+                    "UPDATE annotations SET note_redacted = ? WHERE annotation_id = ?",
+                    (redact_note(row["note_redacted"]), row["annotation_id"]),
+                )
+                continue
+            existing_hash = hashlib.sha256(
+                "|".join(str(row[field]) for field in (
+                    "annotation_id", "project_id", "session_id", "turn_id", "sequence",
+                    "observed_at", "note_hash", "note_length",
+                )).encode("utf-8")
+            ).hexdigest()
+            incoming_hash = hashlib.sha256(b"quarantined during migration v2").hexdigest()
+            conflict_id = hashlib.sha256(
+                f"migration-v2:{row['annotation_id']}:{existing_hash}".encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                """INSERT INTO conflicts(conflict_id, record_id, existing_hash, incoming_hash, observed_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(conflict_id) DO NOTHING""",
+                (conflict_id, row["annotation_id"], existing_hash, incoming_hash, row["observed_at"]),
+            )
+            connection.execute("DELETE FROM annotations WHERE annotation_id = ?", (row["annotation_id"],))
 
     def schema_version(self) -> int:
         return int(self.connection.execute("PRAGMA user_version").fetchone()[0])

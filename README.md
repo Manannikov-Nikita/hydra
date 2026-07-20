@@ -14,6 +14,11 @@ Each model annotation also carries a required `task_family` (non-empty text of
 at most 80 characters), so later reconciliation can group semantic work without
 capturing raw interaction content.
 
+When version 2 upgrades a version 1 database, it re-sanitizes every retained
+legacy note inside the migration transaction. Rows whose project/session/turn
+links contradict each other are removed and recorded as hash-only quarantine
+conflicts before relational triggers are installed.
+
 This foundation provides contracts, identity discovery, and versioned SQLite
 migrations only. Rollout parsing, reports, hooks, MCP, and plugin behavior are
 intentionally out of scope.

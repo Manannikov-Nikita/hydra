@@ -24,15 +24,21 @@ class IngestReport:
     diagnostics: int
 
 
+@dataclass(frozen=True)
+class RolloutRoot:
+    path: Path | str
+    label: str = "explicit_root"
+
+
 def opaque(value: str) -> str:
     return hmac.new(HASH_KEY, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def discover_rollouts(roots: Iterable[Path | str]) -> tuple[Path, ...]:
+def discover_rollouts(roots: Iterable[Path | str | RolloutRoot]) -> tuple[Path, ...]:
     """Discover only explicit JSONL roots; no SQLite or rollout mutation occurs."""
     found: set[Path] = set()
     for root in roots:
-        path = Path(root)
+        path = Path(root.path if isinstance(root, RolloutRoot) else root)
         if path.is_file() and path.suffix == ".jsonl":
             found.add(path.resolve())
         elif path.is_dir():
@@ -69,13 +75,12 @@ def _usage(payload: dict[str, Any]) -> dict[str, int] | None:
     if not isinstance(usage, dict):
         return None
     return {
-        "input": _safe_int(usage.get("input_tokens")),
-        "cached": _safe_int(usage.get("cached_input_tokens")),
-        "output": _safe_int(usage.get("output_tokens")),
-        "reasoning": _safe_int(usage.get("reasoning_output_tokens")),
+        "input": _safe_int(usage.get("input_tokens")), "cached": _safe_int(usage.get("cached_input_tokens")),
+        "output": _safe_int(usage.get("output_tokens")), "reasoning": _safe_int(usage.get("reasoning_output_tokens")),
         "cache_write": _safe_int(usage.get("cache_write_input_tokens")),
         "vendor_total": _safe_int(usage.get("total_tokens")),
-        "context_window": _safe_int(usage.get("context_window")),
+        "context_window": _safe_int(info.get("model_context_window")),
+        "complete": int(all(field in usage for field in ("input_tokens", "cached_input_tokens", "output_tokens"))),
     }
 
 
@@ -87,13 +92,14 @@ def _insert_diagnostic(connection: Any, source: str, line: int, kind: str, paylo
     )
 
 
-def _upsert_turn(connection: Any, session: str, turn: str, state: str, duration: int | None = None) -> None:
+def _upsert_turn(connection: Any, session: str, turn: str, state: str, timestamp: Any, duration: int | None = None) -> None:
     connection.execute(
-        """INSERT INTO turn_attempts(session_key, turn_key, attempt_ordinal, state, emitted_duration_ms, wall_duration_ms)
-           VALUES (?, ?, 1, ?, ?, NULL)
+        """INSERT INTO turn_attempts(session_key, turn_key, attempt_ordinal, state, emitted_duration_ms, wall_duration_ms, started_at, finished_at)
+           VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
            ON CONFLICT(session_key, turn_key, attempt_ordinal) DO UPDATE SET
-             state = excluded.state, emitted_duration_ms = COALESCE(excluded.emitted_duration_ms, turn_attempts.emitted_duration_ms)""",
-        (session, opaque(turn), state, duration),
+             state = excluded.state, emitted_duration_ms = COALESCE(excluded.emitted_duration_ms, turn_attempts.emitted_duration_ms),
+             started_at = COALESCE(turn_attempts.started_at, excluded.started_at), finished_at = COALESCE(excluded.finished_at, turn_attempts.finished_at)""",
+        (session, opaque(turn), state, duration, timestamp if state == "open" else None, timestamp if state != "open" else None),
     )
 
 
@@ -203,7 +209,7 @@ def _parse_source(
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "counter_reset", {"fields": "token_vector"})
                 epochs[session_key] = (epoch, vector)
-                completeness = "complete" if usage["input"] or usage["output"] else "partial"
+                completeness = "complete" if usage["complete"] else "partial"
                 connection.execute(
                     """INSERT INTO token_snapshots(source_digest, line_number, session_key, project_id, epoch, input_tokens,
                        cached_input_tokens, output_tokens, reasoning_tokens, cache_write_tokens, vendor_total, context_window, completeness)
@@ -252,7 +258,17 @@ def _parse_source(
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "out_of_order", payload)
                     session_key = "unresolved/" + source[:20]
-                _upsert_turn(connection, session_key, turn, {"task_started": "open", "task_complete": "completed", "turn_aborted": "aborted"}[event_type], _safe_int(payload.get("duration_ms")) or None)
+                _upsert_turn(connection, session_key, turn, {"task_started": "open", "task_complete": "completed", "turn_aborted": "aborted"}[event_type], envelope.get("timestamp"), _safe_int(payload.get("duration_ms")) or None)
+                continue
+            if kind == "response_item" and payload.get("type") == "custom_tool_call":
+                if session_key is not None and isinstance(payload.get("call_id"), str):
+                    connection.execute(
+                        """INSERT INTO tool_spans(session_key, call_key, category, terminal_state, latency_ms)
+                           VALUES (?, ?, 'opaque_exec', 'unknown', NULL) ON CONFLICT DO NOTHING""",
+                        (session_key, opaque(payload["call_id"])),
+                    )
+                continue
+            if kind == "response_item" and payload.get("type") == "custom_tool_call_output":
                 continue
             if kind == "response_item" and payload.get("type") == "function_call":
                 if session_key is None or not isinstance(payload.get("call_id"), str):
@@ -322,24 +338,26 @@ def _parse_source(
 
 
 def ingest_rollouts(
-    store: HydraStore, roots: Iterable[Path | str], project_root: Path | str, project_id: str,
-    model_causes: dict[str, str] | None = None,
+    store: HydraStore, roots: Iterable[Path | str | RolloutRoot], project_root: Path | str, project_id: str,
+    model_causes: dict[str, str] | None = None, hash_key: bytes | None = None,
 ) -> IngestReport:
     """Ingest explicit v1 JSONL roots idempotently, storing only normalized safe facts."""
     root = Path(project_root)
-    files = discover_rollouts(roots)
+    root_specs = tuple(roots)
+    files = discover_rollouts(root_specs)
     diagnostics = 0
     unique: set[str] = set()
     for path in files:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         unique.add(digest)
         location = opaque(str(path))
+        label = next((item.label for item in root_specs if isinstance(item, RolloutRoot) and path.is_relative_to(Path(item.path).resolve())), "explicit_root")
         with store.rollout_transaction() as connection:
             known = connection.execute("SELECT 1 FROM rollout_sources WHERE source_digest = ?", (digest,)).fetchone() is not None
             connection.execute("INSERT INTO rollout_sources(source_digest, source_type) VALUES (?, 'jsonl') ON CONFLICT DO NOTHING", (digest,))
             connection.execute(
                 """INSERT INTO rollout_source_locations(source_digest, location_key, location_type)
-                   VALUES (?, ?, 'explicit_root') ON CONFLICT DO NOTHING""", (digest, location),
+                   VALUES (?, ?, ?) ON CONFLICT DO NOTHING""", (digest, location, label),
             )
         if not known:
             diagnostics += _parse_source(store, path, digest, root, project_id, model_causes or {})

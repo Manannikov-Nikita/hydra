@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import sqlite3
 from typing import Iterable
 
@@ -56,6 +57,31 @@ class ProjectMetrics:
     sessions: int
     semantic_coverage: float
     provenance: str = "exact"
+
+
+@dataclass(frozen=True)
+class TurnAttempt:
+    turn_key: str
+    started_at: str | None
+    finished_at: str | None
+    emitted_duration_ms: int | None
+
+
+@dataclass(frozen=True)
+class TurnTotals:
+    wall_clock_ms: int
+    agent_time_ms: int
+    provenance: str
+
+
+def aggregate_turns(attempts: Iterable[TurnAttempt]) -> TurnTotals:
+    wall = 0
+    agent = 0
+    for item in attempts:
+        agent += item.emitted_duration_ms or 0
+        if item.started_at and item.finished_at:
+            wall += int((datetime.fromisoformat(item.finished_at.replace("Z", "+00:00")) - datetime.fromisoformat(item.started_at.replace("Z", "+00:00"))).total_seconds() * 1000)
+    return TurnTotals(wall, agent, "derived")
 
 
 def aggregate_tokens(snapshots: Iterable[TokenSnapshot]) -> TokenTotals:

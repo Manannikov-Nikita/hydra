@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 
 from hydra_codex.classifier import classify_test_command, classify_test_outcome
-from hydra_codex.metrics import SessionEdge, TokenSnapshot, aggregate_project, aggregate_tokens, tree_contribution
-from hydra_codex.rollout import ingest_rollouts
+from hydra_codex.metrics import SessionEdge, TokenSnapshot, TurnAttempt, aggregate_project, aggregate_tokens, aggregate_turns, tree_contribution
+from hydra_codex.rollout import RolloutRoot, ingest_rollouts
 from hydra_codex.storage import HydraStore
 
 
@@ -45,6 +45,13 @@ class TokenAggregationTests(unittest.TestCase):
         self.assertEqual((confirmed.working_tokens, confirmed.provenance), (150, "derived"))
         self.assertEqual((inferred.working_tokens, inferred.provenance), (None, "estimated"))
 
+    def test_turn_aggregation_keeps_wall_clock_and_agent_time_distinct(self) -> None:
+        totals = aggregate_turns((
+            TurnAttempt("a", "2026-07-20T00:00:00Z", "2026-07-20T00:00:03Z", 1200),
+            TurnAttempt("b", "2026-07-20T00:00:04Z", None, 800),
+        ))
+        self.assertEqual((totals.wall_clock_ms, totals.agent_time_ms, totals.provenance), (3000, 2000, "derived"))
+
 
 class RolloutIngestTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -62,7 +69,7 @@ class RolloutIngestTests(unittest.TestCase):
         records = [
             v1("session_meta", {"id": "anon-session-a", "cwd": str(self.project / "one")}),
             v1("event_msg", {"type": "task_started", "turn_id": "turn-a", "duration_ms": 9}, 1),
-            v1("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 3, "cache_write_input_tokens": 2, "total_tokens": 110, "context_window": 1000}}}, 2),
+            v1("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 3, "cache_write_input_tokens": 2, "total_tokens": 110}, "model_context_window": 1000}}, 2),
             v1("session_meta", {"id": "anon-session-a", "cwd": str(self.project / "one")}, 3),
             v1("event_msg", {"type": "turn_aborted", "turn_id": "turn-a"}, 4),
             v1("event_msg", {"type": "task_started", "turn_id": "turn-open"}, 5),
@@ -105,6 +112,25 @@ class RolloutIngestTests(unittest.TestCase):
 
         self.assertEqual((self.store.count("rollout_sessions"), self.store.count("session_edges")), (2, 1))
 
+    def test_partial_vectors_turn_timing_custom_tools_and_location_labels_are_safe(self) -> None:
+        source = self.root / "archive" / "safe.jsonl"
+        write_jsonl(source, [
+            v1("session_meta", {"id": "anon-partial", "cwd": str(self.project)}),
+            v1("event_msg", {"type": "task_started", "turn_id": "timed"}, 0),
+            v1("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 20}, "model_context_window": 4096}}, 1),
+            v1("response_item", {"type": "custom_tool_call", "call_id": "opaque-a", "name": "opaque_exec", "input": "never store this"}, 2),
+            v1("response_item", {"type": "custom_tool_call_output", "call_id": "opaque-a", "output": "never store this"}, 3),
+            v1("event_msg", {"type": "task_complete", "turn_id": "timed", "duration_ms": 50}, 4),
+        ])
+
+        ingest_rollouts(self.store, (RolloutRoot(source, "archived"),), self.project, "project-synthetic", hash_key=b"test-install-key")
+
+        self.assertEqual(tuple(self.store.connection.execute("SELECT completeness, context_window FROM token_snapshots").fetchone()), ("partial", 4096))
+        self.assertEqual(tuple(self.store.connection.execute("SELECT category, terminal_state FROM tool_spans").fetchone()), ("opaque_exec", "unknown"))
+        self.assertEqual(self.store.connection.execute("SELECT location_type FROM rollout_source_locations").fetchone()[0], "archived")
+        turn = self.store.connection.execute("SELECT started_at, finished_at, emitted_duration_ms FROM turn_attempts").fetchone()
+        self.assertEqual(tuple(turn), ("2026-07-20T00:00:00Z", "2026-07-20T00:00:04Z", 50))
+
     def test_malformed_out_of_order_events_are_diagnostic_and_reingest_is_idempotent(self) -> None:
         source = self.root / "rollouts" / "broken.jsonl"
         source.parent.mkdir(parents=True)
@@ -127,14 +153,16 @@ class RolloutIngestTests(unittest.TestCase):
             v1("response_item", {"type": "function_call_output", "call_id": "call-a", "output": json.dumps({"exit_code": 0, "stdout": private_text})}, 2),
             v1("event_msg", {"type": "mcp_tool_call_end", "call_id": "call-a", "duration": {"secs": 0, "nanos": 9000000}, "result": {"Ok": {}}, "invocation": {"server": "safe", "tool": "safe", "arguments": {}}}, 3),
             v1("response_item", {"type": "function_call", "call_id": "call-b", "name": "hydra_annotate", "arguments": json.dumps({"path": "src/safe.py"})}, 4),
+            v1("response_item", {"type": "function_call", "call_id": "call-read", "name": "file_read", "arguments": json.dumps({"path": "src/read.py"})}, 4),
             v1("event_msg", {"type": "patch_apply_end", "call_id": "call-b", "success": True, "status": "ok", "stdout": private_text, "stderr": "", "changes": {str(self.project / "src" / "safe.py"): {"type": "modify", "move_path": None, "unified_diff": private_text}}}, 5),
         ])
 
         ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic")
 
         spans = self.store.connection.execute("SELECT category, terminal_state FROM tool_spans ORDER BY call_key").fetchall()
-        self.assertEqual([tuple(row) for row in spans], [("tool", "success"), ("instrumentation", "success")])
+        self.assertEqual([tuple(row) for row in spans], [("tool", "unknown"), ("tool", "success"), ("instrumentation", "success")])
         self.assertEqual(tuple(self.store.connection.execute("SELECT operation, relative_path FROM file_observations").fetchone()), ("write", "src/safe.py"))
+        self.assertIn(("read", "src/read.py"), [tuple(row) for row in self.store.connection.execute("SELECT operation, relative_path FROM file_observations")])
         self.assertNotIn(private_text, "\n".join(self.store.connection.iterdump()))
 
     def test_test_detection_and_model_cause_conflict_use_deterministic_evidence(self) -> None:

@@ -1,0 +1,3 @@
+{"payload":{"cwd":"__PROJECT_ROOT__","id":"10000000-0000-4000-8000-000000000025","parent_thread_id":"10000000-0000-4000-8000-000000000001","session_id":"10000000-0000-4000-8000-000000000001","source":{"subagent":{"thread_spawn":{"agent_path":"/fixture/reviewer"}}},"timestamp":"2026-07-16T00:36:44.939Z"},"timestamp":"2026-07-16T00:36:45.154Z","type":"session_meta"}
+{"payload":{"info":{"model_context_window":0,"total_token_usage":{"cached_input_tokens":3972608,"input_tokens":4215272,"output_tokens":13456,"reasoning_output_tokens":6023,"total_tokens":4228728}},"type":"token_count"},"timestamp":"2026-07-16T00:48:15.805Z","type":"event_msg"}
+{"payload":{"type":"hydra_fixture_activity_boundary"},"timestamp":"2026-07-16T00:48:15.832Z","type":"event_msg"}

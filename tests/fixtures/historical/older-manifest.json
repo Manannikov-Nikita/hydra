@@ -1,0 +1,26 @@
+{
+  "agent_time_seconds": 66772.237,
+  "baseline_rule": "root=zero; child=last cumulative token event at or before session start + 1 second; otherwise zero with explicit uncertainty",
+  "cutoff": "2026-07-16T02:08:30.224Z",
+  "cutoff_event": "root task_complete",
+  "expected": {
+    "cached_input_tokens": 206700800,
+    "full_context": 213288642,
+    "input_tokens": 212729495,
+    "output_tokens": 559147,
+    "reasoning_output_tokens": 190343,
+    "sessions": 28,
+    "working_tokens": 6587842
+  },
+  "fixture": "older",
+  "fixture_activity_boundaries": 27,
+  "fixture_schema": "hydra.acceptance-rollout/v1",
+  "observed_replay_baselines": 1,
+  "replayed_session_meta_count": 1,
+  "root": "20000000-0000-4000-8000-000000000001",
+  "semantic_annotations": [],
+  "semantic_coverage": 0,
+  "session_count": 28,
+  "wall_clock_seconds": 16069.767,
+  "zero_no_observation": 26
+}

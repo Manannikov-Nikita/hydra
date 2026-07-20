@@ -17,6 +17,7 @@ from hydra_codex.task_tree import (
     TokenVector,
     aggregate_task_tree,
 )
+from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "historical"
@@ -150,9 +151,14 @@ class HistoricalAcceptanceTests(unittest.TestCase):
                     store, (materialized,), project, project_id, hash_key=b"h" * 32,
                 )
                 observations = normalized_fixture_observations(materialized)
-                metrics = aggregate_task_tree(
+                raw_metrics = aggregate_task_tree(
                     root_id=manifest["root"], sessions=observations[0], tokens=observations[1],
                     lifecycle=observations[2], activities=observations[3],
+                )
+                hasher = Pseudonymizer(b"h" * 32)
+                metrics = aggregate_stored_task_tree(
+                    store.connection, project_id=project_id,
+                    root_id=hasher.digest("identity", manifest["root"]),
                 )
 
                 expected = manifest["expected"]
@@ -174,7 +180,6 @@ class HistoricalAcceptanceTests(unittest.TestCase):
                         expected_activity.get(activity.session_id, activity.observed_at),
                         activity.observed_at,
                     )
-                hasher = Pseudonymizer(b"h" * 32)
                 for session_id, last_activity in expected_activity.items():
                     stored = store.connection.execute(
                         "SELECT last_activity_at FROM rollout_sessions WHERE session_key=?",
@@ -182,7 +187,7 @@ class HistoricalAcceptanceTests(unittest.TestCase):
                     ).fetchone()
                     self.assertIsNotNone(stored)
                     self.assertEqual(timestamp(stored[0]), last_activity)
-                self.assertIn(manifest["root"], metrics.session_ids)
+                self.assertIn(hasher.digest("identity", manifest["root"]), metrics.session_ids)
                 self.assertEqual(metrics.cutoff_at, timestamp(manifest["cutoff"]))
                 self.assertEqual(metrics.sessions.value, expected["sessions"])
                 self.assertEqual(metrics.subagents.value, expected["sessions"] - 1)
@@ -208,6 +213,14 @@ class HistoricalAcceptanceTests(unittest.TestCase):
                     metrics.unique.caveats,
                 )
                 self.assertEqual(metrics.recorded.vector, metrics.unique.vector + metrics.replay_baseline.vector)
+                self.assertEqual(metrics.recorded.vector, raw_metrics.recorded.vector)
+                self.assertEqual(metrics.replay_baseline.vector, raw_metrics.replay_baseline.vector)
+                self.assertEqual(metrics.unique.vector, raw_metrics.unique.vector)
+                self.assertEqual(metrics.root_wall_clock_ms, raw_metrics.root_wall_clock_ms)
+                self.assertEqual(metrics.agent_time_ms, raw_metrics.agent_time_ms)
+                self.assertEqual(metrics.semantic_coverage.value, 0)
+                self.assertEqual(metrics.tool_calls.value, 0)
+                self.assertEqual(metrics.file_reads.known_lower_bound, 0)
 
 
 if __name__ == "__main__":

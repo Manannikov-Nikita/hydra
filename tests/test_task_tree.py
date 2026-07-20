@@ -5,10 +5,13 @@ import unittest
 
 from hydra_codex.task_tree import (
     ActivityObservation,
+    FileObservation,
     LifecycleObservation,
     NormalizedSession,
+    TestRunObservation,
     TokenObservation,
     TokenVector,
+    ToolObservation,
     aggregate_task_tree,
 )
 
@@ -151,6 +154,95 @@ class TaskTreeMetricTests(unittest.TestCase):
     def test_cached_input_cannot_exceed_total_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "cached_input_tokens"):
             TokenVector(5, 6, 1, 0)
+
+    def test_missing_token_components_stay_nullable_with_per_field_lower_bounds(self) -> None:
+        metrics = aggregate_task_tree(
+            root_id="root",
+            sessions=(NormalizedSession("root", None, at(0)),),
+            tokens=(TokenObservation("root", at(5), 1, TokenVector(100, None, 7, None)),),
+            lifecycle=(LifecycleObservation("root", "task_complete", at(6)),),
+            activities=(),
+        )
+
+        self.assertEqual(metrics.recorded.vector, TokenVector(100, None, 7, None))
+        self.assertEqual(metrics.recorded.input.value, 100)
+        self.assertEqual(metrics.recorded.input.provenance, "exact")
+        self.assertIsNone(metrics.recorded.cached_input.value)
+        self.assertEqual(metrics.recorded.cached_input.known_lower_bound, 0)
+        self.assertEqual(metrics.recorded.cached_input.provenance, "estimated")
+        self.assertIn("missing_cached_input_component", metrics.recorded.cached_input.caveats)
+        self.assertIsNone(metrics.recorded.working.value)
+        self.assertEqual(metrics.recorded.working.known_lower_bound, 7)
+        self.assertIsNone(metrics.recorded.reasoning.value)
+
+    def test_only_confirmed_full_confidence_edges_are_replay_eligible(self) -> None:
+        for kind, confidence in (("inferred", 0.6), ("ambiguous", 0.4), ("confirmed", 0.9)):
+            with self.subTest(kind=kind, confidence=confidence):
+                metrics = aggregate_task_tree(
+                    root_id="root",
+                    sessions=(
+                        NormalizedSession("root", None, at(0)),
+                        NormalizedSession(
+                            "child", "root", at(2),
+                            edge_confidence_kind=kind, edge_confidence=confidence,
+                        ),
+                    ),
+                    tokens=(
+                        TokenObservation("root", at(9), 1, TokenVector(10, 2, 3, 1)),
+                        TokenObservation("child", at(2), 1, TokenVector(30, 10, 2, 1)),
+                        TokenObservation("child", at(8), 2, TokenVector(50, 15, 4, 2)),
+                    ),
+                    lifecycle=(LifecycleObservation("root", "task_complete", at(10)),),
+                    activities=(),
+                )
+
+                self.assertEqual(metrics.replay_baseline.vector, TokenVector.zero())
+                self.assertEqual(metrics.unique.vector, metrics.recorded.vector)
+                self.assertEqual(metrics.unconfirmed_replay_edges, 1)
+                self.assertEqual(metrics.unique.provenance, "estimated")
+                self.assertIn(f"unconfirmed_replay_edge:{kind}:1", metrics.unique.caveats)
+
+    def test_operational_facts_cover_tools_instrumentation_files_tests_and_retries(self) -> None:
+        metrics = aggregate_task_tree(
+            root_id="root",
+            sessions=(
+                NormalizedSession("root", None, at(0)),
+                NormalizedSession("child", "root", at(1)),
+            ),
+            tokens=(
+                TokenObservation("root", at(8), 1, TokenVector(10, 2, 3, 1)),
+                TokenObservation("child", at(7), 1, TokenVector(20, 5, 4, 2)),
+            ),
+            lifecycle=(LifecycleObservation("root", "task_complete", at(10)),),
+            activities=(),
+            tools=(
+                ToolObservation("root", "call-1", "opaque_exec", at(2)),
+                ToolObservation("child", "call-2", "instrumentation", at(3)),
+                ToolObservation("root", "after", "instrumentation", at(11)),
+            ),
+            files=(
+                FileObservation("root", "read-1", "read", at(4)),
+                FileObservation("child", "write-1", "write", at(5)),
+                FileObservation("root", "after", "write", at(11)),
+            ),
+            tests=(
+                TestRunObservation("root", "test-1", "targeted", "none", at(6)),
+                TestRunObservation("child", "test-2", "full", "flaky_retry", at(7)),
+                TestRunObservation("root", "after", "full", "infra_recovery", at(11)),
+            ),
+        )
+
+        self.assertEqual(metrics.tool_calls.value, 2)
+        self.assertEqual(metrics.instrumentation_calls.value, 1)
+        self.assertEqual(metrics.file_reads.value, None)
+        self.assertEqual(metrics.file_reads.known_lower_bound, 1)
+        self.assertEqual(metrics.file_writes.known_lower_bound, 1)
+        self.assertEqual(metrics.test_runs.value, 2)
+        self.assertEqual(metrics.targeted_test_runs.value, 1)
+        self.assertEqual(metrics.full_test_runs.value, 1)
+        self.assertEqual(metrics.test_retries.value, 1)
+        self.assertEqual(metrics.file_reads.provenance, "estimated")
+        self.assertIn("observed_file_lower_bound", metrics.file_reads.caveats)
 
 
 if __name__ == "__main__":

@@ -286,9 +286,13 @@ def _parse_source(
                 ).fetchone()[0] == "confirmed":
                     connection.execute(
                         """INSERT INTO fork_baselines(child_key, source_digest, line_number, input_tokens, cached_input_tokens,
-                           output_tokens, reasoning_tokens, cache_write_tokens, provenance)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'exact') ON CONFLICT(child_key) DO NOTHING""",
-                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"] or 0),
+                           output_tokens, reasoning_tokens, cache_write_tokens, provenance, observed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'exact', ?) ON CONFLICT(child_key) DO UPDATE SET
+                             source_digest=excluded.source_digest,line_number=excluded.line_number,input_tokens=excluded.input_tokens,
+                             cached_input_tokens=excluded.cached_input_tokens,output_tokens=excluded.output_tokens,
+                             reasoning_tokens=excluded.reasoning_tokens,cache_write_tokens=excluded.cache_write_tokens,observed_at=excluded.observed_at
+                           WHERE excluded.observed_at > fork_baselines.observed_at""",
+                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"] or 0, envelope.get("timestamp")),
                     )
                 continue
             event_type = payload.get("type") if kind == "event_msg" else None

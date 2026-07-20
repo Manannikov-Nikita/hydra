@@ -134,3 +134,13 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
         ])
         ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"h" * 32)
         self.assertEqual(self.store.count("fork_baselines"), 0)
+
+    def test_last_eligible_baseline_candidate_wins_independent_of_root_order(self) -> None:
+        early = self.base / "early.jsonl"
+        late = self.base / "late.jsonl"
+        meta = record("session_meta", {"id": "child", "cwd": str(self.project), "parent_thread_id": "parent"}, 0)
+        vector = lambda value: record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": value, "cached_input_tokens": 1, "output_tokens": 2, "reasoning_output_tokens": 3}}}, value)
+        write(early, [meta, vector(0)])
+        write(late, [meta, vector(1)])
+        ingest_rollouts(self.store, (late, early), self.project, "project-a", hash_key=b"i" * 32)
+        self.assertEqual(self.store.connection.execute("SELECT input_tokens FROM fork_baselines").fetchone()[0], 1)

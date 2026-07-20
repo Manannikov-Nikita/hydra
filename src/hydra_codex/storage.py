@@ -259,6 +259,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         """INSERT INTO token_snapshots SELECT source_digest,line_number,session_key,project_id,epoch,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,vendor_total,context_window,completeness,turn_key,observed_at FROM token_snapshots_v9""",
         "DROP TABLE token_snapshots_v9",
     )),
+    (11, ("ALTER TABLE fork_baselines ADD COLUMN observed_at TEXT",)),
 )
 
 

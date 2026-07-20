@@ -1,0 +1,106 @@
+"""Pure, deterministic rollout metric calculations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import sqlite3
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class TokenSnapshot:
+    session_key: str
+    line_number: int
+    epoch: int
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    cache_write_tokens: int
+
+
+@dataclass(frozen=True)
+class SessionEdge:
+    child_key: str
+    parent_key: str | None
+    baseline_working_tokens: int | None
+    confidence_kind: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class TokenTotals:
+    working_tokens: int
+    full_context: int
+    reasoning_tokens: int
+    epochs: int
+    provenance: str
+
+
+@dataclass(frozen=True)
+class TreeContribution:
+    working_tokens: int | None
+    full_context: int | None
+    provenance: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ProjectMetrics:
+    working_tokens: int
+    full_context: int
+    reasoning_tokens: int
+    recorded_working_tokens: int
+    recorded_full_context: int
+    recorded_reasoning_tokens: int
+    sessions: int
+    semantic_coverage: float
+    provenance: str = "exact"
+
+
+def aggregate_tokens(snapshots: Iterable[TokenSnapshot]) -> TokenTotals:
+    """Use the final cumulative vector from each session counter epoch."""
+    final: dict[tuple[str, int], TokenSnapshot] = {}
+    for item in sorted(snapshots, key=lambda value: (value.session_key, value.epoch, value.line_number)):
+        final[(item.session_key, item.epoch)] = item
+    values = tuple(final.values())
+    return TokenTotals(
+        sum(item.input_tokens - item.cached_input_tokens + item.output_tokens for item in values),
+        sum(item.input_tokens + item.output_tokens for item in values),
+        sum(item.reasoning_tokens for item in values), len(values), "exact",
+    )
+
+
+def tree_contribution(totals: TokenTotals, edge: SessionEdge | None) -> TreeContribution:
+    """Subtract only a confirmed baseline that was recorded by the rollout."""
+    if edge is None:
+        return TreeContribution(totals.working_tokens, totals.full_context, "exact", 1.0)
+    if edge.parent_key is None or edge.baseline_working_tokens is None or edge.confidence_kind != "confirmed":
+        return TreeContribution(None, None, "estimated", edge.confidence)
+    return TreeContribution(max(0, totals.working_tokens - edge.baseline_working_tokens), totals.full_context, "derived", edge.confidence)
+
+
+def aggregate_project(connection: sqlite3.Connection, project_id: str) -> ProjectMetrics:
+    rows = connection.execute(
+        """SELECT session_key, line_number, epoch, input_tokens, cached_input_tokens,
+                  output_tokens, reasoning_tokens, cache_write_tokens
+           FROM token_snapshots WHERE project_id = ?""", (project_id,)
+    ).fetchall()
+    recorded = aggregate_tokens(TokenSnapshot(*tuple(row)) for row in rows)
+    baselines = connection.execute(
+        """SELECT fork_baselines.input_tokens, fork_baselines.cached_input_tokens,
+                  fork_baselines.output_tokens, fork_baselines.reasoning_tokens
+           FROM fork_baselines JOIN rollout_sessions ON rollout_sessions.session_key = fork_baselines.child_key
+           WHERE project_id = ?""", (project_id,)
+    ).fetchall()
+    baseline_working = sum(row[0] - row[1] + row[2] for row in baselines)
+    baseline_full = sum(row[0] + row[2] for row in baselines)
+    baseline_reasoning = sum(row[3] for row in baselines)
+    sessions = int(connection.execute("SELECT COUNT(*) FROM rollout_sessions WHERE project_id = ?", (project_id,)).fetchone()[0])
+    annotations = int(connection.execute("SELECT COUNT(*) FROM annotations WHERE project_id = ?", (project_id,)).fetchone()[0])
+    return ProjectMetrics(
+        recorded.working_tokens - baseline_working, recorded.full_context - baseline_full,
+        recorded.reasoning_tokens - baseline_reasoning, recorded.working_tokens,
+        recorded.full_context, recorded.reasoning_tokens, sessions,
+        0.0 if not annotations else 1.0, "derived" if baselines else "exact",
+    )

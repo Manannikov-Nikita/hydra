@@ -92,11 +92,11 @@ class SQLiteStorageTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_migrates_a_fresh_database_and_reopens_at_the_same_version(self) -> None:
-        self.assertEqual(self.store.schema_version(), 2)
+        self.assertEqual(self.store.schema_version(), 4)
         self.store.close()
         reopened = HydraStore(self.database)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.schema_version(), 2)
+        self.assertEqual(reopened.schema_version(), 4)
         self.assertEqual(reopened.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_second_migration_sanitizes_and_quarantines_actual_version_one_rows(self) -> None:
@@ -158,7 +158,7 @@ class SQLiteStorageTests(unittest.TestCase):
             "SELECT * FROM conflicts WHERE record_id = 'legacy-invalid'"
         ).fetchone()
 
-        self.assertEqual(migrated.schema_version(), 2)
+        self.assertEqual(migrated.schema_version(), 4)
         self.assertIn("task_family", columns)
         self.assertEqual(len(safe_rows), len(SECRET_FORM_MATRIX))
         self.assertTrue(all(row[0] == "[redacted]" for row in safe_rows))

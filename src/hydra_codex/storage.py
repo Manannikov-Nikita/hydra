@@ -170,6 +170,80 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE annotations ADD COLUMN task_family TEXT NOT NULL DEFAULT 'legacy'",
         ),
     ),
+    (
+        3,
+        (
+            """CREATE TABLE IF NOT EXISTS rollout_sources (
+                source_digest TEXT PRIMARY KEY, source_type TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS rollout_source_locations (
+                source_digest TEXT NOT NULL REFERENCES rollout_sources(source_digest),
+                location_key TEXT NOT NULL, location_type TEXT NOT NULL,
+                PRIMARY KEY(source_digest, location_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS rollout_diagnostics (
+                source_digest TEXT NOT NULL, line_number INTEGER NOT NULL,
+                envelope_kind TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                PRIMARY KEY(source_digest, line_number, fingerprint)
+            )""",
+            """CREATE TABLE IF NOT EXISTS rollout_sessions (
+                session_key TEXT PRIMARY KEY, project_id TEXT NOT NULL, path_key TEXT NOT NULL,
+                resume_segments INTEGER NOT NULL DEFAULT 1
+            )""",
+            """CREATE TABLE IF NOT EXISTS token_snapshots (
+                source_digest TEXT NOT NULL, line_number INTEGER NOT NULL,
+                session_key TEXT NOT NULL REFERENCES rollout_sessions(session_key), project_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+                vendor_total INTEGER, context_window INTEGER, completeness TEXT NOT NULL,
+                PRIMARY KEY(source_digest, line_number)
+            )""",
+            """CREATE TABLE IF NOT EXISTS session_edges (
+                child_key TEXT PRIMARY KEY REFERENCES rollout_sessions(session_key), parent_key TEXT,
+                baseline_working_tokens INTEGER, confidence_kind TEXT NOT NULL, confidence REAL NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS turn_attempts (
+                session_key TEXT NOT NULL, turn_key TEXT NOT NULL, attempt_ordinal INTEGER NOT NULL,
+                state TEXT NOT NULL, emitted_duration_ms INTEGER, wall_duration_ms INTEGER,
+                PRIMARY KEY(session_key, turn_key, attempt_ordinal)
+            )""",
+            """CREATE TABLE IF NOT EXISTS tool_spans (
+                session_key TEXT NOT NULL, call_key TEXT NOT NULL, category TEXT NOT NULL,
+                terminal_state TEXT NOT NULL, latency_ms INTEGER,
+                PRIMARY KEY(session_key, call_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS file_observations (
+                source_digest TEXT NOT NULL, line_number INTEGER NOT NULL, session_key TEXT NOT NULL,
+                operation TEXT NOT NULL, relative_path TEXT NOT NULL, path_hash TEXT NOT NULL,
+                PRIMARY KEY(source_digest, line_number, operation, relative_path)
+            )""",
+            """CREATE TABLE IF NOT EXISTS rollout_test_runs (
+                source_digest TEXT NOT NULL, line_number INTEGER NOT NULL, session_key TEXT NOT NULL,
+                command_hash TEXT NOT NULL, runner TEXT NOT NULL, scope TEXT NOT NULL,
+                classification TEXT NOT NULL, outcome TEXT NOT NULL,
+                PRIMARY KEY(source_digest, line_number)
+            )""",
+            """CREATE TABLE IF NOT EXISTS metric_facts (
+                fact_key TEXT PRIMARY KEY, project_id TEXT NOT NULL, metric_name TEXT NOT NULL,
+                metric_value INTEGER NOT NULL, provenance TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS semantic_conflicts (
+                conflict_key TEXT PRIMARY KEY, source_digest TEXT NOT NULL, line_number INTEGER NOT NULL,
+                deterministic_cause TEXT NOT NULL, model_cause TEXT NOT NULL
+            )""",
+        ),
+    ),
+    (
+        4,
+        (
+            """CREATE TABLE IF NOT EXISTS fork_baselines (
+                child_key TEXT PRIMARY KEY REFERENCES rollout_sessions(session_key), source_digest TEXT NOT NULL,
+                line_number INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+                provenance TEXT NOT NULL
+            )""",
+        ),
+    ),
 )
 
 
@@ -214,6 +288,12 @@ class HydraStore:
         except sqlite3.Error:
             self.connection.rollback()
             raise
+
+    @contextmanager
+    def rollout_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Atomic, idempotent persistence boundary for safe normalized rollout facts."""
+        with self._transaction() as connection:
+            yield connection
 
     def _migrate(self) -> None:
         try:
@@ -357,7 +437,13 @@ class HydraStore:
         ]
 
     def count(self, table: str) -> int:
-        allowed = {"sessions", "turns", "annotations", "conflicts"}
+        allowed = {
+            "sessions", "turns", "annotations", "conflicts", "rollout_sources",
+            "rollout_source_locations", "rollout_diagnostics", "rollout_sessions",
+            "token_snapshots", "session_edges", "turn_attempts", "tool_spans",
+            "file_observations", "rollout_test_runs", "metric_facts", "semantic_conflicts",
+            "fork_baselines",
+        }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")
         return int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])

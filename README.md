@@ -19,6 +19,11 @@ legacy note inside the migration transaction. Rows whose project/session/turn
 links contradict each other are removed and recorded as hash-only quarantine
 conflicts before relational triggers are installed.
 
-This foundation provides contracts, identity discovery, and versioned SQLite
-migrations only. Rollout parsing, reports, hooks, MCP, and plugin behavior are
-intentionally out of scope.
+The `hydra.codex-rollout/v1` adapter reads only caller-supplied JSONL roots,
+line by line. It deduplicates copied source files by digest while preserving
+hashed locations, persists allowlisted normalized facts and diagnostics, and
+never persists transcript text, command/tool output, arguments, patches, or
+search results. Token aggregation retains cumulative epochs, reports reasoning
+separately, and makes fork-baseline uncertainty explicit.
+
+Rendering, hooks, MCP, and plugin behavior remain intentionally out of scope.

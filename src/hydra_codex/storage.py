@@ -249,6 +249,16 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (7, ("CREATE TABLE IF NOT EXISTS rollout_event_keys (event_key TEXT PRIMARY KEY, source_digest TEXT NOT NULL, source_ordinal INTEGER NOT NULL)",)),
     (8, ("ALTER TABLE token_snapshots ADD COLUMN turn_key TEXT",)),
     (9, ("ALTER TABLE token_snapshots ADD COLUMN observed_at TEXT",)),
+    (10, (
+        "ALTER TABLE token_snapshots RENAME TO token_snapshots_v9",
+        """CREATE TABLE token_snapshots (
+            source_digest TEXT NOT NULL, line_number INTEGER NOT NULL, session_key TEXT NOT NULL REFERENCES rollout_sessions(session_key), project_id TEXT NOT NULL,
+            epoch INTEGER NOT NULL, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER, cache_write_tokens INTEGER,
+            vendor_total INTEGER, context_window INTEGER, completeness TEXT NOT NULL, turn_key TEXT, observed_at TEXT,
+            PRIMARY KEY(source_digest, line_number))""",
+        """INSERT INTO token_snapshots SELECT source_digest,line_number,session_key,project_id,epoch,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,vendor_total,context_window,completeness,turn_key,observed_at FROM token_snapshots_v9""",
+        "DROP TABLE token_snapshots_v9",
+    )),
 )
 
 

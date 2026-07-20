@@ -107,12 +107,21 @@ class FixAIdentityAndProjectTests(unittest.TestCase):
     def test_cross_source_timestamp_order_wins_and_counter_reset_creates_epoch(self) -> None:
         old = self.base / "z-old.jsonl"
         new = self.base / "a-new.jsonl"
-        write(old, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10}}}, 10)])
-        write(new, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 200, "cached_input_tokens": 40, "output_tokens": 20}}}, 20)])
+        write(old, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "reasoning_output_tokens": 0}}}, 10)])
+        write(new, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 200, "cached_input_tokens": 40, "output_tokens": 20, "reasoning_output_tokens": 0}}}, 20)])
         ingest_rollouts(self.store, (new, old), self.project, "project-a", hash_key=b"f" * 32)
         first = aggregate_project(self.store.connection, "project-a")
         self.assertEqual(first.working_tokens, 180)
         reset = self.base / "m-reset.jsonl"
-        write(reset, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 4}}}, 30)])
+        write(reset, [record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0), record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 0}}}, 30)])
         ingest_rollouts(self.store, (reset,), self.project, "project-a", hash_key=b"f" * 32)
         self.assertEqual(aggregate_project(self.store.connection, "project-a").working_tokens, 209)
+
+    def test_invalid_components_are_null_and_valid_zero_is_present(self) -> None:
+        source = self.base / "partial.jsonl"
+        write(source, [
+            record("session_meta", {"id": "thread", "cwd": str(self.project)}, 0),
+            record("event_msg", {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 0, "cached_input_tokens": -1, "output_tokens": True, "reasoning_output_tokens": "bad"}}}, 1),
+        ])
+        ingest_rollouts(self.store, (source,), self.project, "project-a", hash_key=b"g" * 32)
+        self.assertEqual(tuple(self.store.connection.execute("SELECT input_tokens, cached_input_tokens, output_tokens, reasoning_tokens FROM token_snapshots").fetchone()), (0, None, None, None))

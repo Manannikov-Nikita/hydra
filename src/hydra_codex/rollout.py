@@ -72,8 +72,8 @@ def discover_rollouts(roots: Iterable[Path | str | RolloutRoot]) -> tuple[Path, 
     return tuple(sorted(found))
 
 
-def _safe_int(value: Any) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+def _safe_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _fingerprint(value: Any) -> str:
@@ -106,7 +106,7 @@ def _usage(payload: dict[str, Any]) -> dict[str, int] | None:
         "cache_write": _safe_int(usage.get("cache_write_input_tokens")),
         "vendor_total": _safe_int(usage.get("total_tokens")),
         "context_window": _safe_int(info.get("model_context_window")),
-        "complete": int(all(field in usage for field in ("input_tokens", "cached_input_tokens", "output_tokens"))),
+        "complete": int(all(_safe_int(usage.get(field)) is not None for field in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"))),
     }
 
 
@@ -141,7 +141,7 @@ def _tool_end_state(payload: dict[str, Any]) -> str:
 def _duration_ms(value: Any) -> int | None:
     if not isinstance(value, dict):
         return None
-    seconds, nanos = _safe_int(value.get("secs")), _safe_int(value.get("nanos"))
+    seconds, nanos = _safe_int(value.get("secs")) or 0, _safe_int(value.get("nanos")) or 0
     return seconds * 1000 + nanos // 1_000_000
 
 
@@ -256,7 +256,7 @@ def _parse_source(
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "token_count", payload)
                     continue
-                vector = (usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"])
+                vector = tuple(value if value is not None else 0 for value in (usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"]))
                 prior_epoch, prior = epochs.get(session_key, (0, vector))
                 epoch = prior_epoch + 1 if any(current < previous for current, previous in zip(vector, prior)) else prior_epoch
                 if epoch > prior_epoch:
@@ -269,20 +269,20 @@ def _parse_source(
                        cached_input_tokens, output_tokens, reasoning_tokens, cache_write_tokens, vendor_total, context_window, completeness, observed_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
                     (source, line_number, session_key, project_id, epoch, usage["input"], usage["cached"], usage["output"],
-                     usage["reasoning"], usage["cache_write"], usage["vendor_total"] or None, usage["context_window"] or None, completeness, envelope.get("timestamp")),
+                     usage["reasoning"], usage["cache_write"], usage["vendor_total"], usage["context_window"], completeness, envelope.get("timestamp")),
                 )
                 connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque(current_turn) if current_turn else None, source, line_number))
                 edge = connection.execute(
                     "SELECT parent_key FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()
-                if edge is not None and connection.execute(
+                if usage["complete"] and edge is not None and connection.execute(
                     "SELECT confidence_kind FROM session_edges WHERE child_key = ?", (session_key,)
                 ).fetchone()[0] == "confirmed":
                     connection.execute(
                         """INSERT INTO fork_baselines(child_key, source_digest, line_number, input_tokens, cached_input_tokens,
                            output_tokens, reasoning_tokens, cache_write_tokens, provenance)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'exact') ON CONFLICT(child_key) DO NOTHING""",
-                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"]),
+                        (session_key, source, line_number, usage["input"], usage["cached"], usage["output"], usage["reasoning"], usage["cache_write"] or 0),
                     )
                 continue
             event_type = payload.get("type") if kind == "event_msg" else None

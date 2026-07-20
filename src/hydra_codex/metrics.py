@@ -108,17 +108,21 @@ def tree_contribution(totals: TokenTotals, edge: SessionEdge | None) -> TreeCont
 
 
 def aggregate_project(connection: sqlite3.Connection, project_id: str) -> ProjectMetrics:
+    partial = int(connection.execute("SELECT COUNT(*) FROM token_snapshots WHERE project_id = ? AND completeness != 'complete'", (project_id,)).fetchone()[0])
+    sessions = int(connection.execute("SELECT COUNT(*) FROM rollout_sessions WHERE project_id = ?", (project_id,)).fetchone()[0])
+    annotations = int(connection.execute("SELECT COUNT(*) FROM annotations WHERE project_id = ?", (project_id,)).fetchone()[0])
+    if partial:
+        return ProjectMetrics(None, None, None, None, None, None, sessions, 0.0 if not annotations else 1.0, "estimated")
     rows = connection.execute(
         """SELECT session_key, line_number, epoch, input_tokens, cached_input_tokens,
                   output_tokens, reasoning_tokens, cache_write_tokens
            FROM token_snapshots WHERE project_id = ? ORDER BY observed_at, source_digest, line_number""", (project_id,)
     ).fetchall()
-    partial = int(connection.execute("SELECT COUNT(*) FROM token_snapshots WHERE project_id = ? AND completeness != 'complete'", (project_id,)).fetchone()[0])
     global_rows = []
     last: dict[str, tuple[int, int, int, int, int]] = {}
     epochs: dict[str, int] = {}
     for row in rows:
-        vector = tuple(row[index] for index in range(3, 8))
+        vector = tuple(0 if row[index] is None else row[index] for index in range(3, 8))
         session = row[0]
         if session in last and any(now < before for now, before in zip(vector, last[session])):
             epochs[session] = epochs.get(session, 0) + 1
@@ -134,10 +138,6 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
     baseline_working = sum(row[0] - row[1] + row[2] for row in baselines)
     baseline_full = sum(row[0] + row[2] for row in baselines)
     baseline_reasoning = sum(row[3] for row in baselines)
-    sessions = int(connection.execute("SELECT COUNT(*) FROM rollout_sessions WHERE project_id = ?", (project_id,)).fetchone()[0])
-    annotations = int(connection.execute("SELECT COUNT(*) FROM annotations WHERE project_id = ?", (project_id,)).fetchone()[0])
-    if partial:
-        return ProjectMetrics(None, None, None, None, None, None, sessions, 0.0 if not annotations else 1.0, "estimated")
     return ProjectMetrics(
         recorded.working_tokens - baseline_working, recorded.full_context - baseline_full,
         recorded.reasoning_tokens - baseline_reasoning, recorded.working_tokens,

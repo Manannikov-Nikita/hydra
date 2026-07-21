@@ -411,9 +411,11 @@ class TestEvidenceBuffer:
         self.source_digest = source_digest
         self.model_causes = model_causes
         self.pseudonymize = pseudonymize
-        self.intents: dict[str, tuple[TestIntent, str]] = {}
-        self.results: dict[str, tuple[StructuredTestResult, str | None]] = {}
-        self.rejected: set[str] = set()
+        self.intents: dict[tuple[str, str], tuple[TestIntent, str]] = {}
+        self.results: dict[
+            tuple[str, str], tuple[StructuredTestResult, str | None]
+        ] = {}
+        self.rejected: set[tuple[str, str]] = set()
 
     def intent(
         self,
@@ -427,9 +429,10 @@ class TestEvidenceBuffer:
         turn_key: str | None,
         tool_call_key: str,
     ) -> bool:
+        buffer_key = (session_key, logical_call_id)
         # A later command-bearing event is fresh execution evidence for a
         # reused call key and therefore supersedes an earlier cancellation.
-        self.rejected.discard(logical_call_id)
+        self.rejected.discard(buffer_key)
         runner, scope = classify_test_command(command)
         is_test = runner != "unknown"
         command_hash = self.pseudonymize("command", command)
@@ -441,7 +444,11 @@ class TestEvidenceBuffer:
             f"test-candidate/evidence/{session_key}/{tool_call_key}/"
             f"{self.source_digest}/{line_number}/{command_hash}",
         )
-        self.intents[logical_call_id] = (
+        current = self.intents.get(buffer_key)
+        if current is not None:
+            self._persist_current(buffer_key)
+        self.results.pop(buffer_key, None)
+        self.intents[buffer_key] = (
             TestIntent(
                 candidate_key, evidence_key, self.source_digest, line_number,
                 session_key, observed_at, turn_key, tool_call_key, command_hash,
@@ -490,7 +497,7 @@ class TestEvidenceBuffer:
             f"test-candidate/evidence/{session_key}/{tool_call_key}/"
             f"{self.source_digest}/{line_number}/{command_hash}",
         )
-        self.intents[logical_call_id] = (
+        self.intents[(session_key, logical_call_id)] = (
             TestIntent(
                 candidate_key, str(description[2]), self.source_digest, line_number,
                 session_key, observed_at or description[6], turn_key or description[7],
@@ -504,11 +511,13 @@ class TestEvidenceBuffer:
         session_key: str | None = None, line_number: int | None = None,
         turn_key: str | None = None, tool_call_key: str | None = None,
     ) -> None:
-        if logical_call_id in self.rejected:
+        if session_key is None:
+            return
+        buffer_key = (session_key, logical_call_id)
+        if buffer_key in self.rejected:
             return
         if (
-            logical_call_id not in self.intents
-            and session_key is not None
+            buffer_key not in self.intents
             and line_number is not None
             and tool_call_key is not None
         ):
@@ -517,7 +526,29 @@ class TestEvidenceBuffer:
                 line_number=line_number, observed_at=observed_at,
                 turn_key=turn_key, tool_call_key=tool_call_key,
             )
-        self.results[logical_call_id] = (parse_structured_result(output), observed_at)
+        if buffer_key not in self.intents:
+            return
+        self.results[buffer_key] = (parse_structured_result(output), observed_at)
+
+    def _persist_current(self, buffer_key: tuple[str, str]) -> None:
+        current = self.intents.get(buffer_key)
+        if current is None:
+            return
+        intent, model_call_id = current
+        result, observed_at = self.results.get(
+            buffer_key, (unknown_result(), intent.observed_at),
+        )
+        persist_test_evidence(
+            self.connection, intent, result, observed_at=observed_at,
+        )
+        model_cause = self.model_causes.get(model_call_id)
+        if model_cause is not None and intent.runner != "unknown":
+            persist_semantic_conflict(
+                self.connection, intent, result, model_cause,
+                self.pseudonymize(
+                    "diagnostic", f"test-conflict/{intent.evidence_key}",
+                ),
+            )
 
     def _persist_non_execution(self, session_key: str, tool_call_key: str) -> None:
         evidence_key = self.pseudonymize(
@@ -549,24 +580,19 @@ class TestEvidenceBuffer:
         self, logical_call_id: str, *, session_key: str, tool_call_key: str,
     ) -> None:
         """Discard an App command whose terminal state proves no completed run."""
-        self.rejected.add(logical_call_id)
-        self.intents.pop(logical_call_id, None)
-        self.results.pop(logical_call_id, None)
+        buffer_key = (session_key, logical_call_id)
+        self._persist_current(buffer_key)
+        self.rejected.add(buffer_key)
+        self.intents.pop(buffer_key, None)
+        self.results.pop(buffer_key, None)
         self._persist_non_execution(session_key, tool_call_key)
 
     def flush(self) -> None:
-        for logical_call_id, (intent, model_call_id) in self.intents.items():
-            if logical_call_id in self.rejected:
+        for buffer_key, (intent, _model_call_id) in self.intents.items():
+            if buffer_key in self.rejected:
                 continue
             if self._has_app_terminal_rejection(intent):
                 self._persist_non_execution(intent.session_key, intent.tool_call_key)
-            result, observed_at = self.results.get(logical_call_id, (unknown_result(), intent.observed_at))
-            persist_test_evidence(self.connection, intent, result, observed_at=observed_at)
-            model_cause = self.model_causes.get(model_call_id)
-            if model_cause is not None and intent.runner != "unknown":
-                persist_semantic_conflict(
-                    self.connection, intent, result, model_cause,
-                    self.pseudonymize("diagnostic", f"test-conflict/{intent.evidence_key}"),
-                )
+            self._persist_current(buffer_key)
         materialize_test_evidence(self.connection)
         reconcile_test_retries(self.connection)

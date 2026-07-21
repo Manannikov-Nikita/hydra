@@ -93,7 +93,7 @@ class CustomToolPersistenceTests(unittest.TestCase):
             {tuple(row) for row in self.store.connection.execute(
                 "SELECT operation,relative_path FROM file_observations"
             )},
-            {("write", "src/safe.py"), ("read", "assets/screenshot.png")},
+            set(),
         )
         self.assertEqual(self.store.count("rollout_test_runs"), 1)
         self.assertIn("custom_exec_unsupported", {
@@ -104,6 +104,43 @@ class CustomToolPersistenceTests(unittest.TestCase):
         database_dump = "\n".join(self.store.connection.iterdump())
         for private_value in (secret_name, secret_argument, secret_output, "pytest tests/test_safe.py"):
             self.assertNotIn(private_value, database_dump)
+
+    def test_custom_exec_does_not_persist_unproven_nested_file_facts(self) -> None:
+        self.ingest([
+            self.meta(),
+            envelope("response_item", {
+                "type": "custom_tool_call", "call_id": "broker", "name": "exec",
+                "input": (
+                    'tools.exec_command({"cmd":"cat src/maybe.py"});'
+                    'tools.apply_patch("*** Update File: src/maybe.py\\n+maybe");'
+                    'tools.view_image({"path":"assets/maybe.png"});'
+                ),
+            }, 1),
+            envelope("response_item", {
+                "type": "custom_tool_call_output", "call_id": "broker",
+                "output": [{"type": "input_text", "text": "Script completed"}],
+            }, 2),
+        ])
+
+        self.assertEqual(self.store.count("file_observations"), 0)
+
+    def test_identical_nested_test_commands_remain_two_distinct_attempts(self) -> None:
+        command = 'tools.exec_command({"cmd":"pytest tests/test_repeat.py"});'
+        self.ingest([
+            self.meta(),
+            envelope("response_item", {
+                "type": "custom_tool_call", "call_id": "broker", "name": "exec",
+                "input": command + command,
+            }, 1),
+        ])
+
+        rows = [tuple(row) for row in self.store.connection.execute(
+            "SELECT tool_call_key,command_hash,outcome FROM rollout_test_runs ORDER BY evidence_key"
+        )]
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0][0], rows[1][0])
+        self.assertEqual(rows[0][1], rows[1][1])
+        self.assertEqual([row[2] for row in rows], ["unknown", "unknown"])
 
     def test_persists_exact_allowlisted_custom_exec_diagnostic_suffixes(self) -> None:
         programs = (

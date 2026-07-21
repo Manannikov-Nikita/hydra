@@ -8,6 +8,11 @@ from typing import Any, Iterable
 
 from .custom_tool_persistence import persist_custom_tool_call
 from .function_normalization import normalize_function_call
+from .lineage import (
+    assert_session_project,
+    persist_confirmed_parent,
+    persist_inferred_parent,
+)
 from .project import ProjectNotFound, resolve_project
 from .rollout_identity import ACTIVE_HASHER, IngestReport, Pseudonymizer, RolloutRoot, discover_rollouts, opaque
 from .rollout_observations import fingerprint as observation_fingerprint
@@ -23,7 +28,7 @@ from .rollout_persistence import tool_end_state as _tool_end_state
 from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
 from .rollout_sources import line_fingerprint, located_lineage, prefix_lineage, relation_to, revision_lines, scan_source
 from .storage import HydraStore
-from .test_evidence import TestEvidenceBuffer
+from .test_evidence import TestEvidenceBuffer, parse_structured_result
 from .tool_normalization import custom_exec_outcome
 from .tool_spans import persist_tool_end, persist_tool_start
 
@@ -47,6 +52,32 @@ def _parse_source(
     seen_session = False
     with store.rollout_transaction() as connection, path.open("rb") as handle:
         test_evidence = TestEvidenceBuffer(connection, source, model_causes, opaque)
+        # File operands from fallible direct tools stay in memory until the
+        # matching structured terminal record proves success.  Values contain
+        # only already-normalized relative paths, never raw arguments.
+        pending_file_calls: dict[
+            str, tuple[str, str, str, tuple[tuple[str, str], ...]]
+        ] = {}
+        successful_exec_calls: dict[str, tuple[int, str | None, str | None]] = {}
+        successful_patch_calls: dict[str, tuple[int, str | None, str | None]] = {}
+
+        def flush_file_call(
+            call_id: str, expected_tool: str,
+            terminal_line: int, terminal_at: str | None, terminal_turn: str | None,
+        ) -> None:
+            pending = pending_file_calls.get(call_id)
+            if pending is None or pending[0] != expected_tool:
+                return
+            _, pending_session, call_key, accesses = pending
+            for operation, relative_path in accesses:
+                _persist_file(
+                    connection, source, terminal_line, pending_session,
+                    operation, relative_path, project_root, terminal_at,
+                    opaque("turn", terminal_turn) if terminal_turn else None,
+                    observation_call_key=call_key,
+                )
+            del pending_file_calls[call_id]
+
         parsed_lines = 0
         for line_number, raw_bytes in enumerate(handle, start=1):
             parsed_lines = line_number
@@ -137,15 +168,26 @@ def _parse_source(
                 connection.execute(
                     """INSERT INTO rollout_sessions(
                            session_key,project_id,path_key,resume_segments,conversation_key,started_at,last_activity_at)
-                       VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_key) DO UPDATE SET
-                         started_at=CASE WHEN rollout_sessions.started_at IS NULL
-                                              OR julianday(excluded.started_at) < julianday(rollout_sessions.started_at)
-                                         THEN excluded.started_at ELSE rollout_sessions.started_at END,
-                         last_activity_at=CASE WHEN rollout_sessions.last_activity_at IS NULL
-                                                   OR julianday(excluded.last_activity_at) > julianday(rollout_sessions.last_activity_at)
-                                              THEN excluded.last_activity_at ELSE rollout_sessions.last_activity_at END""",
+                       VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_key) DO NOTHING""",
                     (session_key, project_id, session_path, 1, opaque("conversation", conversation) if conversation else next_key,
                      session_meta_at, observed_at),
+                )
+                assert_session_project(
+                    connection, session_key=session_key, project_id=project_id,
+                )
+                connection.execute(
+                    """UPDATE rollout_sessions SET
+                         started_at=CASE WHEN started_at IS NULL
+                                              OR julianday(?) < julianday(started_at)
+                                         THEN ? ELSE started_at END,
+                         last_activity_at=CASE WHEN last_activity_at IS NULL
+                                                   OR julianday(?) > julianday(last_activity_at)
+                                              THEN ? ELSE last_activity_at END
+                       WHERE session_key=?""",
+                    (
+                        session_meta_at, session_meta_at,
+                        observed_at, observed_at, session_key,
+                    ),
                 )
                 if not seen_session:
                     persisted_start = connection.execute(
@@ -168,13 +210,9 @@ def _parse_source(
                 if payload.get("parent_thread_id") is not None:
                     parent = payload.get("parent_thread_id")
                     if isinstance(parent, str):
-                        connection.execute(
-                            """INSERT INTO session_edges(child_key, parent_key, baseline_working_tokens, confidence_kind, confidence)
-                               VALUES (?, ?, ?, ?, ?) ON CONFLICT(child_key) DO UPDATE SET
-                                 parent_key = excluded.parent_key, baseline_working_tokens = NULL,
-                                 confidence_kind = 'confirmed', confidence = 1.0
-                               WHERE session_edges.confidence_kind != 'confirmed'""",
-                            (session_key, opaque("identity", parent), None, "confirmed", 1.0),
+                        persist_confirmed_parent(
+                            connection, child_key=session_key,
+                            parent_key=opaque("identity", parent),
                         )
                 seen_session = True
                 continue
@@ -211,10 +249,11 @@ def _parse_source(
                     """INSERT INTO rollout_sessions(session_key, project_id, path_key, resume_segments)
                        VALUES (?, ?, 'unresolved', 1) ON CONFLICT DO NOTHING""", (child_key, project_id)
                 )
-                connection.execute(
-                    """INSERT INTO session_edges(child_key, parent_key, baseline_working_tokens, confidence_kind, confidence)
-                       VALUES (?, ?, NULL, 'inferred', 0.6) ON CONFLICT(child_key) DO NOTHING""",
-                    (child_key, session_key),
+                assert_session_project(
+                    connection, session_key=child_key, project_id=project_id,
+                )
+                persist_inferred_parent(
+                    connection, child_key=child_key, parent_key=session_key,
                 )
                 continue
             if kind == "event_msg" and event_type in {"task_started", "task_complete", "turn_aborted"}:
@@ -283,12 +322,31 @@ def _parse_source(
                     source_digest=source, source_ordinal=line_number,
                     provenance=normalized.provenance,
                 )
-                for access in normalized.file_accesses:
-                    _persist_file(
-                        connection, source, line_number, session_key,
-                        access.operation, access.relative_path, project_root,
-                        observed_at, opaque("turn", current_turn) if current_turn else None,
+                accesses = tuple(
+                    (access.operation, access.relative_path)
+                    for access in normalized.file_accesses
+                )
+                if normalized.safe_name in {"exec_command", "apply_patch"}:
+                    pending_file_calls[payload["call_id"]] = (
+                        normalized.safe_name, session_key, call_key, accesses,
                     )
+                    completed = (
+                        successful_exec_calls.get(payload["call_id"])
+                        if normalized.safe_name == "exec_command"
+                        else successful_patch_calls.get(payload["call_id"])
+                    )
+                    if completed is not None:
+                        flush_file_call(
+                            payload["call_id"], normalized.safe_name, *completed,
+                        )
+                else:
+                    for operation, relative_path in accesses:
+                        _persist_file(
+                            connection, source, line_number, session_key,
+                            operation, relative_path, project_root,
+                            observed_at, opaque("turn", current_turn) if current_turn else None,
+                            observation_call_key=call_key,
+                        )
                 if normalized.ephemeral_command is not None:
                     test_evidence.intent(
                         logical_call_id=payload["call_id"], model_call_id=payload["call_id"],
@@ -299,11 +357,21 @@ def _parse_source(
                 continue
             if kind == "response_item" and payload.get("type") == "function_call_output":
                 call_id = payload.get("call_id")
+                result = parse_structured_result(payload.get("output"))
+                if isinstance(call_id, str) and result.exit_status == 0:
+                    terminal = (line_number, observed_at, current_turn)
+                    successful_exec_calls[call_id] = terminal
+                    flush_file_call(call_id, "exec_command", *terminal)
                 if session_key is not None and isinstance(call_id, str):
+                    terminal_state = (
+                        "success" if result.exit_status == 0
+                        else "failed" if result.exit_status is not None
+                        else "unknown"
+                    )
                     persist_tool_end(
                         connection, session_key=session_key, call_key=opaque("call", call_id), category="tool", tool_name="function",
                         finished_at=observed_at,
-                        terminal_state="unknown", latency_ms=None, turn_key=opaque("turn", current_turn) if current_turn else None,
+                        terminal_state=terminal_state, latency_ms=None, turn_key=opaque("turn", current_turn) if current_turn else None,
                         source_digest=source, source_ordinal=line_number,
                     )
                 if isinstance(call_id, str):
@@ -311,22 +379,30 @@ def _parse_source(
                 continue
             if kind == "event_msg" and event_type in {"mcp_tool_call_end", "patch_apply_end", "web_search_end"}:
                 call_id = payload.get("call_id")
+                terminal_state = _tool_end_state(payload)
                 if session_key is not None and isinstance(call_id, str):
                     kind_name = {"mcp_tool_call_end": "mcp", "patch_apply_end": "patch", "web_search_end": "web"}[event_type]
                     persist_tool_end(
                         connection, session_key=session_key, call_key=opaque("call", call_id),
                         category="web" if kind_name == "web" else "tool", tool_name=kind_name,
                         finished_at=observed_at,
-                        terminal_state=_tool_end_state(payload), latency_ms=_duration_ms(payload.get("duration")),
+                        terminal_state=terminal_state, latency_ms=_duration_ms(payload.get("duration")),
                         turn_key=opaque("turn", current_turn) if current_turn else None, source_digest=source, source_ordinal=line_number,
                     )
-                if event_type == "patch_apply_end" and session_key is not None:
+                if (
+                    event_type == "patch_apply_end" and session_key is not None
+                    and isinstance(call_id, str) and terminal_state == "success"
+                ):
+                    terminal = (line_number, observed_at, current_turn)
+                    successful_patch_calls[call_id] = terminal
+                    flush_file_call(call_id, "apply_patch", *terminal)
                     changes = payload.get("changes")
                     if isinstance(changes, dict):
                         for changed_path in changes:
                             _persist_file(
                                 connection, source, line_number, session_key, "write", changed_path, project_root,
                                 observed_at, opaque("turn", current_turn) if current_turn else None,
+                                observation_call_key=opaque("call", call_id),
                             )
                 continue
             if kind == "event_msg" and event_type not in KNOWN_EVENT_TYPES:

@@ -16,6 +16,7 @@ from .codex_events import (
     EventAdapterError,
     read_codex_event_jsonl,
 )
+from .lineage import assert_session_project, persist_confirmed_parent
 from .rollout_identity import ACTIVE_HASHER, Pseudonymizer
 from .rollout_persistence import persist_file
 from .rollout_privacy import canonical_timestamp
@@ -24,6 +25,7 @@ from .shell_facts import shell_file_facts
 from .storage import HydraStore
 from .test_evidence import TestEvidenceBuffer
 from .token_selection import refresh_token_source_selection
+from .tool_spans import persist_tool_end, persist_tool_start
 
 
 @dataclass(frozen=True)
@@ -307,7 +309,15 @@ def _persist_normalized_event(
     # Persist file evidence only from the authoritative terminal item so one
     # logical tool call cannot inflate read/write amplification.
     terminal_tool = tool is not None and tool.phase == "completed"
-    if terminal_tool and tool.ephemeral_command is not None:
+    terminal_status = tool.status in {"completed", "success"} if tool is not None else False
+    successful_command = (
+        terminal_tool and terminal_status and tool.safe_name == "exec_command"
+        and tool.exit_status == 0
+    )
+    successful_file_change = (
+        terminal_tool and terminal_status and tool.safe_name == "apply_patch"
+    )
+    if successful_command and tool.ephemeral_command is not None:
         for operation, path in shell_file_facts(
             tool.ephemeral_command,
             project_root=project_root,
@@ -316,12 +326,14 @@ def _persist_normalized_event(
             persist_file(
                 connection, normalized_source, event.source_ordinal, session,
                 operation, path, project_root, event.observed_at, event.turn_key,
+                observation_call_key=tool.call_key,
             )
-    if terminal_tool:
+    if successful_file_change:
         for path in tool.ephemeral_file_writes:
             persist_file(
                 connection, normalized_source, event.source_ordinal, session,
                 "write", path, project_root, event.observed_at, event.turn_key,
+                observation_call_key=tool.call_key,
             )
 
 
@@ -380,29 +392,35 @@ def _persist_tool(
         return
     call_key = tool.call_key or event.event_key
     complete = tool.phase == "completed"
-    connection.execute(
-        """INSERT INTO tool_spans(
-               session_key,call_key,category,terminal_state,latency_ms,tool_name,
-               started_at,finished_at,turn_key,source_digest,source_ordinal,
-               completeness,provenance)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(session_key,call_key) DO UPDATE SET
-             category=excluded.category,
-             terminal_state=CASE WHEN excluded.completeness='complete'
-                                 THEN excluded.terminal_state ELSE tool_spans.terminal_state END,
-             latency_ms=COALESCE(excluded.latency_ms,tool_spans.latency_ms),
-             tool_name=excluded.tool_name,
-             started_at=COALESCE(tool_spans.started_at,excluded.started_at),
-             finished_at=COALESCE(excluded.finished_at,tool_spans.finished_at),
-             completeness=CASE WHEN excluded.completeness='complete'
-                               THEN 'complete' ELSE tool_spans.completeness END""",
-        (
-            session, call_key, tool.category, tool.status, tool.duration_ms,
-            tool.safe_name, None if complete else event.observed_at,
-            event.observed_at if complete else None, event.turn_key,
-            normalized_source, event.source_ordinal,
-            "complete" if complete else "incomplete", event.provenance,
-        ),
+    if not complete:
+        persist_tool_start(
+            connection, session_key=session, call_key=call_key,
+            category=tool.category, tool_name=tool.safe_name,
+            started_at=event.observed_at, turn_key=event.turn_key,
+            source_digest=normalized_source, source_ordinal=event.source_ordinal,
+            provenance=event.provenance,
+        )
+        return
+    failed_statuses = {"failed", "interrupted", "cancelled", "declined"}
+    if tool.safe_name == "exec_command":
+        terminal = (
+            "success" if tool.exit_status == 0
+            else "failed" if tool.exit_status is not None or tool.status in failed_statuses
+            else "unknown"
+        )
+    else:
+        terminal = (
+            "success" if tool.status in {"completed", "success"}
+            else "failed" if tool.status in failed_statuses
+            else "unknown"
+        )
+    persist_tool_end(
+        connection, session_key=session, call_key=call_key,
+        category=tool.category, tool_name=tool.safe_name,
+        finished_at=event.observed_at, terminal_state=terminal,
+        latency_ms=tool.duration_ms, turn_key=event.turn_key,
+        source_digest=normalized_source, source_ordinal=event.source_ordinal,
+        provenance=event.provenance,
     )
 
 
@@ -433,7 +451,15 @@ def _persist_batch(
             tool = event.tool
             if tool is not None and tool.safe_name == "exec_command":
                 logical_call = tool.call_key or event.event_key
-                if tool.ephemeral_command is not None:
+                rejected_test = (
+                    tool.phase == "completed"
+                    and tool.status not in {"completed", "success"}
+                )
+                if rejected_test:
+                    test_evidence.reject(
+                        logical_call, session_key=session, tool_call_key=logical_call,
+                    )
+                elif tool.ephemeral_command is not None:
                     test_evidence.intent(
                         logical_call_id=logical_call,
                         model_call_id=logical_call,
@@ -444,7 +470,10 @@ def _persist_batch(
                         turn_key=event.turn_key,
                         tool_call_key=logical_call,
                     )
-                if tool.phase == "completed" and tool.exit_status is not None:
+                if (
+                    not rejected_test and tool.phase == "completed"
+                    and tool.exit_status is not None
+                ):
                     test_evidence.result(
                         logical_call,
                         {"exit_code": tool.exit_status, "output": tool.ephemeral_output or ""},
@@ -461,15 +490,13 @@ def _persist_batch(
                         event.observed_at, event.observed_at,
                     ),
                 )
-                connection.execute(
-                    """INSERT INTO session_edges(
-                           child_key,parent_key,baseline_working_tokens,
-                           confidence_kind,confidence)
-                       VALUES (?,?,NULL,'confirmed',1.0)
-                       ON CONFLICT(child_key) DO UPDATE SET
-                         parent_key=excluded.parent_key,baseline_working_tokens=NULL,
-                         confidence_kind='confirmed',confidence=1.0""",
-                    (event.child_thread_key, event.parent_thread_key or session),
+                assert_session_project(
+                    connection, session_key=event.child_thread_key,
+                    project_id=project_id,
+                )
+                persist_confirmed_parent(
+                    connection, child_key=event.child_thread_key,
+                    parent_key=event.parent_thread_key or session,
                 )
     test_evidence.flush()
     connection.executemany(

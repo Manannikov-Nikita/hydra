@@ -104,7 +104,7 @@ class PersistedTestEvidenceTests(unittest.TestCase):
             model_causes=model_causes, hash_key=b"t" * 32,
         )
 
-    def test_custom_exec_test_intents_link_to_outer_span_but_never_inherit_broker_success(self) -> None:
+    def test_custom_exec_test_intents_link_to_nested_spans_but_never_inherit_broker_success(self) -> None:
         path = self.root / "modern.jsonl"
         program = (
             'tools.exec_command({"cmd":"pytest tests/a.py"});'
@@ -124,15 +124,22 @@ class PersistedTestEvidenceTests(unittest.TestCase):
         outer = self.store.connection.execute(
             "SELECT call_key FROM tool_spans WHERE tool_name = 'custom_exec'"
         ).fetchone()[0]
+        nested = {
+            row[0] for row in self.store.connection.execute(
+                "SELECT call_key FROM tool_spans WHERE tool_name = 'exec_command'"
+            )
+        }
         rows = self.store.connection.execute(
             """SELECT tool_call_key, exit_status, outcome, failure_cause, retry_kind,
                       attempt_ordinal, provenance, completeness, observed_at, turn_key
                  FROM rollout_test_runs ORDER BY runner"""
         ).fetchall()
         self.assertEqual(len(rows), 2)
+        self.assertEqual({row[0] for row in rows}, nested)
+        self.assertNotIn(outer, nested)
         for row in rows:
             self.assertEqual(tuple(row[:8]),
-                             (outer, None, "unknown", "unknown", "none", 1, "derived", "intent_only"))
+                             (row[0], None, "unknown", "unknown", "none", 1, "derived", "intent_only"))
             self.assertEqual(row[8], "2026-07-21T00:00:02Z")
             self.assertIsNotNone(row[9])
         dump = "\n".join(self.store.connection.iterdump())
@@ -195,7 +202,7 @@ class PersistedTestEvidenceTests(unittest.TestCase):
                  FROM file_observations WHERE operation = 'write'"""
         ).fetchone()
         self.assertTrue(write[0])
-        self.assertGreater(write[1], 0)
+        self.assertEqual(write[1], 0)
         self.assertEqual(write[2], "2026-07-21T00:00:11Z")
         self.assertIsNotNone(write[3])
         child_rows = [row for row in rows if row[0] != root_key]

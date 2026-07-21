@@ -9,6 +9,7 @@ import sqlite3
 from typing import Any, Callable
 
 from .classifier import classify_test_command
+from .source_authority import SOURCE_AUTHORITY, source_family
 
 
 MODEL_CAUSES = frozenset({
@@ -87,6 +88,23 @@ def unknown_result(completeness: str = "intent_only") -> StructuredTestResult:
     return StructuredTestResult(None, "unknown", "unknown", completeness)
 
 
+def _candidate_rank(
+    connection: sqlite3.Connection,
+    source_digest: str,
+    completeness: str,
+    line_number: int,
+) -> tuple[int, int, str, int]:
+    # A terminal result is strictly more informative than intent alone.  Source
+    # authority resolves conflicts only between facts with equal completeness;
+    # otherwise an incomplete rollout would erase the sole confirmed App result.
+    return (
+        int(completeness == "complete"),
+        SOURCE_AUTHORITY[source_family(connection, source_digest)],
+        source_digest,
+        line_number,
+    )
+
+
 def persist_test_evidence(
     connection: sqlite3.Connection,
     intent: TestIntent,
@@ -94,7 +112,18 @@ def persist_test_evidence(
     *,
     observed_at: str | None = None,
 ) -> None:
-    """Upsert one stable evidence item without retaining command or output text."""
+    """Upsert one stable item using source authority, never last-writer wins."""
+    existing = connection.execute(
+        "SELECT source_digest,line_number,completeness FROM rollout_test_runs WHERE evidence_key=?",
+        (intent.evidence_key,),
+    ).fetchone()
+    incoming_rank = _candidate_rank(
+        connection, intent.source_digest, result.completeness, intent.line_number,
+    )
+    if existing is not None and incoming_rank <= _candidate_rank(
+        connection, str(existing[0]), str(existing[2]), int(existing[1]),
+    ):
+        return
     connection.execute(
         """INSERT INTO rollout_test_runs(
                evidence_key, source_digest, line_number, session_key, observed_at, turn_key,
@@ -102,16 +131,13 @@ def persist_test_evidence(
                retry_kind, attempt_ordinal, provenance, completeness)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', 1, 'derived', ?)
            ON CONFLICT(evidence_key) DO UPDATE SET
-             observed_at = CASE WHEN excluded.completeness = 'complete' THEN excluded.observed_at
-                                ELSE rollout_test_runs.observed_at END,
-             exit_status = CASE WHEN excluded.completeness = 'complete' THEN excluded.exit_status
-                                ELSE rollout_test_runs.exit_status END,
-             outcome = CASE WHEN excluded.completeness = 'complete' THEN excluded.outcome
-                            ELSE rollout_test_runs.outcome END,
-             failure_cause = CASE WHEN excluded.completeness = 'complete' THEN excluded.failure_cause
-                                  ELSE rollout_test_runs.failure_cause END,
-             completeness = CASE WHEN excluded.completeness = 'complete' THEN excluded.completeness
-                                 ELSE rollout_test_runs.completeness END""",
+             source_digest=excluded.source_digest,line_number=excluded.line_number,
+             session_key=excluded.session_key,observed_at=excluded.observed_at,
+             turn_key=excluded.turn_key,tool_call_key=excluded.tool_call_key,
+             command_hash=excluded.command_hash,runner=excluded.runner,scope=excluded.scope,
+             exit_status=excluded.exit_status,outcome=excluded.outcome,
+             failure_cause=excluded.failure_cause,retry_kind='none',attempt_ordinal=1,
+             provenance=excluded.provenance,completeness=excluded.completeness""",
         (
             intent.evidence_key, intent.source_digest, intent.line_number, intent.session_key,
             observed_at or intent.observed_at, intent.turn_key, intent.tool_call_key,
@@ -207,6 +233,7 @@ class TestEvidenceBuffer:
         self.pseudonymize = pseudonymize
         self.intents: dict[str, tuple[TestIntent, str]] = {}
         self.results: dict[str, tuple[StructuredTestResult, str | None]] = {}
+        self.rejected: set[str] = set()
 
     def intent(
         self,
@@ -220,6 +247,8 @@ class TestEvidenceBuffer:
         turn_key: str | None,
         tool_call_key: str,
     ) -> bool:
+        if logical_call_id in self.rejected:
+            return False
         runner, scope = classify_test_command(command)
         if runner == "unknown":
             return False
@@ -237,10 +266,53 @@ class TestEvidenceBuffer:
         return True
 
     def result(self, logical_call_id: str, output: object, observed_at: str | None) -> None:
+        if logical_call_id in self.rejected:
+            return
         self.results[logical_call_id] = (parse_structured_result(output), observed_at)
+
+    def _delete_rejected(self, session_key: str, tool_call_key: str) -> None:
+        incoming_authority = SOURCE_AUTHORITY[
+            source_family(self.connection, self.source_digest)
+        ]
+        rows = self.connection.execute(
+            "SELECT evidence_key,source_digest FROM rollout_test_runs "
+            "WHERE session_key=? AND tool_call_key=?",
+            (session_key, tool_call_key),
+        ).fetchall()
+        for evidence_key, source_digest in rows:
+            existing_authority = SOURCE_AUTHORITY[
+                source_family(self.connection, str(source_digest))
+            ]
+            if existing_authority <= incoming_authority:
+                self.connection.execute(
+                    "DELETE FROM rollout_test_runs WHERE evidence_key=?",
+                    (evidence_key,),
+                )
+
+    def _has_app_terminal_rejection(self, intent: TestIntent) -> bool:
+        if source_family(self.connection, self.source_digest) != "app_server":
+            return False
+        return self.connection.execute(
+            """SELECT 1 FROM codex_events
+                 WHERE session_key=? AND tool_call_key=? AND tool_phase='completed'
+                   AND tool_status NOT IN ('completed','success') LIMIT 1""",
+            (intent.session_key, intent.tool_call_key),
+        ).fetchone() is not None
+
+    def reject(
+        self, logical_call_id: str, *, session_key: str, tool_call_key: str,
+    ) -> None:
+        """Discard an App command whose terminal state proves no completed run."""
+        self.rejected.add(logical_call_id)
+        self.intents.pop(logical_call_id, None)
+        self.results.pop(logical_call_id, None)
+        self._delete_rejected(session_key, tool_call_key)
 
     def flush(self) -> None:
         for logical_call_id, (intent, model_call_id) in self.intents.items():
+            if logical_call_id in self.rejected or self._has_app_terminal_rejection(intent):
+                self._delete_rejected(intent.session_key, intent.tool_call_key)
+                continue
             result, observed_at = self.results.get(logical_call_id, (unknown_result(), intent.observed_at))
             persist_test_evidence(self.connection, intent, result, observed_at=observed_at)
             model_cause = self.model_causes.get(model_call_id)

@@ -21,7 +21,7 @@ def _tokens(command: str) -> tuple[str, ...] | None:
         or "<" in command
         or "(" in command
         or ")" in command
-        or any(operator in command for operator in (">|", ">&", "&>"))
+        or any(operator in command for operator in (">|", ">&", "&>", ">!"))
         or any(marker in command for marker in _EXPANSION_MARKERS)
     ):
         return None

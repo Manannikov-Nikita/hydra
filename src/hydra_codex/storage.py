@@ -16,6 +16,7 @@ from .migrations_b2 import B2_MIGRATIONS
 from .migrations_c3 import C3_MIGRATIONS, C3_REQUIRED_SCHEMA
 from .migrations_d4 import D4_MIGRATIONS, D4_REQUIRED_SCHEMA
 from .migrations_e5 import E5_MIGRATIONS, E5_REQUIRED_SCHEMA
+from .migrations_f6 import F6_MIGRATIONS, F6_REQUIRED_SCHEMA
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -255,7 +256,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS
 
 
 class HydraStore:
@@ -351,6 +352,7 @@ class HydraStore:
         required.update(C3_REQUIRED_SCHEMA)
         required.update(D4_REQUIRED_SCHEMA)
         required.update(E5_REQUIRED_SCHEMA)
+        required.update(F6_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):

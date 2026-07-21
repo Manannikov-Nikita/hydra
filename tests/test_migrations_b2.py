@@ -157,6 +157,15 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                             self.assertEqual(store.connection.execute(
                                 "SELECT terminal_state FROM tool_spans WHERE call_key='legacy-call'"
                             ).fetchone()[0], "success")
+                            self.assertEqual(store.connection.execute(
+                                """SELECT COUNT(*) FROM tool_span_candidates
+                                     WHERE call_key='legacy-call'"""
+                            ).fetchone()[0], 2)
+                            self.assertEqual(store.connection.execute(
+                                """SELECT terminal_state FROM tool_span_candidates
+                                     WHERE call_key='legacy-call'
+                                       AND candidate_kind='legacy_values'"""
+                            ).fetchone()[0], "success")
                         if version >= 13:
                             self.assertEqual(store.connection.execute(
                                 "SELECT outcome FROM rollout_test_runs WHERE evidence_key='legacy-evidence'"
@@ -184,6 +193,50 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             connection.close()
             with self.assertRaises(StorageUnavailable):
                 HydraStore(drifted)
+
+    def test_tool_candidate_migration_normalizes_legacy_app_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "legacy-app-tool-status.sqlite3"
+            build_schema(database, MIGRATIONS[-2][0])
+            connection = sqlite3.connect(database)
+            try:
+                connection.executemany(
+                    """INSERT INTO tool_spans(
+                           session_key,call_key,category,terminal_state,latency_ms,
+                           tool_name,completeness,provenance)
+                       VALUES ('legacy-rollout-session',?,'tool',?,1,
+                               'exec_command','complete',?)""",
+                    (
+                        ("legacy-completed", "completed", "exact"),
+                        ("legacy-declined", "declined", "exact"),
+                        ("legacy-estimated", "completed", "estimated"),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore(database)
+            try:
+                rows = [tuple(row) for row in store.connection.execute(
+                    """SELECT call_key,terminal_state FROM tool_span_candidates
+                         WHERE candidate_kind='legacy_values'
+                           AND call_key LIKE 'legacy-%'
+                         ORDER BY call_key"""
+                )]
+                self.assertEqual(rows, [
+                    ("legacy-call", "success"),
+                    ("legacy-completed", "success"),
+                    ("legacy-declined", "failed"),
+                    ("legacy-estimated", "success"),
+                ])
+                self.assertEqual(store.connection.execute(
+                    """SELECT provenance FROM tool_span_candidates
+                         WHERE call_key='legacy-estimated'
+                           AND candidate_kind='legacy_values'"""
+                ).fetchone()[0], "estimated")
+            finally:
+                store.close()
 
     def test_interrupted_migration_rolls_back_and_clean_retry_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

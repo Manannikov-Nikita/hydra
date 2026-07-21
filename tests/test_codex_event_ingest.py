@@ -762,7 +762,8 @@ class CodexEventPersistenceTests(unittest.TestCase):
 
         task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
         self.assertEqual(task.status, "complete")
-        self.assertIsNone(task.metrics.recorded.input.value)
+        self.assertEqual(task.metrics.recorded.input.value, 100)
+        self.assertEqual(task.metrics.recorded.input.known_lower_bound, 100)
         self.assertIn(
             "post_cutoff_timestamp_missing_token:1", task.metrics.recorded.caveats,
         )
@@ -1017,6 +1018,25 @@ class CodexEventPersistenceTests(unittest.TestCase):
                 }},
             },
         )
+        rows += tuple(
+            {
+                "received_at": f"2024-07-03T09:46:40.{400 + index * 100:06d}Z",
+                "message": {
+                    "method": "item/completed", "params": {
+                        "threadId": "official-parent", "turnId": "official-turn",
+                        "item": {
+                            "id": f"patch-{status}", "type": "fileChange",
+                            "changes": [{
+                                "path": f"src/{status}.py", "kind": "update",
+                                "diff": "private unsuccessful diff",
+                            }],
+                            "status": status,
+                        },
+                    },
+                },
+            }
+            for index, status in enumerate(("failed", "declined", "cancelled", "interrupted"))
+        )
         source.write_text(
             "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
             encoding="utf-8",
@@ -1069,6 +1089,23 @@ class CodexEventPersistenceTests(unittest.TestCase):
                     "output": json.dumps({"exit_code": 0, "output": "rollout output"}),
                 },
             },
+            {
+                "timestamp": "2024-07-03T09:46:40.210000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call", "call_id": "shared-file-call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "cat src/a.py"}),
+                },
+            },
+            {
+                "timestamp": "2024-07-03T09:46:40.220000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output", "call_id": "shared-file-call",
+                    "output": json.dumps({"exit_code": 0, "output": "rollout file"}),
+                },
+            },
         )
         rollout.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in rollout_rows),
@@ -1079,25 +1116,373 @@ class CodexEventPersistenceTests(unittest.TestCase):
         )
 
         app = self.base / "hybrid-app.jsonl"
+        app_rows = (
+            {
+                "received_at": "2024-07-03T09:46:40.300000Z",
+                "message": {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": session, "turnId": "hybrid-turn",
+                        "item": {
+                            "id": call_id, "type": "commandExecution",
+                            "command": command, "cwd": str(self.project),
+                            "status": "completed", "exitCode": 0,
+                            "aggregatedOutput": "app output",
+                        },
+                    },
+                },
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.310000Z",
+                "message": {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": session, "turnId": "hybrid-turn",
+                        "item": {
+                            "id": "shared-file-call", "type": "commandExecution",
+                            "command": "cat src/a.py", "cwd": str(self.project),
+                            "status": "completed", "exitCode": 0,
+                            "aggregatedOutput": "app file",
+                        },
+                    },
+                },
+            },
+        )
+        app.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in app_rows),
+            encoding="utf-8",
+        )
+        self.ingest(CodexEventSource(app, APP_SERVER_V2))
+
+        self.assertEqual(self.store.count("tool_spans"), 2)
+        self.assertEqual(self.store.count("rollout_test_runs"), 1)
+        self.assertEqual(self.store.count("file_observations"), 1)
+
+    def test_app_file_facts_require_proven_successful_terminal_items(self) -> None:
+        source = self.base / "app-file-success.jsonl"
+        items = (
+            ("good-read", "commandExecution", "completed", 0, "src/good.py"),
+            ("nonzero-read", "commandExecution", "completed", 1, "src/nonzero.py"),
+            ("failed-read", "commandExecution", "failed", 0, "src/failed.py"),
+            ("good-write", "fileChange", "success", None, "src/good-write.py"),
+            ("failed-write", "fileChange", "failed", None, "src/failed-write.py"),
+        )
+        rows = []
+        for index, (call_id, kind, status, exit_code, path) in enumerate(items):
+            item: dict[str, object] = {
+                "id": call_id, "type": kind, "status": status,
+            }
+            if kind == "commandExecution":
+                item.update({
+                    "command": f"cat {path}", "cwd": str(self.project),
+                    "exitCode": exit_code,
+                })
+            else:
+                item["changes"] = [{"path": path, "kind": "update"}]
+            rows.append({
+                "received_at": f"2024-07-03T09:46:41.{index:06d}Z",
+                "message": {"method": "item/completed", "params": {
+                    "threadId": "file-success-thread", "turnId": "file-success-turn",
+                    "item": item,
+                }},
+            })
+        source.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                "SELECT operation,relative_path FROM file_observations ORDER BY relative_path"
+            )],
+            [("write", "src/good-write.py"), ("read", "src/good.py")],
+        )
+
+    def test_cross_adapter_file_dedup_keeps_earliest_terminal_timestamp(self) -> None:
+        session = "shared-file-thread"
+        call_id = "shared-file-call"
+        app = self.base / "shared-file-app-first.jsonl"
+        app.write_text(json.dumps({
+            "received_at": "2024-07-03T09:46:40.300000Z",
+            "message": {"method": "item/completed", "params": {
+                "threadId": session, "turnId": "app-turn",
+                "item": {
+                    "id": call_id, "type": "commandExecution",
+                    "command": "cat src/shared.py", "cwd": str(self.project),
+                    "status": "completed", "exitCode": 0,
+                },
+            }},
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        self.ingest(CodexEventSource(app, APP_SERVER_V2))
+
+        rollout = self.base / "shared-file-rollout-second.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:40Z", "type": "session_meta",
+                    "payload": {"id": session, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.100000Z", "type": "response_item",
+                    "payload": {
+                        "type": "function_call", "call_id": call_id,
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": "cat src/shared.py"}),
+                    },
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.200000Z", "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output", "call_id": call_id,
+                        "output": json.dumps({"exit_code": 0}),
+                    },
+                },
+            )
+        ), encoding="utf-8")
+        ingest_rollouts(
+            self.store, (rollout,), self.project, PROJECT, hash_key=KEY,
+        )
+
+        row = self.store.connection.execute(
+            "SELECT observed_at,line_number,relative_path FROM file_observations"
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            ("2024-07-03T09:46:40.200000Z", 0, "src/shared.py"),
+        )
+        self.assertEqual(self.store.count("file_observations"), 1)
+
+    def test_app_unsuccessful_terminal_commands_are_not_executed_test_runs(self) -> None:
+        source = self.base / "unsuccessful-test-commands.jsonl"
+        rows = tuple(
+            {
+                "received_at": f"2024-07-03T09:46:40.{index:06d}Z",
+                "message": {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "unsuccessful-test-thread",
+                        "turnId": "unsuccessful-test-turn",
+                        "item": {
+                            "id": f"test-{status}",
+                            "type": "commandExecution",
+                            "command": "pytest tests/test_never_executed.py",
+                            "cwd": str(self.project),
+                            "status": status,
+                            "exitCode": 1,
+                            "aggregatedOutput": "private terminal output",
+                        },
+                    },
+                },
+            }
+            for index, status in enumerate(
+                ("declined", "cancelled", "interrupted", "failed"), start=1,
+            )
+        )
+        source.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual(self.store.count("rollout_test_runs"), 0)
+
+    def test_split_app_decline_removes_started_test_in_both_ingest_orders(self) -> None:
+        call_id = "split-declined-test"
+        command = "pytest tests/test_declined.py"
+        start = self.app_source("declined-start", {
+            "received_at": "2024-07-03T09:46:40.100000Z",
+            "message": {
+                "method": "item/started",
+                "params": {
+                    "threadId": "declined-thread", "turnId": "declined-turn",
+                    "item": {
+                        "id": call_id, "type": "commandExecution",
+                        "command": command, "cwd": str(self.project),
+                        "status": "inProgress",
+                    },
+                },
+            },
+        })
+        terminal = self.app_source("declined-terminal", {
+            "received_at": "2024-07-03T09:46:40.200000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "declined-thread", "turnId": "declined-turn",
+                    "item": {
+                        "id": call_id, "type": "commandExecution",
+                        "command": command, "cwd": str(self.project),
+                        "status": "declined",
+                    },
+                },
+            },
+        })
+
+        for index, sources in enumerate(((start, terminal), (terminal, start)), start=1):
+            store = HydraStore(self.base / f"declined-order-{index}.sqlite3")
+            self.addCleanup(store.close)
+            for source in sources:
+                ingest_codex_events(
+                    store, (source,), self.project, PROJECT, hash_key=KEY,
+                )
+            self.assertEqual(store.count("rollout_test_runs"), 0)
+
+    def test_rollout_test_result_wins_app_conflict_in_both_ingest_orders(self) -> None:
+        session = "conflicting-test-thread"
+        call_id = "conflicting-test-call"
+        command = "pytest tests/test_conflict.py"
+        rollout = self.base / "conflicting-test-rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "session_meta",
+                    "payload": {"id": session, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.100000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call", "call_id": call_id,
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": command}),
+                    },
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.200000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output", "call_id": call_id,
+                        "output": json.dumps({
+                            "exit_code": 1, "stderr": "assertion failed",
+                        }),
+                    },
+                },
+            )
+        ), encoding="utf-8")
+        app = self.base / "conflicting-test-app.jsonl"
         app.write_text(json.dumps({
             "received_at": "2024-07-03T09:46:40.300000Z",
             "message": {
                 "method": "item/completed",
                 "params": {
-                    "threadId": session, "turnId": "hybrid-turn",
+                    "threadId": session, "turnId": "conflicting-test-turn",
                     "item": {
                         "id": call_id, "type": "commandExecution",
                         "command": command, "cwd": str(self.project),
                         "status": "completed", "exitCode": 0,
-                        "aggregatedOutput": "app output",
+                        "aggregatedOutput": "private app output",
                     },
                 },
             },
         }, sort_keys=True) + "\n", encoding="utf-8")
-        self.ingest(CodexEventSource(app, APP_SERVER_V2))
 
-        self.assertEqual(self.store.count("tool_spans"), 1)
-        self.assertEqual(self.store.count("rollout_test_runs"), 1)
+        observed: list[tuple[object, ...]] = []
+        for index, order in enumerate(("rollout-first", "app-first"), start=1):
+            store = HydraStore(self.base / f"conflict-{index}.sqlite3")
+            self.addCleanup(store.close)
+            if order == "rollout-first":
+                ingest_rollouts(store, (rollout,), self.project, PROJECT, hash_key=KEY)
+                ingest_codex_events(
+                    store, (CodexEventSource(app, APP_SERVER_V2),),
+                    self.project, PROJECT, hash_key=KEY,
+                )
+            else:
+                ingest_codex_events(
+                    store, (CodexEventSource(app, APP_SERVER_V2),),
+                    self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_rollouts(store, (rollout,), self.project, PROJECT, hash_key=KEY)
+            row = store.connection.execute(
+                "SELECT outcome,exit_status,failure_cause,source_digest FROM rollout_test_runs"
+            ).fetchone()
+            source_type = store.connection.execute(
+                "SELECT source_type FROM rollout_sources WHERE source_digest=?",
+                (row[3],),
+            ).fetchone()
+            observed.append((*tuple(row[:3]), source_type[0] if source_type else None))
+
+        self.assertEqual(observed, [
+            ("failed", 1, "product_failure", "jsonl"),
+            ("failed", 1, "product_failure", "jsonl"),
+        ])
+
+    def test_complete_app_result_fills_incomplete_rollout_in_both_ingest_orders(self) -> None:
+        session = "incomplete-rollout-test-thread"
+        call_id = "incomplete-rollout-test-call"
+        command = "pytest tests/test_completed_elsewhere.py"
+        rollout = self.base / "incomplete-test-rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "session_meta",
+                    "payload": {"id": session, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.100000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call", "call_id": call_id,
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": command}),
+                    },
+                },
+            )
+        ), encoding="utf-8")
+        app = self.base / "complete-test-app.jsonl"
+        app.write_text(json.dumps({
+            "received_at": "2024-07-03T09:46:40.300000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": session, "turnId": "complete-test-turn",
+                    "item": {
+                        "id": call_id, "type": "commandExecution",
+                        "command": command, "cwd": str(self.project),
+                        "status": "completed", "exitCode": 0,
+                        "aggregatedOutput": "private app output",
+                    },
+                },
+            },
+        }, sort_keys=True) + "\n", encoding="utf-8")
+
+        observed: list[tuple[object, ...]] = []
+        for index, order in enumerate(("rollout-first", "app-first"), start=1):
+            store = HydraStore(self.base / f"incomplete-conflict-{index}.sqlite3")
+            self.addCleanup(store.close)
+            if order == "rollout-first":
+                ingest_rollouts(store, (rollout,), self.project, PROJECT, hash_key=KEY)
+                ingest_codex_events(
+                    store, (CodexEventSource(app, APP_SERVER_V2),),
+                    self.project, PROJECT, hash_key=KEY,
+                )
+            else:
+                ingest_codex_events(
+                    store, (CodexEventSource(app, APP_SERVER_V2),),
+                    self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_rollouts(store, (rollout,), self.project, PROJECT, hash_key=KEY)
+            row = store.connection.execute(
+                """SELECT outcome,exit_status,failure_cause,completeness,source_digest
+                     FROM rollout_test_runs"""
+            ).fetchone()
+            source_format = store.connection.execute(
+                "SELECT source_format FROM codex_event_sources WHERE source_digest=?",
+                (row[4],),
+            ).fetchone()
+            observed.append((*tuple(row[:4]), source_format[0] if source_format else None))
+
+        self.assertEqual(observed, [
+            ("success", 0, "none", "complete", "app_server"),
+            ("success", 0, "none", "complete", "app_server"),
+        ])
 
     def test_malformed_and_schema_drift_persist_only_safe_issues(self) -> None:
         malformed = self.base / "malformed.jsonl"

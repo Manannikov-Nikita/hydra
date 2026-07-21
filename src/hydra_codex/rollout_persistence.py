@@ -32,14 +32,49 @@ def insert_diagnostic(
 def persist_file(
     connection: Any, source: str, line: int, session: str, operation: str, value: Any,
     project_root: Any, observed_at: str | None, turn_key: str | None,
+    *, observation_call_key: str | None = None,
 ) -> None:
     relative = path_key(value, project_root, opaque)
     if relative == "unknown":
         return
+    # App Server and rollout JSONL can describe the same logical tool call.  A
+    # stable, privacy-safe observation identity prevents those adapters from
+    # inflating read/write counts.  Keep the earliest terminal observation so
+    # ingestion order cannot move a fact past a task cutoff.
+    if observation_call_key is not None:
+        source = opaque(
+            "event", f"file-observation/{session}/{observation_call_key}",
+        )
+        line = 0
     connection.execute(
         """INSERT INTO file_observations(
                source_digest,line_number,session_key,operation,relative_path,path_hash,observed_at,turn_key)
-           VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(source_digest,line_number,operation,relative_path) DO UPDATE SET
+             observed_at=CASE
+               WHEN file_observations.observed_at IS NULL THEN excluded.observed_at
+               WHEN excluded.observed_at IS NULL THEN file_observations.observed_at
+               WHEN julianday(excluded.observed_at) < julianday(file_observations.observed_at)
+                 THEN excluded.observed_at
+               ELSE file_observations.observed_at
+             END,
+             turn_key=CASE
+               WHEN file_observations.observed_at IS NULL
+                    AND excluded.observed_at IS NOT NULL
+                 THEN COALESCE(excluded.turn_key,file_observations.turn_key)
+               WHEN excluded.observed_at IS NOT NULL
+                    AND julianday(excluded.observed_at) < julianday(file_observations.observed_at)
+                 THEN COALESCE(excluded.turn_key,file_observations.turn_key)
+               WHEN excluded.observed_at = file_observations.observed_at
+                    OR (excluded.observed_at IS NULL AND file_observations.observed_at IS NULL)
+                 THEN CASE
+                   WHEN file_observations.turn_key IS NULL THEN excluded.turn_key
+                   WHEN excluded.turn_key IS NULL THEN file_observations.turn_key
+                   WHEN excluded.turn_key < file_observations.turn_key THEN excluded.turn_key
+                   ELSE file_observations.turn_key
+                 END
+               ELSE COALESCE(file_observations.turn_key,excluded.turn_key)
+             END""",
         (source, line, session, operation, relative, opaque("path", relative), observed_at, turn_key),
     )
 

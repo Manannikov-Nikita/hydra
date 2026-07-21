@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .rollout_identity import opaque
-from .rollout_persistence import persist_file
 from .test_evidence import TestEvidenceBuffer
 from .tool_normalization import CUSTOM_EXEC_DIAGNOSTICS, normalize_custom_exec
 from .tool_spans import persist_tool_start
@@ -52,23 +51,14 @@ def persist_custom_tool_call(
             turn_key=turn_key, source_digest=source_digest, source_ordinal=source_ordinal,
             provenance="lower_bound",
         )
-        observations = call.file_observations or tuple(
-            (
-                "write" if call.safe_name == "apply_patch" else "read",
-                relative_path,
-            )
-            for relative_path in call.relative_paths
-        )
-        for operation, relative_path in observations:
-            persist_file(
-                connection, source_digest, source_ordinal, session_key, operation,
-                relative_path, project_root, observed_at, turn_key,
-            )
+        # The outer broker exposes only one aggregate outcome.  It cannot prove
+        # which nested invocation succeeded, so nested file operands remain
+        # transient normalization data and never become deterministic facts.
         if call.ephemeral_command is not None:
             test_evidence.intent(
                 logical_call_id=f"{call_id}:{index}", model_call_id=call_id,
                 command=call.ephemeral_command, session_key=session_key,
                 line_number=source_ordinal, observed_at=observed_at,
-                turn_key=turn_key, tool_call_key=outer_key,
+                turn_key=turn_key, tool_call_key=nested_key,
             )
     return diagnostic_count

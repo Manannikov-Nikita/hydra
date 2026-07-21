@@ -154,6 +154,8 @@ class ShellFileObservationTests(unittest.TestCase):
             "cat safe.txt >| private.txt",
             "cat safe.txt >& private.txt",
             "cat safe.txt &> private.txt",
+            "cat safe.txt >! private.txt",
+            "cat safe.txt >>! private.txt",
         )
 
         for command in commands:
@@ -353,7 +355,7 @@ class ShellFileObservationTests(unittest.TestCase):
                 1,
             )
 
-    def test_ingestion_is_idempotent_private_and_reports_only_derived_lower_bounds(self) -> None:
+    def test_custom_exec_ingestion_never_promotes_nested_file_operands(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             project = base / "project with spaces"
@@ -390,13 +392,7 @@ class ShellFileObservationTests(unittest.TestCase):
             observations = store.connection.execute(
                 "SELECT operation,relative_path FROM file_observations ORDER BY operation"
             ).fetchall()
-            self.assertEqual(
-                [tuple(row) for row in observations],
-                [
-                    ("read", "src/input file.py"),
-                    ("write", f"build/{private_fragment}.txt"),
-                ],
-            )
+            self.assertEqual([tuple(row) for row in observations], [])
             dump = "\n".join(store.connection.iterdump())
             self.assertNotIn("cat ", dump)
             self.assertNotIn(str(project), dump)
@@ -412,11 +408,11 @@ class ShellFileObservationTests(unittest.TestCase):
             )
             self.assertEqual(
                 (metrics.file_reads.value, metrics.file_reads.known_lower_bound),
-                (None, 1),
+                (None, 0),
             )
             self.assertEqual(
                 (metrics.file_writes.value, metrics.file_writes.known_lower_bound),
-                (None, 1),
+                (None, 0),
             )
             self.assertEqual(metrics.file_reads.provenance, "estimated")
             self.assertIn("observed_file_lower_bound", metrics.file_reads.caveats)

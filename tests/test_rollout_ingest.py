@@ -243,7 +243,7 @@ class RolloutIngestTests(unittest.TestCase):
             ("hydra", "instrumentation", "exact", "unknown", "complete"),
             ("mcp", "tool", "exact", "success", "complete"),
             ("web", "web", "exact", "success", "complete"),
-            ("exec_command", "tool", "exact", "unknown", "complete"),
+            ("exec_command", "tool", "exact", "success", "complete"),
         ])
         self.assertEqual(
             [tuple(row) for row in self.store.connection.execute(
@@ -258,6 +258,82 @@ class RolloutIngestTests(unittest.TestCase):
             "private-mcp.py", "private-web.py", "cat direct.py",
         ):
             self.assertNotIn(private_value, persisted)
+
+    def test_failed_shell_and_patch_results_do_not_emit_file_facts(self) -> None:
+        write_jsonl(self.root / "rollouts" / "failed-files.jsonl", [
+            v1("session_meta", {"id": "anon-failed-files", "cwd": str(self.project)}),
+            v1("response_item", {
+                "type": "function_call", "call_id": "failed-read", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat src/does-not-exist.py"}),
+            }, 1),
+            v1("response_item", {
+                "type": "function_call_output", "call_id": "failed-read",
+                "output": json.dumps({"exit_code": 1, "stderr": "not found"}),
+            }, 2),
+            v1("response_item", {
+                "type": "function_call", "call_id": "failed-patch", "name": "apply_patch",
+                "arguments": json.dumps({
+                    "patch": "*** Update File: src/not-written.py\n+not written",
+                }),
+            }, 3),
+            v1("event_msg", {
+                "type": "patch_apply_end", "call_id": "failed-patch", "success": False,
+                "changes": {"src/not-written.py": {"type": "modify"}},
+            }, 4),
+        ])
+
+        ingest_rollouts(
+            self.store, (self.root / "rollouts",), self.project, "project-synthetic",
+        )
+
+        self.assertEqual(self.store.count("file_observations"), 0)
+
+    def test_direct_file_facts_use_only_matching_success_terminal_timestamp(self) -> None:
+        write_jsonl(self.root / "rollouts" / "successful-files.jsonl", [
+            v1("session_meta", {"id": "anon-successful-files", "cwd": str(self.project)}),
+            # Output-first records are allowed, but still require an exact exit code.
+            v1("response_item", {
+                "type": "function_call_output", "call_id": "late-read",
+                "output": json.dumps({"exit_code": 0}),
+            }, 3),
+            v1("response_item", {
+                "type": "function_call", "call_id": "late-read", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat src/late.py"}),
+            }, 2),
+            v1("response_item", {
+                "type": "function_call", "call_id": "unstructured", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat src/unstructured.py"}),
+            }, 4),
+            v1("response_item", {
+                "type": "function_call_output", "call_id": "unstructured",
+                "output": "Script completed without a structured exit",
+            }, 5),
+            v1("response_item", {
+                "type": "function_call", "call_id": "successful-patch", "name": "apply_patch",
+                "arguments": json.dumps({
+                    "patch": "*** Update File: src/patched.py\n+patched",
+                }),
+            }, 6),
+            v1("event_msg", {
+                "type": "patch_apply_end", "call_id": "successful-patch", "success": True,
+                "changes": {"src/patched.py": {"type": "modify"}},
+            }, 7),
+        ])
+
+        ingest_rollouts(
+            self.store, (self.root / "rollouts",), self.project, "project-synthetic",
+        )
+
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                "SELECT operation,relative_path,observed_at,line_number "
+                "FROM file_observations ORDER BY relative_path"
+            )],
+            [
+                ("read", "src/late.py", "2026-07-20T00:00:03Z", 0),
+                ("write", "src/patched.py", "2026-07-20T00:00:07Z", 0),
+            ],
+        )
 
     def test_tool_span_persistence_joins_both_event_orders_and_creates_end_only_rows(self) -> None:
         write_jsonl(self.root / "rollouts" / "tool-orders.jsonl", [
@@ -319,9 +395,7 @@ class RolloutIngestTests(unittest.TestCase):
         ])
         self.assertNotIn(raw_program, "\n".join(self.store.connection.iterdump()))
         self.assertNotIn(raw_output, "\n".join(self.store.connection.iterdump()))
-        self.assertIn(("write", "src/safe.py"), [tuple(row) for row in self.store.connection.execute(
-            "SELECT operation, relative_path FROM file_observations"
-        )])
+        self.assertEqual(self.store.count("file_observations"), 0)
 
     def test_test_detection_and_model_cause_conflict_use_deterministic_evidence(self) -> None:
         self.assertEqual(classify_test_command("python -m pytest"), ("pytest", "full"))

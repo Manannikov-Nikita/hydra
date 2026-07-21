@@ -28,13 +28,28 @@ def _app_row_key(item: tuple[object, ...]) -> tuple[str, int]:
 def _selected_app_rows(
     candidates: list[tuple[object, ...]],
 ) -> set[tuple[str, int]]:
-    """Keep an ordered cumulative history when every App receipt is timestamped."""
+    """Keep cutoff-safe history without globally ordering incomparable streams."""
     timestamped = [
         (canonical_timestamp(item[1]).epoch, item)
         for item in candidates
     ]
     if any(epoch is None for epoch, _item in timestamped):
-        return {_app_row_key(max(candidates, key=_app_winner))}
+        # Source ordinals are meaningful only inside one immutable JSONL stream.
+        # Pick one stream deterministically, then retain its cumulative history
+        # so a trusted completion cutoff can still use a proven earlier value.
+        selected_source = str(max(candidates, key=_app_winner)[7])
+        source_rows = sorted(
+            (item for item in candidates if str(item[7]) == selected_source),
+            key=lambda item: int(item[8]),
+        )
+        selected: set[tuple[str, int]] = set()
+        previous: tuple[int, int, int, int] | None = None
+        for item in source_rows:
+            vector = _app_vector(item)
+            if vector != previous:
+                selected.add(_app_row_key(item))
+            previous = vector
+        return selected
 
     by_instant: dict[float, list[tuple[object, ...]]] = {}
     for epoch, item in timestamped:

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
-import hmac
 import json
 from pathlib import Path
 from typing import Any, Mapping
+
+from .rollout_identity import Pseudonymizer
 
 
 APP_SERVER_V2 = "codex.app-server/v2"
@@ -39,7 +39,8 @@ class EventAdapterError(ValueError):
 
 
 def _digest(key: bytes, domain: str, value: bytes) -> str:
-    return hmac.new(key, b"hydra/codex-event/" + domain.encode() + b"/" + value, hashlib.sha256).hexdigest()
+    canonical_domain = "event" if domain == "event" else "diagnostic"
+    return Pseudonymizer(key).digest(canonical_domain, f"{domain}/{value.hex()}")
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -132,7 +133,8 @@ class CodexEventBatch:
 
 
 def _opaque(key: bytes, domain: str, value: Any) -> str | None:
-    return _digest(key, domain, value.encode("utf-8")) if isinstance(value, str) and value else None
+    canonical = {"thread": "identity", "turn": "turn", "call": "call"}
+    return Pseudonymizer(key).digest(canonical[domain], value) if isinstance(value, str) and value else None
 
 
 def _nonnegative(value: Any) -> int | None:
@@ -149,11 +151,19 @@ def _epoch_ns(value: int, divisor: int) -> tuple[str, int]:
     return text, nanoseconds
 
 
+def _safe_epoch_ns(value: int, divisor: int) -> tuple[str, int] | None:
+    try:
+        return _epoch_ns(value, divisor)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _app_timestamp(method: str, params: Mapping[str, Any]) -> tuple[str | None, int | None, bool]:
     millisecond_field = "startedAtMs" if method == "item/started" else "completedAtMs" if method == "item/completed" else None
     if millisecond_field is not None:
         value = _nonnegative(params.get(millisecond_field))
-        return (*_epoch_ns(value, 1_000_000), False) if value is not None else (None, None, True)
+        converted = _safe_epoch_ns(value, 1_000_000) if value is not None else None
+        return (*converted, False) if converted is not None else (None, None, True)
     turn = params.get("turn")
     if isinstance(turn, Mapping) and method in {"turn/started", "turn/completed"}:
         field = "startedAt" if method == "turn/started" else "completedAt"
@@ -161,11 +171,13 @@ def _app_timestamp(method: str, params: Mapping[str, Any]) -> tuple[str | None, 
         if raw is None:
             return None, None, False
         value = _nonnegative(raw)
-        return (*_epoch_ns(value, 1_000_000_000), False) if value is not None else (None, None, True)
+        converted = _safe_epoch_ns(value, 1_000_000_000) if value is not None else None
+        return (*converted, False) if converted is not None else (None, None, True)
     thread = params.get("thread")
     if method == "thread/started" and isinstance(thread, Mapping):
         value = _nonnegative(thread.get("createdAt"))
-        return (*_epoch_ns(value, 1_000_000_000), False) if value is not None else (None, None, True)
+        converted = _safe_epoch_ns(value, 1_000_000_000) if value is not None else None
+        return (*converted, False) if converted is not None else (None, None, True)
     return None, None, False
 
 
@@ -378,7 +390,11 @@ def _parse_otel(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tupl
     if numeric_time < 0:
         issues.append("invalid_timestamp")
     else:
-        observed_at, observed_ns = _epoch_ns(numeric_time, 1)
+        converted = _safe_epoch_ns(numeric_time, 1)
+        if converted is None:
+            issues.append("invalid_timestamp")
+        else:
+            observed_at, observed_ns = converted
     event_kind = attributes.get("event.kind") or attributes.get("event_kind")
     snapshots: tuple[TokenSnapshotFact, ...] = ()
     if event_name in {"codex.sse_event", "codex.websocket_event"} and event_kind == "response.completed":

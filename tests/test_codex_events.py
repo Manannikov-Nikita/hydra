@@ -13,6 +13,7 @@ from hydra_codex.codex_events import (
     EventAdapterError,
     read_codex_event_jsonl,
 )
+from hydra_codex.rollout_identity import Pseudonymizer
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex_events"
@@ -33,6 +34,9 @@ class CodexEventAdapterTests(unittest.TestCase):
         self.assertTrue(all(event.provenance == "exact" for event in batch.events))
         self.assertNotEqual(batch.events[0].thread_key, "fixture-thread-a")
         self.assertNotEqual(batch.events[0].turn_key, "fixture-turn-a")
+        canonical = Pseudonymizer(KEY)
+        self.assertEqual(batch.events[0].thread_key, canonical.digest("identity", "fixture-thread-a"))
+        self.assertEqual(batch.events[0].turn_key, canonical.digest("turn", "fixture-turn-a"))
 
         started, completed = batch.events[1:3]
         self.assertEqual(started.observed_at, "2024-07-03T09:46:41.200000Z")
@@ -43,6 +47,7 @@ class CodexEventAdapterTests(unittest.TestCase):
         self.assertEqual(completed.tool.duration_ms, 300)
         self.assertEqual(completed.tool.exit_status, 0)
         self.assertEqual(completed.tool.call_key, started.tool.call_key)
+        self.assertEqual(completed.tool.call_key, canonical.digest("call", "fixture-call-a"))
 
         usage = batch.events[3]
         self.assertEqual(len(usage.token_snapshots), 2)
@@ -226,6 +231,35 @@ class CodexEventAdapterTests(unittest.TestCase):
 
         self.assertEqual([issue.code for issue in app.issues], ["invalid_envelope", "invalid_envelope"])
         self.assertEqual([issue.code for issue in otel.issues], ["invalid_envelope", "invalid_attributes"])
+
+    def test_huge_timestamps_and_duplicate_otel_attributes_fail_closed_without_aborting(self) -> None:
+        huge = 10**100
+        app_lines = [
+            {"method": "item/completed", "params": {"threadId": "thread", "turnId": "turn", "completedAtMs": huge, "item": {"id": "message", "type": "agentMessage", "text": "private app content"}}},
+            {"method": "turn/started", "params": {"threadId": "thread", "turn": {"id": "turn", "items": [], "startedAt": 1720000000, "status": "inProgress"}}},
+        ]
+        duplicate = {
+            "timeUnixNano": str(huge), "body": {"stringValue": "codex.user_prompt"},
+            "attributes": [
+                {"key": "prompt", "value": {"stringValue": "private first"}},
+                {"key": "prompt", "value": {"stringValue": "private second"}},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            app_path = Path(directory) / "app.jsonl"
+            app_path.write_text("\n".join(json.dumps(item) for item in app_lines) + "\n", encoding="utf-8")
+            app = read_codex_event_jsonl(app_path, schema=APP_SERVER_V2, privacy_key=KEY)
+            otel_path = Path(directory) / "otel.jsonl"
+            otel_path.write_text(json.dumps(duplicate) + "\n", encoding="utf-8")
+            otel = read_codex_event_jsonl(otel_path, schema=OTEL_LOG_V1, privacy_key=KEY)
+
+        self.assertEqual([issue.code for issue in app.issues], ["invalid_timestamp"])
+        self.assertEqual([event.source_ordinal for event in app.events], [1, 2])
+        self.assertIsNone(app.events[0].observed_at)
+        self.assertEqual([issue.code for issue in otel.issues], ["invalid_attributes"])
+        serialized = json.dumps(asdict(app), sort_keys=True) + json.dumps(asdict(otel), sort_keys=True)
+        for raw in ("private app content", "private first", "private second"):
+            self.assertNotIn(raw, serialized)
 
 
 if __name__ == "__main__":

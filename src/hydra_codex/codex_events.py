@@ -33,6 +33,7 @@ _ISSUES = frozenset({
     "malformed_json", "invalid_encoding", "invalid_envelope", "unsupported_envelope",
     "invalid_timestamp", "invalid_attributes", "invalid_usage", "invalid_duration",
 })
+_MISSING = object()
 
 
 class EventAdapterError(ValueError):
@@ -169,6 +170,27 @@ class CodexEventBatch:
 def _opaque(key: bytes, domain: str, value: Any) -> str | None:
     canonical = {"thread": "identity", "turn": "turn", "call": "call"}
     return Pseudonymizer(key).digest(canonical[domain], value) if isinstance(value, str) and value else None
+
+
+def _coherent_alias(
+    outer: Mapping[str, Any], outer_name: str, nested_name: str,
+) -> tuple[str | None, bool, bool]:
+    """Return one coherent identity plus whether an alias was supplied/valid."""
+    outer_value = outer.get(outer_name, _MISSING)
+    nested_value: Any = _MISSING
+    if nested_name in outer:
+        nested = outer[nested_name]
+        if not isinstance(nested, Mapping) or "id" not in nested:
+            return None, True, False
+        nested_value = nested["id"]
+    supplied = tuple(value for value in (outer_value, nested_value) if value is not _MISSING)
+    if not supplied:
+        return None, False, True
+    if any(not isinstance(value, str) or not value for value in supplied):
+        return None, True, False
+    if len(supplied) == 2 and supplied[0] != supplied[1]:
+        return None, True, False
+    return str(supplied[0]), True, True
 
 
 def _nonnegative(value: Any) -> int | None:
@@ -344,30 +366,17 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     if method not in _APP_METHODS:
         return None, ("unsupported_envelope",)
     thread_object = params.get("thread") if isinstance(params.get("thread"), Mapping) else None
-    parameter_thread = params.get("threadId")
-    nested_thread = thread_object.get("id") if thread_object else None
-    if (
-        isinstance(parameter_thread, str)
-        and isinstance(nested_thread, str)
-        and parameter_thread != nested_thread
-    ):
+    thread, thread_present, valid_thread = _coherent_alias(
+        params, "threadId", "thread",
+    )
+    if not thread_present or not valid_thread:
         return None, ("invalid_envelope",)
-    thread = parameter_thread if isinstance(parameter_thread, str) else nested_thread
     turn = params.get("turn") if isinstance(params.get("turn"), Mapping) else None
-    parameter_turn = params.get("turnId")
-    nested_turn = turn.get("id") if turn else None
-    if (
-        isinstance(parameter_turn, str)
-        and isinstance(nested_turn, str)
-        and parameter_turn != nested_turn
-    ):
-        return None, ("invalid_envelope",)
-    turn_id = parameter_turn if isinstance(parameter_turn, str) else nested_turn
-    if not isinstance(thread, str) or not thread:
-        return None, ("invalid_envelope",)
-    if method in {"turn/started", "turn/completed", "item/started", "item/completed"} and (
-        not isinstance(turn_id, str) or not turn_id
-    ):
+    turn_id, turn_present, valid_turn = _coherent_alias(params, "turnId", "turn")
+    turn_required = method in {
+        "turn/started", "turn/completed", "item/started", "item/completed",
+    }
+    if not valid_turn or (turn_required and not turn_present):
         return None, ("invalid_envelope",)
     item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
     if method in {"item/started", "item/completed"} and (

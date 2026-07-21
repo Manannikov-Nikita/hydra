@@ -9,6 +9,7 @@ import unittest
 from hydra_codex.codex_event_ingest import CodexEventSource, ingest_codex_events
 from hydra_codex.codex_events import APP_SERVER_V2
 from hydra_codex.migrations_h8 import H8_MIGRATIONS
+from hydra_codex.reconcile_engine import reconcile_project
 from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.storage import HydraStore
 from hydra_codex.test_evidence import materialize_test_evidence, parse_structured_result
@@ -110,6 +111,20 @@ class StructuralTerminalRepairTests(unittest.TestCase):
                            'app_server',2,2)"""
             )
             connection.execute(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,session_key,
+                       canonical_revision_digest,lineage_state)
+                   VALUES ('legacy-logical','legacy-project','legacy-session',
+                           'legacy-normalized','clean')"""
+            )
+            connection.execute(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,
+                       line_count,byte_count,chain_digest,materialized)
+                   VALUES ('legacy-normalized','explicit','legacy-logical',
+                           'event_adapter',2,2,'legacy-app',1)"""
+            )
+            connection.execute(
                 """INSERT INTO test_evidence_candidates(
                        candidate_key,candidate_kind,evidence_key,source_digest,
                        line_number,session_key,observed_at,turn_key,tool_call_key,
@@ -125,7 +140,7 @@ class StructuralTerminalRepairTests(unittest.TestCase):
                        session_key,call_key,source_digest,source_ordinal,candidate_kind,
                        category,terminal_state,latency_ms,tool_name,started_at,
                        finished_at,turn_key,provenance)
-                   VALUES ('legacy-session','legacy-call','legacy-app',2,'end',
+                   VALUES ('legacy-session','legacy-call','legacy-normalized',1,'end',
                            'tool','unknown',NULL,'exec_command',NULL,
                            '2026-07-21T00:00:02Z','legacy-turn','exact')"""
             )
@@ -158,6 +173,98 @@ class StructuralTerminalRepairTests(unittest.TestCase):
                          FROM rollout_test_runs"""
                 ).fetchone()),
                 (None, "unknown", "unknown", "result_without_exit"),
+            )
+
+    def test_public_reconcile_repairs_already_v27_intent_after_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "already-v27.sqlite3"
+            store = HydraStore(database)
+            connection = store.connection
+            connection.execute(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,conversation_key)
+                   VALUES ('v27-session','v27-project','safe',1,'')"""
+            )
+            connection.execute(
+                """INSERT INTO codex_event_sources(
+                       source_digest,project_id,schema_version,source_format,
+                       line_count,byte_count)
+                   VALUES ('v27-app','v27-project','codex.app-server/v2',
+                           'app_server',1,1)"""
+            )
+            connection.execute(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,session_key,
+                       canonical_revision_digest,lineage_state)
+                   VALUES ('v27-logical','v27-project','v27-session',
+                           'v27-normalized','clean')"""
+            )
+            connection.execute(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,
+                       line_count,byte_count,chain_digest,materialized)
+                   VALUES ('v27-normalized','explicit','v27-logical','event_adapter',
+                           1,1,'v27-app',1)"""
+            )
+            connection.execute(
+                """INSERT INTO test_evidence_candidates(
+                       candidate_key,candidate_kind,evidence_key,source_digest,
+                       line_number,session_key,observed_at,turn_key,tool_call_key,
+                       command_hash,runner,scope,exit_status,outcome,failure_cause,
+                       provenance,completeness)
+                   VALUES ('v27-candidate','evidence','v27-evidence','v27-app',1,
+                           'v27-session',NULL,'v27-turn','v27-call','v27-command',
+                           'pytest','targeted',NULL,'unknown','unknown','derived',
+                           'intent_only')"""
+            )
+            connection.execute(
+                """INSERT INTO tool_span_candidates(
+                       session_key,call_key,source_digest,source_ordinal,candidate_kind,
+                       category,terminal_state,latency_ms,tool_name,started_at,
+                       finished_at,turn_key,provenance)
+                   VALUES ('v27-session','v27-call','v27-normalized',1,'end','tool',
+                           'unknown',NULL,'exec_command',NULL,
+                           '2026-07-21T00:00:01Z','v27-turn','exact')"""
+            )
+            connection.commit()
+            before = [
+                tuple(row) for row in connection.execute(
+                    """SELECT candidate_key,candidate_kind,evidence_key,source_digest,
+                              line_number,session_key,observed_at,turn_key,tool_call_key,
+                              command_hash,runner,scope,exit_status,outcome,failure_cause,
+                              provenance,completeness
+                         FROM test_evidence_candidates"""
+                )
+            ]
+            self.assertEqual(store.schema_version(), 27)
+            self.assertEqual(store.count("rollout_test_runs"), 0)
+            store.close()
+
+            reopened = HydraStore(database)
+            self.addCleanup(reopened.close)
+            self.assertEqual(reopened.schema_version(), 27)
+            self.assertEqual(reopened.count("rollout_test_runs"), 0)
+            reconcile_project(reopened, "v27-project", b"v" * 32)
+
+            self.assertEqual(
+                tuple(reopened.connection.execute(
+                    """SELECT exit_status,outcome,failure_cause,completeness
+                         FROM rollout_test_runs"""
+                ).fetchone()),
+                (None, "unknown", "unknown", "result_without_exit"),
+            )
+            self.assertEqual(
+                [
+                    tuple(row) for row in reopened.connection.execute(
+                        """SELECT candidate_key,candidate_kind,evidence_key,
+                                  source_digest,line_number,session_key,observed_at,
+                                  turn_key,tool_call_key,command_hash,runner,scope,
+                                  exit_status,outcome,failure_cause,provenance,
+                                  completeness
+                             FROM test_evidence_candidates"""
+                    )
+                ],
+                before,
             )
 
 
@@ -362,10 +469,7 @@ class PersistedTestEvidenceTests(unittest.TestCase):
                 )
             ])
 
-        self.assertEqual(observed, [
-            [("pytest", "full", "unknown", None, "unknown", "conflicted")],
-            [("pytest", "full", "unknown", None, "unknown", "conflicted")],
-        ])
+        self.assertEqual(observed, [[], []])
 
     def test_append_terminal_restores_persisted_intent_without_trusting_lower_command(self) -> None:
         session, call_id = "append-result-session", "append-result"

@@ -2162,7 +2162,7 @@ class CodexEventPersistenceTests(unittest.TestCase):
                 )
                 self.assertEqual(store.count("rollout_test_runs"), 0)
 
-    def test_split_app_terminal_without_repeated_command_restores_known_result(self) -> None:
+    def test_split_app_terminal_restores_known_result(self) -> None:
         start = self.app_source("split-known-start", {
             "received_at": "2024-07-03T09:46:40.100000Z",
             "message": {
@@ -2185,6 +2185,7 @@ class CodexEventPersistenceTests(unittest.TestCase):
                     "threadId": "split-known-thread", "turnId": "split-known-turn",
                     "item": {
                         "id": "split-known-call", "type": "commandExecution",
+                        "command": "pytest tests/test_split_known.py",
                         "status": "completed", "exitCode": 0,
                     },
                 },
@@ -2243,6 +2244,7 @@ class CodexEventPersistenceTests(unittest.TestCase):
                     "threadId": "reused-call-thread", "turnId": "reused-call-turn",
                     "item": {
                         "id": "reused-call", "type": "commandExecution",
+                        "command": "pytest tests/test_reused_call.py",
                         "status": "completed", "exitCode": 0,
                     },
                 },
@@ -2259,6 +2261,357 @@ class CodexEventPersistenceTests(unittest.TestCase):
             ).fetchone()),
             (0, "success", "none", "complete"),
         )
+
+    def test_later_completed_without_exit_overrides_earlier_cancellation(self) -> None:
+        start = self.app_source("cancel-then-complete-start", {
+            "received_at": "2024-07-03T09:46:40.100000Z",
+            "message": {
+                "method": "item/started",
+                "params": {
+                    "threadId": "cancel-then-complete-thread",
+                    "turnId": "cancel-then-complete-turn",
+                    "item": {
+                        "id": "cancel-then-complete-call",
+                        "type": "commandExecution",
+                        "command": "pytest tests/test_late_completion.py",
+                        "status": "inProgress",
+                    },
+                },
+            },
+        })
+        cancelled = self.app_source("cancel-then-complete-cancelled", {
+            "received_at": "2024-07-03T09:46:40.200000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "cancel-then-complete-thread",
+                    "turnId": "cancel-then-complete-turn",
+                    "item": {
+                        "id": "cancel-then-complete-call",
+                        "type": "commandExecution", "status": "cancelled",
+                    },
+                },
+            },
+        })
+        completed = self.app_source("cancel-then-complete-completed", {
+            "received_at": "2024-07-03T09:46:40.300000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "cancel-then-complete-thread",
+                    "turnId": "cancel-then-complete-turn",
+                    "item": {
+                        "id": "cancel-then-complete-call",
+                        "type": "commandExecution",
+                        "command": "pytest tests/test_late_completion.py",
+                        "status": "completed",
+                    },
+                },
+            },
+        })
+
+        orders = (
+            (start, cancelled, completed),
+            (completed, cancelled, start),
+            (cancelled, start, completed),
+        )
+        for index, sources in enumerate(orders, start=1):
+            with self.subTest(order=index):
+                store = HydraStore(self.base / f"cancel-then-complete-{index}.sqlite3")
+                self.addCleanup(store.close)
+                for source in sources:
+                    ingest_codex_events(
+                        store, (source,), self.project, PROJECT, hash_key=KEY,
+                    )
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        """SELECT exit_status,outcome,failure_cause,completeness
+                             FROM rollout_test_runs"""
+                    ).fetchone()),
+                    (None, "unknown", "unknown", "result_without_exit"),
+                )
+
+    def test_same_source_completion_overrides_earlier_cancellation(self) -> None:
+        source = self.base / "same-source-cancel-then-complete.jsonl"
+        source.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "received_at": "2024-07-03T09:46:40.100000Z",
+                    "message": {
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "same-source-thread",
+                            "turnId": "same-source-turn",
+                            "item": {
+                                "id": "same-source-call",
+                                "type": "commandExecution",
+                                "command": "pytest tests/test_same_source.py",
+                                "status": "inProgress",
+                            },
+                        },
+                    },
+                },
+                {
+                    "received_at": "2024-07-03T09:46:40.200000Z",
+                    "message": {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "same-source-thread",
+                            "turnId": "same-source-turn",
+                            "item": {
+                                "id": "same-source-call",
+                                "type": "commandExecution",
+                                "status": "cancelled",
+                            },
+                        },
+                    },
+                },
+                {
+                    "received_at": "2024-07-03T09:46:40.300000Z",
+                    "message": {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "same-source-thread",
+                            "turnId": "same-source-turn",
+                            "item": {
+                                "id": "same-source-call",
+                                "type": "commandExecution",
+                                "command": "pytest tests/test_same_source.py",
+                                "status": "completed",
+                            },
+                        },
+                    },
+                },
+            )
+        ), encoding="utf-8")
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT exit_status,outcome,failure_cause,completeness
+                     FROM rollout_test_runs"""
+            ).fetchone()),
+            (None, "unknown", "unknown", "result_without_exit"),
+        )
+
+    def test_terminal_fallback_refuses_conflicting_command_identity(self) -> None:
+        session = "conflicting-command-thread"
+        call_id = "reused-command-call"
+        rollout = self.base / "conflicting-command-rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "session_meta",
+                    "payload": {"id": session, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.100000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call", "call_id": call_id,
+                        "name": "exec_command",
+                        "arguments": json.dumps({
+                            "cmd": "pytest tests/test_original_identity.py",
+                        }),
+                    },
+                },
+            )
+        ), encoding="utf-8")
+
+        def app_source(name: str, command: str) -> CodexEventSource:
+            path = self.base / f"{name}.jsonl"
+            path.write_text("".join(
+                json.dumps(row, sort_keys=True) + "\n"
+                for row in (
+                    {
+                        "received_at": "2024-07-03T09:46:40.200000Z",
+                        "message": {
+                            "method": "item/started",
+                            "params": {
+                                "threadId": session, "turnId": "command-turn",
+                                "item": {
+                                    "id": call_id, "type": "commandExecution",
+                                    "command": command, "status": "inProgress",
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "received_at": "2024-07-03T09:46:40.300000Z",
+                        "message": {
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": session, "turnId": "command-turn",
+                                "item": {
+                                    "id": call_id, "type": "commandExecution",
+                                    "command": command, "status": "completed",
+                                    "exitCode": 0,
+                                },
+                            },
+                        },
+                    },
+                )
+            ), encoding="utf-8")
+            return CodexEventSource(path, APP_SERVER_V2)
+
+        cases = (
+            ("echo not-a-test", "non-test"),
+            ("pytest tests/test_different_identity.py", "different-test"),
+        )
+        for command, label in cases:
+            app = app_source(f"conflicting-command-{label}", command)
+            for order in ("rollout-first", "app-first"):
+                with self.subTest(command=label, order=order):
+                    store = HydraStore(
+                        self.base / f"conflicting-command-{label}-{order}.sqlite3"
+                    )
+                    self.addCleanup(store.close)
+                    if order == "rollout-first":
+                        ingest_rollouts(
+                            store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                        )
+                        ingest_codex_events(
+                            store, (app,), self.project, PROJECT, hash_key=KEY,
+                        )
+                    else:
+                        ingest_codex_events(
+                            store, (app,), self.project, PROJECT, hash_key=KEY,
+                        )
+                        ingest_rollouts(
+                            store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                        )
+                    self.assertEqual(store.count("rollout_test_runs"), 0)
+                    self.assertGreaterEqual(
+                        store.connection.execute(
+                            """SELECT COUNT(DISTINCT command_hash)
+                                 FROM test_evidence_candidates
+                                WHERE session_key=? AND tool_call_key=?
+                                  AND candidate_kind IN ('description','evidence')""",
+                            (
+                                Pseudonymizer(KEY).digest("identity", session),
+                                Pseudonymizer(KEY).digest("call", call_id),
+                            ),
+                        ).fetchone()[0],
+                        2,
+                    )
+
+    def test_commandless_app_terminal_cannot_restore_rollout_command(self) -> None:
+        session = "restore-conflict-thread"
+        call_id = "restore-conflict-call"
+        rollout = self.base / "restore-conflict.rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "session_meta",
+                    "payload": {"id": session, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.100000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call", "call_id": call_id,
+                        "name": "exec_command",
+                        "arguments": json.dumps({
+                            "cmd": "pytest tests/test_authoritative.py",
+                        }),
+                    },
+                },
+            )
+        ), encoding="utf-8")
+        app_start = self.app_source("restore-conflict-start", {
+            "received_at": "2024-07-03T09:46:40.200000Z",
+            "message": {
+                "method": "item/started",
+                "params": {
+                    "threadId": session, "turnId": "restore-conflict-turn",
+                    "item": {
+                        "id": call_id, "type": "commandExecution",
+                        "command": "echo not-a-test", "status": "inProgress",
+                    },
+                },
+            },
+        })
+        app_completed = self.app_source("restore-conflict-completed", {
+            "received_at": "2024-07-03T09:46:40.300000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": session, "turnId": "restore-conflict-turn",
+                    "item": {
+                        "id": call_id, "type": "commandExecution",
+                        "status": "completed",
+                    },
+                },
+            },
+        })
+
+        for order in ("rollout-first", "app-first"):
+            with self.subTest(order=order):
+                store = HydraStore(self.base / f"restore-conflict-{order}.sqlite3")
+                self.addCleanup(store.close)
+                sources = (
+                    (("rollout", rollout), ("app", app_start))
+                    if order == "rollout-first"
+                    else (("app", app_start), ("rollout", rollout))
+                )
+                for kind, source in sources:
+                    if kind == "rollout":
+                        ingest_rollouts(
+                            store, (source,), self.project, PROJECT, hash_key=KEY,
+                        )
+                    else:
+                        ingest_codex_events(
+                            store, (source,), self.project, PROJECT, hash_key=KEY,
+                        )
+                ingest_codex_events(
+                    store, (app_completed,), self.project, PROJECT, hash_key=KEY,
+                )
+                self.assertEqual(store.count("rollout_test_runs"), 0)
+
+    def test_same_authority_completed_reused_call_is_ambiguous(self) -> None:
+        def completed_source(name: str, command: str) -> CodexEventSource:
+            return self.app_source(name, {
+                "received_at": "2024-07-03T09:46:40.300000Z",
+                "message": {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "same-authority-thread",
+                        "turnId": "same-authority-turn",
+                        "item": {
+                            "id": "same-authority-call",
+                            "type": "commandExecution", "command": command,
+                            "status": "completed", "exitCode": 0,
+                        },
+                    },
+                },
+            })
+
+        cases = (
+            ("pytest tests/test_first.py", "pytest tests/test_second.py"),
+            ("pytest tests/test_first.py", "echo not-a-test"),
+        )
+        for case_index, commands in enumerate(cases, start=1):
+            sources = tuple(
+                completed_source(f"same-authority-{case_index}-{index}", command)
+                for index, command in enumerate(commands, start=1)
+            )
+            for order_index, ordered in enumerate((sources, tuple(reversed(sources))), start=1):
+                with self.subTest(case=case_index, order=order_index):
+                    store = HydraStore(
+                        self.base / f"same-authority-{case_index}-{order_index}.sqlite3"
+                    )
+                    self.addCleanup(store.close)
+                    for source in ordered:
+                        ingest_codex_events(
+                            store, (source,), self.project, PROJECT, hash_key=KEY,
+                        )
+                    self.assertEqual(store.count("rollout_test_runs"), 0)
 
     def test_conflicting_nested_app_ids_are_rejected_before_lifecycle_persistence(self) -> None:
         rollout = self.base / "authoritative-abort.jsonl"
@@ -2367,6 +2720,84 @@ class CodexEventPersistenceTests(unittest.TestCase):
 
         self.assertEqual((report.events, report.issues), (2, 0))
         self.assertEqual(self.store.count("codex_events"), 2)
+
+    def test_present_malformed_nested_app_id_aliases_are_rejected(self) -> None:
+        source = self.base / "malformed-alias-types.jsonl"
+        source.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread",
+                        "thread": {"id": 7},
+                        "turn": {
+                            "id": "valid-turn", "status": "inProgress",
+                            "startedAt": 1720000000,
+                        },
+                    },
+                },
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread", "turnId": "valid-turn",
+                        "turn": {
+                            "id": ["invalid"], "status": "inProgress",
+                            "startedAt": 1720000001,
+                        },
+                    },
+                },
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread", "thread": 7,
+                        "turn": {
+                            "id": "valid-turn", "status": "inProgress",
+                            "startedAt": 1720000002,
+                        },
+                    },
+                },
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread", "turnId": "valid-turn",
+                        "turn": [],
+                    },
+                },
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread", "turnId": "valid-turn",
+                        "turn": None,
+                    },
+                },
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread", "thread": {},
+                        "turn": {
+                            "id": "valid-turn", "status": "inProgress",
+                            "startedAt": 1720000003,
+                        },
+                    },
+                },
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "valid-thread", "turnId": "valid-turn",
+                        "turn": {},
+                    },
+                },
+            )
+        ), encoding="utf-8")
+
+        report = self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual((report.events, report.issues), (0, 7))
+        self.assertEqual(self.store.count("codex_events"), 0)
+        dump = "\n".join(self.store.connection.iterdump())
+        self.assertNotIn("valid-thread", dump)
+        self.assertNotIn("valid-turn", dump)
 
     def test_malformed_and_schema_drift_persist_only_safe_issues(self) -> None:
         malformed = self.base / "malformed.jsonl"

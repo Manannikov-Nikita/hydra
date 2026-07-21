@@ -182,13 +182,16 @@ class ReconcileEngineTests(unittest.TestCase):
         self, session: str, line: int, second: int, failure: str,
     ) -> None:
         self.connection.execute(
-            """INSERT INTO rollout_test_runs(
-                   evidence_key,source_digest,line_number,session_key,observed_at,tool_call_key,
-                   command_hash,runner,scope,exit_status,outcome,failure_cause,retry_kind,
-                   attempt_ordinal,provenance,completeness)
-               VALUES (?,?,?,?,?,'call','command','pytest','targeted',1,'failed',?,
-                       'none',1,'derived','complete')""",
-            (f"test-{session}-{line}", f"source-{session}", line, session, stamp(second), failure),
+            """INSERT INTO test_evidence_candidates(
+                   candidate_key,candidate_kind,evidence_key,source_digest,line_number,
+                   session_key,observed_at,tool_call_key,command_hash,runner,scope,
+                   exit_status,outcome,failure_cause,provenance,completeness)
+               VALUES (?,'evidence',?,?,?,?,?,?,?,?,?,1,'failed',?,'derived','complete')""",
+            (
+                f"candidate-{session}-{line}", f"test-{session}-{line}",
+                f"source-{session}", line, session, stamp(second), f"call-{line}",
+                "command", "pytest", "targeted", failure,
+            ),
         )
 
     def test_reconcile_is_idempotent_orders_complete_and_incomplete_roots_and_respects_cutoffs(self) -> None:

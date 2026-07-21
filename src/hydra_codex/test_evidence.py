@@ -9,7 +9,11 @@ import sqlite3
 from typing import Any, Callable
 
 from .classifier import classify_test_command
-from .source_authority import SOURCE_AUTHORITY, source_family
+from .source_authority import (
+    SOURCE_AUTHORITY,
+    rollout_revision_identity,
+    source_family,
+)
 
 
 MODEL_CAUSES = frozenset({
@@ -161,6 +165,59 @@ def persist_non_execution(
     )
 
 
+def _bound_structural_terminals(
+    connection: sqlite3.Connection, matching: list[sqlite3.Row],
+    evidence_candidates: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    """Find terminal tool facts proven to describe a matching command fact.
+
+    App Server evidence is retained against the read-only source while tool-span
+    candidates use its normalized adapter source.  The adapter's chain digest,
+    exact source ordinal, session, and call key jointly bind those two facts.
+    A reused call key alone is deliberately insufficient.
+    """
+    terminals: dict[tuple[str, int], sqlite3.Row] = {}
+    for evidence in matching:
+        identity_hashes = {
+            str(candidate[9])
+            for candidate in evidence_candidates
+            if (
+                str(candidate[3]), int(candidate[4])
+            ) == (
+                str(evidence[3]), int(evidence[4])
+            )
+        }
+        if identity_hashes != {str(evidence[9])}:
+            continue
+        for terminal in connection.execute(
+            """SELECT terminal.source_digest,terminal.source_ordinal,
+                      terminal.finished_at,terminal.turn_key
+                 FROM tool_span_candidates AS terminal
+                 LEFT JOIN rollout_sources AS adapter
+                   ON adapter.source_digest=terminal.source_digest
+                WHERE terminal.session_key=? AND terminal.call_key=?
+                  AND terminal.candidate_kind='end'
+                  AND terminal.tool_name IN (
+                      'exec_command','nested_exec','function','unknown'
+                  )
+                  AND terminal.source_ordinal=?
+                  AND (
+                      terminal.source_digest=?
+                      OR (
+                          adapter.source_type='explicit'
+                          AND adapter.relation='event_adapter'
+                          AND adapter.chain_digest=?
+                      )
+                  )""",
+            (
+                str(evidence[5]), str(evidence[8]), int(evidence[4]),
+                str(evidence[3]), str(evidence[3]),
+            ),
+        ):
+            terminals[(str(terminal[0]), int(terminal[1]))] = terminal
+    return list(terminals.values())
+
+
 def materialize_test_evidence(connection: sqlite3.Connection) -> None:
     """Rebuild one canonical test run per session/tool call from immutable facts."""
     rows = list(connection.execute(
@@ -193,45 +250,29 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
 
         # Command classification is a description fact and therefore follows
         # source authority even when a lower-authority source supplies the only
-        # complete result.  The result itself is completeness-first.
-        description = max(descriptions, key=lambda row: _description_rank(connection, row))
+        # complete result.  Same-authority disagreement means a reused call
+        # identity is ambiguous and must not pick a command by digest order.
+        authority = max(
+            SOURCE_AUTHORITY[source_family(connection, str(row[3]))]
+            for row in descriptions
+        )
+        authoritative = [
+            row for row in descriptions
+            if SOURCE_AUTHORITY[source_family(connection, str(row[3]))] == authority
+        ]
+        if len({str(row[9]) for row in authoritative}) != 1:
+            continue
+        description = max(
+            authoritative, key=lambda row: _description_rank(connection, row),
+        )
         if description[1] != "evidence":
             continue
         matching = [row for row in evidence if row[9] == description[9]]
         completed = [row for row in matching if row[16] == "complete"]
         terminal = [row for row in matching if row[16] != "intent_only"]
-        mismatched_complete = any(
-            row[16] == "complete" and row[9] != description[9]
-            for row in evidence
+        structural_terminals = _bound_structural_terminals(
+            connection, matching, evidence,
         )
-        has_non_execution = any(row[1] == "non_execution" for row in candidates)
-        exact_results = list(connection.execute(
-            """SELECT source_digest,source_ordinal,observed_at,turn_key,
-                      tool_exit_status
-                 FROM codex_events
-                WHERE session_key=? AND tool_call_key=? AND tool_phase='completed'
-                  AND tool_exit_status IS NOT NULL""",
-            (session_key, tool_call_key),
-        ))
-        exact_result = max(
-            exact_results,
-            key=lambda row: (
-                SOURCE_AUTHORITY[source_family(connection, str(row[0]))],
-                int(row[1]), str(row[0]),
-            ),
-        ) if exact_results else None
-        # A stable exact exit proves that this command executed at least once;
-        # a separate cancellation receipt for the reused call key cannot erase
-        # that metric.  Cancellation-only structural ends remain non-execution.
-        if has_non_execution and not completed and exact_result is None:
-            continue
-        structural_terminals = list(connection.execute(
-            """SELECT source_digest,source_ordinal,finished_at,turn_key
-                 FROM tool_span_candidates
-                WHERE session_key=? AND call_key=? AND candidate_kind='end'
-                  AND tool_name IN ('exec_command','nested_exec','function','unknown')""",
-            (session_key, tool_call_key),
-        ))
         structural_terminal = max(
             structural_terminals,
             key=lambda row: (
@@ -239,26 +280,17 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
                 int(row[1]), str(row[0]),
             ),
         ) if structural_terminals else None
-        if (
-            not terminal and not mismatched_complete
-            and exact_result is None and structural_terminal is None
-        ):
+        # Execution is existential but command-bound.  A matching terminal can
+        # outlive an earlier cancellation, while a reused call key or another
+        # command hash can never manufacture an execution metric.
+        if not terminal and structural_terminal is None:
             continue
         selected = max(
             completed or terminal or matching,
             key=lambda row: _evidence_rank(connection, row),
         )
         result = (
-            unknown_result("conflicted")
-            if not completed and mismatched_complete
-            else StructuredTestResult(
-                int(exact_result[4]),
-                "success" if int(exact_result[4]) == 0 else "failed",
-                "none" if int(exact_result[4]) == 0 else "unknown",
-                "complete",
-            )
-            if not terminal and exact_result is not None
-            else unknown_result("result_without_exit")
+            unknown_result("result_without_exit")
             if not terminal and structural_terminal is not None
             else StructuredTestResult(
                 selected[12], selected[13], selected[14], selected[16],
@@ -273,28 +305,18 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'none',1,?,?)""",
             (
                 description[2],
-                exact_result[0]
-                if not terminal and exact_result is not None
-                else structural_terminal[0]
+                structural_terminal[0]
                 if not terminal and structural_terminal is not None
                 else selected[3],
-                exact_result[1]
-                if not terminal and exact_result is not None
-                else structural_terminal[1]
+                structural_terminal[1]
                 if not terminal and structural_terminal is not None
                 else selected[4],
                 session_key,
                 (
-                    exact_result[2]
-                    if not terminal and exact_result is not None
-                    else
                     structural_terminal[2]
                     if not terminal and structural_terminal is not None else selected[6]
                 ) or description[6],
                 (
-                    exact_result[3]
-                    if not terminal and exact_result is not None
-                    else
                     structural_terminal[3]
                     if not terminal and structural_terminal is not None else selected[7]
                 ) or description[7],
@@ -405,8 +427,9 @@ class TestEvidenceBuffer:
         turn_key: str | None,
         tool_call_key: str,
     ) -> bool:
-        if logical_call_id in self.rejected:
-            return False
+        # A later command-bearing event is fresh execution evidence for a
+        # reused call key and therefore supersedes an earlier cancellation.
+        self.rejected.discard(logical_call_id)
         runner, scope = classify_test_command(command)
         is_test = runner != "unknown"
         command_hash = self.pseudonymize("command", command)
@@ -442,6 +465,22 @@ class TestEvidenceBuffer:
                   AND candidate_kind IN ('description','evidence')""",
             (session_key, tool_call_key),
         ))
+        current_revision = rollout_revision_identity(
+            self.connection, self.source_digest,
+        )
+        rows = [
+            row for row in rows
+            if str(row[3]) == self.source_digest
+            or (
+                current_revision is not None
+                and (
+                    candidate_revision := rollout_revision_identity(
+                        self.connection, str(row[3]),
+                    )
+                ) is not None
+                and candidate_revision[0] == current_revision[0]
+            )
+        ]
         if not rows:
             return
         description = max(rows, key=lambda row: _description_rank(self.connection, row))

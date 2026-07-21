@@ -167,8 +167,13 @@ class StoredReportScenario(unittest.TestCase):
                 retry_kind="none", scope="targeted",
             )
         for index in range(retries):
+            if deterministic_failure is None or index > 0:
+                self._test_run(
+                    name, source, offset + 6 + index, 100 + index * 2,
+                    failure="product_failure", retry_kind="none", scope="full",
+                )
             self._test_run(
-                name, source, offset + 6 + index, index + 1,
+                name, source, offset + 6 + index, 101 + index * 2,
                 failure="none", retry_kind="flaky_retry", scope="full",
             )
 
@@ -253,15 +258,17 @@ class StoredReportScenario(unittest.TestCase):
         exit_status = 0 if failure == "none" else 1
         outcome = "success" if exit_status == 0 else "failed"
         self.db.execute(
-            """INSERT INTO rollout_test_runs(
-                   evidence_key,source_digest,line_number,session_key,observed_at,
-                   tool_call_key,command_hash,runner,scope,exit_status,outcome,
-                   failure_cause,retry_kind,attempt_ordinal,provenance,completeness)
-               VALUES (?,?,?,?,?,'call','command','pytest',?,?,?,?,?,1,
+            """INSERT INTO test_evidence_candidates(
+                   candidate_key,candidate_kind,evidence_key,source_digest,
+                   line_number,session_key,observed_at,tool_call_key,command_hash,
+                   runner,scope,exit_status,outcome,failure_cause,provenance,
+                   completeness)
+               VALUES (?,'evidence',?,?,?,?,?,?,'command','pytest',?,?,?,?,
                        'derived','complete')""",
             (
-                f"test-{session}-{index}", source, 20 + index, session, stamp(second),
-                scope, exit_status, outcome, failure, retry_kind,
+                f"candidate-{session}-{index}", f"test-{session}-{index}",
+                source, 20 + index, session, stamp(second),
+                f"call-{session}-{index}", scope, exit_status, outcome, failure,
             ),
         )
 
@@ -357,8 +364,8 @@ class SemanticReportIntegrationTests(StoredReportScenario):
         self.assertEqual(evidence["total_count"]["value"], 3)
         self.assertEqual(rows, {
             ("targeted", "product_failure", "none", "test_full", "final_verification", 1),
-            ("full", "infra_failure", "infra_recovery", "test_full", "final_verification", 1),
-            ("full", "none", "flaky_retry", "test_full", "final_verification", 1),
+            ("full", "infra_failure", "none", "test_full", "final_verification", 1),
+            ("full", "none", "infra_recovery", "test_full", "final_verification", 1),
         })
         for artifact in (render_json(report), render_markdown(report), render_html(report)):
             self.assertNotIn("source-root", artifact)

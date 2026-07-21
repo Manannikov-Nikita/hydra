@@ -29,6 +29,7 @@ from .storage import HydraStore
 from .rollout_reconcile import reconcile_turn_attempts
 from .task_tree_storage import aggregate_stored_task_tree
 from .task_tree_types import ScalarFact, TaskTreeMetrics
+from .test_evidence import materialize_test_evidence, reconcile_test_retries
 
 
 RECONCILIATION_VERSION = 1
@@ -291,6 +292,8 @@ def reconcile_project(
     if not isinstance(installation_key, bytes) or len(installation_key) < 16:
         raise ValueError("installation_key must contain at least 16 bytes")
     with store.rollout_transaction() as connection:
+        materialize_test_evidence(connection)
+        reconcile_test_retries(connection)
         reconcile_turn_attempts(connection)
     plans, assembled, input_digest = _assemble_project(store, project_id)
     references = project_public_references((item.root_key for item in plans), installation_key)

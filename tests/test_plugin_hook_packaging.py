@@ -223,8 +223,8 @@ class PluginHookContractTests(unittest.TestCase):
             ROOT / "plugins" / "hydra-codex" / "skills" / "hydra-report"
             / "references" / "report-schema.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("`hydra.report/v2`", schema)
-        self.assertIn("semantic_breakdown", schema)
+        self.assertIn("`hydra.report/v3`", schema)
+        self.assertIn("`semantic.annotations`", schema)
 
 
 if __name__ == "__main__":

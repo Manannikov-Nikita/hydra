@@ -10,6 +10,12 @@ transport that can bind identity outside model-controlled arguments. During
 the pilot, the capability-bearing CLI command injected by the hook is the only
 supported annotation path.
 
+The report tool returns the same `hydra.report/v3` contract as the CLI,
+including provenance-aware semantic markers, deterministic test evidence,
+pilot health, and conservative trend results. The source bundle is packaged
+but is not automatically enabled by installing the Python package; activation
+remains a post-pilot operator step.
+
 ## Installation prerequisite
 
 hydra-codex must be installed in the environment that starts Codex before

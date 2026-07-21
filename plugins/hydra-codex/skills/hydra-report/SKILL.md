@@ -24,9 +24,11 @@ raw prompts or turn an agent's prose summary into an exact measurement.
 4. Read every fact's `provenance`, `lower_bound`, and `caveats` before
    explaining it. Preserve `unavailable` and `unclassified` rather than
    guessing.
-5. Treat a trend warning as valid only when Hydra reports at least five
-   completed tasks in the same `task_family` and a second exact signal besides
-   token growth.
+5. Treat a trend warning as valid only when Hydra reports the current task plus
+   four strictly earlier completed tasks in the same `task_family`, token
+   growth, and a second complete deterministic signal. A derived test-retry
+   count may qualify; estimated, model-reported, partial, future, or equal-time
+   evidence may not.
 
 ## Live annotations
 
@@ -35,6 +37,9 @@ changes, a blocker appears, or the task finishes. Keep `note` under 240
 characters. Report purpose and outcome only. Never supply tokens, elapsed time,
 test or file counts, paths, `session_id`, `thread_id`, `turn_id`, or timestamps;
 trusted hooks add identity and time.
+
+Use a lowercase categorical `task_family` such as `multiple-answer-quiz`, not a
+prompt excerpt, user identifier, path, email address, UUID, or secret.
 
 For the MVP, follow the exact capability-bearing CLI command injected by the
 turn hook. The typed MCP annotation tool is post-pilot: use it only when the
@@ -53,4 +58,7 @@ semantic coverage is valid evidence that no phase labels existed.
   calibration, instrumentation overhead is estimated or unavailable.
 - When semantic labels disagree with test or tool evidence, deterministic facts
   win and the report retains the `semantic_conflict` caveat.
+- Use `semantic.annotations.test_evidence` to explain whether repeated tests
+  were product failures, flaky retries, infrastructure recovery, or final
+  verification. Never infer that purpose from command text.
 - Read [report-schema.md](references/report-schema.md) for field meanings.

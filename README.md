@@ -108,11 +108,18 @@ agent-time are separate because subagents may overlap.
 The rollout adapter deterministically classifies tool calls, relative file
 reads/writes, test runner and targeted/full scope, structured product failures,
 infrastructure failures, flaky retries, and verification after a code change.
-The semantic marker explains why that interval happened. Phase token allocation
-is still `derived`, because Codex exposes usage per model call rather than per
-semantic operation.
+Direct, unambiguous `rg`, `sed`, `cat`, `head`, and `tail` commands contribute
+privacy-safe relative file lower bounds; compound, expanded, deferred, or
+otherwise ambiguous shell expressions contribute no guessed file facts.
 
-Every numeric fact in `hydra.report/v2` has one provenance value:
+The semantic marker explains why an interval happened. Report v3 also exposes
+a deterministic test-evidence cross-tab by scope, failure, retry kind, semantic
+phase, and semantic cause. This distinguishes final verification from product,
+flaky, and infrastructure retries without retaining command text or output.
+Phase token allocation is still `derived`, because Codex exposes usage per
+model call rather than per semantic operation.
+
+Every numeric fact in `hydra.report/v3` has one provenance value:
 
 - `exact`: directly observed and unambiguous;
 - `derived`: deterministic calculation from observations;
@@ -142,7 +149,9 @@ Hydra does not store raw prompts, assistant messages, tool output, command text,
 patches, or search results. It retains allowlisted categories, hashes, lengths,
 privacy-safe short notes, relative paths, and schema diagnostics. Annotation
 arguments cannot contain tokens, times, file/test counts, paths, session IDs,
-turn IDs, or timestamps.
+turn IDs, or timestamps. `task_family` is a lowercase categorical code such as
+`multiple-answer-quiz`; unsafe or private-looking values are rejected before
+storage and unsafe legacy values never form a trend cohort.
 
 The versioned rollout JSONL adapter is read-only. Hydra does not read or mutate
 Codex internal SQLite databases as a telemetry API. Versioned App Server and
@@ -166,8 +175,11 @@ five subsequent real Codex tasks with the local CLI and hooks, then evaluate
 missing-marker rate, semantic conflicts, schema diagnostics, and observed
 instrumentation calls. Do not enable trend warnings before five completed tasks
 in the same `task_family`; a token increase also needs a second increasing
-signal such as test retries, read amplification, review/fix cycles, or
-compaction. Only after that pilot should the plugin become the default install.
+deterministic signal such as a complete test-retry count, read amplification,
+review/fix cycles, or compaction. Only strictly earlier tasks form the baseline.
+The fifth task leaves pilot status at `awaiting_receipt`; Hydra never marks the
+pilot verified merely because five fixtures or tasks exist. Only after a real
+pilot receipt should the plugin become the default install.
 
 ## Authoritative Codex surfaces
 

@@ -33,6 +33,10 @@ class StdioMcpServerTests(unittest.TestCase):
         initialized = server.handle(request(1, "initialize", {"protocolVersion": "2025-06-18"}))
         self.assertEqual(initialized["result"]["protocolVersion"], "2025-06-18")
         tools = server.handle(request(2, "tools/list"))["result"]["tools"]
+        self.assertEqual([tool["name"] for tool in tools], ["hydra.report"])
+
+        trusted = StdioMcpServer(FakeRunner([]), annotation_enabled=True)
+        tools = trusted.handle(request(12, "tools/list"))["result"]["tools"]
         self.assertEqual([tool["name"] for tool in tools], ["hydra.annotate", "hydra.report"])
         annotation_schema = tools[0]["inputSchema"]
         self.assertFalse(annotation_schema["additionalProperties"])
@@ -44,7 +48,9 @@ class StdioMcpServerTests(unittest.TestCase):
 
     def test_annotation_is_validated_and_forwarded_only_as_json(self) -> None:
         runner = FakeRunner([ProcessResult(0, '{"status":"ok"}\n', "")])
-        server = StdioMcpServer(runner, executable="hydra-test")
+        server = StdioMcpServer(
+            runner, executable="hydra-test", annotation_enabled=True,
+        )
         arguments = {
             "kind": "phase",
             "phase": "implement",
@@ -63,7 +69,7 @@ class StdioMcpServerTests(unittest.TestCase):
 
     def test_annotation_rejects_identity_and_measurement_fields_without_running(self) -> None:
         runner = FakeRunner([])
-        response = StdioMcpServer(runner).handle(request(4, "tools/call", {
+        response = StdioMcpServer(runner, annotation_enabled=True).handle(request(4, "tools/call", {
             "name": "hydra.annotate",
             "arguments": {
                 "kind": "phase", "phase": "test_full", "cause": "plan",
@@ -74,6 +80,19 @@ class StdioMcpServerTests(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(runner.calls, [])
         self.assertNotIn("secret", response["result"]["content"][0]["text"])
+
+    def test_annotation_is_not_callable_without_trusted_turn_transport(self) -> None:
+        runner = FakeRunner([])
+        response = StdioMcpServer(runner).handle(request(14, "tools/call", {
+            "name": "hydra.annotate", "arguments": {
+                "kind": "phase", "phase": "implement", "cause": "plan",
+                "scope_change": "none", "task_family": "telemetry",
+                "confidence": 1, "note": "must not run",
+            },
+        }))
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(runner.calls, [])
 
     def test_report_reconciles_then_renders_and_never_accepts_paths(self) -> None:
         runner = FakeRunner([
@@ -96,7 +115,7 @@ class StdioMcpServerTests(unittest.TestCase):
 
     def test_subprocess_errors_are_generic_and_do_not_echo_stderr(self) -> None:
         runner = FakeRunner([ProcessResult(1, "", "raw secret from database")])
-        response = StdioMcpServer(runner).handle(request(7, "tools/call", {
+        response = StdioMcpServer(runner, annotation_enabled=True).handle(request(7, "tools/call", {
             "name": "hydra.annotate",
             "arguments": {
                 "kind": "finish", "phase": "implement", "cause": "plan",

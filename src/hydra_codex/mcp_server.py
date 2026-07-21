@@ -68,9 +68,10 @@ _ANNOTATION_REQUIRED = (
 )
 
 
-def _tool_definitions() -> list[dict[str, object]]:
-    return [
-        {
+def _tool_definitions(*, annotation_enabled: bool) -> list[dict[str, object]]:
+    tools: list[dict[str, object]] = []
+    if annotation_enabled:
+        tools.append({
             "name": "hydra.annotate",
             "description": (
                 "Record only the current task phase, cause, scope change, or finish outcome. "
@@ -80,8 +81,8 @@ def _tool_definitions() -> list[dict[str, object]]:
                 "type": "object", "properties": _ANNOTATION_PROPERTIES,
                 "required": list(_ANNOTATION_REQUIRED), "additionalProperties": False,
             },
-        },
-        {
+        })
+    tools.append({
             "name": "hydra.report",
             "description": "Reconcile local telemetry and render recent privacy-safe task reports.",
             "inputSchema": {
@@ -92,8 +93,8 @@ def _tool_definitions() -> list[dict[str, object]]:
                 },
                 "required": ["last"], "additionalProperties": False,
             },
-        },
-    ]
+        })
+    return tools
 
 
 def _result_text(text: str, *, error: bool = False) -> dict[str, object]:
@@ -114,9 +115,16 @@ def _call_error(identifier: object) -> dict[str, object]:
 
 
 class StdioMcpServer:
-    def __init__(self, runner: CommandRunner | None = None, *, executable: str = "hydra-codex") -> None:
+    def __init__(
+        self,
+        runner: CommandRunner | None = None,
+        *,
+        executable: str = "hydra-codex",
+        annotation_enabled: bool = False,
+    ) -> None:
         self._runner = SubprocessRunner() if runner is None else runner
         self._executable = executable
+        self._annotation_enabled = annotation_enabled
 
     def _annotate(self, arguments: object) -> dict[str, object]:
         if not isinstance(arguments, Mapping):
@@ -182,14 +190,16 @@ class StdioMcpServer:
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": _tool_definitions()}
+            result = {"tools": _tool_definitions(annotation_enabled=self._annotation_enabled)}
         elif method == "tools/call":
             params = message.get("params")
             if not isinstance(params, Mapping) or not isinstance(params.get("name"), str):
                 return _call_error(identifier)
             try:
-                if params["name"] == "hydra.annotate":
+                if params["name"] == "hydra.annotate" and self._annotation_enabled:
                     result = self._annotate(params.get("arguments", {}))
+                elif params["name"] == "hydra.annotate":
+                    return _call_error(identifier)
                 elif params["name"] == "hydra.report":
                     result = self._report(params.get("arguments", {}))
                 else:

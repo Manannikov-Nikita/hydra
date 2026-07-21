@@ -4,8 +4,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import io
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -75,22 +78,36 @@ class CodexHookTests(unittest.TestCase):
         return handle_event(payload, environ=self.environ, clock=lambda: NOW)
 
     def capability(self, response: dict[str, object]) -> str:
-        self.assertEqual(set(response), {"systemMessage"})
-        message = response["systemMessage"]
+        self.assertEqual(set(response), {"hookSpecificOutput"})
+        output = response["hookSpecificOutput"]
+        self.assertIsInstance(output, dict)
+        self.assertEqual(output["hookEventName"], "UserPromptSubmit")
+        self.assertEqual(set(output), {"hookEventName", "additionalContext"})
+        message = output["additionalContext"]
         self.assertIsInstance(message, str)
         match = re.search(r"hcap_v1_[A-Za-z0-9_-]{43}", message)
         self.assertIsNotNone(match)
         return match.group(0)
+
+    def instruction(self, response: dict[str, object]) -> str:
+        self.capability(response)
+        return str(response["hookSpecificOutput"]["additionalContext"])
 
     def test_user_prompt_opens_private_turn_and_returns_only_short_model_instruction(self) -> None:
         raw_prompt = "Do not persist this secret prompt: sk-private-example"
         response = self.handle(prompt_payload(cwd=str(self.root), prompt=raw_prompt))
 
         capability = self.capability(response)
-        message = str(response["systemMessage"])
-        self.assertLessEqual(len(message), 640)
-        self.assertIn("hydra-codex annotate", message)
-        self.assertIn("finish", message)
+        message = self.instruction(response)
+        self.assertLessEqual(len(message), 900)
+        self.assertNotIn("...", message)
+        self.assertIn(
+            'env PYTHONPATH="$(git rev-parse --show-toplevel)/src" '
+            "HYDRA_TURN_CAPABILITY=",
+            message,
+        )
+        self.assertIn("python3.12 -m hydra_codex annotate --kind phase", message)
+        self.assertIn("python3.12 -m hydra_codex annotate --kind finish", message)
         self.assertNotIn(raw_prompt, message)
         self.assertNotIn("session-private-a", message)
         self.assertNotIn("turn-private-a", message)
@@ -163,16 +180,16 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(len({row["session_key"] for row in rows}), 2)
         self.assertEqual(len({row["turn_key"] for row in rows}), 2)
 
-    def test_first_missing_finish_blocks_once_then_records_missing_without_blocking(self) -> None:
+    def test_prompt_then_stop_retry_records_missing_without_blocking_again(self) -> None:
         self.handle(prompt_payload(cwd=str(self.root)))
 
         first = self.handle(stop_payload(cwd=str(self.root)))
-        second = self.handle(stop_payload(cwd=str(self.root)))
-        third = self.handle(stop_payload(cwd=str(self.root)))
+        second = self.handle(stop_payload(cwd=str(self.root), active=True))
+        third = self.handle(stop_payload(cwd=str(self.root), active=True))
 
-        self.assertEqual(first.get("continue"), False)
-        self.assertEqual(set(first), {"continue", "stopReason"})
-        self.assertIn("finish", str(first["stopReason"]))
+        self.assertEqual(first.get("decision"), "block")
+        self.assertEqual(set(first), {"decision", "reason"})
+        self.assertIn("finish", str(first["reason"]))
         self.assertEqual(second, {})
         self.assertEqual(third, {})
         store = HydraStore(self.database)
@@ -219,7 +236,7 @@ class CodexHookTests(unittest.TestCase):
 
         self.assertEqual(self.handle(stop_payload(cwd=str(self.root))), {})
 
-    def test_active_stop_hook_returns_immediately_without_touching_storage(self) -> None:
+    def test_active_stop_without_trusted_identity_fails_open_without_touching_storage(self) -> None:
         unavailable = dict(self.environ)
         unavailable["HYDRA_DATABASE_PATH"] = str(self.root / "missing" / "db.sqlite3")
 
@@ -282,6 +299,25 @@ class CodexHookTests(unittest.TestCase):
                 self.assertIsInstance(json.loads(stdout.getvalue()), dict)
                 self.assertEqual(stdout.getvalue().count("\n"), 1)
                 self.assertEqual(stderr.getvalue(), "")
+
+    def test_checkout_local_module_command_is_importable_without_installing_package(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(root / "src")
+
+        completed = subprocess.run(
+            [sys.executable, "-m", "hydra_codex", "annotate", "--help"],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--kind", completed.stdout)
+        self.assertIn("--task-family", completed.stdout)
 
 
 class CodexHookManifestTests(unittest.TestCase):

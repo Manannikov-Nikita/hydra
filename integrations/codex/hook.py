@@ -93,12 +93,25 @@ def _turn_context(
 
 def _instruction(capability: str) -> dict[str, object]:
     message = (
-        f"Hydra capability: {capability}. On semantic phase changes run "
-        f"`env HYDRA_TURN_CAPABILITY={capability} hydra-codex annotate ...`; "
-        "add kind=finish before the final answer. Report only phase, cause, outcome, "
-        "scope_change, task_family, note, and confidence; never report metrics or IDs."
+        "Hydra telemetry for this turn. On each phase change run "
+        "`env PYTHONPATH=\"$(git rev-parse --show-toplevel)/src\" "
+        f"HYDRA_TURN_CAPABILITY={capability} python3.12 -m hydra_codex annotate "
+        "--kind phase --phase implement --cause plan --scope-change none "
+        "--task-family task --confidence 0.9 --note \"phase change\"`. "
+        "Before the final answer run "
+        "`env PYTHONPATH=\"$(git rev-parse --show-toplevel)/src\" "
+        f"HYDRA_TURN_CAPABILITY={capability} python3.12 -m hydra_codex annotate "
+        "--kind finish --phase test_full --cause final_verification --outcome success "
+        "--scope-change none --task-family task --confidence 1 --note \"done\"`. "
+        "Replace only semantic values; never submit tokens, time, file/test counts, "
+        "session_id, or turn_id."
     )
-    return {"systemMessage": message}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": message,
+        },
+    }
 
 
 def _handle_prompt(
@@ -136,8 +149,6 @@ def _handle_stop(
     active = payload.get("stop_hook_active")
     if not isinstance(active, bool):
         raise ValueError("invalid stop_hook_active")
-    if active:
-        return {}
     context = _turn_context(payload, project, observed_at)
     issued = issue_capability(
         store,
@@ -147,7 +158,10 @@ def _handle_stop(
     )
     state = observe_stop(store, keys, issued.token, observed_at=observed_at)
     if state is StopState.RETRY_REQUIRED:
-        return {"continue": False, "stopReason": _STOP_REASON}
+        if active:
+            observe_stop(store, keys, issued.token, observed_at=observed_at)
+            return {}
+        return {"decision": "block", "reason": _STOP_REASON}
     return {}
 
 
@@ -165,8 +179,6 @@ def handle_event(
         if not isinstance(payload, Mapping):
             return {}
         event = payload.get("hook_event_name")
-        if event == "Stop" and payload.get("stop_hook_active") is True:
-            return {}
         if event not in {"UserPromptSubmit", "Stop"}:
             return {}
         cwd = _required_text(payload, "cwd")

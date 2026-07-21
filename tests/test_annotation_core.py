@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
+import io
+import tempfile
+import sqlite3
+from threading import Barrier
+import unittest
+from pathlib import Path
+
+from hydra_codex.annotation_core import (
+    AnnotationConflict,
+    AnnotationDisposition,
+    CapabilityExpired,
+    CapabilityRejected,
+    StopState,
+    TrustedAnnotationContext,
+    TrustedTurnContext,
+    annotate_with_capability,
+    finish_turn,
+    issue_capability,
+    observe_stop,
+    record_initial_understand,
+)
+from hydra_codex.rollout_identity import Pseudonymizer
+from hydra_codex.storage import MIGRATIONS, V2_TRIGGER_STATEMENTS, HydraStore
+
+
+PROJECT_ID = "hprj_annotation_test"
+RAW_SESSION = "raw-session-private-019f"
+RAW_TURN = "raw-turn-private-7a42"
+CREATED_AT = "2026-07-21T09:00:00Z"
+EXPIRES_AT = "2026-07-21T10:00:00Z"
+
+
+def turn_context() -> TrustedTurnContext:
+    return TrustedTurnContext(
+        project_id=PROJECT_ID,
+        session_id=RAW_SESSION,
+        turn_id=RAW_TURN,
+        observed_at=CREATED_AT,
+    )
+
+
+def request(sequence: int, *, key: str | None = None, observed_at: str | None = None) -> TrustedAnnotationContext:
+    return TrustedAnnotationContext(
+        request_key=key or f"trusted-request-{sequence}",
+        sequence=sequence,
+        observed_at=observed_at or f"2026-07-21T09:0{sequence}:00Z",
+    )
+
+
+def phase_payload(phase: str = "implement", *, note: str = "working") -> dict[str, object]:
+    return {
+        "kind": "phase",
+        "phase": phase,
+        "cause": "plan",
+        "scope_change": "none",
+        "task_family": "annotation-core",
+        "confidence": 0.9,
+        "note": note,
+    }
+
+
+def finish_payload(*, note: str = "complete") -> dict[str, object]:
+    return {
+        "kind": "finish",
+        "phase": "test_full",
+        "cause": "final_verification",
+        "scope_change": "none",
+        "task_family": "annotation-core",
+        "confidence": 0.95,
+        "note": note,
+        "outcome": "success",
+    }
+
+
+class AnnotationCapabilitySchemaTests(unittest.TestCase):
+    def test_fresh_database_has_private_capability_annotation_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            self.addCleanup(store.close)
+
+            expected = {
+                "trusted_turn_bindings",
+                "turn_capabilities",
+                "annotation_receipts",
+                "semantic_intervals",
+                "semantic_fact_staging",
+            }
+            actual = {
+                row[0]
+                for row in store.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+            self.assertTrue(expected.issubset(actual))
+
+    def test_previous_database_upgrades_without_rewriting_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "upgrade.sqlite3"
+            connection = sqlite3.connect(database)
+            for version, statements in MIGRATIONS[:-1]:
+                for statement in statements:
+                    connection.execute(statement)
+                if version == 2:
+                    for statement in V2_TRIGGER_STATEMENTS:
+                        connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version,applied_at) VALUES (?,'2026-07-21T00:00:00Z')",
+                    (version,),
+                )
+                connection.execute(f"PRAGMA user_version={version}")
+            connection.execute(
+                "INSERT INTO sessions VALUES ('old-session','hprj_upgrade','safe','2026-07-21T00:00:00Z','exact')"
+            )
+            connection.execute(
+                "INSERT INTO turns VALUES ('old-turn','old-session',0,'2026-07-21T00:00:00Z','exact')"
+            )
+            connection.execute(
+                """INSERT INTO annotations(
+                       annotation_id,project_id,session_id,turn_id,sequence,observed_at,kind,
+                       phase,cause,scope_change,confidence,outcome,provenance,note_redacted,
+                       note_hash,note_length,task_family)
+                   VALUES ('old-annotation','hprj_upgrade','old-session','old-turn',0,
+                       '2026-07-21T00:00:00Z','phase','understand','prompt','none',1.0,
+                       NULL,'model_reported','safe','old-hash',4,'upgrade')"""
+            )
+            connection.commit()
+            connection.close()
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+
+            self.assertEqual(store.connection.execute(
+                "SELECT task_family FROM annotations WHERE annotation_id='old-annotation'"
+            ).fetchone()[0], "upgrade")
+            self.assertEqual(store.connection.execute(
+                "SELECT COUNT(*) FROM trusted_turn_bindings"
+            ).fetchone()[0], 0)
+
+
+class AnnotationCapabilityCoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database = Path(self.temporary.name) / "hydra.sqlite3"
+        self.store = HydraStore(self.database)
+        self.keys = Pseudonymizer(b"a" * 32)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.temporary.cleanup()
+
+    def issue(self):
+        return issue_capability(
+            self.store,
+            self.keys,
+            turn_context(),
+            expires_at=EXPIRES_AT,
+        )
+
+    def test_issue_returns_256_bit_secret_once_and_persists_only_bound_digest(self) -> None:
+        issued = self.issue()
+
+        capability = self.store.connection.execute("SELECT * FROM turn_capabilities").fetchone()
+        binding = self.store.connection.execute("SELECT * FROM trusted_turn_bindings").fetchone()
+        database_text = " ".join(
+            value.decode("utf-8", "ignore")
+            for value in (self.database.read_bytes(),)
+        )
+
+        self.assertRegex(issued.token, r"^hcap_v1_[A-Za-z0-9_-]{43}$")
+        self.assertNotEqual(capability["capability_digest"], issued.token)
+        self.assertEqual(binding["project_id"], PROJECT_ID)
+        self.assertEqual(binding["session_key"], self.keys.digest("identity", RAW_SESSION))
+        self.assertEqual(binding["turn_key"], self.keys.digest("turn", RAW_TURN))
+        self.assertEqual((capability["used_at"], capability["revoked_at"], capability["stop_retry"]), (None, None, 0))
+        self.assertNotIn(issued.token, database_text)
+        self.assertNotIn(RAW_SESSION, database_text)
+        self.assertNotIn(RAW_TURN, database_text)
+
+    def test_initial_understand_and_multiple_annotations_share_one_capability(self) -> None:
+        issued = self.issue()
+
+        initial = record_initial_understand(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0),
+            task_family="annotation-core",
+        )
+        phase = annotate_with_capability(
+            self.store,
+            self.keys,
+            issued.token,
+            request(1),
+            phase_payload(),
+        )
+        blocker = annotate_with_capability(
+            self.store,
+            self.keys,
+            issued.token,
+            request(2),
+            {
+                **phase_payload(),
+                "kind": "blocker",
+                "cause": "infra_failure",
+                "note": "runner queue",
+            },
+        )
+
+        rows = self.store.connection.execute(
+            "SELECT kind,phase,sequence FROM annotations ORDER BY sequence"
+        ).fetchall()
+        intervals = self.store.connection.execute(
+            "SELECT phase,start_sequence,end_sequence FROM semantic_intervals ORDER BY start_sequence"
+        ).fetchall()
+        capability = self.store.connection.execute("SELECT used_at,revoked_at FROM turn_capabilities").fetchone()
+
+        self.assertEqual((initial.disposition, phase.disposition, blocker.disposition), (
+            AnnotationDisposition.INSERTED,
+            AnnotationDisposition.INSERTED,
+            AnnotationDisposition.INSERTED,
+        ))
+        self.assertEqual([tuple(row) for row in rows], [
+            ("phase", "understand", 0),
+            ("phase", "implement", 1),
+            ("blocker", "implement", 2),
+        ])
+        self.assertEqual([tuple(row) for row in intervals], [
+            ("understand", 0, 1),
+            ("implement", 1, 2),
+            ("implement", 2, None),
+        ])
+        self.assertEqual(capability["used_at"], request(0).observed_at)
+        self.assertIsNone(capability["revoked_at"])
+
+    def test_finish_revokes_new_writes_but_identical_finish_retry_is_idempotent(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        first = finish_turn(
+            self.store,
+            self.keys,
+            issued.token,
+            request(1, key="finish-request", observed_at="2026-07-21T09:01:00Z"),
+            finish_payload(),
+        )
+        retried = finish_turn(
+            self.store,
+            self.keys,
+            issued.token,
+            request(1, key="finish-request", observed_at="2026-07-21T10:01:00Z"),
+            finish_payload(),
+        )
+
+        receipt = self.store.connection.execute("SELECT retry_count,last_received_at FROM annotation_receipts WHERE sequence=1").fetchone()
+        capability = self.store.connection.execute("SELECT revoked_at FROM turn_capabilities").fetchone()
+        binding = self.store.connection.execute("SELECT state,finished_at FROM trusted_turn_bindings").fetchone()
+
+        self.assertEqual(first.disposition, AnnotationDisposition.INSERTED)
+        self.assertEqual(retried.disposition, AnnotationDisposition.RETRIED)
+        self.assertEqual(tuple(receipt), (1, "2026-07-21T10:01:00Z"))
+        self.assertEqual(capability["revoked_at"], "2026-07-21T09:01:00Z")
+        self.assertEqual(tuple(binding), ("finished", "2026-07-21T09:01:00Z"))
+        with self.assertRaises(CapabilityRejected):
+            annotate_with_capability(
+                self.store, self.keys, issued.token, request(2), phase_payload("docs")
+            )
+
+    def test_conflicting_duplicate_sequence_is_diagnosed_without_overwrite(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        annotate_with_capability(
+            self.store, self.keys, issued.token, request(1, key="first"), phase_payload("implement")
+        )
+
+        with self.assertRaises(AnnotationConflict):
+            annotate_with_capability(
+                self.store, self.keys, issued.token, request(1, key="second"), phase_payload("review")
+            )
+
+        row = self.store.connection.execute("SELECT phase,note_redacted FROM annotations WHERE sequence=1").fetchone()
+        fact = self.store.connection.execute("SELECT fact_kind FROM semantic_fact_staging").fetchone()
+        self.assertEqual(tuple(row), ("implement", "working"))
+        self.assertEqual(fact[0], "annotation_sequence_conflict")
+
+    def test_trusted_timestamp_regression_is_diagnosed_without_corrupting_interval(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+
+        with self.assertRaises(AnnotationConflict):
+            annotate_with_capability(
+                self.store,
+                self.keys,
+                issued.token,
+                request(1, observed_at="2026-07-21T08:59:59Z"),
+                phase_payload(),
+            )
+
+        interval = self.store.connection.execute(
+            "SELECT start_sequence,ended_at FROM semantic_intervals"
+        ).fetchone()
+        fact = self.store.connection.execute(
+            "SELECT fact_kind FROM semantic_fact_staging"
+        ).fetchone()
+        self.assertEqual(tuple(interval), (0, None))
+        self.assertEqual(fact[0], "annotation_out_of_order")
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM annotations").fetchone()[0], 1)
+
+    def test_blocker_phase_disagreement_keeps_active_phase_and_stages_conflict(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        annotate_with_capability(
+            self.store, self.keys, issued.token, request(1), phase_payload("implement")
+        )
+
+        annotate_with_capability(
+            self.store,
+            self.keys,
+            issued.token,
+            request(2),
+            {
+                **phase_payload("review"),
+                "kind": "blocker",
+                "cause": "infra_failure",
+            },
+        )
+
+        open_phase = self.store.connection.execute(
+            "SELECT phase FROM semantic_intervals WHERE ended_at IS NULL"
+        ).fetchone()[0]
+        fact = self.store.connection.execute(
+            "SELECT fact_kind FROM semantic_fact_staging"
+        ).fetchone()[0]
+        self.assertEqual(open_phase, "implement")
+        self.assertEqual(fact, "semantic_conflict")
+
+    def test_model_payload_cannot_supply_trusted_identity_or_timestamp(self) -> None:
+        issued = self.issue()
+        payload = {**phase_payload(), "turn_id": "model-chosen-turn"}
+
+        with self.assertRaisesRegex(ValueError, "forbidden fields"):
+            annotate_with_capability(
+                self.store, self.keys, issued.token, request(0), payload
+            )
+
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM annotations").fetchone()[0], 0)
+
+    def test_expired_or_unknown_capability_fails_without_echoing_private_input(self) -> None:
+        issued = issue_capability(
+            self.store,
+            self.keys,
+            turn_context(),
+            expires_at="2026-07-21T09:00:30Z",
+        )
+        private_note = "token SUPER-PRIVATE-NOTE-123456789"
+        private_payload = phase_payload(note=private_note)
+        output = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(output):
+            with self.assertRaises(CapabilityExpired) as expired:
+                annotate_with_capability(
+                    self.store,
+                    self.keys,
+                    issued.token,
+                    request(0, observed_at="2026-07-21T09:00:30Z"),
+                    private_payload,
+                )
+            with self.assertRaises(CapabilityRejected) as unknown:
+                annotate_with_capability(
+                    self.store,
+                    self.keys,
+                    "hcap_v1_" + "z" * 43,
+                    request(0),
+                    private_payload,
+                )
+
+        combined = output.getvalue() + str(expired.exception) + str(unknown.exception)
+        for private in (issued.token, private_note, str(self.database)):
+            self.assertNotIn(private, combined)
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM annotations").fetchone()[0], 0)
+
+    def test_stop_requests_one_retry_then_stages_missing_finish_without_blocking(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+
+        first = observe_stop(
+            self.store, self.keys, issued.token, observed_at="2026-07-21T09:01:00Z"
+        )
+        second = observe_stop(
+            self.store, self.keys, issued.token, observed_at="2026-07-21T09:02:00Z"
+        )
+        third = observe_stop(
+            self.store, self.keys, issued.token, observed_at="2026-07-21T09:03:00Z"
+        )
+
+        capability = self.store.connection.execute("SELECT stop_retry,revoked_at FROM turn_capabilities").fetchone()
+        facts = self.store.connection.execute(
+            "SELECT fact_kind,COUNT(*) FROM semantic_fact_staging GROUP BY fact_kind"
+        ).fetchall()
+        binding = self.store.connection.execute("SELECT state,finished_at FROM trusted_turn_bindings").fetchone()
+
+        self.assertEqual((first, second, third), (
+            StopState.RETRY_REQUIRED,
+            StopState.SELF_REPORT_MISSING,
+            StopState.SELF_REPORT_MISSING,
+        ))
+        self.assertEqual(tuple(capability), (1, "2026-07-21T09:02:00Z"))
+        self.assertEqual([tuple(row) for row in facts], [("self_report_missing", 1)])
+        self.assertEqual(tuple(binding), ("finished", "2026-07-21T09:02:00Z"))
+
+    def test_finish_makes_stop_complete_without_consuming_retry(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        finish_turn(
+            self.store, self.keys, issued.token, request(1), finish_payload()
+        )
+
+        state = observe_stop(
+            self.store, self.keys, issued.token, observed_at="2026-07-21T09:03:00Z"
+        )
+
+        retry = self.store.connection.execute("SELECT stop_retry FROM turn_capabilities").fetchone()[0]
+        self.assertEqual(state, StopState.FINISHED)
+        self.assertEqual(retry, 0)
+
+    def test_identical_concurrent_retry_is_serialized_by_immediate_transaction(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        ready = Barrier(2)
+
+        def write_once() -> AnnotationDisposition:
+            worker = HydraStore(self.database)
+            try:
+                ready.wait(timeout=2)
+                return annotate_with_capability(
+                    worker,
+                    self.keys,
+                    issued.token,
+                    request(1, key="concurrent-request"),
+                    phase_payload(),
+                ).disposition
+            finally:
+                worker.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = sorted(pool.map(lambda _: write_once(), range(2)), key=lambda item: item.value)
+
+        receipt = self.store.connection.execute("SELECT retry_count FROM annotation_receipts WHERE sequence=1").fetchone()
+        self.assertEqual(set(outcomes), {AnnotationDisposition.INSERTED, AnnotationDisposition.RETRIED})
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM annotations WHERE sequence=1").fetchone()[0], 1)
+        self.assertEqual(receipt[0], 1)
+
+    def test_database_dump_contains_no_raw_capability_identity_request_or_secret_note(self) -> None:
+        issued = self.issue()
+        private_request = "private-request-id-should-not-persist"
+        private_note = "Authorization: Bearer private-note-secret-value"
+        annotate_with_capability(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0, key=private_request),
+            phase_payload(note=private_note),
+        )
+        self.store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        dump = self.database.read_bytes()
+
+        for private in (issued.token, RAW_SESSION, RAW_TURN, private_request, private_note):
+            self.assertNotIn(private.encode(), dump)
+        stored = self.store.connection.execute(
+            "SELECT note_redacted,note_hash FROM annotations"
+        ).fetchone()
+        self.assertEqual(stored["note_redacted"], "[redacted]")
+        self.assertNotEqual(stored["note_hash"], private_note)
+
+
+if __name__ == "__main__":
+    unittest.main()

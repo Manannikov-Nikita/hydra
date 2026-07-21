@@ -13,6 +13,7 @@ from typing import Iterator
 from .contracts import AnnotationRecord, ConflictRecord, ThreadSessionRecord, TurnRecord
 from .migration_support import V2_TRIGGER_STATEMENTS
 from .migrations_b2 import B2_MIGRATIONS
+from .migrations_c3 import C3_MIGRATIONS, C3_REQUIRED_SCHEMA
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -252,7 +253,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS
 
 
 class HydraStore:
@@ -345,6 +346,7 @@ class HydraStore:
             "turn_attempts": {"attempt_ordinal", "timing_provenance"},
             "token_snapshots": {"epoch", "input_tokens", "cached_input_tokens", "observed_at"},
         }
+        required.update(C3_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):

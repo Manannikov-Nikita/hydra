@@ -96,6 +96,47 @@ class LocalCommandServiceTests(unittest.TestCase):
             stdin=json.dumps(payload),
         )
 
+    def _rollout(self, name: str, *, second: int, input_tokens: int) -> Path:
+        source = self.root / "rollouts" / f"{name}.jsonl"
+        source.parent.mkdir(exist_ok=True)
+        records = (
+            {
+                "timestamp": f"2026-07-21T00:00:{second:02d}Z",
+                "type": "session_meta",
+                "payload": {"id": name, "cwd": str(self.project)},
+            },
+            {
+                "timestamp": f"2026-07-21T00:00:{second + 1:02d}Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": f"turn-{name}"},
+            },
+            {
+                "timestamp": f"2026-07-21T00:00:{second + 2:02d}Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 10,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "cache_write_input_tokens": 0,
+                        "total_tokens": input_tokens + 20,
+                    }},
+                },
+            },
+            {
+                "timestamp": f"2026-07-21T00:00:{second + 3:02d}Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": f"turn-{name}"},
+            },
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in records),
+            encoding="utf-8",
+        )
+        return source
+
     def test_default_cli_accepts_hook_capability_for_phase_and_finish(self) -> None:
         capability = self._open_turn()
 
@@ -275,6 +316,56 @@ class LocalCommandServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(result.sequence, 1)
+
+    def test_ingest_reconcile_report_and_compare_work_without_injected_services(self) -> None:
+        self._rollout("task-a", second=10, input_tokens=100)
+        self._rollout("task-b", second=20, input_tokens=180)
+        common = ["--db", str(self.database), "--cwd", str(self.project)]
+
+        ingested = invoke(
+            [
+                "ingest", *common,
+                "--source", f"explicit={self.root / 'rollouts'}",
+            ],
+            environ=self.environ,
+        )
+        reconciled = invoke(["reconcile", *common], environ=self.environ)
+        rendered = invoke(
+            ["report", *common, "--last", "2", "--format", "json"],
+            environ=self.environ,
+        )
+
+        self.assertEqual(ingested[0], 0, ingested[2])
+        self.assertEqual(reconciled, (
+            0, '{"command":"reconcile","status":"ok"}\n', "",
+        ))
+        self.assertEqual(rendered[0], 0, rendered[2])
+        payload = json.loads(rendered[1])
+        self.assertEqual(payload["schema_version"], "hydra.report-list/v1")
+        self.assertEqual(len(payload["reports"]), 2)
+        self.assertEqual(
+            {item["schema_version"] for item in payload["reports"]},
+            {"hydra.report/v2"},
+        )
+        refs = [item["task_ref"] for item in payload["reports"]]
+        self.assertTrue(all(re.fullmatch(r"task_[0-9a-f]+", item) for item in refs))
+        self.assertEqual(
+            {
+                item["semantic"]["breakdown"]["marker_count"]["value"]
+                for item in payload["reports"]
+            },
+            {0},
+        )
+
+        compared = invoke(
+            ["compare", refs[1], refs[0], *common, "--format", "markdown"],
+            environ=self.environ,
+        )
+        self.assertEqual(compared[0], 0, compared[2])
+        self.assertIn("# Hydra task comparison", compared[1])
+        self.assertIn(refs[0].replace("_", r"\_"), compared[1])
+        self.assertNotIn("task-a", compared[1])
+        self.assertNotIn("task-b", compared[1])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,6 @@
-"""Command-line entry point placeholder for future hook integration."""
+"""Module entry point for ``python -m hydra_codex``."""
 
-
-def main() -> int:
-    return 0
+from .cli import main
 
 
 if __name__ == "__main__":

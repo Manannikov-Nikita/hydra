@@ -110,6 +110,32 @@ class PackagedHookEntrypointTests(unittest.TestCase):
             command, self.stop(session="plugin-session", turn="plugin-turn"),
         ))
 
+    def test_project_hook_owns_events_when_plugin_is_enabled_in_same_checkout(self) -> None:
+        (self.root / ".codex").mkdir()
+        (self.root / ".codex" / "hooks.json").write_text(
+            (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        local_command = [
+            sys.executable, str(ROOT / "integrations" / "codex" / "hook.py"),
+        ]
+        plugin_command = [sys.executable, "-m", "hydra_codex.hook_runtime"]
+        prompt = self.prompt(session="dual-session", turn="dual-turn")
+        stop = self.stop(session="dual-session", turn="dual-turn")
+
+        local_prompt = self.invoke(local_command, prompt)
+        self.environment["HYDRA_CODEX_HOOK_SOURCE"] = "plugin"
+        plugin_prompt = self.invoke(plugin_command, prompt)
+        del self.environment["HYDRA_CODEX_HOOK_SOURCE"]
+        local_stop = self.invoke(local_command, stop)
+        self.environment["HYDRA_CODEX_HOOK_SOURCE"] = "plugin"
+        plugin_stop = self.invoke(plugin_command, stop)
+
+        self.assert_prompt_shape(local_prompt)
+        self.assertEqual(plugin_prompt, {})
+        self.assert_stop_shape(local_stop)
+        self.assertEqual(plugin_stop, {})
+
 
 class PluginHookContractTests(unittest.TestCase):
     def test_console_script_and_plugin_hook_manifest_are_consistent(self) -> None:
@@ -134,7 +160,10 @@ class PluginHookContractTests(unittest.TestCase):
             self.assertEqual(len(group["hooks"]), 1)
             command = group["hooks"][0]
             self.assertEqual(command["type"], "command")
-            self.assertEqual(command["command"], "hydra-codex-hook")
+            self.assertEqual(
+                command["command"],
+                "env HYDRA_CODEX_HOOK_SOURCE=plugin hydra-codex-hook",
+            )
             self.assertLessEqual(command["timeout"], 10)
 
     def test_plugin_documents_post_pilot_installation_precondition(self) -> None:

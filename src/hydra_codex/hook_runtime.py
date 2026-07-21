@@ -35,6 +35,7 @@ _STOP_REASON = "Hydra: add one finish annotation with outcome before ending this
 _INSTALLED_ANNOTATION_COMMAND = (
     "HYDRA_TURN_CAPABILITY={capability} hydra-codex annotate"
 )
+_PLUGIN_SOURCE = "plugin"
 
 
 def _required_text(payload: Mapping[str, Any], field: str) -> str:
@@ -88,6 +89,42 @@ def _turn_context(
         turn_id=_required_text(payload, "turn_id"),
         observed_at=observed_at,
     )
+
+
+def _project_hook_owns_event(
+    project: ProjectResolution,
+    event: str,
+    environ: Mapping[str, str],
+) -> bool:
+    """Let an explicit project Hydra hook shadow the post-pilot plugin hook."""
+    if environ.get("HYDRA_CODEX_HOOK_SOURCE") != _PLUGIN_SOURCE:
+        return False
+    manifest_path = project.project_root / ".codex" / "hooks.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, Mapping):
+        return False
+    hooks = manifest.get("hooks")
+    if not isinstance(hooks, Mapping):
+        return False
+    groups = hooks.get(event)
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        if not isinstance(group, Mapping) or not isinstance(group.get("hooks"), list):
+            continue
+        for hook in group["hooks"]:
+            if not isinstance(hook, Mapping):
+                continue
+            command = hook.get("command")
+            if isinstance(command, str) and (
+                "integrations/codex/hook.py" in command
+                or command.strip() == "hydra-codex-hook"
+            ):
+                return True
+    return False
 
 
 def _instruction(capability: str, annotation_command: str) -> dict[str, object]:
@@ -154,11 +191,14 @@ def _handle_stop(
         context,
         expires_at=(now + _CAPABILITY_LIFETIME).isoformat().replace("+00:00", "Z"),
     )
-    state = observe_stop(store, keys, issued.token, observed_at=observed_at)
+    state = observe_stop(
+        store,
+        keys,
+        issued.token,
+        observed_at=observed_at,
+        retry_active=active,
+    )
     if state is StopState.RETRY_REQUIRED:
-        if active:
-            observe_stop(store, keys, issued.token, observed_at=observed_at)
-            return {}
         return {"decision": "block", "reason": _STOP_REASON}
     return {}
 
@@ -196,6 +236,8 @@ def handle_event(
             (lambda: datetime.now(timezone.utc)) if clock is None else clock,
         )
         project = project_resolver(cwd)
+        if _project_hook_owns_event(project, event, environment):
+            return {}
         keys = key_loader(_key_path(environment))
         store = _open_store(store_factory, _database_path(environment))
         try:

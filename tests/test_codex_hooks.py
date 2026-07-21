@@ -206,6 +206,43 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(binding["state"], "finished")
         self.assertNotIn(b"private assistant response", self.database.read_bytes())
 
+    def test_duplicate_project_and_plugin_stop_hooks_share_one_retry(self) -> None:
+        self.handle(prompt_payload(cwd=str(self.root)))
+
+        first = self.handle(stop_payload(cwd=str(self.root)))
+        duplicate = self.handle(stop_payload(cwd=str(self.root)))
+        store = HydraStore(self.database)
+        try:
+            before_retry = store.connection.execute(
+                "SELECT state FROM trusted_turn_bindings"
+            ).fetchone()["state"]
+            before_facts = store.connection.execute(
+                "SELECT COUNT(*) FROM semantic_fact_staging"
+            ).fetchone()[0]
+        finally:
+            store.close()
+
+        consumed = self.handle(stop_payload(cwd=str(self.root), active=True))
+        duplicate_active = self.handle(stop_payload(cwd=str(self.root), active=True))
+
+        self.assertEqual(first.get("decision"), "block")
+        self.assertEqual(duplicate.get("decision"), "block")
+        self.assertEqual((before_retry, before_facts), ("open", 0))
+        self.assertEqual(consumed, {})
+        self.assertEqual(duplicate_active, {})
+        store = HydraStore(self.database)
+        try:
+            facts = store.connection.execute(
+                "SELECT fact_kind FROM semantic_fact_staging"
+            ).fetchall()
+            binding = store.connection.execute(
+                "SELECT state FROM trusted_turn_bindings"
+            ).fetchone()
+        finally:
+            store.close()
+        self.assertEqual([row["fact_kind"] for row in facts], ["self_report_missing"])
+        self.assertEqual(binding["state"], "finished")
+
     def test_existing_finish_allows_stop_without_retry(self) -> None:
         capability = self.capability(self.handle(prompt_payload(cwd=str(self.root))))
         keys = Pseudonymizer.installation_key(self.key_path)

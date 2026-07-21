@@ -278,7 +278,10 @@ def observe_stop(
     capability: str,
     *,
     observed_at: str,
+    retry_active: bool,
 ) -> StopState:
+    if not isinstance(retry_active, bool):
+        raise ValueError("retry_active must be a boolean")
     observed = timestamp(observed_at)
     capability_key = capability_digest(keys, capability)
     with store.rollout_transaction() as connection:
@@ -330,6 +333,7 @@ def observe_stop(
                 "UPDATE turn_capabilities SET stop_retry=1 WHERE turn_key=?",
                 (binding["turn_key"],),
             )
+        if not retry_active:
             return StopState.RETRY_REQUIRED
         connection.execute(
             """UPDATE trusted_turn_bindings

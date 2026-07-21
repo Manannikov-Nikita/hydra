@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "hydra-codex-hook",
+            "command": "env HYDRA_CODEX_HOOK_SOURCE=plugin hydra-codex-hook",
             "timeout": 10
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "hydra-codex-hook",
+            "command": "env HYDRA_CODEX_HOOK_SOURCE=plugin hydra-codex-hook",
             "timeout": 10
           }
         ]

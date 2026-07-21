@@ -14,4 +14,7 @@ package first; do not rewrite the plugin to select a turn by `cwd`.
 
 The checkout-local `.codex/hooks.json` remains the uninstalled fallback for the
 Hydra repository itself. Its wrapper loads `src/` directly and delegates to the
-same packaged runtime.
+same packaged runtime. When both sources are present, the plugin marks its hook
+source and suppresses itself for events owned by the project manifest. This
+keeps one model instruction and one Stop decision without disabling unrelated
+project hooks.

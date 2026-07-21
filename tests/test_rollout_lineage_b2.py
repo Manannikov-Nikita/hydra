@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +76,134 @@ class RolloutLineageB2Tests(unittest.TestCase):
         self.assertEqual(self.store.count("token_snapshots"), 3)
         self.assertEqual(self.store.count("rollout_source_locations"), 2)
 
+    def test_unchanged_materialized_source_skips_scanner_and_preserves_counts(self) -> None:
+        source = self.base / "active" / "unchanged.jsonl"
+        write(source, [self.meta(), self.token(10)])
+        first = ingest_rollouts(
+            self.store, (RolloutRoot(source, "active"),), self.project,
+            "project-b2", hash_key=self.key,
+        )
+        stable_counts = {
+            table: self.store.count(table)
+            for table in (
+                "rollout_sources", "rollout_logical_sources", "rollout_events",
+                "token_snapshots", "rollout_diagnostics",
+            )
+        }
+
+        with patch(
+            "hydra_codex.rollout.scan_source",
+            side_effect=AssertionError("unchanged source must not be scanned"),
+        ):
+            second = ingest_rollouts(
+                self.store, (RolloutRoot(source, "archived"),), self.project,
+                "project-b2", hash_key=self.key,
+            )
+
+        self.assertEqual((first.files_seen, first.unique_sources), (1, 1))
+        self.assertEqual((second.files_seen, second.unique_sources), (1, 1))
+        self.assertEqual(
+            {
+                table: self.store.count(table)
+                for table in stable_counts
+            },
+            stable_counts,
+        )
+        self.assertEqual(self.store.count("rollout_source_location_states"), 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT location_type FROM rollout_source_locations"
+            ).fetchone()[0],
+            "archived",
+        )
+        self.assertNotIn(str(source), "\n".join(self.store.connection.iterdump()))
+
+    def test_changed_metadata_scans_and_materializes_append(self) -> None:
+        source = self.base / "active" / "append.jsonl"
+        initial = [self.meta(), self.token(10)]
+        write(source, initial)
+        ingest_rollouts(
+            self.store, (source,), self.project, "project-b2", hash_key=self.key,
+        )
+        write(source, initial + [self.token(20, "2026-07-21T00:00:02Z")])
+        from hydra_codex import rollout as rollout_module
+
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as scanner:
+            ingest_rollouts(
+                self.store, (source,), self.project, "project-b2", hash_key=self.key,
+            )
+
+        self.assertEqual(scanner.call_count, 1)
+        self.assertIn(
+            "append",
+            {row[0] for row in self.store.connection.execute(
+                "SELECT relation FROM rollout_sources"
+            )},
+        )
+        self.assertEqual(self.store.count("token_snapshots"), 2)
+
+    def test_new_archived_location_scans_once_then_fast_paths(self) -> None:
+        active = self.base / "active" / "relocated.jsonl"
+        archived = self.base / "archived" / "relocated.jsonl"
+        rows = [self.meta(), self.token(10)]
+        write(active, rows)
+        ingest_rollouts(
+            self.store, (RolloutRoot(active, "active"),), self.project,
+            "project-b2", hash_key=self.key,
+        )
+        write(archived, rows)
+        from hydra_codex import rollout as rollout_module
+
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as scanner:
+            ingest_rollouts(
+                self.store, (RolloutRoot(archived, "archived"),), self.project,
+                "project-b2", hash_key=self.key,
+            )
+        self.assertEqual(scanner.call_count, 1)
+        with patch(
+            "hydra_codex.rollout.scan_source",
+            side_effect=AssertionError("known archive location must fast-path"),
+        ):
+            ingest_rollouts(
+                self.store, (RolloutRoot(archived, "archived"),), self.project,
+                "project-b2", hash_key=self.key,
+            )
+
+        self.assertEqual(self.store.count("rollout_logical_sources"), 1)
+        self.assertEqual(self.store.count("rollout_source_locations"), 2)
+        self.assertEqual(self.store.count("rollout_source_location_states"), 2)
+
+    def test_scanner_version_mismatch_forces_scan_and_refreshes_state(self) -> None:
+        source = self.base / "active" / "scanner-version.jsonl"
+        write(source, [self.meta(), self.token(10)])
+        ingest_rollouts(
+            self.store, (source,), self.project, "project-b2", hash_key=self.key,
+        )
+        self.store.connection.execute(
+            "UPDATE rollout_source_location_states SET scanner_version=-1"
+        )
+        self.store.connection.commit()
+        from hydra_codex import rollout as rollout_module
+
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as scanner:
+            ingest_rollouts(
+                self.store, (source,), self.project, "project-b2", hash_key=self.key,
+            )
+
+        self.assertEqual(scanner.call_count, 1)
+        self.assertGreater(
+            self.store.connection.execute(
+                "SELECT scanner_version FROM rollout_source_location_states"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_truncate_and_rewrite_are_safe_lineage_relations(self) -> None:
         source = self.base / "active" / "thread.jsonl"
         original = [self.meta(), self.token(10), self.token(20, "2026-07-21T00:00:02Z")]
@@ -82,12 +211,22 @@ class RolloutLineageB2Tests(unittest.TestCase):
         ingest_rollouts(self.store, (RolloutRoot(source, "active"),), self.project, "project-b2", hash_key=self.key)
 
         write(source, original[:2])
-        ingest_rollouts(self.store, (RolloutRoot(source, "active"),), self.project, "project-b2", hash_key=self.key)
+        from hydra_codex import rollout as rollout_module
+
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as truncate_scanner:
+            ingest_rollouts(self.store, (RolloutRoot(source, "active"),), self.project, "project-b2", hash_key=self.key)
+        self.assertEqual(truncate_scanner.call_count, 1)
         self.assertEqual(self.store.count("token_snapshots"), 2)
         self.assertIn("truncate", {row[0] for row in self.store.connection.execute("SELECT relation FROM rollout_sources")})
 
         write(source, [self.meta(), self.token(15)])
-        ingest_rollouts(self.store, (RolloutRoot(source, "active"),), self.project, "project-b2", hash_key=self.key)
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as rewrite_scanner:
+            ingest_rollouts(self.store, (RolloutRoot(source, "active"),), self.project, "project-b2", hash_key=self.key)
+        self.assertEqual(rewrite_scanner.call_count, 1)
         self.assertEqual(self.store.count("token_snapshots"), 2)
         self.assertEqual(self.store.connection.execute("SELECT lineage_state FROM rollout_logical_sources").fetchone()[0], "conflicted")
         self.assertIn("source_rewrite", {row[0] for row in self.store.connection.execute("SELECT envelope_kind FROM rollout_diagnostics")})
@@ -145,10 +284,18 @@ class RolloutLineageB2Tests(unittest.TestCase):
         with patch("hydra_codex.rollout._parse_source", side_effect=RuntimeError("parse failure")):
             with self.assertRaises(RuntimeError):
                 ingest_rollouts(self.store, (retry,), self.project, "project-b2", hash_key=self.key)
+        self.assertEqual(self.store.count("rollout_source_location_states"), 1)
         before = self.store.count("rollout_sources")
-        ingest_rollouts(self.store, (retry,), self.project, "project-b2", hash_key=self.key)
+        from hydra_codex import rollout as rollout_module
+
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as retry_scanner:
+            ingest_rollouts(self.store, (retry,), self.project, "project-b2", hash_key=self.key)
+        self.assertEqual(retry_scanner.call_count, 1)
         self.assertGreater(self.store.count("rollout_sources"), before)
         self.assertEqual(self.store.count("token_snapshots"), 2)
+        self.assertEqual(self.store.count("rollout_source_location_states"), 2)
 
     def test_mutation_between_preflight_and_parse_rolls_back(self) -> None:
         source = self.base / "rollouts" / "mutating.jsonl"
@@ -164,6 +311,40 @@ class RolloutLineageB2Tests(unittest.TestCase):
                 ingest_rollouts(self.store, (source,), self.project, "project-b2", hash_key=self.key)
         self.assertEqual(self.store.count("rollout_sources"), 0)
         self.assertEqual(self.store.count("token_snapshots"), 0)
+        self.assertEqual(self.store.count("rollout_source_location_states"), 0)
+
+    def test_metadata_race_after_parse_rolls_back_and_retry_scans(self) -> None:
+        source = self.base / "rollouts" / "metadata-race.jsonl"
+        write(source, [self.meta(), self.token(10)])
+        original = __import__("hydra_codex.rollout", fromlist=["_parse_source"])._parse_source
+
+        def touch_after_parse(*args, **kwargs):
+            result = original(*args, **kwargs)
+            details = source.stat()
+            os.utime(
+                source,
+                ns=(details.st_atime_ns, details.st_mtime_ns + 1_000_000_000),
+            )
+            return result
+
+        with patch("hydra_codex.rollout._parse_source", side_effect=touch_after_parse):
+            with self.assertRaisesRegex(RuntimeError, "changed during ingest"):
+                ingest_rollouts(
+                    self.store, (source,), self.project, "project-b2", hash_key=self.key,
+                )
+        self.assertEqual(self.store.count("rollout_sources"), 0)
+        self.assertEqual(self.store.count("rollout_source_location_states"), 0)
+
+        from hydra_codex import rollout as rollout_module
+
+        with patch(
+            "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+        ) as retry_scanner:
+            ingest_rollouts(
+                self.store, (source,), self.project, "project-b2", hash_key=self.key,
+            )
+        self.assertEqual(retry_scanner.call_count, 1)
+        self.assertEqual(self.store.count("rollout_source_location_states"), 1)
 
     def test_unknown_inner_types_are_fingerprinted_without_raw_values(self) -> None:
         source = self.base / "rollouts" / "unknown-inner.jsonl"
@@ -386,17 +567,32 @@ class RolloutLineageB2Tests(unittest.TestCase):
             self.store, (first, resumed), self.project, "project-b2", hash_key=self.key,
         )
         self.store.connection.execute("UPDATE fork_baselines SET input_tokens=999")
+        self.store.connection.execute(
+            "UPDATE token_snapshots SET epoch=99,contributes_total=0"
+        )
         self.store.connection.commit()
 
-        ingest_rollouts(
-            self.store, (first, resumed), self.project, "project-b2", hash_key=self.key,
-        )
+        with patch(
+            "hydra_codex.rollout.scan_source",
+            side_effect=AssertionError("reconciliation must not require rescanning"),
+        ):
+            ingest_rollouts(
+                self.store, (first, resumed), self.project, "project-b2", hash_key=self.key,
+            )
 
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT input_tokens FROM fork_baselines"
             ).fetchone()[0],
             10,
+        )
+        self.assertEqual(
+            {
+                tuple(row) for row in self.store.connection.execute(
+                    "SELECT epoch,contributes_total FROM token_snapshots"
+                )
+            },
+            {(0, 1)},
         )
 
 

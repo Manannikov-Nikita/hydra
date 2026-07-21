@@ -33,6 +33,69 @@ from .tool_normalization import custom_exec_outcome
 from .tool_spans import persist_tool_end, persist_tool_start
 
 
+SOURCE_SCANNER_VERSION = 1
+
+
+def _source_stat(path: Path) -> tuple[int, int, int, int, int]:
+    details = path.stat()
+    return (
+        int(details.st_dev), int(details.st_ino), int(details.st_size),
+        int(details.st_mtime_ns), int(details.st_ctime_ns),
+    )
+
+
+def _unchanged_location(
+    connection: Any, project_id: str, location: str,
+    source_stat: tuple[int, int, int, int, int],
+) -> tuple[str, str] | None:
+    row = connection.execute(
+        """SELECT state.logical_source_key,state.revision_digest
+             FROM rollout_source_location_states AS state
+             JOIN rollout_logical_sources AS logical
+               ON logical.logical_source_key=state.logical_source_key
+              AND logical.project_id=state.project_id
+             JOIN rollout_sources AS revision
+               ON revision.source_digest=state.revision_digest
+              AND revision.logical_source_key=state.logical_source_key
+              AND revision.materialized=1
+             JOIN rollout_source_locations AS location
+               ON location.logical_source_key=state.logical_source_key
+              AND location.location_key=state.location_key
+              AND location.revision_digest=state.revision_digest
+            WHERE state.project_id=? AND state.location_key=?
+              AND state.st_dev=? AND state.st_ino=? AND state.st_size=?
+              AND state.st_mtime_ns=? AND state.st_ctime_ns=?
+              AND state.scanner_version=?""",
+        (project_id, location, *source_stat, SOURCE_SCANNER_VERSION),
+    ).fetchone()
+    return None if row is None else (str(row[0]), str(row[1]))
+
+
+def _persist_location_state(
+    connection: Any, project_id: str, location: str, logical: str,
+    revision: str, source_stat: tuple[int, int, int, int, int],
+) -> None:
+    connection.execute(
+        """INSERT INTO rollout_source_location_states(
+               project_id,location_key,logical_source_key,revision_digest,
+               st_dev,st_ino,st_size,st_mtime_ns,st_ctime_ns,scanner_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(project_id,location_key) DO UPDATE SET
+             logical_source_key=excluded.logical_source_key,
+             revision_digest=excluded.revision_digest,
+             st_dev=excluded.st_dev,
+             st_ino=excluded.st_ino,
+             st_size=excluded.st_size,
+             st_mtime_ns=excluded.st_mtime_ns,
+             st_ctime_ns=excluded.st_ctime_ns,
+             scanner_version=excluded.scanner_version""",
+        (
+            project_id, location, logical, revision, *source_stat,
+            SOURCE_SCANNER_VERSION,
+        ),
+    )
+
+
 def _insert_diagnostic(connection: Any, source: str, line: int, kind: str, payload: Any, *, unsafe_value: Any = None) -> None:
     _persist_diagnostic(
         connection, source, line, kind, payload,
@@ -528,15 +591,29 @@ def ingest_rollouts(
         diagnostics = 0
         unique: set[str] = set()
         for path in files:
-            scan = scan_source(path, hasher.key, opaque)
-            digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
-            unique.add(digest)
             location = opaque("source", str(path))
             label = next(
                 (item.label for item in root_specs if isinstance(item, RolloutRoot)
                  and path.is_relative_to(Path(item.path).resolve())),
                 "explicit",
             )
+            before_stat = _source_stat(path)
+            with store.rollout_transaction() as connection:
+                unchanged = _unchanged_location(
+                    connection, project_id, location, before_stat,
+                )
+                if unchanged is not None:
+                    logical, digest = unchanged
+                    connection.execute(
+                        """UPDATE rollout_source_locations SET location_type=?
+                            WHERE logical_source_key=? AND location_key=?""",
+                        (label, logical, location),
+                    )
+                    unique.add(digest)
+                    continue
+            scan = scan_source(path, hasher.key, opaque)
+            digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
+            unique.add(digest)
             with store.rollout_transaction() as connection:
                 known = connection.execute(
                     "SELECT logical_source_key,materialized FROM rollout_sources WHERE source_digest=?", (digest,),
@@ -550,6 +627,13 @@ def ingest_rollouts(
                         (known[0], location, label, digest),
                     )
                     if known[1]:
+                        after_stat = _source_stat(path)
+                        if after_stat != before_stat:
+                            raise RuntimeError("rollout source changed during ingest")
+                        _persist_location_state(
+                            connection, project_id, location, str(known[0]),
+                            digest, after_stat,
+                        )
                         continue
                 identity_key = opaque("identity", scan.identity) if scan.identity else opaque("identity", "unresolved/" + digest)
                 located = located_lineage(connection, location, project_id)
@@ -641,6 +725,17 @@ def ingest_rollouts(
                     ),
                 )
                 reconcile_fork_baselines(connection, project_id)
+                materialized = connection.execute(
+                    "SELECT materialized FROM rollout_sources WHERE source_digest=?",
+                    (digest,),
+                ).fetchone()
+                if materialized is not None and materialized[0]:
+                    after_stat = _source_stat(path)
+                    if after_stat != before_stat:
+                        raise RuntimeError("rollout source changed during ingest")
+                    _persist_location_state(
+                        connection, project_id, location, logical, digest, after_stat,
+                    )
         with store.rollout_transaction() as connection:
             from .token_selection import refresh_token_source_selection
 

@@ -152,6 +152,36 @@ def build_schema(path: Path, version: int) -> None:
 
 
 class MigrationMatrixB2Tests(unittest.TestCase):
+    def test_v28_migration_adds_private_location_state_without_changing_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v28.sqlite3"
+            build_schema(database, 28)
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+
+            self.assertEqual(store.schema_version(), 29)
+            self.assertEqual(
+                {
+                    row[1] for row in store.connection.execute(
+                        "PRAGMA table_info(rollout_source_location_states)"
+                    )
+                },
+                {
+                    "project_id", "location_key", "logical_source_key",
+                    "revision_digest", "st_dev", "st_ino", "st_size",
+                    "st_mtime_ns", "st_ctime_ns", "scanner_version",
+                },
+            )
+            self.assertEqual(store.count("rollout_source_location_states"), 0)
+            self.assertEqual(
+                tuple(store.connection.execute(
+                    "SELECT logical_source_key,location_key,revision_digest "
+                    "FROM rollout_source_locations"
+                ).fetchone()),
+                ("legacy-logical", "legacy-location", "legacy-source"),
+            )
+
     def test_every_prior_schema_migrates_and_preserves_rows(self) -> None:
         latest = MIGRATIONS[-1][0]
         with tempfile.TemporaryDirectory() as temporary:

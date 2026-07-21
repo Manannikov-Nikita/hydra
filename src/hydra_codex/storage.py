@@ -24,6 +24,7 @@ from .migrations_i9 import I9_MIGRATIONS, I9_REQUIRED_SCHEMA
 from .migrations_j10 import J10_MIGRATIONS, J10_REQUIRED_SCHEMA
 from .migrations_k11 import K11_MIGRATIONS, K11_REQUIRED_SCHEMA
 from .migrations_l12 import L12_MIGRATIONS, L12_REQUIRED_SCHEMA
+from .migrations_m13 import M13_MIGRATIONS, M13_REQUIRED_SCHEMA
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -263,7 +264,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -447,6 +448,7 @@ class HydraStore:
         required.update(J10_REQUIRED_SCHEMA)
         required.update(K11_REQUIRED_SCHEMA)
         required.update(L12_REQUIRED_SCHEMA)
+        required.update(M13_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -595,7 +597,8 @@ class HydraStore:
     def count(self, table: str) -> int:
         allowed = {
             "sessions", "turns", "annotations", "conflicts", "rollout_sources",
-            "rollout_source_locations", "rollout_diagnostics", "rollout_sessions",
+            "rollout_source_locations", "rollout_source_location_states",
+            "rollout_diagnostics", "rollout_sessions",
             "token_snapshots", "session_edges", "turn_attempts", "tool_spans",
             "file_observations", "rollout_test_runs", "metric_facts", "semantic_conflicts",
             "fork_baselines",

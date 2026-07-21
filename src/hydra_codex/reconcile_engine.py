@@ -10,6 +10,7 @@ import json
 import sqlite3
 from typing import Iterable
 
+from .exact_time import ExactInstant, require_exact_timestamp
 from .public_refs import project_public_references
 from .reconcile_annotations import AnnotationFacts
 from .reconcile_facts import (
@@ -43,11 +44,10 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("stored reconciled timestamp is not timezone-aware")
-    return parsed
+def _plan_instant(plan: TaskPlan) -> ExactInstant:
+    if plan.cutoff_instant is None:
+        raise ValueError("task plan is missing its exact cutoff")
+    return plan.cutoff_instant
 
 
 def _digest(key: bytes, domain: bytes, payload: bytes) -> str:
@@ -79,7 +79,7 @@ def _task_fingerprint(
     return {
         "root": plan.root_key,
         "status": plan.status,
-        "cutoff": _iso(plan.cutoff_at),
+        "cutoff": _plan_instant(plan).canonical,
         "cutoff_timing_provenance": plan.cutoff_timing_provenance,
         "sessions": list(plan.session_ids),
         "recorded": list(recorded.vector.values),
@@ -202,8 +202,9 @@ def _persist_task(
                project_id,root_key,public_ref,status,cutoff_at,last_activity_at,task_family,
                reconciliation_version,input_digest) VALUES (?,?,?,?,?,?,?,?,?)""",
         (
-            project_id, plan.root_key, public_ref, plan.status, _iso(plan.cutoff_at),
-            _iso(plan.cutoff_at), semantic.task_family, RECONCILIATION_VERSION, input_digest,
+            project_id, plan.root_key, public_ref, plan.status,
+            _plan_instant(plan).canonical, _plan_instant(plan).canonical,
+            semantic.task_family, RECONCILIATION_VERSION, input_digest,
         ),
     )
     connection.executemany(
@@ -301,7 +302,10 @@ def reconcile_project(
         installation_key, b"hydra/reconcile-run/v1/",
         f"{project_id}/{RECONCILIATION_VERSION}/{input_digest}".encode("utf-8"),
     )[:32]
-    completed_at = max((item.cutoff_at for item in plans), default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+    completed_instant = max(
+        (_plan_instant(item) for item in plans),
+        default=require_exact_timestamp("1970-01-01T00:00:00Z"),
+    )
     with store.rollout_transaction() as connection:
         connection.execute("DELETE FROM reconciled_tasks WHERE project_id=?", (project_id,))
         for plan, _metrics, deltas, semantic in assembled:
@@ -317,8 +321,9 @@ def reconcile_project(
                ON CONFLICT(run_id) DO UPDATE SET
                    outcome='success',completed_at=excluded.completed_at,task_count=excluded.task_count""",
             (
-                run_id, project_id, _iso(completed_at), RECONCILIATION_VERSION,
-                input_digest, _iso(completed_at), len(plans),
+                run_id, project_id, completed_instant.canonical,
+                RECONCILIATION_VERSION, input_digest,
+                completed_instant.canonical, len(plans),
             ),
         )
     complete_count = sum(item.status == "complete" for item in plans)
@@ -426,13 +431,19 @@ def list_reconciled_tasks(
         metrics_by_root = {item[0].root_key: item[1] for item in assembled}
         annotations_by_root = {item[0].root_key: item[3].annotations for item in assembled}
         rows.sort(key=lambda row: (
-            -_timestamp(row["last_activity_at"]).timestamp(), str(row["public_ref"]),
+            -require_exact_timestamp(
+                row["last_activity_at"], "stored task activity timestamp",
+            ).epoch_nanoseconds,
+            str(row["public_ref"]),
         ))
         if last is not None:
             rows = rows[:last]
         tasks: list[ReconciledTask] = []
         for row in rows:
-            cutoff = _timestamp(row["cutoff_at"])
+            cutoff_instant = require_exact_timestamp(
+                row["cutoff_at"], "stored task cutoff timestamp",
+            )
+            cutoff = cutoff_instant.presentation
             metrics = metrics_by_root[str(row["root_key"])]
             semantic = _semantic_from_store(
                 store.connection, project_id, row["root_key"], row["task_family"],
@@ -441,6 +452,7 @@ def list_reconciled_tasks(
             tasks.append(ReconciledTask(
                 str(row["public_ref"]), str(row["status"]), cutoff,
                 replace(metrics, semantic_coverage=semantic.coverage), semantic,
+                cutoff_instant,
             ))
         return tuple(tasks)
 

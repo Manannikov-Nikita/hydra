@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from .project_schema import project_event_schema_counts
 from .reconcile_types import ReconciledTask
 from .report_operations import evaluate_report_trends, report_from_task_tree
 from .report_semantics import (
@@ -23,31 +24,6 @@ from .report_semantics import (
 from .reporting import NumericFact, PilotHealth, TaskReport, _from_scalar
 from .storage import HydraStore
 from .task_tree_types import ScalarFact
-
-
-def _project_event_schema_counts(
-    store: HydraStore, project_id: str,
-) -> tuple[int, dict[str, int]]:
-    total = int(store.connection.execute(
-        """SELECT COUNT(*)
-             FROM codex_event_issues i
-             JOIN codex_event_sources s ON s.source_digest=i.source_digest
-            WHERE s.project_id=?""",
-        (project_id,),
-    ).fetchone()[0])
-    attributed = {
-        str(row[0]): int(row[1])
-        for row in store.connection.execute(
-            """SELECT t.public_ref,COALESCE(SUM(d.occurrence_count),0)
-                 FROM reconciled_tasks t
-                 JOIN reconciled_task_diagnostics d
-                   ON d.project_id=t.project_id AND d.root_key=t.root_key
-                WHERE t.project_id=? AND d.diagnostic_code LIKE 'schema:event:%'
-                GROUP BY t.public_ref""",
-            (project_id,),
-        )
-    }
-    return total, attributed
 
 
 def _project_pilot_health(
@@ -91,8 +67,8 @@ def _project_pilot_health(
             None, "count", "estimated", ("instrumentation_count_unavailable",),
             sum(item.metrics.instrumentation_calls.known_lower_bound for item in cohort),
         )
-    project_event_issues, attributed_event_issues = _project_event_schema_counts(
-        store, project_id,
+    project_event_issues, attributed_event_issues = project_event_schema_counts(
+        store.connection, project_id,
     )
     non_event_schema = sum(
         max(

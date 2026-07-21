@@ -19,7 +19,7 @@ class PilotMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = HydraStore(Path(temporary) / "hydra.sqlite3")
             try:
-                self.assertEqual(store.schema_version(), 33)
+                self.assertEqual(store.schema_version(), 34)
                 tables = {
                     str(row[0])
                     for row in store.connection.execute(
@@ -33,8 +33,9 @@ class PilotMigrationTests(unittest.TestCase):
                     """INSERT INTO pilot_runs(
                            pilot_id,project_id,started_at,closed_at,target,
                            task_family,thresholds_json,state)
-                       VALUES ('pilot_test','project','2026-07-22T00:00:00Z',NULL,5,
-                               'telemetry-analysis','{}','open')"""
+                       VALUES ('pilot_test','project','2026-07-22T00:00:00Z',
+                               '2026-07-22T01:00:00Z',5,
+                               'telemetry-analysis','{}','closed')"""
                 )
                 store.connection.execute(
                     """INSERT INTO pilot_receipts(

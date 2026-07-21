@@ -19,6 +19,13 @@ def timing_authority(observation: LifecycleObservation) -> int:
     return _TIMING_AUTHORITY[observation.timing_provenance]
 
 
+def _instant(observation: LifecycleObservation):
+    instant = observation.observed_instant
+    if instant is None:  # Defensive for objects created outside the dataclass API.
+        raise ValueError("lifecycle observation is missing its exact instant")
+    return instant
+
+
 def is_later_attempt_start(
     start: LifecycleObservation, completion: LifecycleObservation,
 ) -> bool:
@@ -29,9 +36,9 @@ def is_later_attempt_start(
     )
     if not distinct_turn and timing_authority(start) < timing_authority(completion):
         return False
-    if start.observed_at > completion.observed_at:
+    if _instant(start) > _instant(completion):
         return True
-    if start.observed_at != completion.observed_at:
+    if _instant(start) != _instant(completion):
         return False
     if (
         start.logical_source_key == completion.logical_source_key
@@ -60,28 +67,28 @@ def select_lifecycle_boundary(
     ] = []
     for turn_key, items in grouped.items():
         selected = max(items, key=lambda item: (
-            timing_authority(item), item.observed_at,
+            timing_authority(item), _instant(item),
             item.logical_source_key or "",
             item.source_ordinal if item.source_ordinal is not None else -1,
         ))
         conflicts = sum(
             timing_authority(item) < timing_authority(selected)
-            and item.observed_at != selected.observed_at
+            and _instant(item) != _instant(selected)
             for item in items
         )
         matching_starts = tuple(
             item for item in start_items if item.turn_key == turn_key
         )
         started = max(matching_starts, key=lambda item: (
-            timing_authority(item), item.observed_at,
+            timing_authority(item), _instant(item),
             item.logical_source_key or "",
             item.source_ordinal if item.source_ordinal is not None else -1,
         )) if matching_starts else None
         attempts.append((selected, conflicts, started))
 
     selected, conflicts, _started = max(attempts, key=lambda attempt: (
-        (attempt[2] or attempt[0]).observed_at,
-        attempt[0].observed_at,
+        _instant(attempt[2] or attempt[0]),
+        _instant(attempt[0]),
         timing_authority(attempt[0]),
         attempt[0].turn_key or "",
         attempt[0].logical_source_key or "",

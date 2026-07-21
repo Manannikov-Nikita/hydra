@@ -29,6 +29,11 @@ from .migrations_n14 import N14_MIGRATIONS, N14_REQUIRED_SCHEMA
 from .migrations_o15 import O15_MIGRATIONS, O15_REQUIRED_SCHEMA
 from .migrations_p16 import P16_MIGRATIONS, P16_REQUIRED_SCHEMA
 from .migrations_q17 import Q17_MIGRATIONS, Q17_REQUIRED_SCHEMA
+from .migrations_r18 import (
+    R18_MIGRATIONS,
+    R18_PILOT_RECEIPTS_TABLE_SQL,
+    R18_REQUIRED_SCHEMA,
+)
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -268,14 +273,14 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
     definitions: dict[str, str] = {}
     for migrations in (
         G7_MIGRATIONS, H8_MIGRATIONS, I9_MIGRATIONS,
-        P16_MIGRATIONS, Q17_MIGRATIONS,
+        P16_MIGRATIONS, Q17_MIGRATIONS, R18_MIGRATIONS,
     ):
         for _version, statements in migrations:
             for statement in statements:
@@ -499,10 +504,18 @@ class HydraStore:
         required.update(O15_REQUIRED_SCHEMA)
         required.update(P16_REQUIRED_SCHEMA)
         required.update(Q17_REQUIRED_SCHEMA)
+        required.update(R18_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
                 raise StorageUnavailable(f"Hydra schema is missing required columns for {table}")
+        if (
+            _table_schema_sql(self.connection, "pilot_receipts")
+            != _normalized_schema_sql(R18_PILOT_RECEIPTS_TABLE_SQL)
+        ):
+            raise StorageUnavailable(
+                "Hydra schema has altered pilot_receipts trust constraints"
+            )
         tool_role_foreign_key = (
             (
                 "tool_spans", "session_key", "session_key", "NO ACTION", "CASCADE",

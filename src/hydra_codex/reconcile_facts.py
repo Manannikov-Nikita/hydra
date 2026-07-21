@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import sqlite3
 from typing import Iterable
 
+from .exact_time import ExactInstant, instant_from_datetime, parse_exact_timestamp
 from .lifecycle_timing import select_lifecycle_boundary
 from .reconcile_annotations import (
     AnnotationFacts,
@@ -89,6 +90,18 @@ def _canonical_root(key: str, parents: dict[str, str | None]) -> str:
     return current
 
 
+def _lifecycle_instant(observation: LifecycleObservation) -> ExactInstant:
+    if observation.observed_instant is None:
+        return instant_from_datetime(observation.observed_at)
+    return observation.observed_instant
+
+
+def _session_instant(session: NormalizedSession) -> ExactInstant | None:
+    if session.started_at is None:
+        return None
+    return session.started_instant or instant_from_datetime(session.started_at)
+
+
 def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tuple[TaskPlan, ...]:
     sessions = {item.session_id: item for item in _sessions(connection, project_id)}
     if not sessions:
@@ -117,10 +130,10 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
         eligible_terminals = [
             terminal for terminal in terminals.get(root, ())
             if (
-                sessions[root].started_at is not None
-                and sessions[root].started_at <= terminal.observed_at
+                _session_instant(sessions[root]) is not None
+                and _session_instant(sessions[root]) <= _lifecycle_instant(terminal)
             ) or any(
-                start.observed_at <= terminal.observed_at
+                _lifecycle_instant(start) <= _lifecycle_instant(terminal)
                 for start in starts.get(root, ())
             )
         ]
@@ -130,34 +143,40 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
         if terminal is not None and not has_later_root_start(
             root, lifecycle, terminal,
         ):
-            cutoff = terminal.observed_at
+            cutoff_instant = _lifecycle_instant(terminal)
+            cutoff = cutoff_instant.presentation
             status = "complete" if terminal.kind == "task_complete" else "incomplete"
             cutoff_source = terminal.logical_source_key
             cutoff_ordinal = terminal.source_ordinal
             cutoff_timing_provenance = terminal.timing_provenance
         else:
             candidates = [
-                value for member in members
-                for value in (
-                    *((sessions[member].started_at,) if sessions[member].started_at is not None else ()),
-                    *activity_by_session.get(member, ()),
+                instant for member in members
+                for instant in (
+                    *((_session_instant(sessions[member]),)
+                      if sessions[member].started_at is not None else ()),
+                    *(instant_from_datetime(value)
+                      for value in activity_by_session.get(member, ())),
                 )
+                if instant is not None
             ]
             if not candidates:
                 continue
-            cutoff = max(candidates)
+            cutoff_instant = max(candidates)
+            cutoff = cutoff_instant.presentation
             status = "incomplete"
             cutoff_source = None
             cutoff_ordinal = None
             cutoff_timing_provenance = "derived"
         included = tuple(sorted(
             member for member in members
-            if sessions[member].started_at is None or sessions[member].started_at <= cutoff
+            if _session_instant(sessions[member]) is None
+            or _session_instant(sessions[member]) <= cutoff_instant
         ))
         if root in included:
             plans.append(TaskPlan(
                 root, status, cutoff, included, cutoff_source, cutoff_ordinal,
-                cutoff_timing_provenance,
+                cutoff_timing_provenance, cutoff_instant,
             ))
     return tuple(sorted(plans, key=lambda item: item.root_key))
 
@@ -200,6 +219,7 @@ def build_token_deltas(
     }
     intervals, _invalid_intervals = load_intervals(
         connection, project_id, plan.session_ids, plan.cutoff_at,
+        plan.cutoff_instant,
     )
     diagnostics: Counter[str] = Counter()
     authoritative_abort = bool(
@@ -210,10 +230,17 @@ def build_token_deltas(
     previous: dict[tuple[str, int], TokenVector] = {}
     deltas: list[DeltaFact] = []
     for ordinal, row in enumerate(rows, start=1):
-        observed = _optional_timestamp(row[4])
+        observed_instant = parse_exact_timestamp(row[4])
+        observed = (
+            None if observed_instant is None else observed_instant.presentation
+        )
         session_key = str(row[0])
         session = sessions[session_key]
-        if observed is not None and observed > plan.cutoff_at:
+        if (
+            observed_instant is not None
+            and plan.cutoff_instant is not None
+            and observed_instant > plan.cutoff_instant
+        ):
             continue
         if (
             observed is not None and session.started_at is not None
@@ -275,8 +302,10 @@ def build_token_deltas(
         if delta == TokenVector.zero():
             continue
         phase = cause = None
-        if observed is not None and not amount_estimated:
-            phase, cause, overlap = phase_at(intervals.get(session_key, []), observed)
+        if observed_instant is not None and not amount_estimated:
+            phase, cause, overlap = phase_at(
+                intervals.get(session_key, []), observed_instant,
+            )
             if overlap:
                 diagnostics["overlapping_semantic_intervals"] += 1
                 phase = cause = None
@@ -415,10 +444,10 @@ def semantic_assembly(
               WHERE project_id=? AND session_key IN ({placeholders})""",
         (project_id, *plan.session_ids),
     ):
-        observed = _optional_timestamp(observed_at)
+        observed = parse_exact_timestamp(observed_at)
         if observed is None:
             diagnostics["semantic:invalid_fact_timestamp"] += 1
-        elif observed <= plan.cutoff_at:
+        elif plan.cutoff_instant is not None and observed <= plan.cutoff_instant:
             staged[str(kind)] += 1
     old_conflict_rows = list(connection.execute(
         f"""SELECT c.source_digest,c.line_number,e.observed_at,l.logical_source_key
@@ -439,6 +468,7 @@ def semantic_assembly(
             diagnostics["ambiguous_legacy_conflict_placement"] += 1
     annotations = build_annotation_facts(
         connection, project_id, plan.session_ids, plan.cutoff_at,
+        plan.cutoff_instant,
     )
     if annotations.invalid_test_times:
         diagnostics["semantic:invalid_test_timestamp"] += len(annotations.invalid_test_times)
@@ -470,8 +500,12 @@ def semantic_assembly(
         (project_id, *plan.session_ids),
     ))
     for code, value, _session_key in event_schema_rows:
-        observed = _optional_timestamp(value)
-        if observed is not None and observed <= plan.cutoff_at:
+        observed = parse_exact_timestamp(value)
+        if (
+            observed is not None
+            and plan.cutoff_instant is not None
+            and observed <= plan.cutoff_instant
+        ):
             diagnostics[f"schema:event:{code}"] += 1
         else:
             diagnostics["ambiguous_event_schema_diagnostic_placement"] += 1

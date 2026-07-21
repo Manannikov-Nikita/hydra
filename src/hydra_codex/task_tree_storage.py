@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import sqlite3
 
+from .exact_time import ExactInstant, parse_exact_timestamp
 from .task_tree import aggregate_task_tree
 from .task_tree_types import (
     ActivityObservation,
@@ -21,13 +22,27 @@ from .task_tree_types import (
 
 
 def _optional_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+    parsed = parse_exact_timestamp(value)
+    return None if parsed is None else parsed.presentation
+
+
+def _optional_instant(value: object) -> ExactInstant | None:
+    return parse_exact_timestamp(value)
+
+
+def _attempt_instant(
+    attempt_value: object, receipt_value: object,
+) -> tuple[ExactInstant | None, str]:
+    """Recover source nanoseconds when reconciliation kept the same public time."""
+    attempt = _optional_instant(attempt_value)
+    receipt = _optional_instant(receipt_value)
+    if attempt is None:
+        return receipt, "estimated"
+    if attempt.fractional_digits > 6:
+        return attempt, "exact"
+    if receipt is not None and receipt.presentation == attempt.presentation:
+        return receipt, "exact"
+    return attempt, "exact"
 
 
 def _sessions(connection: sqlite3.Connection, project_id: str) -> tuple[NormalizedSession, ...]:
@@ -37,14 +52,17 @@ def _sessions(connection: sqlite3.Connection, project_id: str) -> tuple[Normaliz
             WHERE s.project_id=? ORDER BY s.session_key""",
         (project_id,),
     )
-    return tuple(
-        NormalizedSession(
-            str(row[0]), row[1], _optional_timestamp(row[2]),
+    sessions: list[NormalizedSession] = []
+    for row in rows:
+        started = _optional_instant(row[2])
+        sessions.append(NormalizedSession(
+            str(row[0]), row[1],
+            None if started is None else started.presentation,
             edge_confidence_kind=str(row[3] or "confirmed"),
             edge_confidence=float(row[4] if row[4] is not None else 1.0),
-        )
-        for row in rows
-    )
+            started_instant=started,
+        ))
+    return tuple(sessions)
 
 
 def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObservation, ...]:
@@ -116,31 +134,25 @@ def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[Lifecyc
     ] = {}
     for row in rows:
         attempt_key = f"{row[1]}/{row[2]}"
-        started_at = _optional_timestamp(row[4])
-        started_provenance = "exact"
-        if started_at is None:
-            started_at = _optional_timestamp(row[10])
-            started_provenance = "estimated"
-        if started_at is not None:
+        started, started_provenance = _attempt_instant(row[4], row[10])
+        if started is not None:
             observations.append(LifecycleObservation(
-                str(row[0]), "task_started", started_at,
+                str(row[0]), "task_started", started.presentation,
                 str(row[6]) if row[6] is not None else None,
                 int(row[8]) if row[8] is not None else None,
-                attempt_key, started_provenance,
+                attempt_key, started_provenance, started,
             ))
         if row[3] not in mapping:
             continue
-        terminal_at = _optional_timestamp(row[5])
-        terminal_provenance = "exact"
-        if terminal_at is None:
-            terminal_at = _optional_timestamp(row[11])
-            terminal_provenance = "estimated"
-        if terminal_at is not None:
+        terminal_instant, terminal_provenance = _attempt_instant(
+            row[5], row[11],
+        )
+        if terminal_instant is not None:
             terminal = LifecycleObservation(
-                str(row[0]), mapping[str(row[3])], terminal_at,
+                str(row[0]), mapping[str(row[3])], terminal_instant.presentation,
                 str(row[7]) if row[7] is not None else None,
                 int(row[9]) if row[9] is not None else None,
-                attempt_key, terminal_provenance,
+                attempt_key, terminal_provenance, terminal_instant,
             )
             observations.append(terminal)
             terminal_attempts.setdefault((str(row[0]), str(row[1])), []).append(
@@ -165,20 +177,23 @@ def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[Lifecyc
         (project_id,),
     )
     for row in discarded:
-        observed_at = _optional_timestamp(row[2])
+        observed_instant = _optional_instant(row[2])
         candidates = terminal_attempts.get((str(row[0]), str(row[5])), ())
-        if observed_at is None or not candidates:
+        if observed_instant is None or not candidates:
             continue
         prior = tuple(
             candidate for candidate in candidates
-            if candidate.observed_at <= observed_at
+            if candidate.observed_instant is not None
+            and candidate.observed_instant <= observed_instant
         )
         canonical = max(
-            prior or tuple(candidates), key=lambda item: item.observed_at,
+            prior or tuple(candidates),
+            key=lambda item: item.observed_instant,
         )
         observations.append(LifecycleObservation(
-            str(row[0]), mapping[str(row[1])], observed_at,
+            str(row[0]), mapping[str(row[1])], observed_instant.presentation,
             str(row[3]), int(row[4]), canonical.turn_key, "estimated",
+            observed_instant,
         ))
     return tuple(observations)
 

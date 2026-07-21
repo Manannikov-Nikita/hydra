@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import math
 from typing import Literal
+
+from .exact_time import ExactInstant, instant_from_datetime
 
 
 Provenance = Literal["exact", "derived", "model_reported", "estimated"]
@@ -136,12 +138,21 @@ class NormalizedSession:
     started_at: datetime | None
     edge_confidence_kind: EdgeConfidence = "confirmed"
     edge_confidence: float = 1.0
+    started_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.session_id:
             raise ValueError("session_id must not be empty")
         if self.started_at is not None:
             _require_aware(self.started_at, "started_at")
+            instant = self.started_instant or instant_from_datetime(self.started_at)
+            if instant.presentation != self.started_at:
+                raise ValueError("started instant and datetime must match")
+            object.__setattr__(self, "started_instant", instant)
+        elif self.started_instant is not None:
+            raise ValueError("started instant requires started_at")
         if self.edge_confidence_kind not in ("confirmed", "inferred", "ambiguous"):
             raise ValueError("invalid edge confidence kind")
         if not isinstance(self.edge_confidence, (int, float)) or isinstance(self.edge_confidence, bool):
@@ -219,9 +230,16 @@ class LifecycleObservation:
     source_ordinal: int | None = None
     turn_key: str | None = None
     timing_provenance: Provenance = "exact"
+    observed_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
+        instant = self.observed_instant or instant_from_datetime(self.observed_at)
+        if instant.presentation != self.observed_at:
+            raise ValueError("observed instant and datetime must match")
+        object.__setattr__(self, "observed_instant", instant)
         if self.source_ordinal is not None and (
             isinstance(self.source_ordinal, bool)
             or not isinstance(self.source_ordinal, int)

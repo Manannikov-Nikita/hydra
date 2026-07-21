@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime
 import hashlib
 import json
 import math
 from pathlib import Path
-import re
+import secrets
 from typing import Any
 
+from .exact_time import (
+    ExactInstant,
+    instant_from_datetime,
+    parse_exact_timestamp,
+    public_timestamp,
+    require_exact_timestamp,
+)
+from .project_schema import project_event_schema_counts
 from .redaction import project_task_family, validate_task_family
 from .reconcile_engine import RECONCILIATION_VERSION, list_reconciled_tasks
 from .reconcile_facts import discover_task_plans
@@ -19,70 +27,17 @@ from .storage import HydraStore
 
 PILOT_SCHEMA = "hydra.pilot/v1"
 AUDIT_SCHEMA = "hydra.audit/v1"
-_NANOSECONDS_PER_SECOND = 1_000_000_000
-_RFC3339_NANOSECOND = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})[Tt]"
-    r"(?P<clock>\d{2}:\d{2}:\d{2})"
-    r"(?:\.(?P<fraction>\d{1,9}))?"
-    r"(?P<offset>[Zz]|[+-]\d{2}:\d{2})$"
-)
-
-
 def _iso(value: datetime) -> str:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("pilot clock must return an aware datetime")
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        return public_timestamp(value)
+    except ValueError as error:
+        raise ValueError("pilot clock must return an aware datetime") from error
 
 
 def _timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("stored pilot timestamp is not timezone-aware")
-    return parsed
-
-
-def _datetime_nanoseconds(value: datetime) -> int:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("pilot timestamp must be timezone-aware")
-    observed = value.astimezone(timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    delta = observed - epoch
-    whole_seconds = delta.days * 86_400 + delta.seconds
-    return (
-        whole_seconds * _NANOSECONDS_PER_SECOND
-        + observed.microsecond * 1_000
-    )
-
-
-def _stored_timestamp_nanoseconds(value: object) -> int | None:
-    if not isinstance(value, str):
-        return None
-    match = _RFC3339_NANOSECOND.fullmatch(value)
-    if match is None:
-        return None
-    offset = match.group("offset")
-    if offset in {"Z", "z"}:
-        offset = "+00:00"
-    else:
-        offset_hour = int(offset[1:3])
-        offset_minute = int(offset[4:6])
-        if (
-            offset_hour > 23
-            or offset_minute > 59
-            or offset == "-00:00"
-        ):
-            return None
-    try:
-        observed = datetime.fromisoformat(
-            f'{match.group("date")}T{match.group("clock")}{offset}'
-        )
-    except ValueError:
-        return None
-    fraction = match.group("fraction") or ""
-    return (
-        _datetime_nanoseconds(observed)
-        + int(fraction.ljust(9, "0") or "0")
-    )
+    return require_exact_timestamp(
+        value, "stored pilot timestamp",
+    ).presentation
 
 
 def _canonical(value: object) -> str:
@@ -113,6 +68,26 @@ class PilotRun:
     task_family: str
     thresholds: dict[str, int | float]
     state: str
+    started_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
+    closed_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        started = self.started_instant or instant_from_datetime(self.started_at)
+        if started.presentation != self.started_at:
+            raise ValueError("pilot start instant and datetime must match")
+        object.__setattr__(self, "started_instant", started)
+        if self.closed_at is None:
+            if self.closed_instant is not None:
+                raise ValueError("pilot close instant requires closed_at")
+            return
+        closed = self.closed_instant or instant_from_datetime(self.closed_at)
+        if closed.presentation != self.closed_at:
+            raise ValueError("pilot close instant and datetime must match")
+        object.__setattr__(self, "closed_instant", closed)
 
 
 @dataclass(frozen=True)
@@ -158,15 +133,23 @@ class PilotReceipt:
 
 
 def _run_from_row(row) -> PilotRun:
+    started = require_exact_timestamp(row["started_at"], "pilot started_at")
+    closed = (
+        None
+        if row["closed_at"] is None
+        else require_exact_timestamp(row["closed_at"], "pilot closed_at")
+    )
     return PilotRun(
         str(row["pilot_id"]),
         str(row["project_id"]),
-        _timestamp(str(row["started_at"])),
-        None if row["closed_at"] is None else _timestamp(str(row["closed_at"])),
+        started.presentation,
+        None if closed is None else closed.presentation,
         int(row["target"]),
         str(row["task_family"]),
         dict(json.loads(str(row["thresholds_json"]))),
         str(row["state"]),
+        started,
+        closed,
     )
 
 
@@ -197,14 +180,12 @@ def start_pilot(
             if run.target != target or run.task_family != family:
                 raise ValueError("project already has a different open pilot")
             return run
-        pilot_id = "hpilot_v1_" + hashlib.sha256(
-            _canonical({
-                "project_id": project_id,
-                "started_at": started_at,
-                "target": target,
-                "task_family": family,
-            }).encode("utf-8")
-        ).hexdigest()[:32]
+        while True:
+            pilot_id = "hpilot_v1_" + secrets.token_hex(16)
+            if connection.execute(
+                "SELECT 1 FROM pilot_runs WHERE pilot_id=?", (pilot_id,),
+            ).fetchone() is None:
+                break
         connection.execute(
             """INSERT INTO pilot_runs(
                    pilot_id,project_id,started_at,closed_at,target,task_family,
@@ -264,10 +245,9 @@ def _initial_present(
     store: HydraStore,
     project_id: str,
     sessions: tuple[str, ...],
-    cutoff_at: datetime,
+    cutoff_at: ExactInstant,
 ) -> bool:
     placeholders = ",".join("?" for _ in sessions)
-    cutoff_nanoseconds = _datetime_nanoseconds(cutoff_at)
     rows = store.connection.execute(
         f"""SELECT observed_at FROM annotations
               WHERE project_id=? AND session_id IN ({placeholders})
@@ -276,9 +256,9 @@ def _initial_present(
         (project_id, *sessions),
     )
     return any(
-        observed is not None and observed <= cutoff_nanoseconds
+        observed is not None and observed <= cutoff_at
         for (value,) in rows
-        if (observed := _stored_timestamp_nanoseconds(value)) is not None
+        if (observed := parse_exact_timestamp(value)) is not None
     )
 
 
@@ -286,10 +266,9 @@ def _transport_facts(
     store: HydraStore,
     project_id: str,
     sessions: tuple[str, ...],
-    cutoff_at: datetime,
+    cutoff_at: ExactInstant,
 ) -> tuple[int, int, list[int]]:
     placeholders = ",".join("?" for _ in sessions)
-    cutoff_nanoseconds = _datetime_nanoseconds(cutoff_at)
     rows = store.connection.execute(
         f"""SELECT disposition,latency_ms,staged_at
                FROM annotation_transport_events
@@ -301,11 +280,11 @@ def _transport_facts(
     failures = 0
     latencies: list[int] = []
     for disposition, latency, staged_at in rows:
-        observed = _stored_timestamp_nanoseconds(staged_at)
+        observed = parse_exact_timestamp(staged_at)
         if observed is None:
             failures += 1
             continue
-        if observed > cutoff_nanoseconds:
+        if observed > cutoff_at:
             continue
         if disposition == "accepted":
             accepted += 1
@@ -360,7 +339,20 @@ def pilot_status(
     *,
     _window_end: datetime | None = None,
 ) -> PilotStatus:
-    """Build and persist the current deterministic cohort snapshot."""
+    """Build and persist one atomic deterministic cohort snapshot."""
+    with store.rollout_transaction():
+        return _pilot_status_snapshot(
+            store, project_id, pilot_id, _window_end=_window_end,
+        )
+
+
+def _pilot_status_snapshot(
+    store: HydraStore,
+    project_id: str,
+    pilot_id: str,
+    *,
+    _window_end: datetime | None = None,
+) -> PilotStatus:
     run = _pilot_run(store, project_id, pilot_id)
     if _window_end is not None:
         _iso(_window_end)
@@ -368,32 +360,47 @@ def pilot_status(
             raise ValueError("closed pilot window cannot be overridden")
     tasks = list_reconciled_tasks(store, project_id)
     sessions_by_ref = _task_sessions(store, project_id)
-    window_end = run.closed_at if run.closed_at is not None else _window_end
+    window_end = (
+        run.closed_instant
+        if run.closed_instant is not None
+        else None if _window_end is None else instant_from_datetime(_window_end)
+    )
+    if run.started_instant is None:
+        raise RuntimeError("pilot start instant is unavailable")
     eligible = tuple(
         task for task in tasks
         if task.status == "complete"
-        and task.last_activity_at > run.started_at
-        and (window_end is None or task.last_activity_at <= window_end)
+        and task.last_activity_instant is not None
+        and task.last_activity_instant > run.started_instant
+        and (
+            window_end is None
+            or task.last_activity_instant <= window_end
+        )
     )
     public_tasks: list[dict[str, object]] = []
+    task_cutoffs: list[list[str]] = []
     all_latencies: list[int] = []
     denominators: list[int] = []
     classified = 0
     with store.rollout_transaction() as connection:
         for task in sorted(
-            eligible, key=lambda item: (item.last_activity_at, item.public_ref),
+            eligible,
+            key=lambda item: (item.last_activity_instant, item.public_ref),
         ):
             sessions = sessions_by_ref.get(task.public_ref)
             if not sessions:
                 raise RuntimeError("reconciled pilot task sessions are unavailable")
+            task_instant = task.last_activity_instant
+            if task_instant is None:
+                raise RuntimeError("reconciled task exact time is unavailable")
             cutoff = _iso(task.last_activity_at)
             instrumented = task.semantic.annotations.instrumented
             initial_missing = not _initial_present(
-                store, project_id, sessions, task.last_activity_at,
+                store, project_id, sessions, task_instant,
             )
             finish_missing = task.semantic.annotations.finish_count == 0
             accepted, failures, latencies = _transport_facts(
-                store, project_id, sessions, task.last_activity_at,
+                store, project_id, sessions, task_instant,
             )
             all_latencies.extend(latencies)
             family = (
@@ -426,6 +433,7 @@ def pilot_status(
             task_digest = hashlib.sha256(
                 _canonical({
                     **task_fact,
+                    "completed_at_exact": task_instant.canonical,
                     "reconciliation_version": RECONCILIATION_VERSION,
                     "storage_schema_version": store.schema_version(),
                 }).encode("utf-8")
@@ -454,7 +462,8 @@ def pilot_status(
                        trend_eligible=excluded.trend_eligible,
                        task_input_digest=excluded.task_input_digest""",
                 (
-                    run.pilot_id, task.public_ref, cutoff, family, scope,
+                    run.pilot_id, task.public_ref, task_instant.canonical,
+                    family, scope,
                     int(instrumented), int(initial_missing), int(finish_missing),
                     failures, task.semantic.semantic_conflicts,
                     task.semantic.schema_diagnostics, coverage, accepted,
@@ -463,6 +472,7 @@ def pilot_status(
                 ),
             )
             public_tasks.append(task_fact)
+            task_cutoffs.append([task.public_ref, task_instant.canonical])
 
     eligible_count = len(public_tasks)
     instrumented_count = sum(bool(item["instrumented"]) for item in public_tasks)
@@ -478,6 +488,17 @@ def pilot_status(
         if not task_coverages or any(value is None for value in task_coverages)
         else min(float(value) for value in task_coverages)
     )
+    project_event_issues, attributed_event_issues = project_event_schema_counts(
+        store.connection, project_id,
+    )
+    non_event_schema = sum(
+        max(
+            0,
+            int(item["schema_diagnostics"])
+            - attributed_event_issues.get(str(item["task_ref"]), 0),
+        )
+        for item in public_tasks
+    )
     facts: dict[str, Any] = {
         "eligible_tasks": eligible_count,
         "instrumented_tasks": instrumented_count,
@@ -488,7 +509,7 @@ def pilot_status(
         "finish_missing": sum(bool(item["finish_missing"]) for item in public_tasks),
         "delivery_failures": sum(int(item["delivery_failures"]) for item in public_tasks),
         "semantic_conflicts": sum(int(item["semantic_conflicts"]) for item in public_tasks),
-        "schema_diagnostics": sum(int(item["schema_diagnostics"]) for item in public_tasks),
+        "schema_diagnostics": non_event_schema + project_event_issues,
         "aggregate_coverage": coverage,
         "minimum_task_coverage": minimum_coverage,
         "staging_latency_p95_ms": _p95(all_latencies),
@@ -498,7 +519,11 @@ def pilot_status(
     transport_verified = all(threshold_results.values())
     binding = {
         "pilot_id": run.pilot_id,
+        "started_at": run.started_instant.canonical,
+        "target": run.target,
+        "task_family": run.task_family,
         "task_refs": [item["task_ref"] for item in public_tasks],
+        "task_cutoffs": task_cutoffs,
         "reconciliation_version": RECONCILIATION_VERSION,
         "storage_schema_version": store.schema_version(),
         "thresholds": run.thresholds,
@@ -515,7 +540,13 @@ def pilot_status(
     receipt_current = False
     receipt_verified = False
     if receipt_row is not None:
-        receipt_current = str(receipt_row["snapshot_digest"]) == snapshot_digest
+        receipt_created = parse_exact_timestamp(receipt_row["created_at"])
+        receipt_current = (
+            str(receipt_row["snapshot_digest"]) == snapshot_digest
+            and run.state == "closed"
+            and run.closed_instant is not None
+            and receipt_created == run.closed_instant
+        )
         receipt_verified = receipt_current and receipt_row["decision"] == "verified"
         receipt = {
             "receipt_id": str(receipt_row["receipt_id"]),
@@ -606,7 +637,11 @@ def close_pilot(
         run = _pilot_run(store, project_id, pilot_id)
         if run.state != "open":
             raise ValueError("pilot is already closed")
-        if now < run.started_at:
+        close_instant = instant_from_datetime(now)
+        if (
+            run.started_instant is None
+            or close_instant < run.started_instant
+        ):
             raise ValueError("pilot close time predates its start")
         if connection.execute(
             "SELECT 1 FROM pilot_receipts WHERE pilot_id=?", (pilot_id,),
@@ -642,6 +677,13 @@ def close_pilot(
                 "audit_sha256": audit_sha256,
             }).encode("utf-8")
         ).hexdigest()[:32]
+        updated = connection.execute(
+            """UPDATE pilot_runs SET state='closed',closed_at=?
+                 WHERE pilot_id=? AND state='open'""",
+            (created_at, pilot_id),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("pilot close transition was not applied exactly once")
         connection.execute(
             """INSERT INTO pilot_receipts(
                    receipt_id,pilot_id,created_at,decision,task_refs_json,
@@ -655,11 +697,6 @@ def close_pilot(
                 _canonical(observed_facts), str(live["snapshot_digest"]),
                 audit_sha256,
             ),
-        )
-        connection.execute(
-            """UPDATE pilot_runs SET state='closed',closed_at=?
-                 WHERE pilot_id=? AND state='open'""",
-            (created_at, pilot_id),
         )
         return PilotReceipt(
             receipt_id, pilot_id, created_at, decision, task_refs,

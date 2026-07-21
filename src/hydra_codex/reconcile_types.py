@@ -7,6 +7,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Mapping
 
+from .exact_time import ExactInstant, instant_from_datetime
 from .reconcile_annotations import AnnotationFacts
 from .task_tree_types import Provenance, ScalarFact, TaskTreeMetrics, validate_provenance
 
@@ -25,9 +26,16 @@ class TaskPlan:
     cutoff_source_key: str | None = None
     cutoff_source_ordinal: int | None = None
     cutoff_timing_provenance: Provenance = "exact"
+    cutoff_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         _aware(self.cutoff_at, "cutoff_at")
+        instant = self.cutoff_instant or instant_from_datetime(self.cutoff_at)
+        if instant.presentation != self.cutoff_at:
+            raise ValueError("cutoff instant and datetime must match")
+        object.__setattr__(self, "cutoff_instant", instant)
         validate_provenance(
             self.cutoff_timing_provenance, "cutoff timing provenance",
         )
@@ -85,6 +93,9 @@ class ReconciledTask:
     last_activity_at: datetime
     metrics: TaskTreeMetrics
     semantic: SemanticTaskFacts
+    last_activity_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.public_ref.startswith("task_"):
@@ -92,6 +103,12 @@ class ReconciledTask:
         if self.status not in {"complete", "incomplete"}:
             raise ValueError("invalid reconciled task status")
         _aware(self.last_activity_at, "last_activity_at")
+        instant = self.last_activity_instant or instant_from_datetime(
+            self.last_activity_at,
+        )
+        if instant.presentation != self.last_activity_at:
+            raise ValueError("activity instant and datetime must match")
+        object.__setattr__(self, "last_activity_instant", instant)
         if self.last_activity_at != self.metrics.cutoff_at:
             raise ValueError("task activity and metric cutoff must match")
 

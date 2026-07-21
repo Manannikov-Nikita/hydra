@@ -6,6 +6,7 @@ from datetime import datetime
 import sqlite3
 from typing import Iterable
 
+from .exact_time import instant_from_datetime, parse_exact_timestamp
 from .lifecycle_timing import is_later_attempt_start
 from .reconcile_types import TaskPlan
 from .task_tree_storage import _optional_timestamp
@@ -50,9 +51,10 @@ def within_task_cutoff(
     plan: TaskPlan, observed_value: object,
     logical_source: object, source_ordinal: object,
 ) -> bool:
-    observed = _optional_timestamp(observed_value)
+    observed = parse_exact_timestamp(observed_value)
     if observed is not None:
-        return observed <= plan.cutoff_at
+        cutoff = plan.cutoff_instant or instant_from_datetime(plan.cutoff_at)
+        return observed <= cutoff
     return bool(
         plan.cutoff_source_key is not None
         and plan.cutoff_source_ordinal is not None

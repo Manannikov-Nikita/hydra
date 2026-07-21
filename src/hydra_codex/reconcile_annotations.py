@@ -10,8 +10,8 @@ import json
 import sqlite3
 
 from .contracts import AnnotationCause, AnnotationPhase
+from .exact_time import ExactInstant, instant_from_datetime, parse_exact_timestamp
 from .redaction import redact_note
-from .task_tree_storage import _optional_timestamp
 
 
 TIMELINE_LIMIT = 20
@@ -23,6 +23,7 @@ _TEST_RETRIES = frozenset({
 })
 _PHASES = frozenset(item.value for item in AnnotationPhase)
 _CAUSES = frozenset(item.value for item in AnnotationCause)
+SemanticInterval = tuple[ExactInstant, ExactInstant | None, str, str]
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,9 @@ def load_intervals(
     project_id: str,
     sessions: tuple[str, ...],
     cutoff: datetime,
-) -> tuple[dict[str, list[tuple[datetime, datetime | None, str, str]]], int]:
+    cutoff_instant: ExactInstant | None = None,
+) -> tuple[dict[str, list[SemanticInterval]], int]:
+    exact_cutoff = cutoff_instant or instant_from_datetime(cutoff)
     placeholders = ",".join("?" for _ in sessions)
     rows = connection.execute(
         f"""SELECT session_key,started_at,ended_at,phase,cause
@@ -94,33 +97,45 @@ def load_intervals(
                WHERE project_id=? AND session_key IN ({placeholders})""",
         (project_id, *sessions),
     )
-    result: dict[str, list[tuple[datetime, datetime | None, str, str]]] = defaultdict(list)
+    result: dict[str, list[SemanticInterval]] = defaultdict(list)
     invalid = 0
     for row in rows:
-        start = _optional_timestamp(row[1])
+        start_instant = parse_exact_timestamp(row[1])
         raw_end = row[2]
-        end = _optional_timestamp(raw_end)
+        end_instant = parse_exact_timestamp(raw_end)
         if (
-            start is None
-            or raw_end is not None and end is None
-            or end is not None and end <= start
+            start_instant is None
+            or raw_end is not None and end_instant is None
+            or end_instant is not None and end_instant <= start_instant
         ):
             invalid += 1
             continue
-        if start <= cutoff:
-            result[str(row[0])].append((start, end, str(row[3]), str(row[4])))
+        if start_instant <= exact_cutoff:
+            result[str(row[0])].append((
+                start_instant,
+                end_instant,
+                str(row[3]), str(row[4]),
+            ))
     for values in result.values():
-        values.sort(key=lambda item: (item[0], item[1] or cutoff, item[2], item[3]))
+        values.sort(key=lambda item: (
+            item[0], item[1] or exact_cutoff, item[2], item[3],
+        ))
     return result, invalid
 
 
 def phase_at(
-    intervals: list[tuple[datetime, datetime | None, str, str]],
-    observed: datetime,
+    intervals: list[SemanticInterval],
+    observed: ExactInstant | datetime,
 ) -> tuple[str | None, str | None, bool]:
+    exact_observed = (
+        observed
+        if isinstance(observed, ExactInstant)
+        else instant_from_datetime(observed)
+    )
     matches = [
         item for item in intervals
-        if item[0] <= observed and (item[1] is None or observed < item[1])
+        if item[0] <= exact_observed
+        and (item[1] is None or exact_observed < item[1])
     ]
     if not matches:
         return None, None, False
@@ -148,16 +163,18 @@ def _instrumented(
     project_id: str,
     sessions: tuple[str, ...],
     cutoff: datetime,
+    cutoff_instant: ExactInstant | None = None,
 ) -> bool:
+    exact_cutoff = cutoff_instant or instant_from_datetime(cutoff)
     placeholders = ",".join("?" for _ in sessions)
     return any(
-        observed is not None and observed <= cutoff
+        observed is not None and observed <= exact_cutoff
         for (value,) in connection.execute(
             f"""SELECT created_at FROM trusted_turn_bindings
                   WHERE project_id=? AND session_key IN ({placeholders})""",
             (project_id, *sessions),
         )
-        if (observed := _optional_timestamp(value)) is not None
+        if (observed := parse_exact_timestamp(value)) is not None
     )
 
 
@@ -165,10 +182,12 @@ def _test_facts(
     connection: sqlite3.Connection,
     sessions: tuple[str, ...],
     cutoff: datetime,
-    intervals: dict[str, list[tuple[datetime, datetime | None, str, str]]],
+    intervals: dict[str, list[SemanticInterval]],
+    cutoff_instant: ExactInstant | None = None,
 ) -> tuple[
     Counter[str], tuple[ReconciledTestEvidence, ...], frozenset[str], frozenset[str],
 ]:
+    exact_cutoff = cutoff_instant or instant_from_datetime(cutoff)
     placeholders = ",".join("?" for _ in sessions)
     rows = connection.execute(
         f"""SELECT evidence_key,session_key,observed_at,scope,failure_cause,retry_kind,
@@ -183,13 +202,15 @@ def _test_facts(
     conflicts: set[str] = set()
     invalid: set[str] = set()
     for evidence, session, value, scope, failure, retry, source, line in rows:
-        observed = _optional_timestamp(value)
-        if observed is None:
+        observed_instant = parse_exact_timestamp(value)
+        if observed_instant is None:
             invalid.add(str(evidence))
             continue
-        if observed > cutoff:
+        if observed_instant > exact_cutoff:
             continue
-        phase, model_cause, overlap = phase_at(intervals.get(str(session), []), observed)
+        phase, model_cause, overlap = phase_at(
+            intervals.get(str(session), []), observed_instant,
+        )
         safe_scope = str(scope) if str(scope) in _TEST_SCOPES else "unknown"
         safe_failure = str(failure) if str(failure) in _TEST_FAILURES else "unknown"
         safe_retry = str(retry) if str(retry) in _TEST_RETRIES else "unknown_recovery"
@@ -214,15 +235,17 @@ def build_annotation_facts(
     project_id: str,
     sessions: tuple[str, ...],
     cutoff: datetime,
+    cutoff_instant: ExactInstant | None = None,
 ) -> AnnotationFacts:
+    exact_cutoff = cutoff_instant or instant_from_datetime(cutoff)
     rows = _annotation_rows(connection, project_id, sessions)
-    valid: list[tuple[datetime, sqlite3.Row]] = []
+    valid: list[tuple[ExactInstant, sqlite3.Row]] = []
     invalid = 0
     for row in rows:
-        observed = _optional_timestamp(row[1])
+        observed = parse_exact_timestamp(row[1])
         if observed is None:
             invalid += 1
-        elif observed <= cutoff:
+        elif observed <= exact_cutoff:
             valid.append((observed, row))
     valid.sort(key=lambda item: (item[0], int(item[1][2]), str(item[1][0])))
     real_families = [
@@ -245,10 +268,10 @@ def build_annotation_facts(
     )
     timeline = markers[-TIMELINE_LIMIT:]
     intervals, invalid_intervals = load_intervals(
-        connection, project_id, sessions, cutoff,
+        connection, project_id, sessions, cutoff, exact_cutoff,
     )
     deterministic, test_evidence, conflicts, invalid_tests = _test_facts(
-        connection, sessions, cutoff, intervals,
+        connection, sessions, cutoff, intervals, exact_cutoff,
     )
     fingerprint = hashlib.sha256(json.dumps(
         {
@@ -265,7 +288,7 @@ def build_annotation_facts(
         invalid,
         invalid_intervals,
         len(valid),
-        _instrumented(connection, project_id, sessions, cutoff),
+        _instrumented(connection, project_id, sessions, cutoff, exact_cutoff),
         kind_counts["finish"],
         dict(sorted(kind_counts.items())),
         dict(sorted(cause_counts.items())),

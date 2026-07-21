@@ -7,6 +7,9 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 
+from .js_literal_fields import static_literal_field
+from .shell_facts import shell_file_facts
+
 
 CUSTOM_EXEC_DIAGNOSTICS = frozenset({
     "conditional", "dynamic", "dead_code", "unsupported", "unbalanced",
@@ -38,6 +41,7 @@ class NormalizedToolCall:
     instrumentation: bool
     relative_paths: tuple[str, ...]
     ephemeral_command: str | None = field(default=None, repr=False, compare=False)
+    file_observations: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.safe_name not in _SAFE_TOOL_NAMES:
@@ -51,6 +55,13 @@ class NormalizedToolCall:
             raise ValueError("safe tool family and category disagree")
         if self.relative_paths and self.safe_name not in {"apply_patch", "view_image"}:
             raise ValueError("tool family cannot own relative paths")
+        if self.file_observations and self.safe_name != "exec_command":
+            raise ValueError("tool family cannot own shell file observations")
+        if any(
+            operation not in {"read", "write"} or _relative_path(path, None) != path
+            for operation, path in self.file_observations
+        ):
+            raise ValueError("invalid shell file observation")
 
 
 @dataclass(frozen=True)
@@ -105,50 +116,8 @@ def _decode_string(source: str, index: int = 0) -> tuple[str | None, int]:
 
 
 def _field_literal(arguments: str, field: str) -> str | None:
-    cursor = 0
-    object_depth = 0
-    while cursor < len(arguments):
-        if arguments.startswith("//", cursor):
-            newline = arguments.find("\n", cursor)
-            cursor = len(arguments) if newline < 0 else newline
-            continue
-        if arguments.startswith("/*", cursor):
-            end = arguments.find("*/", cursor + 2)
-            cursor = len(arguments) if end < 0 else end + 2
-            continue
-        character = arguments[cursor]
-        if character == "{":
-            object_depth += 1
-            cursor += 1
-            continue
-        if character == "}":
-            object_depth = max(0, object_depth - 1)
-            cursor += 1
-            continue
-        key: str | None = None
-        end = cursor
-        if character in "'\"":
-            key, end = _decode_string(arguments, cursor)
-        elif character.isalpha() or character in "_$":
-            match = re.match(r"[A-Za-z_$][A-Za-z0-9_$]*", arguments[cursor:])
-            if match is not None:
-                key = match.group(0)
-                end = cursor + match.end()
-        if key is None:
-            cursor = max(cursor + 1, end)
-            continue
-        after = end
-        while after < len(arguments) and arguments[after].isspace():
-            after += 1
-        if object_depth == 1 and after < len(arguments) and arguments[after] == ":":
-            value_start = after + 1
-            while value_start < len(arguments) and arguments[value_start].isspace():
-                value_start += 1
-            if key == field:
-                value, _ = _decode_string(arguments, value_start)
-                return value
-        cursor = end
-    return None
+    result = static_literal_field(arguments, field)
+    return result.value if result.valid and result.present else None
 
 
 def _bindings(source: str) -> dict[str, str]:
@@ -227,16 +196,33 @@ def _patch_literal(arguments: str, bindings: dict[str, str]) -> str | None:
 
 
 def _hydra_command(command: str) -> bool:
-    if any(marker in command for marker in (";", "|", "&", "<", ">", "`", "$")):
+    if any(marker in command for marker in (";", "|", "&", "<", ">", "`", "\n", "\r")):
         return False
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
         return False
+    checkout_path = "PYTHONPATH=$(git rev-parse --show-toplevel)/src"
+    if any("$" in token and token != checkout_path for token in tokens):
+        return False
+    index = 0
+    if tokens and tokens[0].rsplit("/", 1)[-1] == "env":
+        index = 1
+    while index < len(tokens) and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index], re.DOTALL
+    ):
+        index += 1
+    if index >= len(tokens):
+        return False
+    commands = {"annotate", "compare", "ingest", "reconcile", "report"}
+    executable = tokens[index].rsplit("/", 1)[-1]
+    if executable == "hydra-codex":
+        return index + 1 < len(tokens) and tokens[index + 1] in commands
     return (
-        len(tokens) >= 2
-        and tokens[0].rsplit("/", 1)[-1] == "hydra-codex"
-        and tokens[1] in {"annotate", "report"}
+        executable == "python3.12"
+        and index + 3 < len(tokens)
+        and tokens[index + 1:index + 3] == ["-m", "hydra_codex"]
+        and tokens[index + 3] in commands
     )
 
 
@@ -247,13 +233,18 @@ def _normalized_call(
     project_root: Path | None,
 ) -> tuple[NormalizedToolCall | None, str | None]:
     if name == "exec_command":
-        command = _field_literal(arguments, "cmd")
-        if command is None:
+        command_field = static_literal_field(arguments, "cmd")
+        if not command_field.valid or not command_field.present or command_field.value is None:
             return None, "dynamic"
+        command = command_field.value
         instrumentation = _hydra_command(command)
+        workdir_field = static_literal_field(arguments, "workdir")
+        observations = () if not workdir_field.valid else shell_file_facts(
+            command, project_root=project_root, workdir=workdir_field.value,
+        )
         return NormalizedToolCall(
             "exec_command", "instrumentation" if instrumentation else "tool",
-            instrumentation, (), command,
+            instrumentation, (), command, observations,
         ), None
     if name == "apply_patch":
         patch = _patch_literal(arguments, bindings)
@@ -303,6 +294,7 @@ def normalize_custom_exec(
     calls: list[NormalizedToolCall] = []
     diagnostics: list[str] = []
     bindings, index, quote, braces, dead = _bindings(source), 0, None, 0, False
+    last_significant: str | None = None
     while index < len(source):
         if quote:
             if source[index] == "\\":
@@ -322,28 +314,40 @@ def normalize_custom_exec(
             continue
         if source[index] in "'\"`":
             quote = source[index]
+            last_significant = "v"
             index += 1
             continue
         if source[index] == "{":
             braces += 1
+            last_significant = "{"
             index += 1
             continue
         if source[index] == "}":
             braces = max(0, braces - 1)
+            last_significant = "}"
             index += 1
             continue
-        if re.match(r"\breturn\b", source[index:]):
+        keyword = re.match(r"(?:return|throw)\b", source[index:])
+        identifier_prefix = (
+            last_significant is not None
+            and (last_significant.isalnum() or last_significant in "_$.")
+        )
+        if keyword is not None and not identifier_prefix:
             dead = True
-            index += len("return")
+            last_significant = keyword.group(0)[-1]
+            index += len(keyword.group(0))
             continue
         computed = re.match(r"tools\s*\[", source[index:])
         if computed is not None:
             diagnostics.append("dead_code" if dead else "conditional" if braces else "dynamic")
             semicolon = source.find(";", index)
             index = len(source) if semicolon < 0 else semicolon + 1
+            last_significant = ";"
             continue
         match = re.match(r"tools\.([A-Za-z_][A-Za-z0-9_]*)\(", source[index:])
         if match is None:
+            if not source[index].isspace():
+                last_significant = source[index]
             index += 1
             continue
         arguments, cursor = _balanced_call(source, index + match.end())
@@ -353,7 +357,11 @@ def normalize_custom_exec(
         prefix = source[max(source.rfind(";", 0, index), source.rfind("\n", 0, index)) + 1:index]
         if dead:
             diagnostics.append("dead_code")
-        elif braces or re.search(r"\b(?:if|for|while|switch|catch)\b", prefix):
+        elif (
+            braces
+            or re.search(r"\b(?:if|for|while|switch|catch)\b", prefix)
+            or any(marker in prefix for marker in ("&&", "||", "?", "=>"))
+        ):
             diagnostics.append("conditional")
         else:
             call, diagnostic = _normalized_call(
@@ -364,6 +372,7 @@ def normalize_custom_exec(
             elif diagnostic is not None:
                 diagnostics.append(diagnostic)
         index = cursor
+        last_significant = ")"
     return CustomExecNormalization(tuple(calls), tuple(diagnostics))
 
 

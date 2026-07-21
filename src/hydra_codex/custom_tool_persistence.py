@@ -52,8 +52,14 @@ def persist_custom_tool_call(
             turn_key=turn_key, source_digest=source_digest, source_ordinal=source_ordinal,
             provenance="lower_bound",
         )
-        operation = "write" if call.safe_name == "apply_patch" else "read"
-        for relative_path in call.relative_paths:
+        observations = call.file_observations or tuple(
+            (
+                "write" if call.safe_name == "apply_patch" else "read",
+                relative_path,
+            )
+            for relative_path in call.relative_paths
+        )
+        for operation, relative_path in observations:
             persist_file(
                 connection, source_digest, source_ordinal, session_key, operation,
                 relative_path, project_root, observed_at, turn_key,

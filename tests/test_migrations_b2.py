@@ -151,6 +151,16 @@ def build_schema(path: Path, version: int) -> None:
     connection.close()
 
 
+def replace_empty_table(path: Path, table: str, create_statement: str) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(f"DROP TABLE {table}")
+        connection.execute(create_statement)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class MigrationMatrixB2Tests(unittest.TestCase):
     def test_v28_migration_adds_private_location_state_without_changing_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -518,6 +528,115 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                 StorageUnavailable, "missing required columns for tool_span_roles",
             ):
                 HydraStore(database)
+
+    def test_altered_tool_span_role_trust_constraints_fail_schema_validation(self) -> None:
+        cases = {
+            "primary-key-order": """CREATE TABLE tool_span_roles (
+                session_key TEXT NOT NULL,
+                call_key TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role='nested_inferred'),
+                PRIMARY KEY(role,session_key,call_key),
+                FOREIGN KEY(session_key,call_key)
+                    REFERENCES tool_spans(session_key,call_key) ON DELETE CASCADE
+            )""",
+            "missing-composite-foreign-key": """CREATE TABLE tool_span_roles (
+                session_key TEXT NOT NULL,
+                call_key TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role='nested_inferred'),
+                PRIMARY KEY(session_key,call_key,role)
+            )""",
+            "weakened-role-check": """CREATE TABLE tool_span_roles (
+                session_key TEXT NOT NULL,
+                call_key TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(
+                    role IN ('nested_inferred', 'foreign_inferred')
+                ),
+                PRIMARY KEY(session_key,call_key,role),
+                FOREIGN KEY(session_key,call_key)
+                    REFERENCES tool_spans(session_key,call_key) ON DELETE CASCADE
+            )""",
+            "altered-role-literal": """CREATE TABLE tool_span_roles (
+                session_key TEXT NOT NULL,
+                call_key TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role='nested_ inferred'),
+                PRIMARY KEY(session_key,call_key,role),
+                FOREIGN KEY(session_key,call_key)
+                    REFERENCES tool_spans(session_key,call_key) ON DELETE CASCADE
+            )""",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, statement in cases.items():
+                with self.subTest(case=name):
+                    database = root / f"tool-span-roles-{name}.sqlite3"
+                    store = HydraStore(database)
+                    store.close()
+                    replace_empty_table(database, "tool_span_roles", statement)
+
+                    with self.assertRaisesRegex(
+                        StorageUnavailable, "tool_span_roles trust constraints",
+                    ):
+                        HydraStore(database)
+
+    def test_altered_location_state_trust_constraints_fail_schema_validation(self) -> None:
+        columns = """
+            project_id TEXT NOT NULL,
+            location_key TEXT NOT NULL,
+            logical_source_key TEXT NOT NULL,
+            revision_digest TEXT NOT NULL,
+            st_dev INTEGER NOT NULL,
+            st_ino INTEGER NOT NULL,
+            st_size INTEGER NOT NULL,
+            st_mtime_ns INTEGER NOT NULL,
+            st_ctime_ns INTEGER NOT NULL,
+            scanner_version INTEGER NOT NULL
+        """
+        required_foreign_keys = {
+            "logical": """FOREIGN KEY(logical_source_key)
+                REFERENCES rollout_logical_sources(logical_source_key)""",
+            "revision": """FOREIGN KEY(revision_digest)
+                REFERENCES rollout_sources(source_digest)""",
+            "location": """FOREIGN KEY(logical_source_key,location_key)
+                REFERENCES rollout_source_locations(logical_source_key,location_key)""",
+        }
+        cases = {
+            "primary-key-order": (
+                "PRIMARY KEY(location_key,project_id)",
+                tuple(required_foreign_keys.values()),
+            ),
+            **{
+                f"missing-{missing}-foreign-key": (
+                    "PRIMARY KEY(project_id,location_key)",
+                    tuple(
+                        statement for name, statement in required_foreign_keys.items()
+                        if name != missing
+                    ),
+                )
+                for missing in required_foreign_keys
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, (primary_key, foreign_keys) in cases.items():
+                with self.subTest(case=name):
+                    database = root / f"location-states-{name}.sqlite3"
+                    store = HydraStore(database)
+                    store.close()
+                    constraints = ",\n".join((primary_key, *foreign_keys))
+                    replace_empty_table(
+                        database,
+                        "rollout_source_location_states",
+                        f"""CREATE TABLE rollout_source_location_states (
+                            {columns},
+                            {constraints}
+                        )""",
+                    )
+
+                    with self.assertRaisesRegex(
+                        StorageUnavailable,
+                        "rollout_source_location_states trust constraints",
+                    ):
+                        HydraStore(database)
 
     def test_v24_migration_immediately_suppresses_declined_legacy_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

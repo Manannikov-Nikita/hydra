@@ -285,6 +285,45 @@ def _normalized_schema_sql(statement: str) -> str:
     return " ".join(statement.casefold().split()).rstrip(";")
 
 
+def _primary_key_columns(
+    connection: sqlite3.Connection, table: str,
+) -> tuple[str, ...]:
+    columns = (
+        (int(row[5]), str(row[1]))
+        for row in connection.execute(f"PRAGMA table_info({table})")
+        if row[5]
+    )
+    return tuple(column for _ordinal, column in sorted(columns))
+
+
+def _foreign_key_groups(
+    connection: sqlite3.Connection, table: str,
+) -> frozenset[tuple[tuple[str, str, str, str, str], ...]]:
+    grouped: dict[int, list[tuple[int, str, str, str, str, str]]] = {}
+    for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+        grouped.setdefault(int(row[0]), []).append(
+            (
+                int(row[1]), str(row[2]), str(row[3]), str(row[4]),
+                str(row[5]).upper(), str(row[6]).upper(),
+            )
+        )
+    return frozenset(
+        tuple(
+            (target_table, source_column, target_column, on_update, on_delete)
+            for _sequence, target_table, source_column, target_column,
+                on_update, on_delete in sorted(group)
+        )
+        for group in grouped.values()
+    )
+
+
+def _table_schema_sql(connection: sqlite3.Connection, table: str) -> str:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,),
+    ).fetchone()
+    return "" if row is None or row[0] is None else _normalized_schema_sql(str(row[0]))
+
+
 class HydraStore:
     """Single-process SQLite store; callers provide an explicit path for tests."""
 
@@ -453,6 +492,63 @@ class HydraStore:
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
                 raise StorageUnavailable(f"Hydra schema is missing required columns for {table}")
+        tool_role_foreign_key = (
+            (
+                "tool_spans", "session_key", "session_key", "NO ACTION", "CASCADE",
+            ),
+            (
+                "tool_spans", "call_key", "call_key", "NO ACTION", "CASCADE",
+            ),
+        )
+        tool_role_sql = _table_schema_sql(self.connection, "tool_span_roles")
+        exact_role_check = any(re.search(pattern, tool_role_sql) for pattern in (
+            r"check\s*\(\s*\brole\b\s*=\s*'nested_inferred'\s*\)",
+            r"check\s*\(\s*'nested_inferred'\s*=\s*\brole\b\s*\)",
+            r"check\s*\(\s*\brole\b\s+in\s*\(\s*'nested_inferred'\s*\)\s*\)",
+        ))
+        if (
+            _primary_key_columns(self.connection, "tool_span_roles")
+            != ("session_key", "call_key", "role")
+            or tool_role_foreign_key
+            not in _foreign_key_groups(self.connection, "tool_span_roles")
+            or not exact_role_check
+        ):
+            raise StorageUnavailable(
+                "Hydra schema has altered tool_span_roles trust constraints"
+            )
+        location_state_foreign_keys = frozenset({
+            ((
+                "rollout_logical_sources", "logical_source_key",
+                "logical_source_key", "NO ACTION", "NO ACTION",
+            ),),
+            ((
+                "rollout_sources", "revision_digest", "source_digest",
+                "NO ACTION", "NO ACTION",
+            ),),
+            (
+                (
+                    "rollout_source_locations", "logical_source_key",
+                    "logical_source_key", "NO ACTION", "NO ACTION",
+                ),
+                (
+                    "rollout_source_locations", "location_key", "location_key",
+                    "NO ACTION", "NO ACTION",
+                ),
+            ),
+        })
+        if (
+            _primary_key_columns(
+                self.connection, "rollout_source_location_states",
+            ) != ("project_id", "location_key")
+            or not location_state_foreign_keys.issubset(
+                _foreign_key_groups(
+                    self.connection, "rollout_source_location_states",
+                )
+            )
+        ):
+            raise StorageUnavailable(
+                "Hydra schema has altered rollout_source_location_states trust constraints"
+            )
         actual_triggers = {
             str(row[0]): str(row[1])
             for row in self.connection.execute(

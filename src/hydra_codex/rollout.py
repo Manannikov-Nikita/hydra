@@ -27,7 +27,7 @@ from .rollout_persistence import persist_file as _persist_file
 from .rollout_persistence import tool_end_state as _tool_end_state
 from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
 from .rollout_sources import line_fingerprint, located_lineage, prefix_lineage, relation_to, revision_lines, scan_source
-from .storage import HydraStore
+from .storage import HydraStore, StorageUnavailable
 from .test_evidence import TestEvidenceBuffer, parse_structured_result
 from .tool_normalization import custom_exec_outcome
 from .tool_spans import persist_tool_end, persist_tool_start
@@ -231,7 +231,7 @@ def _parse_source(
                            WHEN last_activity_at IS NULL OR ? > last_activity_at THEN ? ELSE last_activity_at END
                        WHERE session_key=?""", (observed_at, observed_at, session_key),
                 )
-            if kind not in KNOWN_ENVELOPES:
+            if not isinstance(kind, str) or kind not in KNOWN_ENVELOPES:
                 diagnostics += 1
                 _insert_diagnostic(connection, source, line_number, "unknown_envelope", payload, unsafe_value=kind)
                 continue
@@ -378,6 +378,21 @@ def _parse_source(
                 connection.execute("UPDATE token_snapshots SET turn_key = ? WHERE source_digest = ? AND line_number = ?", (opaque("turn", current_turn) if current_turn else None, source, line_number))
                 continue
             event_type = payload.get("type") if kind == "event_msg" else None
+            if kind == "event_msg" and not isinstance(event_type, str):
+                diagnostics += 1
+                _insert_diagnostic(
+                    connection, source, line_number, "unknown_event_type",
+                    payload, unsafe_value=event_type,
+                )
+                continue
+            response_type = payload.get("type") if kind == "response_item" else None
+            if kind == "response_item" and not isinstance(response_type, str):
+                diagnostics += 1
+                _insert_diagnostic(
+                    connection, source, line_number, "unknown_response_type",
+                    payload, unsafe_value=response_type,
+                )
+                continue
             if kind == "event_msg" and event_type == "sub_agent_activity":
                 child_identity = payload.get("agent_thread_id")
                 if session_key is None or not isinstance(child_identity, str):
@@ -619,8 +634,18 @@ def ingest_rollouts(
             unique.add(digest)
             with store.rollout_transaction() as connection:
                 known = connection.execute(
-                    "SELECT logical_source_key,materialized FROM rollout_sources WHERE source_digest=?", (digest,),
+                    """SELECT revision.logical_source_key,revision.materialized,
+                              logical.project_id
+                         FROM rollout_sources AS revision
+                         LEFT JOIN rollout_logical_sources AS logical
+                           ON logical.logical_source_key=revision.logical_source_key
+                        WHERE revision.source_digest=?""",
+                    (digest,),
                 ).fetchone()
+                if known is not None and known[2] != project_id:
+                    raise StorageUnavailable(
+                        "rollout source logical project relationship is corrupted"
+                    )
                 if known is not None:
                     connection.execute(
                         """INSERT INTO rollout_source_locations(

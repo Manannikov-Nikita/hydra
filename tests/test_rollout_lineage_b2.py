@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from hydra_codex.rollout import RolloutRoot, ingest_rollouts
 from hydra_codex.rollout_identity import Pseudonymizer
-from hydra_codex.storage import HydraStore
+from hydra_codex.storage import HydraStore, StorageUnavailable
 
 
 def envelope(kind: object, payload: dict, timestamp: object = "2026-07-21T00:00:00Z") -> dict:
@@ -216,6 +216,41 @@ class RolloutLineageB2Tests(unittest.TestCase):
         self.assertEqual(self.store.count("rollout_logical_sources"), 1)
         self.assertEqual(self.store.count("rollout_source_locations"), 2)
         self.assertEqual(self.store.count("rollout_source_location_states"), 2)
+
+    def test_known_revision_with_foreign_logical_source_fails_before_location_mutation(self) -> None:
+        source = self.base / "active" / "foreign-known-revision.jsonl"
+        write(source, [self.meta(identity="foreign-known-revision"), self.token(10)])
+        ingest_rollouts(
+            self.store, (source,), self.project, "project-b2", hash_key=self.key,
+        )
+        revision = self.store.connection.execute(
+            "SELECT source_digest FROM rollout_sources"
+        ).fetchone()[0]
+        self.store.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES ('foreign-logical','foreign-project',NULL,NULL,'clean')"""
+        )
+        self.store.connection.execute(
+            "UPDATE rollout_sources SET logical_source_key='foreign-logical' "
+            "WHERE source_digest=?",
+            (revision,),
+        )
+        self.store.connection.commit()
+        details = source.stat()
+        os.utime(
+            source,
+            ns=(details.st_atime_ns, details.st_mtime_ns + 1_000_000_000),
+        )
+        before = "\n".join(self.store.connection.iterdump())
+
+        with self.assertRaisesRegex(StorageUnavailable, "project"):
+            ingest_rollouts(
+                self.store, (source,), self.project, "project-b2", hash_key=self.key,
+            )
+
+        self.assertEqual("\n".join(self.store.connection.iterdump()), before)
 
     def test_scanner_version_mismatch_forces_scan_and_refreshes_state(self) -> None:
         source = self.base / "active" / "scanner-version.jsonl"
@@ -550,6 +585,53 @@ class RolloutLineageB2Tests(unittest.TestCase):
         dump = "\n".join(self.store.connection.iterdump())
         for private_value in (unknown_envelope, unknown_event, unknown_response, *sentinels):
             self.assertNotIn(private_value, dump)
+
+    def test_object_and_array_schema_discriminators_are_private_diagnostics(self) -> None:
+        sentinels = tuple(
+            f"private-non-string-discriminator-{index}" for index in range(6)
+        )
+        source = self.base / "rollouts" / "non-string-schema.jsonl"
+        write(source, [
+            self.meta(),
+            envelope({"future_type": sentinels[0]}, {"content": sentinels[0]}),
+            envelope([sentinels[1]], {"content": sentinels[1]}),
+            envelope("event_msg", {
+                "type": {"future_type": sentinels[2]}, "content": sentinels[2],
+            }),
+            envelope("event_msg", {
+                "type": [sentinels[3]], "content": sentinels[3],
+            }),
+            envelope("response_item", {
+                "type": {"future_type": sentinels[4]}, "content": sentinels[4],
+            }),
+            envelope("response_item", {
+                "type": [sentinels[5]], "content": sentinels[5],
+            }),
+        ])
+
+        try:
+            report = ingest_rollouts(
+                self.store, (source,), self.project, "project-b2", hash_key=self.key,
+            )
+        except TypeError as error:
+            self.fail(f"non-string discriminator escaped privacy handling: {error}")
+
+        self.assertEqual(report.diagnostics, 6)
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                """SELECT envelope_kind,COUNT(*)
+                     FROM rollout_diagnostics
+                    GROUP BY envelope_kind ORDER BY envelope_kind"""
+            )],
+            [
+                ("unknown_envelope", 2),
+                ("unknown_event_type", 2),
+                ("unknown_response_type", 2),
+            ],
+        )
+        dump = "\n".join(self.store.connection.iterdump())
+        for sentinel in sentinels:
+            self.assertNotIn(sentinel, dump)
 
     def test_divergent_copy_at_new_location_conflicts_instead_of_double_counting(self) -> None:
         active = self.base / "active" / "thread.jsonl"

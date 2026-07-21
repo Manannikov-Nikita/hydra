@@ -217,6 +217,40 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             with self.assertRaises(StorageUnavailable):
                 HydraStore(drifted)
 
+    def test_immutable_candidate_trigger_drift_fails_closed(self) -> None:
+        trigger_names = (
+            "lineage_claim_candidates_no_update",
+            "lineage_claim_candidates_no_delete",
+            "test_evidence_candidates_no_update",
+            "test_evidence_candidates_no_delete",
+            "file_observation_candidates_no_update",
+            "file_observation_candidates_no_delete",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for trigger_name in trigger_names:
+                for drift_kind in ("missing", "tampered"):
+                    with self.subTest(trigger=trigger_name, drift=drift_kind):
+                        database = root / f"{trigger_name}-{drift_kind}.sqlite3"
+                        store = HydraStore(database)
+                        store.close()
+                        connection = sqlite3.connect(database)
+                        connection.execute(f"DROP TRIGGER {trigger_name}")
+                        if drift_kind == "tampered":
+                            table_name = trigger_name.removesuffix("_no_update").removesuffix("_no_delete")
+                            action = "UPDATE" if trigger_name.endswith("_no_update") else "DELETE"
+                            connection.execute(
+                                f"""CREATE TRIGGER {trigger_name}
+                                    BEFORE {action} ON {table_name}
+                                    BEGIN SELECT 1; END"""
+                            )
+                        connection.commit()
+                        connection.close()
+                        with self.assertRaisesRegex(
+                            StorageUnavailable, "immutable candidate trigger",
+                        ):
+                            HydraStore(database)
+
     def test_tool_candidate_migration_normalizes_legacy_app_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "legacy-app-tool-status.sqlite3"

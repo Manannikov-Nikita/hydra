@@ -9,7 +9,11 @@ from typing import Any, Callable
 from .rollout_identity import opaque
 from .rollout_observations import path_key, safe_int
 from .rollout_privacy import canonical_timestamp, safe_diagnostic_kind
-from .source_authority import SOURCE_AUTHORITY, source_family
+from .source_authority import (
+    SOURCE_AUTHORITY,
+    rollout_revision_identity,
+    source_family,
+)
 
 
 def insert_diagnostic(
@@ -111,8 +115,52 @@ def _earliest(
     return observed_at, min(turns) if turns else None
 
 
+def _proven_append_owner(
+    connection: Any,
+    *,
+    session_key: str,
+    call_key: str,
+    canonical_source: str | None,
+    owner_source: str,
+    terminal_state: str,
+    owner_candidates: tuple[_FileCandidate, ...],
+) -> bool:
+    canonical_revision = rollout_revision_identity(connection, canonical_source)
+    owner_revision = rollout_revision_identity(connection, owner_source)
+    if canonical_revision is None or owner_revision is None:
+        return False
+    canonical_logical, canonical_lines = canonical_revision
+    owner_logical, owner_lines = owner_revision
+    if canonical_logical != owner_logical or owner_lines <= canonical_lines:
+        return False
+    relation = connection.execute(
+        "SELECT relation FROM rollout_sources WHERE source_digest=?",
+        (owner_source,),
+    ).fetchone()
+    if relation is None or relation[0] != "append":
+        return False
+    if any(candidate.source_ordinal <= canonical_lines for candidate in owner_candidates):
+        return False
+    terminal = connection.execute(
+        """SELECT 1 FROM tool_span_candidates
+              WHERE session_key=? AND call_key=? AND source_digest=?
+                AND candidate_kind='end' AND terminal_state=?
+                AND source_ordinal>?
+              LIMIT 1""",
+        (
+            session_key,
+            call_key,
+            owner_source,
+            terminal_state,
+            canonical_lines,
+        ),
+    ).fetchone()
+    return terminal is not None
+
+
 def materialize_file_observations(
     connection: Any, *, session_key: str, call_key: str,
+    source_identity: Callable[[str, str], str | None] | None = None,
 ) -> None:
     """Rebuild one call's materialized file facts from immutable candidates."""
     candidates = _file_candidates(
@@ -120,8 +168,34 @@ def materialize_file_observations(
     )
     if not candidates:
         return
-    materialized_source = opaque(
-        "event", f"file-observation/{session_key}/{call_key}",
+    tool = connection.execute(
+        "SELECT tool_name,terminal_state,source_digest FROM tool_spans "
+        "WHERE session_key=? AND call_key=?",
+        (session_key, call_key),
+    ).fetchone()
+    canonical_name = "unknown" if tool is None else str(tool[0] or "unknown")
+    terminal_state = "unknown" if tool is None else str(tool[1])
+
+    materialized_source = (
+        opaque("event", f"file-observation/{session_key}/{call_key}")
+        if source_identity is None
+        else source_identity(session_key, call_key)
+    )
+    migrated = tuple(
+        candidate for candidate in candidates
+        if candidate.evidence_kind in {"legacy", "quarantined"}
+    )
+    # Without the installation key migration cannot safely recreate a
+    # synthetic materialized identity.  It may still remove disproven facts
+    # and must quarantine unresolved legacy line-zero rows, but it leaves a
+    # successful direct legacy observation intact until the next keyed ingest.
+    removable = (
+        migrated
+        if materialized_source is not None or terminal_state == "failed"
+        else tuple(
+            candidate for candidate in migrated
+            if candidate.evidence_kind == "quarantined"
+        )
     )
     connection.executemany(
         """DELETE FROM file_observations
@@ -132,27 +206,22 @@ def materialize_file_observations(
                 candidate.source_digest, candidate.source_ordinal, session_key,
                 candidate.operation, candidate.path_hash,
             )
-            for candidate in candidates
-            if candidate.evidence_kind == "legacy"
+            for candidate in removable
         ),
     )
-    connection.execute(
-        "DELETE FROM file_observations WHERE source_digest=? AND line_number=0",
-        (materialized_source,),
-    )
-
-    tool = connection.execute(
-        "SELECT tool_name,terminal_state,source_digest FROM tool_spans "
-        "WHERE session_key=? AND call_key=?",
-        (session_key, call_key),
-    ).fetchone()
-    canonical_name = "unknown" if tool is None else str(tool[0] or "unknown")
-    terminal_state = "unknown" if tool is None else str(tool[1])
+    if materialized_source is not None:
+        connection.execute(
+            "DELETE FROM file_observations WHERE source_digest=? AND line_number=0",
+            (materialized_source,),
+        )
     if terminal_state == "failed":
+        return
+    if materialized_source is None:
         return
 
     eligible = tuple(
         candidate for candidate in candidates
+        if candidate.evidence_kind != "quarantined"
         if _compatible_tool(candidate.tool_name, canonical_name)
         and (not candidate.requires_success or terminal_state == "success")
     )
@@ -169,16 +238,61 @@ def materialize_file_observations(
         )
         for candidate in eligible
     )
-    authority = max(rank for _candidate, rank in ranked)
-    canonical_authority = (
-        SOURCE_AUTHORITY[source_family(connection, tool[2])]
-        if tool is not None else None
+    canonical_source = None if tool is None else tool[2]
+    canonical_candidates = tuple(
+        candidate for candidate in eligible
+        if canonical_source is not None
+        and candidate.source_digest == canonical_source
     )
-    if canonical_authority is not None and authority < canonical_authority:
+    if canonical_candidates:
+        owners = canonical_candidates
+    elif any(
+        candidate.source_digest == canonical_source for candidate in candidates
+    ):
+        # The canonical adapter emitted file evidence, but none of it is
+        # compatible with the canonical tool/outcome.  Do not substitute a
+        # competing same-family source.
         return
+    else:
+        # Append-only rollout revisions can move a terminal file event into a
+        # later source while the canonical span description still points at a
+        # start event in the previous revision.  Preserve that case, but only
+        # at the canonical source-family authority; lower adapters stay unable
+        # to invent paths.
+        authority = max(rank for _candidate, rank in ranked)
+        canonical_authority = (
+            SOURCE_AUTHORITY[source_family(connection, canonical_source)]
+            if canonical_source is not None else None
+        )
+        if canonical_authority is not None and authority < canonical_authority:
+            return
+        owner_sources = {
+            candidate.source_digest for candidate, rank in ranked
+            if rank == authority
+        }
+        if len(owner_sources) != 1:
+            # Multiple competing revisions without a canonical-source fact are
+            # not an append proof.  Retain immutable candidates but do not
+            # manufacture a union of their paths.
+            return
+        owners = tuple(
+            candidate for candidate, rank in ranked
+            if rank == authority and candidate.source_digest in owner_sources
+        )
+        owner_source = next(iter(owner_sources))
+        if not _proven_append_owner(
+            connection,
+            session_key=session_key,
+            call_key=call_key,
+            canonical_source=canonical_source,
+            owner_source=owner_source,
+            terminal_state=terminal_state,
+            owner_candidates=owners,
+        ):
+            return
     fact_keys = {
         (candidate.operation, candidate.relative_path)
-        for candidate, rank in ranked if rank == authority
+        for candidate in owners
     }
     corroborating = tuple(
         candidate for candidate in eligible
@@ -186,9 +300,8 @@ def materialize_file_observations(
     )
     for operation, relative_path in sorted(fact_keys):
         path_hash = min(
-            candidate.path_hash for candidate, rank in ranked
-            if rank == authority
-            and (candidate.operation, candidate.relative_path)
+            candidate.path_hash for candidate in owners
+            if (candidate.operation, candidate.relative_path)
             == (operation, relative_path)
         )
         matches = tuple(

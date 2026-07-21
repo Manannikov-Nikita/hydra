@@ -380,7 +380,12 @@ def _parse_source(
                         source_digest=source, source_ordinal=line_number,
                     )
                 if isinstance(call_id, str):
-                    test_evidence.result(call_id, payload.get("output"), observed_at)
+                    test_evidence.result(
+                        call_id, payload.get("output"), observed_at,
+                        session_key=session_key, line_number=line_number,
+                        turn_key=opaque("turn", current_turn) if current_turn else None,
+                        tool_call_key=opaque("call", call_id),
+                    )
                 continue
             if kind == "event_msg" and event_type in {"mcp_tool_call_end", "patch_apply_end", "web_search_end"}:
                 call_id = payload.get("call_id")

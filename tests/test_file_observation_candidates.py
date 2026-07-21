@@ -212,8 +212,11 @@ class FileObservationCandidateTests(unittest.TestCase):
             ],
         )
 
-    def test_append_only_same_family_revision_does_not_lose_terminal_file_fact(self) -> None:
-        for source in ("zz-rollout-old", "aa-rollout-new"):
+    def test_canonical_rollout_digest_owns_conflicting_same_family_fact_set(self) -> None:
+        for source in (
+            "zz-rollout-canonical-0", "aa-rollout-other-0",
+            "zz-rollout-canonical-1", "aa-rollout-other-1",
+        ):
             logical = f"{source}-logical"
             self.connection.execute(
                 """INSERT INTO rollout_logical_sources(
@@ -229,36 +232,201 @@ class FileObservationCandidateTests(unittest.TestCase):
                 (source, logical, f"{source}-chain"),
             )
 
+        observed: list[list[tuple[str, str]]] = []
+        for index, order in enumerate(("other-first", "canonical-first")):
+            call = f"same-family-conflict-{index}"
+            canonical = f"zz-rollout-canonical-{index}"
+            other = f"aa-rollout-other-{index}"
+            self._tool(canonical, tool_name="exec_command", terminal="success", call=call)
+            self._tool(other, tool_name="exec_command", terminal="success", call=call)
+
+            def canonical_fact() -> None:
+                self._file(
+                    canonical, operation="read", path=f"src/canonical-{index}.py",
+                    observed_at="2026-07-21T00:00:01.200000Z",
+                    tool_name="exec_command", call=call,
+                )
+
+            def other_fact() -> None:
+                self._file(
+                    other, operation="read", path=f"src/other-{index}.py",
+                    observed_at="2026-07-21T00:00:01.100000Z",
+                    tool_name="exec_command", call=call,
+                )
+
+            if order == "other-first":
+                other_fact()
+                canonical_fact()
+            else:
+                canonical_fact()
+                other_fact()
+            observed.append([
+                tuple(row) for row in self.connection.execute(
+                    "SELECT operation,relative_path FROM file_observations "
+                    "WHERE relative_path IN (?,?) ORDER BY relative_path",
+                    (f"src/canonical-{index}.py", f"src/other-{index}.py"),
+                )
+            ])
+
+        self.assertEqual(observed, [
+            [("read", "src/canonical-0.py")],
+            [("read", "src/canonical-1.py")],
+        ])
+
+    def test_conflicting_append_revisions_without_canonical_fact_fail_closed(self) -> None:
+        sources = (
+            "zz-rollout-start", "aa-rollout-terminal", "bb-rollout-terminal",
+        )
+        for source in sources:
+            logical = f"{source}-logical"
+            self.connection.execute(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,lineage_state)
+                   VALUES (?,?,'clean')""",
+                (logical, "project"),
+            )
+            self.connection.execute(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,
+                       line_count,byte_count,chain_digest,materialized)
+                   VALUES (?,'jsonl',?,'initial',1,1,?,1)""",
+                (source, logical, f"{source}-chain"),
+            )
         persist_tool_start(
-            self.connection, session_key="session", call_key="extension-call",
+            self.connection, session_key="session", call_key="ambiguous-append",
             category="tool", tool_name="exec_command",
-            started_at="2026-07-21T00:00:00Z", turn_key="old-turn",
-            source_digest="zz-rollout-old", source_ordinal=1,
+            started_at="2026-07-21T00:00:00Z", turn_key="start-turn",
+            source_digest="zz-rollout-start", source_ordinal=1,
         )
-        persist_tool_start(
-            self.connection, session_key="session", call_key="extension-call",
-            category="tool", tool_name="exec_command",
-            started_at="2026-07-21T00:00:00Z", turn_key="new-turn",
-            source_digest="aa-rollout-new", source_ordinal=1,
+        for index, source in enumerate(sources[1:]):
+            persist_tool_end(
+                self.connection, session_key="session", call_key="ambiguous-append",
+                category="tool", tool_name="exec_command",
+                finished_at="2026-07-21T00:00:01Z", terminal_state="success",
+                latency_ms=1000, turn_key=f"terminal-turn-{index}",
+                source_digest=source, source_ordinal=2,
+            )
+            self._file(
+                source, operation="read", path=f"src/conflict-{index}.py",
+                observed_at="2026-07-21T00:00:01Z", tool_name="exec_command",
+                call="ambiguous-append", line=3,
+            )
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM file_observations "
+                "WHERE relative_path LIKE 'src/conflict-%'"
+            ).fetchone()[0],
+            0,
         )
-        persist_tool_end(
-            self.connection, session_key="session", call_key="extension-call",
-            category="tool", tool_name="exec_command",
-            finished_at="2026-07-21T00:00:01Z", terminal_state="success",
-            latency_ms=1000, turn_key="new-turn",
-            source_digest="aa-rollout-new", source_ordinal=2,
-        )
-        self._file(
-            "aa-rollout-new", operation="read", path="src/extended.py",
-            observed_at="2026-07-21T00:00:01Z", tool_name="exec_command",
-            call="extension-call", line=3, turn="new-turn",
-        )
+
+    def test_append_only_same_family_revision_does_not_lose_terminal_file_fact(self) -> None:
+        for index in range(2):
+            logical = f"append-logical-{index}"
+            self.connection.execute(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,lineage_state)
+                   VALUES (?,?,'clean')""",
+                (logical, "project"),
+            )
+            self.connection.executemany(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,
+                       line_count,byte_count,chain_digest,materialized)
+                   VALUES (?,'jsonl',?,?,?,?,?,1)""",
+                (
+                    (f"zz-rollout-old-{index}", logical, "initial", 1, 1, f"old-{index}"),
+                    (f"aa-rollout-new-{index}", logical, "append", 3, 3, f"new-{index}"),
+                ),
+            )
+
+        for index, order in enumerate(("old-first", "new-first")):
+            call = f"extension-call-{index}"
+            old = f"zz-rollout-old-{index}"
+            new = f"aa-rollout-new-{index}"
+
+            def old_start() -> None:
+                persist_tool_start(
+                    self.connection, session_key="session", call_key=call,
+                    category="tool", tool_name="exec_command",
+                    started_at="2026-07-21T00:00:00Z", turn_key="old-turn",
+                    source_digest=old, source_ordinal=1,
+                )
+
+            def new_terminal() -> None:
+                persist_tool_end(
+                    self.connection, session_key="session", call_key=call,
+                    category="tool", tool_name="exec_command",
+                    finished_at="2026-07-21T00:00:01Z", terminal_state="success",
+                    latency_ms=1000, turn_key="new-turn",
+                    source_digest=new, source_ordinal=2,
+                )
+                self._file(
+                    new, operation="read", path=f"src/extended-{index}.py",
+                    observed_at="2026-07-21T00:00:01Z",
+                    tool_name="exec_command", call=call, line=3, turn="new-turn",
+                )
+
+            if order == "old-first":
+                old_start()
+                new_terminal()
+            else:
+                new_terminal()
+                old_start()
 
         self.assertEqual(
             [tuple(row) for row in self.connection.execute(
-                "SELECT operation,relative_path FROM file_observations"
+                "SELECT operation,relative_path FROM file_observations "
+                "WHERE relative_path LIKE 'src/extended-%' ORDER BY relative_path"
             )],
-            [("read", "src/extended.py")],
+            [
+                ("read", "src/extended-0.py"),
+                ("read", "src/extended-1.py"),
+            ],
+        )
+
+    def test_unrelated_single_rollout_source_cannot_supply_append_fallback(self) -> None:
+        for source in ("zz-rollout-start-only", "aa-rollout-terminal-only"):
+            logical = f"{source}-logical"
+            self.connection.execute(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,lineage_state)
+                   VALUES (?,?,'clean')""",
+                (logical, "project"),
+            )
+            self.connection.execute(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,
+                       line_count,byte_count,chain_digest,materialized)
+                   VALUES (?,'jsonl',?,'initial',1,1,?,1)""",
+                (source, logical, f"{source}-chain"),
+            )
+        call = "unrelated-append"
+        persist_tool_start(
+            self.connection, session_key="session", call_key=call,
+            category="tool", tool_name="exec_command",
+            started_at="2026-07-21T00:00:00Z", turn_key="start-turn",
+            source_digest="zz-rollout-start-only", source_ordinal=1,
+        )
+        persist_tool_end(
+            self.connection, session_key="session", call_key=call,
+            category="tool", tool_name="exec_command",
+            finished_at="2026-07-21T00:00:01Z", terminal_state="success",
+            latency_ms=1000, turn_key="terminal-turn",
+            source_digest="aa-rollout-terminal-only", source_ordinal=2,
+        )
+        self._file(
+            "aa-rollout-terminal-only", operation="read",
+            path="src/unrelated.py", observed_at="2026-07-21T00:00:01Z",
+            tool_name="exec_command", call=call, line=3, turn="terminal-turn",
+        )
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM file_observations "
+                "WHERE relative_path='src/unrelated.py'"
+            ).fetchone()[0],
+            0,
         )
 
     def test_candidate_rows_are_database_immutable(self) -> None:
@@ -277,6 +445,197 @@ class FileObservationCandidateTests(unittest.TestCase):
 
 
 class FileObservationMigrationTests(unittest.TestCase):
+    @staticmethod
+    def _create_database_before_v25(database: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(database)
+        for version, statements in MIGRATIONS:
+            if version >= 25:
+                break
+            for statement in statements:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version,applied_at) "
+                "VALUES (?,datetime('now'))",
+                (version,),
+            )
+            connection.execute(f"PRAGMA user_version={version}")
+        return connection
+
+    def test_v25_immediately_removes_stale_app_file_when_canonical_rollout_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "failed-canonical.sqlite3"
+            connection = self._create_database_before_v25(database)
+            try:
+                connection.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,conversation_key)
+                       VALUES ('legacy-session','project','path',1,'conversation')"""
+                )
+                connection.execute(
+                    """INSERT INTO tool_spans(
+                           session_key,call_key,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,source_digest,
+                           source_ordinal,completeness,provenance)
+                       VALUES ('legacy-session','shared-call','tool','failed',1,
+                               'exec_command','2026-07-21T00:00:00Z',
+                               '2026-07-21T00:00:01Z','rollout-turn',
+                               'rollout-source',2,'complete','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO tool_span_candidates(
+                           session_key,call_key,source_digest,source_ordinal,
+                           candidate_kind,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,provenance)
+                       VALUES ('legacy-session','shared-call','app-source',3,
+                               'end','tool','success',1,'exec_command',NULL,
+                               '2026-07-21T00:00:01Z','app-turn','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO tool_span_candidates(
+                           session_key,call_key,source_digest,source_ordinal,
+                           candidate_kind,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,provenance)
+                       VALUES ('legacy-session','shared-call','rollout-source',2,
+                               'end','tool','failed',1,'exec_command',NULL,
+                               '2026-07-21T00:00:01Z','rollout-turn','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO file_observations(
+                           source_digest,line_number,session_key,operation,
+                           relative_path,path_hash,observed_at,turn_key)
+                       VALUES ('app-source',3,'legacy-session','read',
+                               'src/stale.py','stale-path',
+                               '2026-07-21T00:00:01Z','app-turn')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM file_observations"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_v25_recovers_v22_line_zero_identity_without_active_hasher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "line-zero.sqlite3"
+            keys = Pseudonymizer(b"line-zero-migration-key-00000001")
+            key_path = root / "rollout-hmac.key"
+            key_path.write_bytes(keys.key)
+            key_path.chmod(0o600)
+            materialized_source = keys.digest(
+                "event", "file-observation/legacy-session/shared-call",
+            )
+            connection = self._create_database_before_v25(database)
+            try:
+                connection.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,conversation_key)
+                       VALUES ('legacy-session','project','path',1,'conversation')"""
+                )
+                connection.execute(
+                    """INSERT INTO tool_spans(
+                           session_key,call_key,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,source_digest,
+                           source_ordinal,completeness,provenance)
+                       VALUES ('legacy-session','shared-call','tool','success',1,
+                               'exec_command','2026-07-21T00:00:00Z',
+                               '2026-07-21T00:00:01Z','rollout-turn',
+                               'rollout-source',2,'complete','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO file_observations(
+                           source_digest,line_number,session_key,operation,
+                           relative_path,path_hash,observed_at,turn_key)
+                       VALUES (?,0,'legacy-session','read','src/shared.py',
+                               'legacy-path','2026-07-21T00:00:01Z','rollout-turn')""",
+                    (materialized_source,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertIsNone(ACTIVE_HASHER.get())
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT call_key FROM file_observation_candidates "
+                    "WHERE evidence_kind='legacy'"
+                ).fetchone()[0],
+                "shared-call",
+            )
+
+            token = ACTIVE_HASHER.set(keys)
+            try:
+                persist_file(
+                    store.connection, "rollout-source", 3, "legacy-session",
+                    "read", "src/shared.py", root,
+                    "2026-07-21T00:00:01Z", "rollout-turn",
+                    observation_call_key="shared-call",
+                    observation_tool_name="exec_command",
+                    requires_success=True,
+                )
+            finally:
+                ACTIVE_HASHER.reset(token)
+
+            self.assertEqual(
+                [tuple(row) for row in store.connection.execute(
+                    "SELECT operation,relative_path FROM file_observations"
+                )],
+                [("read", "src/shared.py")],
+            )
+
+    def test_v25_quarantines_line_zero_when_installation_identity_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "line-zero-no-key.sqlite3"
+            connection = self._create_database_before_v25(database)
+            try:
+                connection.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,conversation_key)
+                       VALUES ('legacy-session','project','path',1,'conversation')"""
+                )
+                connection.execute(
+                    """INSERT INTO tool_spans(
+                           session_key,call_key,category,terminal_state,latency_ms,
+                           tool_name,source_digest,source_ordinal,
+                           completeness,provenance)
+                       VALUES ('legacy-session','shared-call','tool','success',1,
+                               'exec_command','rollout-source',2,'complete','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO file_observations(
+                           source_digest,line_number,session_key,operation,
+                           relative_path,path_hash,observed_at,turn_key)
+                       VALUES ('unverifiable-materialization',0,'legacy-session',
+                               'read','src/shared.py','legacy-path',
+                               '2026-07-21T00:00:01Z','rollout-turn')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT evidence_kind FROM file_observation_candidates"
+                ).fetchone()[0],
+                "quarantined",
+            )
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM file_observations"
+                ).fetchone()[0],
+                0,
+            )
+
     def test_v25_reuses_unambiguous_legacy_apply_patch_call_across_append_extension(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "legacy-apply-patch.sqlite3"

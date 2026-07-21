@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 
 I9_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (25, (
@@ -18,7 +20,9 @@ I9_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             turn_key TEXT,
             tool_name TEXT NOT NULL,
             requires_success INTEGER NOT NULL CHECK(requires_success IN (0,1)),
-            evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('exact','legacy')),
+            evidence_kind TEXT NOT NULL CHECK(evidence_kind IN (
+                'exact','legacy','quarantined'
+            )),
             PRIMARY KEY(session_key,call_key,candidate_key)
         )""",
         """WITH eligible_calls AS (
@@ -70,7 +74,9 @@ I9_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                   observation.source_digest,observation.line_number,
                   observation.operation,observation.relative_path,
                   observation.path_hash,observation.observed_at,
-                  observation.turn_key,'unknown',0,'legacy'
+                  observation.turn_key,'unknown',0,
+                  CASE WHEN observation.line_number=0
+                       THEN 'quarantined' ELSE 'legacy' END
              FROM file_observations AS observation
              LEFT JOIN resolved_calls AS resolved
                ON resolved.observation_rowid=observation.rowid""",
@@ -97,3 +103,57 @@ I9_REQUIRED_SCHEMA = {
         "tool_name", "requires_success", "evidence_kind",
     },
 }
+
+
+def recover_line_zero_file_candidates(
+    connection: Any,
+    *,
+    source_identity: Callable[[str, str], str] | None,
+) -> None:
+    """Bind v22 synthetic line-zero rows to one privacy-safe call identity.
+
+    The synthetic source is an installation-keyed HMAC over session/call.  We
+    compare that already-pseudonymized identity directly and never need raw
+    prompts, paths, or an ``ACTIVE_HASHER`` context.  Missing keys and any
+    ambiguity deliberately leave the candidate quarantined.
+    """
+    if source_identity is None:
+        return
+
+    by_materialized_source: dict[tuple[str, str], set[str]] = {}
+    for session_key, call_key in connection.execute(
+        "SELECT session_key,call_key FROM tool_spans"
+    ):
+        materialized_source = source_identity(str(session_key), str(call_key))
+        by_materialized_source.setdefault(
+            (str(session_key), materialized_source), set(),
+        ).add(str(call_key))
+
+    rows = connection.execute(
+        """SELECT session_key,call_key,candidate_key,source_digest,source_ordinal,
+                  operation,relative_path,path_hash,observed_at,turn_key,tool_name,
+                  requires_success
+             FROM file_observation_candidates
+            WHERE evidence_kind='quarantined' AND source_ordinal=0"""
+    ).fetchall()
+    for row in rows:
+        matches = by_materialized_source.get((str(row[0]), str(row[3])), set())
+        if len(matches) != 1:
+            continue
+        resolved_call = next(iter(matches))
+        candidate_key = "/".join((
+            "legacy-resolved", str(row[3]), str(row[5]), str(row[7]),
+            resolved_call,
+        ))
+        connection.execute(
+            """INSERT INTO file_observation_candidates(
+                   session_key,call_key,candidate_key,source_digest,source_ordinal,
+                   operation,relative_path,path_hash,observed_at,turn_key,tool_name,
+                   requires_success,evidence_kind)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'legacy')
+               ON CONFLICT DO NOTHING""",
+            (
+                row[0], resolved_call, candidate_key, row[3], row[4], row[5],
+                row[6], row[7], row[8], row[9], row[10], row[11],
+            ),
+        )

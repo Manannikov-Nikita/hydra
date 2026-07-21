@@ -268,6 +268,73 @@ class PersistedTestEvidenceTests(unittest.TestCase):
             [("pytest", "full", "failed", 1, "product_failure")],
         ])
 
+    def test_complete_result_from_a_different_command_never_completes_authoritative_intent(self) -> None:
+        session, call_id = "mismatched-result-session", "mismatched-result"
+        rollout = self.root / "mismatched-result.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            call(call_id, "pytest", 1),
+        ])
+        app = self.app_source(
+            "mismatched-result", session=session, call_id=call_id,
+            command="pytest tests/test_other.py", status="completed", exit_code=0,
+        )
+
+        observed: list[list[tuple[object, ...]]] = []
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"mismatched-result-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            observed.append([
+                tuple(row) for row in store.connection.execute(
+                    """SELECT runner,scope,outcome,exit_status,failure_cause,completeness
+                         FROM rollout_test_runs"""
+                )
+            ])
+
+        self.assertEqual(observed, [
+            [("pytest", "full", "unknown", None, "unknown", "conflicted")],
+            [("pytest", "full", "unknown", None, "unknown", "conflicted")],
+        ])
+
+    def test_append_terminal_restores_persisted_intent_without_trusting_lower_command(self) -> None:
+        session, call_id = "append-result-session", "append-result"
+        rollout = self.root / "append-result.rollout.jsonl"
+        prefix = [
+            start(session, self.project),
+            call(call_id, "pytest tests/test_live_append.py", 1),
+        ]
+        write_rollout(rollout, prefix)
+        self.ingest(rollout)
+        self.assertEqual(tuple(self.store.connection.execute(
+            """SELECT runner,scope,outcome,exit_status,completeness
+                 FROM rollout_test_runs"""
+        ).fetchone()), ("pytest", "targeted", "unknown", None, "intent_only"))
+
+        lower = self.app_source(
+            "append-result", session=session, call_id=call_id,
+            command="pytest tests/test_other.py", status="completed", exit_code=0,
+        )
+        ingest_codex_events(
+            self.store, (lower,), self.project, "project-tests", hash_key=b"t" * 32,
+        )
+        write_rollout(rollout, prefix + [
+            result(call_id, {"exit_code": 1, "stderr": "assertion failed"}, 2),
+        ])
+        self.ingest(rollout)
+
+        rows = [tuple(row) for row in self.store.connection.execute(
+            """SELECT runner,scope,outcome,exit_status,failure_cause,completeness
+                 FROM rollout_test_runs"""
+        )]
+        self.assertEqual(rows, [
+            ("pytest", "targeted", "failed", 1, "product_failure", "complete"),
+        ])
+        dump = "\n".join(self.store.connection.iterdump())
+        self.assertNotIn("pytest tests/test_live_append.py", dump)
+        self.assertNotIn("pytest tests/test_other.py", dump)
+        self.assertNotIn("assertion failed", dump)
+
     def test_authoritative_non_test_description_suppresses_lower_app_test_claim(self) -> None:
         session, call_id = "non-test-description-session", "non-test-description"
         rollout = self.root / "non-test-description.rollout.jsonl"

@@ -9,6 +9,7 @@ from hydra_codex.classifier import classify_test_command, classify_test_outcome
 from hydra_codex.metrics import SessionEdge, TokenSnapshot, TurnAttempt, aggregate_project, aggregate_tokens, aggregate_turns, tree_contribution
 from hydra_codex.rollout import RolloutRoot, ingest_rollouts
 from hydra_codex.storage import HydraStore
+from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 
 
 def v1(kind: str, payload: dict, second: int = 0) -> dict:
@@ -141,6 +142,46 @@ class RolloutIngestTests(unittest.TestCase):
         self.assertEqual(tuple(turn), ("2026-07-20T00:00:00Z", "2026-07-20T00:00:04Z", 50))
         metrics = aggregate_project(self.store.connection, "project-synthetic")
         self.assertEqual((metrics.working_tokens, metrics.full_context, metrics.provenance), (None, None, "estimated"))
+
+    def test_cached_tokens_above_input_are_diagnosed_without_breaking_reports(self) -> None:
+        source = self.root / "rollouts" / "invalid-token-relation.jsonl"
+        write_jsonl(source, [
+            v1("session_meta", {"id": "invalid-token-session", "cwd": str(self.project)}),
+            v1("event_msg", {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 1,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 11,
+                }},
+            }, 1),
+            v1("event_msg", {
+                "type": "task_complete", "turn_id": "invalid-token-turn",
+            }, 2),
+        ])
+
+        ingest_rollouts(
+            self.store, (source,), self.project, "project-synthetic",
+            hash_key=b"t" * 32,
+        )
+
+        self.assertEqual(self.store.count("token_snapshots"), 0)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT envelope_kind FROM rollout_diagnostics"
+            ).fetchone()[0],
+            "token_count",
+        )
+        root = self.store.connection.execute(
+            "SELECT session_key FROM rollout_sessions"
+        ).fetchone()[0]
+        metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id="project-synthetic", root_id=root,
+        )
+        self.assertIsNone(metrics.recorded.working.value)
+        self.assertEqual(metrics.recorded.provenance, "estimated")
 
     def test_injected_keys_are_stable_per_key_and_distinct_across_keys(self) -> None:
         source = self.root / "rollouts" / "keyed.jsonl"

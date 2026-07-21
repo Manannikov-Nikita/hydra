@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Iterator
 
@@ -262,6 +263,24 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
 ) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS
 
 
+def _immutable_candidate_trigger_sql() -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for migrations in (G7_MIGRATIONS, H8_MIGRATIONS, I9_MIGRATIONS):
+        for _version, statements in migrations:
+            for statement in statements:
+                match = re.match(r"\s*CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)", statement, re.IGNORECASE)
+                if match is not None:
+                    definitions[match.group(1)] = statement
+    return definitions
+
+
+REQUIRED_IMMUTABLE_CANDIDATE_TRIGGERS = _immutable_candidate_trigger_sql()
+
+
+def _normalized_schema_sql(statement: str) -> str:
+    return " ".join(statement.casefold().split()).rstrip(";")
+
+
 class HydraStore:
     """Single-process SQLite store; callers provide an explicit path for tests."""
 
@@ -339,6 +358,51 @@ class HydraStore:
 
                         materialize_test_evidence(connection)
                         reconcile_test_retries(connection)
+                    if version == 25:
+                        from .migrations_i9 import recover_line_zero_file_candidates
+                        from .rollout_identity import Pseudonymizer
+                        from .rollout_persistence import materialize_file_observations
+
+                        key_path = self.database_path.parent / "rollout-hmac.key"
+                        keys = None
+                        if key_path.exists():
+                            try:
+                                keys = Pseudonymizer.installation_key(key_path)
+                            except (OSError, ValueError, RuntimeError):
+                                # A missing, malformed, or untrusted key cannot
+                                # be used to claim ownership of legacy line-zero
+                                # materializations.  They remain quarantined.
+                                keys = None
+                        source_identity = (
+                            None
+                            if keys is None
+                            else lambda session, call: keys.digest(
+                                "event", f"file-observation/{session}/{call}",
+                            )
+                        )
+                        recover_line_zero_file_candidates(
+                            connection, source_identity=source_identity,
+                        )
+                        migration_identity = (
+                            source_identity
+                            if source_identity is not None
+                            else lambda _session, _call: None
+                        )
+                        calls = connection.execute(
+                            """SELECT session_key,call_key,
+                                      MAX(CASE WHEN evidence_kind='quarantined'
+                                               THEN 1 ELSE 0 END) AS quarantine
+                                 FROM file_observation_candidates
+                                GROUP BY session_key,call_key
+                                ORDER BY quarantine DESC,session_key,call_key"""
+                        ).fetchall()
+                        for session_key, call_key, _quarantine in calls:
+                            materialize_file_observations(
+                                connection,
+                                session_key=str(session_key),
+                                call_key=str(call_key),
+                                source_identity=migration_identity,
+                            )
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
                         (version,),
@@ -371,6 +435,22 @@ class HydraStore:
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
                 raise StorageUnavailable(f"Hydra schema is missing required columns for {table}")
+        actual_triggers = {
+            str(row[0]): str(row[1])
+            for row in self.connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger'"
+            )
+            if row[1] is not None
+        }
+        for name, expected_sql in REQUIRED_IMMUTABLE_CANDIDATE_TRIGGERS.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql) != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    f"Hydra schema has missing or altered immutable candidate trigger: {name}"
+                )
         if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise StorageUnavailable("Hydra schema has foreign-key violations")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":

@@ -40,3 +40,20 @@ def source_rank(connection: Any, source_digest: str | None) -> tuple[int, str]:
     """Return explicit family precedence plus a stable same-family tie break."""
     digest = source_digest if isinstance(source_digest, str) else ""
     return SOURCE_AUTHORITY[source_family(connection, digest)], digest
+
+
+def rollout_revision_identity(
+    connection: Any, source_digest: str | None,
+) -> tuple[str, int] | None:
+    """Return append-lineage identity for a native rollout revision only."""
+    if not isinstance(source_digest, str) or not source_digest:
+        return None
+    row = connection.execute(
+        """SELECT logical_source_key,line_count
+             FROM rollout_sources
+            WHERE source_digest=? AND source_type='jsonl'""",
+        (source_digest,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0]), int(row[1])

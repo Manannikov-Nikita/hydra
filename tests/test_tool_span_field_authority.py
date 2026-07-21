@@ -206,6 +206,39 @@ class ToolSpanFieldAuthorityTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(row), ("success", "estimated", "incomplete"))
 
+    def test_separate_conflicting_starts_keep_stable_digest_tie_break(self) -> None:
+        self.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,lineage_state)
+               VALUES ('rollout-z-logical','project','clean')"""
+        )
+        self.connection.execute(
+            """INSERT INTO rollout_sources(
+                   source_digest,source_type,logical_source_key,relation,
+                   line_count,byte_count,chain_digest,materialized)
+               VALUES ('rollout-z','jsonl','rollout-z-logical','initial',1,1,'z',1)"""
+        )
+        persist_tool_start(
+            self.connection,
+            session_key="session", call_key="conflicting-start",
+            category="tool", tool_name="exec_command",
+            started_at="2024-01-01T00:00:00.100000Z", turn_key="turn",
+            source_digest="rollout", source_ordinal=1,
+        )
+        persist_tool_start(
+            self.connection,
+            session_key="session", call_key="conflicting-start",
+            category="tool", tool_name="apply_patch",
+            started_at="2024-01-01T00:00:00.100000Z", turn_key="turn",
+            source_digest="rollout-z", source_ordinal=1,
+        )
+
+        row = self.connection.execute(
+            """SELECT tool_name,source_digest FROM tool_spans
+                 WHERE session_key='session' AND call_key='conflicting-start'"""
+        ).fetchone()
+        self.assertEqual(tuple(row), ("apply_patch", "rollout-z"))
+
 
 if __name__ == "__main__":
     unittest.main()

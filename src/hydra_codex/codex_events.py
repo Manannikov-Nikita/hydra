@@ -84,6 +84,19 @@ class TokenSnapshotFact:
     reasoning_tokens: int
     reported_total_tokens: int | None
 
+    def __post_init__(self) -> None:
+        values = (
+            self.input_tokens, self.cached_input_tokens,
+            self.output_tokens, self.reasoning_tokens,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values
+        ):
+            raise ValueError("token counters must be non-negative integers")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("cached input tokens cannot exceed input tokens")
+
 
 @dataclass(frozen=True)
 class ToolFact:
@@ -342,12 +355,14 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     if method == "thread/tokenUsage/updated":
         token_usage = params.get("tokenUsage")
         if not isinstance(token_usage, Mapping):
-            return None, ("invalid_usage",)
-        total = _usage(token_usage.get("total"), "thread_total", True)
-        last = _usage(token_usage.get("last"), "last_model_call", False)
-        if total is None or last is None:
-            return None, ("invalid_usage",)
-        snapshots = (total, last)
+            issues.append("invalid_usage")
+        else:
+            total = _usage(token_usage.get("total"), "thread_total", True)
+            last = _usage(token_usage.get("last"), "last_model_call", False)
+            if total is None or last is None:
+                issues.append("invalid_usage")
+            else:
+                snapshots = (total, last)
     phase = "started" if method == "item/started" else "completed"
     tool = _safe_tool(item, phase, key) if method.startswith("item/") else None
     if tool is not None and item.get("durationMs") is not None and tool.duration_ms is None:

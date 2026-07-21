@@ -20,7 +20,11 @@ from .lineage import assert_session_project, persist_confirmed_parent
 from .rollout_identity import ACTIVE_HASHER, Pseudonymizer
 from .rollout_persistence import persist_file
 from .rollout_privacy import canonical_timestamp
-from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs
+from .rollout_reconcile import (
+    reconcile_fork_baselines,
+    reconcile_token_epochs,
+    reconcile_turn_attempts,
+)
 from .shell_facts import shell_file_facts
 from .storage import HydraStore
 from .test_evidence import TestEvidenceBuffer
@@ -288,8 +292,12 @@ def _persist_normalized_event(
     lifecycle = {
         "thread_started": "started", "turn_started": "started",
         "conversation_started": "started", "user_prompt": "started",
-        "turn_completed": "completed",
     }.get(event.event_type)
+    if event.event_type == "turn_completed":
+        lifecycle = (
+            "aborted" if event.status in {"interrupted", "cancelled"}
+            else "completed"
+        )
     if lifecycle is not None and event.observed_at is not None:
         connection.execute(
             """INSERT INTO turn_lifecycle_events(
@@ -460,7 +468,8 @@ def _persist_batch(
                 logical_call = tool.call_key or event.event_key
                 rejected_test = (
                     tool.phase == "completed"
-                    and tool.status not in {"completed", "success"}
+                    and tool.exit_status is None
+                    and tool.status in {"declined", "cancelled", "interrupted"}
                 )
                 if rejected_test:
                     test_evidence.reject(
@@ -560,6 +569,12 @@ def ingest_codex_events(
                 ),
             )
             reconcile_fork_baselines(connection, project_id)
+            reconcile_turn_attempts(
+                connection,
+                lambda source, line, kind: _persist_epoch_diagnostic(
+                    connection, source, line, kind,
+                ),
+            )
         return CodexEventIngestReport(
             len(items), len(unique),
             sum(len(batch.events) for _item, batch in unique.values()),

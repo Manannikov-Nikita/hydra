@@ -105,6 +105,18 @@ def _evidence_rank(
     )
 
 
+def _description_rank(
+    connection: sqlite3.Connection, row: sqlite3.Row,
+) -> tuple[int, str, int, str]:
+    """Rank privacy-safe command descriptions by deterministic authority."""
+    return (
+        SOURCE_AUTHORITY[source_family(connection, str(row[3]))],
+        str(row[3]),
+        int(row[4]),
+        str(row[0]),
+    )
+
+
 def persist_test_evidence(
     connection: sqlite3.Connection,
     intent: TestIntent,
@@ -182,20 +194,26 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
         # Command classification is a description fact and therefore follows
         # source authority even when a lower-authority source supplies the only
         # complete result.  The result itself is completeness-first.
-        description = max(
-            descriptions,
-            key=lambda row: (
-                SOURCE_AUTHORITY[source_family(connection, str(row[3]))],
-                str(row[3]), int(row[4]), str(row[0]),
-            ),
-        )
+        description = max(descriptions, key=lambda row: _description_rank(connection, row))
         if description[1] != "evidence":
             continue
-        completed = [row for row in evidence if row[16] == "complete"]
+        matching = [row for row in evidence if row[9] == description[9]]
+        completed = [row for row in matching if row[16] == "complete"]
+        mismatched_complete = any(
+            row[16] == "complete" and row[9] != description[9]
+            for row in evidence
+        )
         has_non_execution = any(row[1] == "non_execution" for row in candidates)
         if has_non_execution and not completed:
             continue
-        selected = max(evidence, key=lambda row: _evidence_rank(connection, row))
+        selected = max(completed or matching, key=lambda row: _evidence_rank(connection, row))
+        result = (
+            unknown_result("conflicted")
+            if not completed and mismatched_complete
+            else StructuredTestResult(
+                selected[12], selected[13], selected[14], selected[16],
+            )
+        )
         connection.execute(
             """INSERT INTO rollout_test_runs(
                    evidence_key,source_digest,line_number,session_key,observed_at,
@@ -207,8 +225,8 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
                 description[2], selected[3], selected[4], session_key,
                 selected[6] or description[6], selected[7] or description[7],
                 tool_call_key, description[9], description[10], description[11],
-                selected[12], selected[13], selected[14], selected[15],
-                selected[16],
+                result.exit_status, result.outcome, result.failure_cause,
+                selected[15], result.completeness,
             ),
         )
 
@@ -336,9 +354,56 @@ class TestEvidenceBuffer:
         )
         return is_test
 
-    def result(self, logical_call_id: str, output: object, observed_at: str | None) -> None:
+    def _restore_intent(
+        self, *, logical_call_id: str, session_key: str, line_number: int,
+        observed_at: str | None, turn_key: str | None, tool_call_key: str,
+    ) -> None:
+        """Restore only hashed intent fields when an append contains the terminal line."""
+        rows = list(self.connection.execute(
+            """SELECT candidate_key,candidate_kind,evidence_key,source_digest,line_number,
+                      session_key,observed_at,turn_key,tool_call_key,command_hash,runner,
+                      scope,exit_status,outcome,failure_cause,provenance,completeness
+                 FROM test_evidence_candidates
+                WHERE session_key=? AND tool_call_key=?
+                  AND candidate_kind IN ('description','evidence')""",
+            (session_key, tool_call_key),
+        ))
+        if not rows:
+            return
+        description = max(rows, key=lambda row: _description_rank(self.connection, row))
+        command_hash = str(description[9])
+        candidate_key = self.pseudonymize(
+            "event",
+            f"test-candidate/evidence/{session_key}/{tool_call_key}/"
+            f"{self.source_digest}/{line_number}/{command_hash}",
+        )
+        self.intents[logical_call_id] = (
+            TestIntent(
+                candidate_key, str(description[2]), self.source_digest, line_number,
+                session_key, observed_at or description[6], turn_key or description[7],
+                tool_call_key, command_hash, str(description[10]), str(description[11]),
+            ),
+            logical_call_id,
+        )
+
+    def result(
+        self, logical_call_id: str, output: object, observed_at: str | None, *,
+        session_key: str | None = None, line_number: int | None = None,
+        turn_key: str | None = None, tool_call_key: str | None = None,
+    ) -> None:
         if logical_call_id in self.rejected:
             return
+        if (
+            logical_call_id not in self.intents
+            and session_key is not None
+            and line_number is not None
+            and tool_call_key is not None
+        ):
+            self._restore_intent(
+                logical_call_id=logical_call_id, session_key=session_key,
+                line_number=line_number, observed_at=observed_at,
+                turn_key=turn_key, tool_call_key=tool_call_key,
+            )
         self.results[logical_call_id] = (parse_structured_result(output), observed_at)
 
     def _persist_non_execution(self, session_key: str, tool_call_key: str) -> None:

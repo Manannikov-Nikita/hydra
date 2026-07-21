@@ -35,8 +35,16 @@ def usage(payload: dict[str, Any]) -> dict[str, int] | None:
     values = info.get("total_token_usage") if isinstance(info, dict) else None
     if not isinstance(values, dict):
         return None
+    input_tokens = safe_int(values.get("input_tokens"))
+    cached_input_tokens = safe_int(values.get("cached_input_tokens"))
+    if (
+        input_tokens is not None
+        and cached_input_tokens is not None
+        and cached_input_tokens > input_tokens
+    ):
+        return None
     return {
-        "input": safe_int(values.get("input_tokens")), "cached": safe_int(values.get("cached_input_tokens")),
+        "input": input_tokens, "cached": cached_input_tokens,
         "output": safe_int(values.get("output_tokens")), "reasoning": safe_int(values.get("reasoning_output_tokens")),
         "cache_write": safe_int(values.get("cache_write_input_tokens")), "vendor_total": safe_int(values.get("total_tokens")),
         "context_window": safe_int(info.get("model_context_window")),

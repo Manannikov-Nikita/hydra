@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import sqlite3
 from typing import Callable
 
 from .rollout_privacy import canonical_timestamp
+from .source_authority import SOURCE_AUTHORITY, source_family
 
 
 @dataclass
@@ -19,14 +20,81 @@ class _Attempt:
     emitted_duration_ms: int | None = None
 
 
-def _event_order(row: sqlite3.Row) -> tuple[int, float, str, int, str]:
+@dataclass(frozen=True)
+class _LifecycleEvent:
+    event_key: str
+    session_key: str
+    turn_key: str
+    event_kind: str
+    observed_at: str | None
+    timestamp_epoch: float | None
+    emitted_duration_ms: int | None
+    source_digest: str
+    logical_source_key: str
+    source_ordinal: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "_LifecycleEvent":
+        return cls(
+            event_key=str(row[0]), session_key=str(row[1]), turn_key=str(row[2]),
+            event_kind=str(row[3]), observed_at=row[4], timestamp_epoch=row[5],
+            emitted_duration_ms=row[6], source_digest=str(row[7]),
+            logical_source_key=str(row[8]), source_ordinal=int(row[9]),
+        )
+
+
+def _event_order(event: _LifecycleEvent) -> tuple[int, float, str, int, str]:
     return (
-        0 if row[5] is not None else 1,
-        float(row[5] or 0),
-        row[8],
-        int(row[9]),
-        row[0],
+        0 if event.timestamp_epoch is not None else 1,
+        float(event.timestamp_epoch or 0),
+        event.logical_source_key,
+        event.source_ordinal,
+        event.event_key,
     )
+
+
+def _deduplicated_lifecycle_events(
+    connection: sqlite3.Connection, rows: list[sqlite3.Row],
+) -> list[_LifecycleEvent]:
+    """Merge matching cross-adapter facts while preserving adapter-local retries."""
+    exact: dict[tuple[str, float], list[_LifecycleEvent]] = {}
+    missing: list[_LifecycleEvent] = []
+    events = [_LifecycleEvent.from_row(row) for row in rows]
+    for event in events:
+        if event.timestamp_epoch is None:
+            missing.append(event)
+            continue
+        phase = "started" if event.event_kind == "started" else "terminal"
+        exact.setdefault((phase, event.timestamp_epoch), []).append(event)
+
+    merged: list[_LifecycleEvent] = []
+    for group in exact.values():
+        families: dict[str, list[_LifecycleEvent]] = {}
+        for event in group:
+            families.setdefault(
+                source_family(connection, event.source_digest), [],
+            ).append(event)
+        for family_events in families.values():
+            family_events.sort(key=lambda event: (
+                event.logical_source_key, event.source_ordinal, event.event_key,
+            ))
+        for index in range(max(len(items) for items in families.values())):
+            candidates = [
+                items[index] for items in families.values() if index < len(items)
+            ]
+            authoritative = max(candidates, key=lambda event: (
+                SOURCE_AUTHORITY[source_family(connection, event.source_digest)],
+                event.source_digest, event.source_ordinal, event.event_key,
+            ))
+            durations = {
+                event.emitted_duration_ms for event in candidates
+                if event.emitted_duration_ms is not None
+            }
+            merged_duration = next(iter(durations)) if len(durations) == 1 else None
+            merged.append(replace(
+                authoritative, emitted_duration_ms=merged_duration,
+            ))
+    return merged + missing
 
 
 def reconcile_turn_attempts(
@@ -42,33 +110,50 @@ def reconcile_turn_attempts(
     for row in rows:
         groups.setdefault((row[1], row[2]), []).append(row)
     for (session, turn), events in groups.items():
-        source_open: dict[str, sqlite3.Row] = {}
-        for event in sorted(events, key=lambda item: (item[8], item[9])):
-            if event[3] == "started":
-                source_open[event[8]] = event
-            elif event[8] in source_open:
-                started = source_open.pop(event[8])
-                if started[5] is not None and event[5] is not None and event[5] < started[5] and diagnose:
-                    diagnose(event[7], int(event[9]), "invalid_turn_interval")
+        events = _deduplicated_lifecycle_events(connection, events)
+        source_open: dict[str, _LifecycleEvent] = {}
+        for event in sorted(
+            events, key=lambda item: (item.logical_source_key, item.source_ordinal),
+        ):
+            if event.event_kind == "started":
+                source_open[event.logical_source_key] = event
+            elif event.logical_source_key in source_open:
+                started = source_open.pop(event.logical_source_key)
+                if (
+                    started.timestamp_epoch is not None
+                    and event.timestamp_epoch is not None
+                    and event.timestamp_epoch < started.timestamp_epoch
+                    and diagnose
+                ):
+                    diagnose(
+                        event.source_digest, event.source_ordinal,
+                        "invalid_turn_interval",
+                    )
         events.sort(key=_event_order)
         attempts: list[_Attempt] = []
         active: _Attempt | None = None
         for event in events:
-            if event[3] == "started":
+            if event.event_kind == "started":
                 if active is None:
-                    active = _Attempt(started_at=event[4], started_epoch=event[5])
+                    active = _Attempt(
+                        started_at=event.observed_at,
+                        started_epoch=event.timestamp_epoch,
+                    )
                     attempts.append(active)
                 elif diagnose:
-                    diagnose(event[7], int(event[9]), "duplicate_turn_start")
+                    diagnose(
+                        event.source_digest, event.source_ordinal,
+                        "duplicate_turn_start",
+                    )
                 continue
-            state = "completed" if event[3] == "completed" else "aborted"
+            state = "completed" if event.event_kind == "completed" else "aborted"
             if active is None:
                 active = _Attempt()
                 attempts.append(active)
             active.state = state
-            active.finished_at = event[4]
-            active.finished_epoch = event[5]
-            active.emitted_duration_ms = event[6]
+            active.finished_at = event.observed_at
+            active.finished_epoch = event.timestamp_epoch
+            active.emitted_duration_ms = event.emitted_duration_ms
             active = None
         connection.execute("DELETE FROM turn_attempts WHERE session_key=? AND turn_key=?", (session, turn))
         for ordinal, attempt in enumerate(attempts, start=1):

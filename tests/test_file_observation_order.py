@@ -7,6 +7,23 @@ import unittest
 from hydra_codex.rollout_identity import ACTIVE_HASHER, Pseudonymizer
 from hydra_codex.rollout_persistence import persist_file
 from hydra_codex.storage import HydraStore
+from hydra_codex.tool_spans import persist_tool_end, persist_tool_start
+
+
+def _successful_tool(connection: object) -> None:
+    persist_tool_start(
+        connection, session_key="session", call_key="shared-call",
+        category="tool", tool_name="unknown",
+        started_at="2026-07-20T00:00:00Z", turn_key="turn-a",
+        source_digest="source", source_ordinal=0,
+    )
+    persist_tool_end(
+        connection, session_key="session", call_key="shared-call",
+        category="tool", tool_name="unknown",
+        finished_at="2026-07-20T00:00:01Z", terminal_state="success",
+        latency_ms=1000, turn_key="turn-a", source_digest="source",
+        source_ordinal=1,
+    )
 
 
 class FileObservationOrderTests(unittest.TestCase):
@@ -20,6 +37,7 @@ class FileObservationOrderTests(unittest.TestCase):
                 token = ACTIVE_HASHER.set(Pseudonymizer(b"file-order-key-0000000000000001"))
                 try:
                     with store.rollout_transaction() as connection:
+                        _successful_tool(connection)
                         for turn in turns:
                             persist_file(
                                 connection, "source", 1, "session", "read", "src/safe.py",
@@ -42,6 +60,7 @@ class FileObservationOrderTests(unittest.TestCase):
             token = ACTIVE_HASHER.set(Pseudonymizer(b"file-order-key-0000000000000001"))
             try:
                 with store.rollout_transaction() as connection:
+                    _successful_tool(connection)
                     persist_file(
                         connection, "source", 1, "session", "read", "src/safe.py",
                         root, "2026-07-20T00:00:01.000002Z", "turn-later",

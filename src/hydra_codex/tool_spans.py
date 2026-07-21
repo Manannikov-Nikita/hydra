@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .rollout_privacy import canonical_timestamp
-from .source_authority import source_rank
+from .source_authority import rollout_revision_identity, source_rank
 
 
 _CATEGORIES = frozenset({"instrumentation", "opaque_exec", "tool", "web"})
@@ -94,14 +94,38 @@ def _description(
     connection: Any, candidates: tuple[_Candidate, ...],
 ) -> _Candidate:
     ranked = tuple(
-        (candidate, source_rank(connection, candidate.source_digest))
+        (
+            candidate,
+            source_rank(connection, candidate.source_digest),
+            rollout_revision_identity(connection, candidate.source_digest),
+        )
         for candidate in candidates
     )
+    authority = max(rank[0] for _candidate, rank, _revision in ranked)
+    eligible = tuple(
+        item for item in ranked if item[1][0] == authority
+    )
+    kind_priority = max(_KIND_PRIORITY[item[0].kind] for item in eligible)
+    eligible = tuple(
+        item for item in eligible
+        if _KIND_PRIORITY[item[0].kind] == kind_priority
+    )
+
+    # Re-reading an append-only rollout emits the prefix start again alongside
+    # a newly observed generic output. Prefer the longest revision of that one
+    # logical source; do not let opaque HMAC digest ordering define semantics.
+    revisions = tuple(item[2] for item in eligible)
+    logicals = {revision[0] for revision in revisions if revision is not None}
+    if len(logicals) == 1 and all(revision is not None for revision in revisions):
+        latest = max(revision[1] for revision in revisions if revision is not None)
+        eligible = tuple(item for item in eligible if item[2][1] == latest)
+
+    # Separate conflicting starts retain their stable privacy-safe digest tie
+    # break; only revisions within one proven append lineage use line count.
     return max(
-        ranked,
+        eligible,
         key=lambda item: (
-            item[1],
-            _KIND_PRIORITY[item[0].kind],
+            item[1][1],
             -item[0].source_ordinal,
             item[0].category,
             item[0].tool_name,

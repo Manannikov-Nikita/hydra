@@ -146,6 +146,308 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.assertEqual(task.semantic.coverage.value, 0.0)
         self.assertEqual(task.semantic.unclassified_working.value, 90)
 
+    def test_app_only_and_hybrid_lifecycle_reconcile_to_one_attempt_in_both_orders(self) -> None:
+        thread, turn = "hybrid-lifecycle-thread", "hybrid-lifecycle-turn"
+        app = self.base / "hybrid-lifecycle.app.jsonl"
+        app.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {"method": "turn/started", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "startedAt": 1720000000,
+                        "status": "inProgress",
+                    },
+                }},
+                {"method": "turn/completed", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "completedAt": 1720000002,
+                        "status": "completed",
+                    },
+                }},
+            )
+        ), encoding="utf-8")
+        app_source = CodexEventSource(app, APP_SERVER_V2)
+
+        app_only = HydraStore(self.base / "app-only-lifecycle.sqlite3")
+        self.addCleanup(app_only.close)
+        ingest_codex_events(
+            app_only, (app_source,), self.project, PROJECT, hash_key=KEY,
+        )
+        self.assertEqual([
+            tuple(row) for row in app_only.connection.execute(
+                "SELECT attempt_ordinal,state,wall_duration_ms FROM turn_attempts"
+            )
+        ], [(1, "completed", 2000)])
+
+        rollout = self.base / "hybrid-lifecycle.rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": thread, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:42Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete", "turn_id": turn,
+                        "duration_ms": 2000,
+                    },
+                },
+            )
+        ), encoding="utf-8")
+        observed: list[list[tuple[object, ...]]] = []
+        for index, app_first in enumerate((True, False), start=1):
+            store = HydraStore(self.base / f"hybrid-lifecycle-{index}.sqlite3")
+            self.addCleanup(store.close)
+            if app_first:
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+            else:
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+            observed.append([
+                tuple(row) for row in store.connection.execute(
+                    "SELECT attempt_ordinal,state,wall_duration_ms FROM turn_attempts"
+                )
+            ])
+        self.assertEqual(observed, [
+            [(1, "completed", 2000)],
+            [(1, "completed", 2000)],
+        ])
+
+    def test_same_rollout_retries_at_one_timestamp_remain_distinct_attempts(self) -> None:
+        thread, turn = "same-adapter-retry-thread", "same-adapter-retry-turn"
+        timestamp = "2024-07-03T09:46:40Z"
+        rollout = self.base / "same-adapter-retries.rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": thread, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": timestamp, "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn},
+                },
+                {
+                    "timestamp": timestamp, "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete", "turn_id": turn,
+                        "duration_ms": 10,
+                    },
+                },
+                {
+                    "timestamp": timestamp, "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn},
+                },
+                {
+                    "timestamp": timestamp, "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete", "turn_id": turn,
+                        "duration_ms": 20,
+                    },
+                },
+            )
+        ), encoding="utf-8")
+
+        ingest_rollouts(
+            self.store, (rollout,), self.project, PROJECT, hash_key=KEY,
+        )
+
+        attempts = [
+            tuple(row) for row in self.store.connection.execute(
+                """SELECT attempt_ordinal,state,wall_duration_ms,emitted_duration_ms
+                     FROM turn_attempts ORDER BY attempt_ordinal"""
+            )
+        ]
+        self.assertEqual(attempts, [
+            (1, "completed", 0, 10),
+            (2, "completed", 0, 20),
+        ])
+        diagnostics = {
+            row[0] for row in self.store.connection.execute(
+                "SELECT envelope_kind FROM rollout_diagnostics"
+            )
+        }
+        self.assertNotIn("duplicate_turn_start", diagnostics)
+
+    def test_app_cancelled_terminal_is_aborted_and_rollout_terminal_wins_conflict(self) -> None:
+        terminals = tuple(
+            self.app_source(f"{status}-turn", {
+                "method": "turn/completed", "params": {
+                    "threadId": f"{status}-thread", "turn": {
+                        "id": f"{status}-turn", "completedAt": 1720000002,
+                        "status": status,
+                    },
+                },
+            })
+            for status in ("interrupted", "cancelled")
+        )
+        self.ingest(*terminals)
+        self.assertEqual(
+            [row[0] for row in self.store.connection.execute(
+                "SELECT state FROM turn_attempts ORDER BY session_key"
+            )],
+            ["aborted", "aborted"],
+        )
+
+        thread, turn = "terminal-conflict-thread", "terminal-conflict-turn"
+        app = self.base / "terminal-conflict.app.jsonl"
+        app.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {"method": "turn/started", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "startedAt": 1720000000,
+                        "status": "inProgress",
+                    },
+                }},
+                {"method": "turn/completed", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "completedAt": 1720000002,
+                        "status": "completed",
+                    },
+                }},
+            )
+        ), encoding="utf-8")
+        rollout = self.base / "terminal-conflict.rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": thread, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:42Z",
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted", "turn_id": turn},
+                },
+            )
+        ), encoding="utf-8")
+        app_source = CodexEventSource(app, APP_SERVER_V2)
+        observed: list[list[tuple[object, ...]]] = []
+        for index, app_first in enumerate((True, False), start=1):
+            store = HydraStore(self.base / f"terminal-conflict-{index}.sqlite3")
+            self.addCleanup(store.close)
+            if app_first:
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+            else:
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+            observed.append([
+                tuple(row) for row in store.connection.execute(
+                    """SELECT attempt_ordinal,state,wall_duration_ms
+                         FROM turn_attempts ORDER BY attempt_ordinal"""
+                )
+            ])
+        self.assertEqual(observed, [
+            [(1, "aborted", 2000)],
+            [(1, "aborted", 2000)],
+        ])
+
+    def test_cross_adapter_lifecycle_merges_exact_duration_by_field(self) -> None:
+        thread, turn = "duration-merge-thread", "duration-merge-turn"
+        app = self.base / "duration-merge.app.jsonl"
+        app.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {"method": "turn/started", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "startedAt": 1720000000,
+                        "status": "inProgress",
+                    },
+                }},
+                {"method": "turn/completed", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "completedAt": 1720000002,
+                        "durationMs": 1777, "status": "completed",
+                    },
+                }},
+            )
+        ), encoding="utf-8")
+        rollout = self.base / "duration-merge.rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": thread, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:42Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": turn},
+                },
+            )
+        ), encoding="utf-8")
+        app_source = CodexEventSource(app, APP_SERVER_V2)
+        observed: list[tuple[object, ...]] = []
+        for index, app_first in enumerate((True, False), start=1):
+            store = HydraStore(self.base / f"duration-merge-{index}.sqlite3")
+            self.addCleanup(store.close)
+            if app_first:
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+            else:
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+            observed.append(tuple(store.connection.execute(
+                """SELECT state,wall_duration_ms,emitted_duration_ms
+                     FROM turn_attempts"""
+            ).fetchone()))
+        self.assertEqual(observed, [
+            ("completed", 2000, 1777),
+            ("completed", 2000, 1777),
+        ])
+
     def test_split_app_sources_reverse_order_keep_only_latest_cumulative_total(self) -> None:
         thread, turn = "split-thread", "split-turn"
 
@@ -836,8 +1138,28 @@ class CodexEventPersistenceTests(unittest.TestCase):
                 },
             },
         })
+        invalid_usage = self.app_source("invalid-usage", {
+            "received_at": "2024-07-03T09:46:41.600000Z",
+            "message": {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "diagnostic-thread", "turnId": "diagnostic-turn",
+                    "tokenUsage": {
+                        "total": {
+                            "inputTokens": 10, "cachedInputTokens": 20,
+                            "outputTokens": 1, "reasoningOutputTokens": 0,
+                        },
+                        "last": {
+                            "inputTokens": 1, "cachedInputTokens": 0,
+                            "outputTokens": 1, "reasoningOutputTokens": 0,
+                        },
+                    },
+                },
+            },
+        })
         self.ingest(
             CodexEventSource(malformed, APP_SERVER_V2), invalid_duration,
+            invalid_usage,
         )
 
         reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
@@ -845,10 +1167,11 @@ class CodexEventPersistenceTests(unittest.TestCase):
         from hydra_codex.reconcile_reports import list_reconciled_reports
 
         report = list_reconciled_reports(self.store, project_id=PROJECT)[0]
-        self.assertEqual(task.semantic.schema_diagnostics, 1)
+        self.assertEqual(task.semantic.schema_diagnostics, 2)
         self.assertIn("schema:event:invalid_duration", task.semantic.diagnostics)
-        self.assertEqual(report.schema_diagnostics.value, 1)
-        self.assertEqual(report.pilot_health.schema_diagnostics.value, 2)
+        self.assertIn("schema:event:invalid_usage", task.semantic.diagnostics)
+        self.assertEqual(report.schema_diagnostics.value, 2)
+        self.assertEqual(report.pilot_health.schema_diagnostics.value, 3)
         self.assertIn(
             "project_event_schema_diagnostics",
             report.pilot_health.schema_diagnostics.caveats,
@@ -1308,7 +1631,7 @@ class CodexEventPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(self.store.count("file_observations"), 1)
 
-    def test_app_unsuccessful_terminal_commands_are_not_executed_test_runs(self) -> None:
+    def test_app_non_execution_without_exit_is_not_an_executed_test_run(self) -> None:
         source = self.base / "unsuccessful-test-commands.jsonl"
         rows = tuple(
             {
@@ -1324,14 +1647,13 @@ class CodexEventPersistenceTests(unittest.TestCase):
                             "command": "pytest tests/test_never_executed.py",
                             "cwd": str(self.project),
                             "status": status,
-                            "exitCode": 1,
                             "aggregatedOutput": "private terminal output",
                         },
                     },
                 },
             }
             for index, status in enumerate(
-                ("declined", "cancelled", "interrupted", "failed"), start=1,
+                ("declined", "cancelled", "interrupted"), start=1,
             )
         )
         source.write_text(
@@ -1342,6 +1664,37 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.ingest(CodexEventSource(source, APP_SERVER_V2))
 
         self.assertEqual(self.store.count("rollout_test_runs"), 0)
+
+    def test_app_failed_terminal_with_exact_exit_is_a_complete_failed_test(self) -> None:
+        source = self.app_source("failed-executed-test", {
+            "received_at": "2024-07-03T09:46:40.100000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "failed-test-thread",
+                    "turnId": "failed-test-turn",
+                    "item": {
+                        "id": "failed-test-call",
+                        "type": "commandExecution",
+                        "command": "pytest tests/test_failed.py",
+                        "cwd": str(self.project),
+                        "status": "failed",
+                        "exitCode": 1,
+                        "aggregatedOutput": "private assertion output",
+                    },
+                },
+            },
+        })
+
+        self.ingest(source)
+
+        row = self.store.connection.execute(
+            """SELECT runner,scope,outcome,exit_status,failure_cause,completeness
+                 FROM rollout_test_runs"""
+        ).fetchone()
+        self.assertEqual(tuple(row), (
+            "pytest", "targeted", "failed", 1, "product_failure", "complete",
+        ))
 
     def test_split_app_decline_removes_started_test_in_both_ingest_orders(self) -> None:
         call_id = "split-declined-test"

@@ -11,6 +11,7 @@ from hydra_codex.codex_events import (
     OTEL_LOG_V1,
     ContentFingerprint,
     EventAdapterError,
+    TokenSnapshotFact,
     read_codex_event_jsonl,
 )
 from hydra_codex.rollout_identity import Pseudonymizer
@@ -21,6 +22,10 @@ KEY = b"event-adapter-fixture-key-000001"
 
 
 class CodexEventAdapterTests(unittest.TestCase):
+    def test_token_snapshot_rejects_an_impossible_cached_input_relation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cached input"):
+            TokenSnapshotFact("thread_total", True, 10, 20, 1, 0, 11)
+
     def test_app_server_v2_normalizes_exact_facts_without_raw_content(self) -> None:
         source = FIXTURES / "app_server_v2.jsonl"
         original = source.read_bytes()
@@ -220,17 +225,20 @@ class CodexEventAdapterTests(unittest.TestCase):
             "not json",
             json.dumps({"method": "item/agentMessage/delta", "params": {"delta": "private delta"}}),
             json.dumps({"method": "thread/tokenUsage/updated", "params": {"threadId": "private-thread", "turnId": "private-turn", "tokenUsage": {"total": {"inputTokens": -1}}}}),
+            json.dumps({"method": "thread/tokenUsage/updated", "params": {"threadId": "private-thread", "turnId": "private-turn", "tokenUsage": {"total": {"inputTokens": 10, "cachedInputTokens": 20, "outputTokens": 1, "reasoningOutputTokens": 0}}}}),
             json.dumps({"timeUnixNano": "not-a-time", "body": {"stringValue": "codex.user_prompt"}, "attributes": [{"key": "prompt", "value": {"stringValue": "private prompt"}}]}),
         ]
         with tempfile.TemporaryDirectory() as directory:
             app_path = Path(directory) / "app.jsonl"
-            app_path.write_text("\n".join(lines[:3]) + "\n", encoding="utf-8")
+            app_path.write_text("\n".join(lines[:4]) + "\n", encoding="utf-8")
             app = read_codex_event_jsonl(app_path, schema=APP_SERVER_V2, privacy_key=KEY)
             otel_path = Path(directory) / "otel.jsonl"
-            otel_path.write_text(lines[3] + "\n", encoding="utf-8")
+            otel_path.write_text(lines[4] + "\n", encoding="utf-8")
             otel = read_codex_event_jsonl(otel_path, schema=OTEL_LOG_V1, privacy_key=KEY)
 
-        self.assertEqual([issue.code for issue in app.issues], ["malformed_json", "unsupported_envelope", "invalid_usage"])
+        self.assertEqual([issue.code for issue in app.issues], [
+            "malformed_json", "unsupported_envelope", "invalid_usage", "invalid_usage",
+        ])
         self.assertEqual([issue.code for issue in otel.issues], ["invalid_timestamp"])
         serialized = json.dumps(asdict(app), sort_keys=True) + json.dumps(asdict(otel), sort_keys=True)
         for raw in ("private delta", "private-thread", "private-turn", "private prompt"):

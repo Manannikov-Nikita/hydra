@@ -109,10 +109,14 @@ def prefix_lineage(
     """Find the strongest clean prefix relation for a source observed at a new location."""
     matches: list[tuple[int, str]] = []
     rows = connection.execute(
-        """SELECT logical_source_key,canonical_revision_digest
-             FROM rollout_logical_sources
-            WHERE session_key=? AND project_id=? AND lineage_state='clean'
-              AND canonical_revision_digest IS NOT NULL""",
+        """SELECT logical.logical_source_key,logical.canonical_revision_digest
+             FROM rollout_logical_sources AS logical
+             JOIN rollout_sources AS revision
+               ON revision.source_digest=logical.canonical_revision_digest
+              AND revision.source_type='jsonl'
+            WHERE logical.session_key=? AND logical.project_id=?
+              AND logical.lineage_state='clean'
+              AND logical.canonical_revision_digest IS NOT NULL""",
         (session_key, project_id),
     )
     for logical, revision in rows:

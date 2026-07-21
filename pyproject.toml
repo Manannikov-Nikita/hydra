@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 hydra-codex = "hydra_codex.__main__:main"
+hydra-codex-hook = "hydra_codex.hook_runtime:main"
 hydra-codex-mcp = "hydra_codex.mcp_server:main"
 
 [tool.setuptools.packages.find]

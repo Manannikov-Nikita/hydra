@@ -603,14 +603,17 @@ def ingest_rollouts(
                     connection, project_id, location, before_stat,
                 )
                 if unchanged is not None:
-                    logical, digest = unchanged
-                    connection.execute(
-                        """UPDATE rollout_source_locations SET location_type=?
-                            WHERE logical_source_key=? AND location_key=?""",
-                        (label, logical, location),
-                    )
-                    unique.add(digest)
-                    continue
+                    after_candidate_stat = _source_stat(path)
+                    if after_candidate_stat == before_stat:
+                        logical, digest = unchanged
+                        connection.execute(
+                            """UPDATE rollout_source_locations SET location_type=?
+                                WHERE logical_source_key=? AND location_key=?""",
+                            (label, logical, location),
+                        )
+                        unique.add(digest)
+                        continue
+                    before_stat = after_candidate_stat
             scan = scan_source(path, hasher.key, opaque)
             digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
             unique.add(digest)

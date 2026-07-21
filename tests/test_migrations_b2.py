@@ -173,6 +173,40 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     "st_mtime_ns", "st_ctime_ns", "scanner_version",
                 },
             )
+            self.assertEqual(
+                {
+                    row[1]: row[5] for row in store.connection.execute(
+                        "PRAGMA table_info(rollout_source_location_states)"
+                    )
+                    if row[5]
+                },
+                {"project_id": 1, "location_key": 2},
+            )
+            foreign_keys: dict[int, list[tuple[int, str, str, str]]] = {}
+            for row in store.connection.execute(
+                "PRAGMA foreign_key_list(rollout_source_location_states)"
+            ):
+                foreign_keys.setdefault(int(row[0]), []).append(
+                    (int(row[1]), str(row[2]), str(row[3]), str(row[4]))
+                )
+            bindings = {
+                tuple(
+                    (table, source, target)
+                    for _sequence, table, source, target in sorted(group)
+                )
+                for group in foreign_keys.values()
+            }
+            self.assertEqual(
+                bindings,
+                {
+                    (("rollout_logical_sources", "logical_source_key", "logical_source_key"),),
+                    (("rollout_sources", "revision_digest", "source_digest"),),
+                    (
+                        ("rollout_source_locations", "logical_source_key", "logical_source_key"),
+                        ("rollout_source_locations", "location_key", "location_key"),
+                    ),
+                },
+            )
             self.assertEqual(store.count("rollout_source_location_states"), 0)
             self.assertEqual(
                 tuple(store.connection.execute(

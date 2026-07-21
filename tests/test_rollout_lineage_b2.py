@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hydra_codex.rollout import RolloutRoot, ingest_rollouts
+from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.storage import HydraStore
 
 
@@ -118,6 +119,45 @@ class RolloutLineageB2Tests(unittest.TestCase):
         )
         self.assertNotIn(str(source), "\n".join(self.store.connection.iterdump()))
 
+    def test_fast_hit_restats_before_skipping_scanner(self) -> None:
+        source = self.base / "active" / "racing-hit.jsonl"
+        initial = [self.meta(identity="racing-hit"), self.token(10)]
+        appended = initial + [self.token(20, "2026-07-21T00:00:02Z")]
+        write(source, initial)
+        ingest_rollouts(
+            self.store, (source,), self.project, "project-b2", hash_key=self.key,
+        )
+        from hydra_codex import rollout as rollout_module
+
+        original = rollout_module._unchanged_location
+
+        def mutate_after_candidate(*args, **kwargs):
+            candidate = original(*args, **kwargs)
+            write(source, appended)
+            return candidate
+
+        with (
+            patch(
+                "hydra_codex.rollout._unchanged_location",
+                side_effect=mutate_after_candidate,
+            ),
+            patch(
+                "hydra_codex.rollout.scan_source", wraps=rollout_module.scan_source,
+            ) as scanner,
+        ):
+            ingest_rollouts(
+                self.store, (source,), self.project, "project-b2", hash_key=self.key,
+            )
+
+        self.assertEqual(scanner.call_count, 1)
+        self.assertIn(
+            "append",
+            {row[0] for row in self.store.connection.execute(
+                "SELECT relation FROM rollout_sources"
+            )},
+        )
+        self.assertEqual(self.store.count("token_snapshots"), 2)
+
     def test_changed_metadata_scans_and_materializes_append(self) -> None:
         source = self.base / "active" / "append.jsonl"
         initial = [self.meta(), self.token(10)]
@@ -203,6 +243,94 @@ class RolloutLineageB2Tests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    def test_poisoned_location_state_cannot_fast_path(self) -> None:
+        cases = ("project", "logical", "revision", "materialized")
+        targets = {
+            case: self.base / "active" / f"poison-{case}.jsonl"
+            for case in cases
+        }
+        decoy = self.base / "active" / "poison-decoy.jsonl"
+        for index, (case, source) in enumerate(targets.items(), start=1):
+            write(source, [self.meta(identity=f"poison-{case}"), self.token(index)])
+        write(decoy, [self.meta(identity="poison-decoy"), self.token(99)])
+        ingest_rollouts(
+            self.store, (*targets.values(), decoy), self.project,
+            "project-b2", hash_key=self.key,
+        )
+        hasher = Pseudonymizer(self.key)
+
+        def state_for(path: Path):
+            location = hasher.digest("source", str(path.resolve()))
+            row = self.store.connection.execute(
+                """SELECT logical_source_key,revision_digest
+                     FROM rollout_source_location_states
+                    WHERE project_id='project-b2' AND location_key=?""",
+                (location,),
+            ).fetchone()
+            return location, str(row[0]), str(row[1])
+
+        _, decoy_logical, decoy_revision = state_for(decoy)
+        from hydra_codex import rollout as rollout_module
+
+        for case, source in targets.items():
+            with self.subTest(case=case):
+                location, logical, revision = state_for(source)
+                if case == "project":
+                    self.store.connection.execute(
+                        """UPDATE rollout_source_location_states
+                              SET project_id='poison-project'
+                            WHERE project_id='project-b2' AND location_key=?""",
+                        (location,),
+                    )
+                elif case == "logical":
+                    self.store.connection.execute(
+                        """INSERT INTO rollout_source_locations(
+                               logical_source_key,location_key,location_type,revision_digest)
+                           VALUES (?,?,'explicit',?)""",
+                        (decoy_logical, location, revision),
+                    )
+                    self.store.connection.execute(
+                        """UPDATE rollout_source_location_states
+                              SET logical_source_key=?
+                            WHERE project_id='project-b2' AND location_key=?""",
+                        (decoy_logical, location),
+                    )
+                elif case == "revision":
+                    self.store.connection.execute(
+                        """UPDATE rollout_source_location_states
+                              SET revision_digest=?
+                            WHERE project_id='project-b2' AND location_key=?""",
+                        (decoy_revision, location),
+                    )
+                else:
+                    self.store.connection.execute(
+                        "UPDATE rollout_sources SET materialized=0 WHERE source_digest=?",
+                        (revision,),
+                    )
+                self.store.connection.commit()
+
+                with patch(
+                    "hydra_codex.rollout.scan_source",
+                    wraps=rollout_module.scan_source,
+                ) as scanner:
+                    ingest_rollouts(
+                        self.store, (source,), self.project, "project-b2",
+                        hash_key=self.key,
+                    )
+
+                self.assertEqual(scanner.call_count, 1)
+                repaired = self.store.connection.execute(
+                    """SELECT state.logical_source_key,state.revision_digest,
+                              source.materialized
+                         FROM rollout_source_location_states AS state
+                         JOIN rollout_sources AS source
+                           ON source.source_digest=state.revision_digest
+                        WHERE state.project_id='project-b2'
+                          AND state.location_key=?""",
+                    (location,),
+                ).fetchone()
+                self.assertEqual(tuple(repaired), (logical, revision, 1))
 
     def test_truncate_and_rewrite_are_safe_lineage_relations(self) -> None:
         source = self.base / "active" / "thread.jsonl"

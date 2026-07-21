@@ -15,7 +15,7 @@ from .contracts import ModelAnnotationInput
 from .project import ProjectNotFound, resolve_project
 from .rollout import ingest_rollouts
 from .rollout_identity import Pseudonymizer, RolloutRoot
-from .storage import HydraStore, StorageUnavailable, default_database_path
+from .storage import HydraStore, StorageUnavailable
 
 
 class CommandServices(Protocol):
@@ -34,16 +34,6 @@ class CommandServices(Protocol):
         self, left: str, right: str, output_format: str,
         database_path: Path | None, cwd: Path,
     ) -> str: ...
-
-
-class _UnavailableServices:
-    def _unavailable(self, *_args: object) -> object:
-        raise RuntimeError("command service is unavailable")
-
-    annotate = _unavailable
-    reconcile = _unavailable
-    report = _unavailable
-    compare = _unavailable
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -128,27 +118,23 @@ def _default_sources(environ: Mapping[str, str]) -> tuple[RolloutRoot, ...]:
     return tuple(RolloutRoot(path, label) for path, label in candidates if path.is_dir())
 
 
-def _installation_key_path(
-    environ: Mapping[str, str], injected: Path | None,
-) -> Path:
-    if injected is not None:
-        return injected.expanduser()
-    home = Path(environ["HOME"]).expanduser() if environ.get("HOME") else Path.home()
-    return default_database_path(home).parent / "rollout-hmac.key"
-
-
 def _run_ingest(
     arguments: argparse.Namespace,
     environ: Mapping[str, str],
     installation_key_path: Path | None,
 ) -> dict[str, object]:
+    from .services import (
+        configured_database_path,
+        configured_installation_key_path,
+    )
+
     database, cwd = _paths(arguments)
     project = resolve_project(cwd)
     roots = _default_sources(environ) + tuple(_source(value, project.project_root) for value in arguments.source)
-    store = HydraStore(database)
+    store = HydraStore(configured_database_path(environ, database))
     try:
         hash_key = Pseudonymizer.installation_key(
-            _installation_key_path(environ, installation_key_path),
+            configured_installation_key_path(environ, installation_key_path),
         ).key
         report = ingest_rollouts(
             store, roots, project.project_root, project.project_id, hash_key=hash_key,
@@ -276,7 +262,15 @@ def main(
     output_stream = sys.stdout if stdout is None else stdout
     error_stream = sys.stderr if stderr is None else stderr
     environment = os.environ if environ is None else environ
-    command_services = _UnavailableServices() if services is None else services
+    if services is None:
+        from .services import LocalCommandServices
+
+        command_services: CommandServices = LocalCommandServices(
+            environ=environment,
+            installation_key_path=installation_key_path,
+        )
+    else:
+        command_services = services
     with redirect_stdout(output_stream), redirect_stderr(error_stream):
         try:
             arguments = build_parser().parse_args(argv)

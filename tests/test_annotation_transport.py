@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -365,6 +366,122 @@ class AnnotationTransportTests(unittest.TestCase):
             ).fetchone()[0], 2)
         finally:
             store.close()
+
+    def test_private_filename_is_never_persisted_or_kept_after_quarantine(self) -> None:
+        self.prompt()
+        sentinel = "PRIVATE-FILENAME-SENTINEL"
+        malformed = self.spool / f"{sentinel}.json"
+        malformed.write_text('{"malformed":', encoding="utf-8")
+        malformed.chmod(0o600)
+
+        self.assertEqual(self.drain(), {})
+
+        store = HydraStore(self.database)
+        try:
+            dump = "\n".join(store.connection.iterdump())
+            rows = store.connection.execute(
+                "SELECT staged_order FROM annotation_transport_events "
+                "WHERE disposition='quarantined'"
+            ).fetchall()
+        finally:
+            store.close()
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn(sentinel, dump)
+        self.assertTrue(all(sentinel not in path.name for path in self.spool.rglob("*")))
+
+    def test_quarantine_move_failure_does_not_commit_diagnostic(self) -> None:
+        self.prompt()
+        malformed = self.spool / "move-failure.json"
+        malformed.write_text('{"malformed":', encoding="utf-8")
+        malformed.chmod(0o600)
+
+        with mock.patch(
+            "hydra_codex.annotation_spool._quarantine",
+            side_effect=OSError("simulated move failure"),
+        ):
+            self.assertEqual(self.drain(), {})
+
+        self.assertTrue(malformed.exists())
+        store = HydraStore(self.database)
+        try:
+            quarantined = store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events "
+                "WHERE disposition='quarantined'"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(quarantined, 0)
+
+    def test_quarantine_claim_recovers_after_database_recording_failure(self) -> None:
+        self.prompt()
+        malformed = self.spool / "record-failure.json"
+        malformed.write_text('{"malformed":', encoding="utf-8")
+        malformed.chmod(0o600)
+        from hydra_codex import annotation_spool
+
+        real_record = annotation_spool._record_transport
+        failed = False
+
+        def fail_first_quarantine(*args: object, **kwargs: object) -> None:
+            nonlocal failed
+            if kwargs.get("disposition") == "quarantined" and not failed:
+                failed = True
+                raise RuntimeError("simulated database recording failure")
+            real_record(*args, **kwargs)
+
+        with mock.patch(
+            "hydra_codex.annotation_spool._record_transport",
+            side_effect=fail_first_quarantine,
+        ):
+            self.assertEqual(self.drain(), {})
+
+        self.assertFalse(malformed.exists())
+        claimed = tuple((self.spool / "quarantine").glob("malformed-*.json"))
+        self.assertEqual(len(claimed), 1)
+        store = HydraStore(self.database)
+        try:
+            before = store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events "
+                "WHERE disposition='quarantined'"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(before, 0)
+
+        self.assertEqual(self.drain(now=NOW + timedelta(seconds=3)), {})
+        store = HydraStore(self.database)
+        try:
+            after = store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events "
+                "WHERE disposition='quarantined'"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(after, 1)
+
+    def test_parallel_drains_create_one_quarantine_claim_and_one_diagnostic(self) -> None:
+        self.prompt()
+        malformed = self.spool / "parallel-malformed.json"
+        malformed.write_text('{"malformed":', encoding="utf-8")
+        malformed.chmod(0o600)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = tuple(executor.map(lambda _index: self.drain(), range(2)))
+
+        self.assertEqual(responses, ({}, {}))
+        self.assertFalse(malformed.exists())
+        self.assertEqual(
+            len(tuple((self.spool / "quarantine").glob("malformed-*.json"))), 1,
+        )
+        store = HydraStore(self.database)
+        try:
+            quarantined = store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events "
+                "WHERE disposition='quarantined'"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(quarantined, 1)
 
 
 if __name__ == "__main__":

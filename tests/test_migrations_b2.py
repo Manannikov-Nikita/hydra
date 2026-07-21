@@ -162,6 +162,36 @@ def replace_empty_table(path: Path, table: str, create_statement: str) -> None:
 
 
 class MigrationMatrixB2Tests(unittest.TestCase):
+    def test_v30_transport_orders_are_sanitized_without_losing_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v30.sqlite3"
+            build_schema(database, 30)
+            sentinel = "PRIVATE-LEGACY-FILENAME-SENTINEL.json"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """INSERT INTO annotation_transport_events(
+                       transport_key,project_id,session_key,turn_key,request_digest,
+                       disposition,diagnostic_category,staged_at,staged_at_ns,
+                       staged_order,received_at,latency_ms,provenance)
+                   VALUES ('htransport_v1_legacy','hprj_safe','session-safe','turn-safe',
+                           NULL,'quarantined','malformed','2026-07-21T00:00:00Z',1,
+                           ?,'2026-07-21T00:00:01Z',1000,'derived')""",
+                (f"00000000000000000001:{sentinel}",),
+            )
+            connection.commit()
+            connection.close()
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+
+            self.assertEqual(store.schema_version(), 31)
+            row = store.connection.execute(
+                "SELECT diagnostic_category,staged_order FROM annotation_transport_events"
+            ).fetchone()
+            self.assertEqual(row["diagnostic_category"], "malformed")
+            self.assertNotIn(sentinel, row["staged_order"])
+            self.assertNotIn(sentinel, "\n".join(store.connection.iterdump()))
+
     def test_v28_migration_adds_private_location_state_without_changing_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "v28.sqlite3"
@@ -170,7 +200,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             store = HydraStore(database)
             self.addCleanup(store.close)
 
-            self.assertEqual(store.schema_version(), 30)
+            self.assertEqual(store.schema_version(), 31)
             self.assertTrue({
                 "transport_key", "disposition", "diagnostic_category",
                 "staged_at_ns", "latency_ms",

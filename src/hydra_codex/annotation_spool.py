@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -30,6 +31,19 @@ from .storage import HydraStore
 
 _REQUEST_PREFIX = "hreq_v1_"
 _REQUEST_PATTERN = re.compile(r"^hreq_v1_[A-Za-z0-9_-]{32}$")
+_QUARANTINE_CATEGORIES = frozenset({
+    "malformed", "expired", "duplicate", "out_of_order", "wrong_capability",
+})
+_CLAIM_VERSION = "hydra.annotation-quarantine-claim/v1"
+
+
+@dataclass(frozen=True)
+class FileObservation:
+    staged_at_ns: int
+    staged_at: str
+    staged_order: str
+    identity: tuple[int, int]
+    file_key: str
 
 
 def spool_directory(environ: Mapping[str, str]) -> Path:
@@ -153,14 +167,23 @@ def _read_envelope(
     return capability, nonce, payload
 
 
-def _file_observation(path: Path) -> tuple[int, str, str, tuple[int, int]]:
+def _file_observation(path: Path, keys: Pseudonymizer) -> FileObservation:
     details = path.lstat()
     staged_ns = int(details.st_mtime_ns)
     staged = datetime.fromtimestamp(
         staged_ns / 1_000_000_000, tz=timezone.utc,
     ).isoformat().replace("+00:00", "Z")
-    order = f"{staged_ns:020d}:{path.name}"
-    return staged_ns, staged, order, (int(details.st_dev), int(details.st_ino))
+    identity = (int(details.st_dev), int(details.st_ino))
+    identity_text = f"{identity[0]}/{identity[1]}"
+    file_key = "hspool_v1_" + keys.digest("event", f"spool-file/{identity_text}")
+    order_key = "horder_v1_" + keys.digest("event", f"spool-order/{identity_text}")
+    return FileObservation(
+        staged_at_ns=staged_ns,
+        staged_at=staged,
+        staged_order=f"{staged_ns:020d}:{order_key}",
+        identity=identity,
+        file_key=file_key,
+    )
 
 
 def _latency_ms(staged_at: str, received_at: str) -> int:
@@ -188,8 +211,9 @@ def _record_transport(
     staged_at: str,
     staged_order: str,
     received_at: str,
+    file_key: str | None = None,
 ) -> None:
-    discriminator = request_digest or keys.digest(
+    discriminator = file_key or request_digest or keys.digest(
         "diagnostic", f"transport-file/{turn_key}/{staged_order}",
     )
     transport_key = "htransport_v1_" + keys.digest(
@@ -235,13 +259,171 @@ def _require_identity(path: Path, expected_identity: tuple[int, int]) -> None:
         raise OSError("annotation envelope path was replaced")
 
 
+def _claim_tag(keys: Pseudonymizer, payload: Mapping[str, object]) -> str:
+    canonical = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return "hclaim_v1_" + keys.digest("diagnostic", canonical)
+
+
+def _claim_metadata(
+    keys: Pseudonymizer,
+    observation: FileObservation,
+    *,
+    project_id: str,
+    session_key: str,
+    turn_key: str,
+    request_digest: str | None,
+    category: str,
+    received_at: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "version": _CLAIM_VERSION,
+        "file_key": observation.file_key,
+        "project_id": project_id,
+        "session_key": session_key,
+        "turn_key": turn_key,
+        "request_digest": request_digest,
+        "category": category,
+        "staged_at": observation.staged_at,
+        "staged_at_ns": observation.staged_at_ns,
+        "staged_order": observation.staged_order,
+        "received_at": received_at,
+    }
+    payload["tag"] = _claim_tag(keys, payload)
+    return payload
+
+
+def _write_claim_once(directory: Path, path: Path, payload: Mapping[str, object]) -> None:
+    content = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".hydra-claim-", suffix=".tmp", dir=directory,
+    )
+    temporary = Path(temporary_name)
+    descriptor_open = True
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor_open = False
+        try:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            handle.close()
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        _fsync_directory(directory)
+    finally:
+        if descriptor_open:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_claim(path: Path, keys: Pseudonymizer) -> dict[str, object]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_size > 8192
+        ):
+            raise ValueError("invalid quarantine claim file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            value = json.load(handle)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    expected_fields = {
+        "version", "file_key", "project_id", "session_key", "turn_key",
+        "request_digest", "category", "staged_at", "staged_at_ns",
+        "staged_order", "received_at", "tag",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise ValueError("invalid quarantine claim")
+    unsigned = {key: item for key, item in value.items() if key != "tag"}
+    tag = value["tag"]
+    if not isinstance(tag, str) or not secrets.compare_digest(tag, _claim_tag(keys, unsigned)):
+        raise ValueError("invalid quarantine claim")
+    if (
+        value["version"] != _CLAIM_VERSION
+        or not isinstance(value["file_key"], str)
+        or re.fullmatch(r"hspool_v1_[0-9a-f]{64}", value["file_key"]) is None
+        or not isinstance(value["category"], str)
+        or value["category"] not in _QUARANTINE_CATEGORIES
+        or not all(
+            isinstance(value[field], str) and bool(value[field])
+            for field in ("project_id", "session_key", "turn_key")
+        )
+        or (
+            value["request_digest"] is not None
+            and (
+                not isinstance(value["request_digest"], str)
+                or re.fullmatch(r"hreq_v1_[0-9a-f]{64}", value["request_digest"]) is None
+            )
+        )
+        or isinstance(value["staged_at_ns"], bool)
+        or not isinstance(value["staged_at_ns"], int)
+        or value["staged_at_ns"] < 0
+        or not isinstance(value["staged_order"], str)
+        or re.fullmatch(
+            r"[0-9]{20}:horder_v1_[0-9a-f]{64}", value["staged_order"],
+        ) is None
+        or not isinstance(value["staged_at"], str)
+        or not isinstance(value["received_at"], str)
+    ):
+        raise ValueError("invalid quarantine claim")
+    timestamp(str(value["staged_at"]))
+    timestamp(str(value["received_at"]))
+    return value
+
+
 def _quarantine(
-    path: Path, spool: Path, category: str, expected_identity: tuple[int, int],
-) -> None:
-    _require_identity(path, expected_identity)
+    path: Path,
+    spool: Path,
+    category: str,
+    observation: FileObservation,
+    *,
+    keys: Pseudonymizer,
+    project_id: str,
+    session_key: str,
+    turn_key: str,
+    request_digest: str | None,
+    received_at: str,
+) -> dict[str, object]:
     directory = _quarantine_directory(spool)
-    target = directory / f"{category}-{secrets.token_urlsafe(18)}.json"
-    os.replace(path, target)
+    proposed = _claim_metadata(
+        keys,
+        observation,
+        project_id=project_id,
+        session_key=session_key,
+        turn_key=turn_key,
+        request_digest=request_digest,
+        category=category,
+        received_at=received_at,
+    )
+    claim_path = directory / f"{observation.file_key}.claim"
+    _write_claim_once(directory, claim_path, proposed)
+    claim = _read_claim(claim_path, keys)
+    if claim["file_key"] != observation.file_key:
+        raise OSError("quarantine claim identity is inconsistent")
+    _require_identity(path, observation.identity)
+    target = directory / f"{claim['category']}-{observation.file_key}.json"
+    if target.exists():
+        raise OSError("quarantine claim target already exists")
+    os.rename(path, target)
     try:
         descriptor = os.open(
             target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -256,6 +438,76 @@ def _quarantine(
             os.close(descriptor)
     _fsync_directory(directory)
     _fsync_directory(spool)
+    return claim
+
+
+def _record_quarantine_claim(
+    store: HydraStore, keys: Pseudonymizer, claim: Mapping[str, object],
+) -> None:
+    _record_transport(
+        store,
+        keys,
+        project_id=str(claim["project_id"]),
+        session_key=str(claim["session_key"]),
+        turn_key=str(claim["turn_key"]),
+        request_digest=(
+            None
+            if claim["request_digest"] is None
+            else str(claim["request_digest"])
+        ),
+        disposition="quarantined",
+        category=str(claim["category"]),
+        staged_at_ns=int(claim["staged_at_ns"]),
+        staged_at=str(claim["staged_at"]),
+        staged_order=str(claim["staged_order"]),
+        received_at=str(claim["received_at"]),
+        file_key=str(claim["file_key"]),
+    )
+
+
+def _quarantine_and_record(
+    path: Path,
+    spool: Path,
+    store: HydraStore,
+    keys: Pseudonymizer,
+    category: str,
+    observation: FileObservation,
+    *,
+    project_id: str,
+    session_key: str,
+    turn_key: str,
+    request_digest: str | None,
+    received_at: str,
+) -> None:
+    claim = _quarantine(
+        path,
+        spool,
+        category,
+        observation,
+        keys=keys,
+        project_id=project_id,
+        session_key=session_key,
+        turn_key=turn_key,
+        request_digest=request_digest,
+        received_at=received_at,
+    )
+    _record_quarantine_claim(store, keys, claim)
+
+
+def _recover_quarantine(
+    store: HydraStore, keys: Pseudonymizer, spool: Path,
+) -> None:
+    directory = _quarantine_directory(spool)
+    for claim_path in sorted(directory.glob("hspool_v1_*.claim")):
+        try:
+            claim = _read_claim(claim_path, keys)
+            target = directory / f"{claim['category']}-{claim['file_key']}.json"
+            observation = _file_observation(target, keys)
+            if observation.file_key != claim["file_key"]:
+                continue
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            continue
+        _record_quarantine_claim(store, keys, claim)
 
 
 def _acknowledge(path: Path, expected_identity: tuple[int, int]) -> None:
@@ -278,32 +530,38 @@ def drain_annotations(
     spool = spool_directory(environ)
     expected_session = keys.digest("identity", session_id)
     expected_turn = keys.digest("turn", turn_id)
+    _recover_quarantine(store, keys, spool)
     acknowledged = 0
     candidates: list[tuple[str, Path]] = []
     for path in spool.glob("*.json"):
         try:
-            candidates.append((_file_observation(path)[2], path))
+            candidates.append((_file_observation(path, keys).staged_order, path))
         except FileNotFoundError:
             continue
     for _candidate_order, path in sorted(candidates):
         try:
-            staged_ns, staged_at, staged_order, file_identity = _file_observation(path)
+            observation = _file_observation(path, keys)
         except FileNotFoundError:
             continue
         request_digest: str | None = None
         bound_session = expected_session
         bound_turn = expected_turn
         try:
-            capability, nonce, payload = _read_envelope(path, file_identity)
+            capability, nonce, payload = _read_envelope(path, observation.identity)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            _record_transport(
-                store, keys, project_id=project_id, session_key=expected_session,
-                turn_key=expected_turn, request_digest=None,
-                disposition="quarantined", category="malformed",
-                staged_at_ns=staged_ns, staged_at=staged_at,
-                staged_order=staged_order, received_at=observed_at,
+            _quarantine_and_record(
+                path,
+                spool,
+                store,
+                keys,
+                "malformed",
+                observation,
+                project_id=project_id,
+                session_key=expected_session,
+                turn_key=expected_turn,
+                request_digest=None,
+                received_at=observed_at,
             )
-            _quarantine(path, spool, "malformed", file_identity)
             continue
         try:
             with store.rollout_transaction() as connection:
@@ -330,15 +588,19 @@ def drain_annotations(
                 ).fetchone()
                 if path.name != f"{nonce}.json":
                     category = "duplicate" if known_request is not None else "malformed"
-                    _record_transport(
-                        store, keys, project_id=project_id,
-                        session_key=bound_session, turn_key=bound_turn,
+                    _quarantine_and_record(
+                        path,
+                        spool,
+                        store,
+                        keys,
+                        category,
+                        observation,
+                        project_id=project_id,
+                        session_key=bound_session,
+                        turn_key=bound_turn,
                         request_digest=request_digest,
-                        disposition="quarantined", category=category,
-                        staged_at_ns=staged_ns, staged_at=staged_at,
-                        staged_order=staged_order, received_at=observed_at,
+                        received_at=observed_at,
                     )
-                    _quarantine(path, spool, category, file_identity)
                     continue
                 latest_order = connection.execute(
                     """SELECT MAX(staged_order) FROM annotation_transport_events
@@ -348,17 +610,21 @@ def drain_annotations(
                 if (
                     known_request is None
                     and latest_order is not None
-                    and staged_order <= str(latest_order)
+                    and observation.staged_order <= str(latest_order)
                 ):
-                    _record_transport(
-                        store, keys, project_id=project_id,
-                        session_key=bound_session, turn_key=bound_turn,
+                    _quarantine_and_record(
+                        path,
+                        spool,
+                        store,
+                        keys,
+                        "out_of_order",
+                        observation,
+                        project_id=project_id,
+                        session_key=bound_session,
+                        turn_key=bound_turn,
                         request_digest=request_digest,
-                        disposition="quarantined", category="out_of_order",
-                        staged_at_ns=staged_ns, staged_at=staged_at,
-                        staged_order=staged_order, received_at=observed_at,
+                        received_at=observed_at,
                     )
-                    _quarantine(path, spool, "out_of_order", file_identity)
                     continue
             deliver_spooled_annotation(
                 store,
@@ -372,41 +638,58 @@ def drain_annotations(
                 store, keys, project_id=project_id, session_key=bound_session,
                 turn_key=bound_turn, request_digest=request_digest,
                 disposition="accepted", category=None,
-                staged_at_ns=staged_ns, staged_at=staged_at,
-                staged_order=staged_order, received_at=observed_at,
+                staged_at_ns=observation.staged_at_ns,
+                staged_at=observation.staged_at,
+                staged_order=observation.staged_order, received_at=observed_at,
+                file_key=observation.file_key,
             )
-            _acknowledge(path, file_identity)
+            _acknowledge(path, observation.identity)
             acknowledged += 1
         except CapabilityExpired:
-            _record_transport(
-                store, keys, project_id=project_id, session_key=bound_session,
-                turn_key=bound_turn, request_digest=request_digest,
-                disposition="quarantined", category="expired",
-                staged_at_ns=staged_ns, staged_at=staged_at,
-                staged_order=staged_order, received_at=observed_at,
+            _quarantine_and_record(
+                path,
+                spool,
+                store,
+                keys,
+                "expired",
+                observation,
+                project_id=project_id,
+                session_key=bound_session,
+                turn_key=bound_turn,
+                request_digest=request_digest,
+                received_at=observed_at,
             )
-            _quarantine(path, spool, "expired", file_identity)
         except AnnotationConflict as error:
             category = (
                 "out_of_order" if "out of order" in str(error) else "duplicate"
             )
-            _record_transport(
-                store, keys, project_id=project_id, session_key=bound_session,
-                turn_key=bound_turn, request_digest=request_digest,
-                disposition="quarantined", category=category,
-                staged_at_ns=staged_ns, staged_at=staged_at,
-                staged_order=staged_order, received_at=observed_at,
+            _quarantine_and_record(
+                path,
+                spool,
+                store,
+                keys,
+                category,
+                observation,
+                project_id=project_id,
+                session_key=bound_session,
+                turn_key=bound_turn,
+                request_digest=request_digest,
+                received_at=observed_at,
             )
-            _quarantine(path, spool, category, file_identity)
         except CapabilityRejected:
-            _record_transport(
-                store, keys, project_id=project_id, session_key=bound_session,
-                turn_key=bound_turn, request_digest=request_digest,
-                disposition="quarantined", category="wrong_capability",
-                staged_at_ns=staged_ns, staged_at=staged_at,
-                staged_order=staged_order, received_at=observed_at,
+            _quarantine_and_record(
+                path,
+                spool,
+                store,
+                keys,
+                "wrong_capability",
+                observation,
+                project_id=project_id,
+                session_key=bound_session,
+                turn_key=bound_turn,
+                request_digest=request_digest,
+                received_at=observed_at,
             )
-            _quarantine(path, spool, "wrong_capability", file_identity)
         except FileNotFoundError:
             continue
     if acknowledged:

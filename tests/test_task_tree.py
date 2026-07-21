@@ -153,6 +153,30 @@ class TaskTreeMetricTests(unittest.TestCase):
                 tokens=(), lifecycle=(), activities=(),
             )
 
+    def test_explicit_cutoff_supports_incomplete_task_without_fabricating_completion(self) -> None:
+        metrics = aggregate_task_tree(
+            root_id="root",
+            sessions=(
+                NormalizedSession("root", None, at(0)),
+                NormalizedSession("child", "root", at(2), edge_confidence_kind="inferred", edge_confidence=0.6),
+                NormalizedSession("ambiguous", "root", at(1), edge_confidence_kind="ambiguous", edge_confidence=0.4),
+            ),
+            tokens=(
+                TokenObservation("root", at(7), 1, TokenVector(10, 2, 3, 1)),
+                TokenObservation("child", at(8), 1, TokenVector(20, 5, 4, 2)),
+                TokenObservation("ambiguous", at(6), 1, TokenVector(99, 0, 1, 0)),
+                TokenObservation("root", at(10), 2, TokenVector(30, 3, 5, 2)),
+            ),
+            lifecycle=(),
+            activities=(ActivityObservation("root", at(8)),),
+            cutoff_at=at(8),
+            include_ambiguous_lineage=False,
+        )
+
+        self.assertEqual(metrics.cutoff_at, at(8))
+        self.assertEqual(metrics.session_ids, ("child", "root"))
+        self.assertEqual(metrics.recorded.vector, TokenVector(30, 7, 7, 3))
+
     def test_cached_input_cannot_exceed_total_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "cached_input_tokens"):
             TokenVector(5, 6, 1, 0)
@@ -245,6 +269,56 @@ class TaskTreeMetricTests(unittest.TestCase):
         self.assertEqual(metrics.test_retries.value, 1)
         self.assertEqual(metrics.file_reads.provenance, "estimated")
         self.assertIn("observed_file_lower_bound", metrics.file_reads.caveats)
+
+    def test_timestampless_operational_events_are_not_overclaimed_as_exact_counts(self) -> None:
+        metrics = aggregate_task_tree(
+            root_id="root",
+            sessions=(NormalizedSession("root", None, at(0)),),
+            tokens=(TokenObservation("root", at(5), 1, TokenVector(10, 2, 3, 1)),),
+            lifecycle=(LifecycleObservation("root", "task_complete", at(10)),),
+            activities=(),
+            tools=(
+                ToolObservation("root", "known", "tool", at(4)),
+                ToolObservation("root", "unknown", "instrumentation", None),
+            ),
+            tests=(
+                TestRunObservation("root", "known", "targeted", "none", at(6)),
+                TestRunObservation("root", "unknown", "full", "infra_recovery", None),
+            ),
+        )
+
+        self.assertIsNone(metrics.tool_calls.value)
+        self.assertEqual(metrics.tool_calls.known_lower_bound, 1)
+        self.assertIn("timestamp_missing_tool:1", metrics.tool_calls.caveats)
+        self.assertIsNone(metrics.test_runs.value)
+        self.assertEqual(metrics.test_runs.known_lower_bound, 1)
+        self.assertIn("timestamp_missing_test:1", metrics.test_runs.caveats)
+
+    def test_operational_events_before_session_start_are_excluded(self) -> None:
+        metrics = aggregate_task_tree(
+            root_id="root",
+            sessions=(NormalizedSession("root", None, at(2)),),
+            tokens=(TokenObservation("root", at(5), 1, TokenVector(10, 2, 3, 1)),),
+            lifecycle=(LifecycleObservation("root", "task_complete", at(10)),),
+            activities=(),
+            tools=(
+                ToolObservation("root", "before", "tool", at(1)),
+                ToolObservation("root", "valid", "tool", at(3)),
+            ),
+            files=(
+                FileObservation("root", "before", "read", at(1)),
+                FileObservation("root", "valid", "read", at(3)),
+            ),
+            tests=(
+                TestRunObservation("root", "before", "full", "none", at(1)),
+                TestRunObservation("root", "valid", "full", "none", at(3)),
+            ),
+        )
+
+        self.assertEqual(metrics.tool_calls.value, 1)
+        self.assertEqual(metrics.file_reads.known_lower_bound, 1)
+        self.assertEqual(metrics.test_runs.value, 1)
+        self.assertEqual(metrics.full_test_runs.value, 1)
 
     def test_exposed_task_facts_reject_invalid_provenance_and_bounds(self) -> None:
         with self.assertRaisesRegex(ValueError, "provenance"):

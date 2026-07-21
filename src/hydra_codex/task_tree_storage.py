@@ -144,6 +144,26 @@ def _activities(connection: sqlite3.Connection, project_id: str) -> tuple[Activi
     )
 
 
+def _trusted_semantic_activities(
+    connection: sqlite3.Connection, project_id: str,
+) -> tuple[ActivityObservation, ...]:
+    rows = connection.execute(
+        """SELECT session_id,observed_at FROM annotations WHERE project_id=?
+           UNION ALL SELECT session_key,created_at FROM trusted_turn_bindings WHERE project_id=?
+           UNION ALL SELECT session_key,finished_at FROM trusted_turn_bindings
+                      WHERE project_id=? AND finished_at IS NOT NULL
+           UNION ALL SELECT session_key,first_stop_at FROM trusted_turn_bindings
+                      WHERE project_id=? AND first_stop_at IS NOT NULL
+           UNION ALL SELECT session_key,observed_at FROM semantic_fact_staging WHERE project_id=?""",
+        (project_id,) * 5,
+    )
+    return tuple(
+        ActivityObservation(str(session_id), observed)
+        for session_id, value in rows
+        if (observed := _optional_timestamp(value)) is not None
+    )
+
+
 def _tools(connection: sqlite3.Connection, project_id: str) -> tuple[ToolObservation, ...]:
     rows = connection.execute(
         """SELECT t.session_key,t.call_key,t.category,COALESCE(t.finished_at,t.started_at)
@@ -191,6 +211,8 @@ def _tests(connection: sqlite3.Connection, project_id: str) -> tuple[TestRunObse
 def aggregate_stored_task_tree(
     connection: sqlite3.Connection, *, project_id: str, root_id: str,
     classified_working_tokens: int = 0,
+    cutoff_at: datetime | None = None,
+    include_ambiguous_lineage: bool = True,
 ) -> TaskTreeMetrics:
     """Build a task tree exclusively from normalized persisted observations."""
     return aggregate_task_tree(
@@ -198,10 +220,15 @@ def aggregate_stored_task_tree(
         sessions=_sessions(connection, project_id),
         tokens=_tokens(connection, project_id),
         lifecycle=_lifecycle(connection, project_id),
-        activities=_activities(connection, project_id),
+        activities=(
+            *_activities(connection, project_id),
+            *_trusted_semantic_activities(connection, project_id),
+        ),
         classified_working_tokens=classified_working_tokens,
         replay_baselines=_baselines(connection, project_id),
         tools=_tools(connection, project_id),
         files=_files(connection, project_id),
         tests=_tests(connection, project_id),
+        cutoff_at=cutoff_at,
+        include_ambiguous_lineage=include_ambiguous_lineage,
     )

@@ -100,10 +100,13 @@ def _session_amount(observations: list[TokenObservation]) -> _Amount:
 
 def _descendants(
     root_id: str, sessions: dict[str, NormalizedSession], cutoff: datetime,
+    include_ambiguous_lineage: bool,
 ) -> tuple[tuple[str, ...], int]:
     children: dict[str, list[str]] = defaultdict(list)
     for item in sessions.values():
-        if item.parent_id is not None:
+        if item.parent_id is not None and (
+            include_ambiguous_lineage or item.edge_confidence_kind in {"confirmed", "inferred"}
+        ):
             children[item.parent_id].append(item.session_id)
     visited: set[str] = set()
     queue = deque((root_id,))
@@ -133,8 +136,10 @@ def aggregate_task_tree(
     replay_baselines: Iterable[ReplayBaselineObservation] | None = None,
     tools: Iterable[ToolObservation] = (), files: Iterable[FileObservation] = (),
     tests: Iterable[TestRunObservation] = (),
+    cutoff_at: datetime | None = None,
+    include_ambiguous_lineage: bool = True,
 ) -> TaskTreeMetrics:
-    """Aggregate one opaque root through its final root completion event."""
+    """Aggregate one opaque root through a trusted completion or explicit cutoff."""
     session_map: dict[str, NormalizedSession] = {}
     for item in sessions:
         if item.session_id in session_map:
@@ -144,34 +149,47 @@ def aggregate_task_tree(
     if root is None:
         raise ValueError("root session is missing")
     lifecycle_items = tuple(lifecycle)
+    token_items = tuple(tokens)
+    activity_items = tuple(activities)
+    tool_observations = tuple(tools)
+    file_observations = tuple(files)
+    test_observations = tuple(tests)
     completions = tuple(
         item for item in lifecycle_items
         if item.session_id == root_id and item.kind == "task_complete"
     )
-    if not completions:
-        raise ValueError("root task_complete observation is required")
     completion = max(
         completions,
         key=lambda item: (item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1),
-    )
-    cutoff = completion.observed_at
+    ) if completions else None
+    if cutoff_at is None:
+        if completion is None:
+            raise ValueError("root task_complete observation is required")
+        cutoff = completion.observed_at
+    else:
+        if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
+            raise ValueError("cutoff_at must be timezone-aware")
+        cutoff = cutoff_at
     if root.started_at is None:
         raise ValueError("root session start is required")
     if root.started_at > cutoff:
         raise ValueError("root starts after its task_complete observation")
-    session_ids, cycle_edges = _descendants(root_id, session_map, cutoff)
+    session_ids, cycle_edges = _descendants(
+        root_id, session_map, cutoff, include_ambiguous_lineage,
+    )
     included = set(session_ids)
 
     token_by_session: dict[str, list[TokenObservation]] = defaultdict(list)
     ambiguous_timestamp_tokens = 0
     ambiguous_timestamp_sessions: set[str] = set()
-    for item in tokens:
+    for item in token_items:
         if item.session_id not in included:
             continue
         started_at = session_map[item.session_id].started_at
         if item.observed_at is None:
             same_source_order = (
                 item.logical_source_key is not None
+                and completion is not None
                 and completion.logical_source_key is not None
                 and item.logical_source_key == completion.logical_source_key
                 and item.source_ordinal is not None
@@ -281,11 +299,11 @@ def aggregate_task_tree(
         session_id: session_map[session_id].started_at
         for session_id in session_ids if session_map[session_id].started_at is not None
     }
-    all_activity = list(activities)
+    all_activity = list(activity_items)
     all_activity.extend(ActivityObservation(item.session_id, item.observed_at) for item in lifecycle_items)
     all_activity.extend(
         ActivityObservation(item.session_id, item.observed_at)
-        for item in tokens if item.observed_at is not None
+        for item in token_items if item.observed_at is not None
     )
     for item in all_activity:
         if item.session_id in last_activity and item.observed_at <= cutoff:
@@ -317,9 +335,15 @@ def aggregate_task_tree(
             )
             and getattr(item, "observed_at") <= cutoff
         )
-    tool_items = observed(tools)
-    file_items = observed(files)
-    test_items = observed(tests)
+    tool_items = observed(tool_observations)
+    file_items = observed(file_observations)
+    test_items = observed(test_observations)
+    missing_tool_items = tuple(
+        item for item in tool_observations if item.session_id in included and item.observed_at is None
+    )
+    missing_test_items = tuple(
+        item for item in test_observations if item.session_id in included and item.observed_at is None
+    )
     tool_keys = {(item.session_id, item.observation_id) for item in tool_items}
     instrumentation = {
         (item.session_id, item.observation_id) for item in tool_items
@@ -328,6 +352,15 @@ def aggregate_task_tree(
     file_reads = {(item.session_id, item.observation_id) for item in file_items if item.operation == "read"}
     file_writes = {(item.session_id, item.observation_id) for item in file_items if item.operation == "write"}
     test_keys = {(item.session_id, item.observation_id) for item in test_items}
+
+    def placement_count(
+        value: int, missing: int, code: str, *, base_caveat: str,
+    ) -> ScalarFact:
+        return _fact_count(
+            value,
+            f"timestamp_missing_{code}:{missing}" if missing else base_caveat,
+            lower_only=bool(missing),
+        )
 
     return TaskTreeMetrics(
         root_id, cutoff, session_ids,
@@ -347,13 +380,33 @@ def aggregate_task_tree(
             agent_time_lower,
         ),
         ScalarFact(coverage, "derived" if coverage is not None else "estimated", () if coverage is not None else ("unknown_working_tokens",)),
-        _fact_count(len(tool_keys), "observed_normalized_tool_spans"),
-        _fact_count(len(instrumentation), "observed_instrumentation_spans"),
+        placement_count(
+            len(tool_keys), len(missing_tool_items), "tool",
+            base_caveat="observed_normalized_tool_spans",
+        ),
+        placement_count(
+            len(instrumentation), sum(item.category == "instrumentation" for item in missing_tool_items),
+            "instrumentation", base_caveat="observed_instrumentation_spans",
+        ),
         _fact_count(len(file_reads), "observed_file_lower_bound", lower_only=True),
         _fact_count(len(file_writes), "observed_file_lower_bound", lower_only=True),
-        _fact_count(len(test_keys), "detected_test_commands"),
-        _fact_count(sum(item.scope == "targeted" for item in test_items), "detected_test_commands"),
-        _fact_count(sum(item.scope == "full" for item in test_items), "detected_test_commands"),
-        _fact_count(sum(item.retry_kind != "none" for item in test_items), "reconciled_test_retries"),
+        placement_count(
+            len(test_keys), len(missing_test_items), "test", base_caveat="detected_test_commands",
+        ),
+        placement_count(
+            sum(item.scope == "targeted" for item in test_items),
+            sum(item.scope == "targeted" for item in missing_test_items),
+            "targeted_test", base_caveat="detected_test_commands",
+        ),
+        placement_count(
+            sum(item.scope == "full" for item in test_items),
+            sum(item.scope == "full" for item in missing_test_items),
+            "full_test", base_caveat="detected_test_commands",
+        ),
+        placement_count(
+            sum(item.retry_kind != "none" for item in test_items),
+            sum(item.retry_kind != "none" for item in missing_test_items),
+            "test_retry", base_caveat="reconciled_test_retries",
+        ),
         observed_baselines, zero_baselines, unconfirmed_edges, cycle_edges,
     )

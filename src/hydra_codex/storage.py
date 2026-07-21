@@ -14,6 +14,7 @@ from .contracts import AnnotationRecord, ConflictRecord, ThreadSessionRecord, Tu
 from .migration_support import V2_TRIGGER_STATEMENTS
 from .migrations_b2 import B2_MIGRATIONS
 from .migrations_c3 import C3_MIGRATIONS, C3_REQUIRED_SCHEMA
+from .migrations_d4 import D4_MIGRATIONS, D4_REQUIRED_SCHEMA
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -253,7 +254,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS
 
 
 class HydraStore:
@@ -347,6 +348,7 @@ class HydraStore:
             "token_snapshots": {"epoch", "input_tokens", "cached_input_tokens", "observed_at"},
         }
         required.update(C3_REQUIRED_SCHEMA)
+        required.update(D4_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -486,6 +488,8 @@ class HydraStore:
             "rollout_event_keys", "rollout_logical_sources", "rollout_events",
             "rollout_revision_lines", "rollout_revision_events", "rollout_session_segments",
             "turn_lifecycle_events",
+            "reconciled_tasks", "reconciled_token_deltas", "reconciled_phase_metrics",
+            "reconciled_semantic_summaries", "reconciled_task_diagnostics",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")

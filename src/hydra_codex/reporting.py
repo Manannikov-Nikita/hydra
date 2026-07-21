@@ -11,10 +11,11 @@ from typing import Mapping
 
 from .public_refs import PublicReferenceProjection, project_public_references
 from .redaction import redact_note
+from .report_semantics import SemanticBreakdown
 from .task_tree_types import ScalarFact, TokenVectorFact, validate_provenance
 
 
-REPORT_SCHEMA = "hydra.report/v1"
+REPORT_SCHEMA = "hydra.report/v2"
 _PUBLIC_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z")
 _SAFE_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
@@ -228,6 +229,7 @@ class TaskReport:
     full_test_runs: NumericFact
     test_retries: NumericFact
     semantic_coverage: NumericFact
+    semantic_breakdown: SemanticBreakdown
     semantic_conflicts: NumericFact
     schema_diagnostics: NumericFact
     instrumentation_overhead: NumericFact
@@ -265,6 +267,8 @@ class TaskReport:
         ):
             _expect_fact(getattr(self, field), field, "count", integer=True)
         _expect_fact(self.semantic_coverage, "semantic_coverage", "ratio", maximum=1)
+        if not isinstance(self.semantic_breakdown, SemanticBreakdown):
+            raise ValueError("semantic_breakdown must be a SemanticBreakdown")
         _expect_fact(self.instrumentation_overhead, "instrumentation_overhead", "tokens", integer=True)
         if not isinstance(self.pilot_health, PilotHealth) or not isinstance(self.trend_input, TrendInput):
             raise ValueError("report pilot and trend contracts are required")
@@ -306,6 +310,7 @@ class TaskReport:
             "schema_diagnostics": self.schema_diagnostics,
             "instrumentation_overhead_tokens": self.instrumentation_overhead,
         })
+        metrics.update(self.semantic_breakdown.public_facts())
         return dict(sorted(metrics.items()))
 
     def public_facts(self) -> dict[str, NumericFact]:
@@ -351,6 +356,7 @@ class TaskReport:
             "counts": counts,
             "semantic": {
                 "coverage": self.semantic_coverage.as_dict(),
+                "breakdown": self.semantic_breakdown.as_dict(),
                 "conflicts": self.semantic_conflicts.as_dict(),
                 "schema_diagnostics": self.schema_diagnostics.as_dict(),
             },

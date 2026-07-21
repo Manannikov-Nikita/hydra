@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Iterable
 from .task_tree_types import TaskTreeMetrics
 
 if TYPE_CHECKING:
+    from .report_semantics import SemanticBreakdown
     from .reporting import ComparisonReport, NumericFact, TaskReport, TrendWindow
 
 
@@ -17,6 +18,7 @@ def report_from_task_tree(
     public_ref: str,
     complete: bool = True,
     task_family: str | None = None,
+    semantic_breakdown: SemanticBreakdown | None = None,
     semantic_conflicts: NumericFact | None = None,
     schema_diagnostics: NumericFact | None = None,
     instrumentation_overhead: NumericFact | None = None,
@@ -33,8 +35,10 @@ def report_from_task_tree(
         _safe_family,
         _unavailable,
     )
+    from .report_semantics import SemanticBreakdown
 
     safe_family = None if task_family is None else _safe_family(task_family)
+    breakdown = semantic_breakdown or SemanticBreakdown.empty()
     conflicts = semantic_conflicts or _unavailable("count", "semantic_conflicts_unavailable")
     diagnostics = schema_diagnostics or _unavailable("count", "schema_diagnostics_unavailable")
     overhead = instrumentation_overhead or _unavailable(
@@ -71,7 +75,7 @@ def report_from_task_tree(
         _from_scalar(metrics.file_reads, "count"), _from_scalar(metrics.file_writes, "count"),
         _from_scalar(metrics.test_runs, "count"), _from_scalar(metrics.targeted_test_runs, "count"),
         _from_scalar(metrics.full_test_runs, "count"), _from_scalar(metrics.test_retries, "count"),
-        semantic_coverage, conflicts, diagnostics, overhead, pilot, trend,
+        semantic_coverage, breakdown, conflicts, diagnostics, overhead, pilot, trend,
     )
 
 

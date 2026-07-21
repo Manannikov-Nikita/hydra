@@ -107,6 +107,7 @@ class PublicReportContractTests(unittest.TestCase):
         )
         payload = json.loads(render_json(report))
 
+        self.assertEqual(REPORT_SCHEMA, "hydra.report/v2")
         self.assertEqual(payload["schema_version"], REPORT_SCHEMA)
         self.assertEqual(payload["task_ref"], public_ref)
         self.assertEqual(payload["status"], "complete")
@@ -116,6 +117,13 @@ class PublicReportContractTests(unittest.TestCase):
         self.assertEqual(report.agent_time.value, 10_000)
         self.assertEqual(report.instrumentation_overhead.value, None)
         self.assertEqual(report.instrumentation_overhead.provenance, "estimated")
+        self.assertIsNone(
+            payload["semantic"]["breakdown"]["phases"]["implement"]["working"]["value"]
+        )
+        self.assertIn(
+            "semantic_breakdown_unavailable",
+            report.public_facts()["semantic.phase.implement.working"].caveats,
+        )
         self.assertNotIn(raw_root, render_json(report))
         self.assertNotIn("root_id", render_json(report))
         self.assertNotIn("session_ids", render_json(report))

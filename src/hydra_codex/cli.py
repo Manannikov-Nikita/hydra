@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = commands.add_parser("ingest")
     _common_options(ingest)
     ingest.add_argument("--source", action="append", default=[])
+    ingest.add_argument("--event-source", action="append", default=[])
 
     annotate = commands.add_parser("annotate")
     _common_options(annotate)
@@ -118,6 +119,24 @@ def _default_sources(environ: Mapping[str, str]) -> tuple[RolloutRoot, ...]:
     return tuple(RolloutRoot(path, label) for path, label in candidates if path.is_dir())
 
 
+def _event_source(value: str, cwd: Path):
+    from .codex_event_ingest import CodexEventSource
+    from .codex_events import APP_SERVER_V2, OTEL_LOG_V1
+
+    if "=" not in value:
+        raise ValueError("event source must have a schema label")
+    label, raw_path = value.split("=", 1)
+    schemas = {"app-server-v2": APP_SERVER_V2, "otel-v1": OTEL_LOG_V1}
+    if label not in schemas or not raw_path:
+        raise ValueError("invalid event source")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = cwd / path
+    if not path.is_file() or path.suffix != ".jsonl":
+        raise ValueError("event source is unavailable")
+    return CodexEventSource(path, schemas[label])
+
+
 def _run_ingest(
     arguments: argparse.Namespace,
     environ: Mapping[str, str],
@@ -139,15 +158,37 @@ def _run_ingest(
         report = ingest_rollouts(
             store, roots, project.project_root, project.project_id, hash_key=hash_key,
         )
+        event_report = None
+        if arguments.event_source:
+            from .codex_event_ingest import ingest_codex_events
+
+            event_report = ingest_codex_events(
+                store,
+                tuple(
+                    _event_source(value, project.project_root)
+                    for value in arguments.event_source
+                ),
+                project.project_root,
+                project.project_id,
+                hash_key=hash_key,
+            )
     finally:
         store.close()
-    return {
+    result: dict[str, object] = {
         "command": "ingest",
         "status": "ok",
         "files_seen": report.files_seen,
         "unique_sources": report.unique_sources,
         "diagnostics": report.diagnostics,
     }
+    if event_report is not None:
+        result.update({
+            "event_files_seen": event_report.files_seen,
+            "event_unique_sources": event_report.unique_sources,
+            "event_count": event_report.events,
+            "event_issues": event_report.issues,
+        })
+    return result
 
 
 def _stdin_text(stdin: TextIO) -> str:

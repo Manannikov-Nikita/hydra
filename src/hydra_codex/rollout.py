@@ -453,6 +453,9 @@ def ingest_rollouts(
                 reconcile_fork_baselines(connection, project_id)
         with store.rollout_transaction() as connection:
             reconcile_fork_baselines(connection, project_id)
+            from .token_selection import refresh_token_source_selection
+
+            refresh_token_source_selection(connection, project_id)
         return IngestReport(len(files), len(unique), diagnostics)
     finally:
         ACTIVE_HASHER.reset(hash_token)

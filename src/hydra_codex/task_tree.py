@@ -187,6 +187,9 @@ def aggregate_task_tree(
             continue
         started_at = session_map[item.session_id].started_at
         if item.observed_at is None:
+            if item.retain_value_without_timestamp:
+                token_by_session[item.session_id].append(item)
+                continue
             same_source_order = (
                 item.logical_source_key is not None
                 and completion is not None
@@ -209,13 +212,28 @@ def aggregate_task_tree(
     timestamp_missing = sum(
         item.observed_at is None for items in token_by_session.values() for item in items
     )
+    selection_caveats = tuple(sorted({
+        item.selection_caveat
+        for items in token_by_session.values() for item in items
+        if item.selection_caveat is not None
+    }))
+    selection_uncertain = any(
+        item.value_provenance == "estimated"
+        for items in token_by_session.values() for item in items
+    )
     recorded_by_session: dict[str, _Amount] = {}
     for session_id in session_ids:
         items = token_by_session.get(session_id, [])
         amount = _session_amount(items)
         if (
             session_id in ambiguous_timestamp_sessions
-            or any(item.observed_at is None or item.placement_provenance == "estimated" for item in items)
+            or any(
+                (
+                    item.observed_at is None
+                    or item.placement_provenance == "estimated"
+                ) and not item.retain_value_without_timestamp
+                for item in items
+            )
         ):
             amount = _Amount(TokenVector.unknown(), amount.bounds)
         recorded_by_session[session_id] = amount
@@ -285,6 +303,7 @@ def aggregate_task_tree(
         recorded_caveats += (f"timestamp_missing_token:{timestamp_missing}",)
     if ambiguous_timestamp_tokens:
         recorded_caveats += (f"ambiguous_timestamp_token:{ambiguous_timestamp_tokens}",)
+    recorded_caveats += selection_caveats
     baseline_caveats = (f"zero_no_observation:{zero_baselines}",) if zero_baselines else ()
     unique_caveats = list(baseline_caveats + recorded_caveats)
     unique_caveats.extend(uncertainty)
@@ -292,7 +311,8 @@ def aggregate_task_tree(
         unique_caveats.append(f"cycle_edges:{cycle_edges}")
     baseline_uncertain = bool(zero_baselines or unconfirmed_edges)
     unique_uncertain = bool(
-        baseline_uncertain or missing_finals or timestamp_missing or ambiguous_timestamp_tokens
+        baseline_uncertain or missing_finals or timestamp_missing
+        or ambiguous_timestamp_tokens or selection_uncertain
     )
 
     last_activity = {
@@ -366,7 +386,8 @@ def aggregate_task_tree(
         root_id, cutoff, session_ids,
         _token_fact(
             recorded,
-            "estimated" if missing_finals or timestamp_missing or ambiguous_timestamp_tokens else "exact",
+            "estimated" if missing_finals or timestamp_missing
+            or ambiguous_timestamp_tokens or selection_uncertain else "exact",
             recorded_caveats,
         ),
         _token_fact(replay, "estimated" if baseline_uncertain else "exact", baseline_caveats + uncertainty),

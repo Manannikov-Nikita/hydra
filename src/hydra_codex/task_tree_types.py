@@ -169,11 +169,15 @@ class TokenObservation:
     placement_provenance: Provenance = "exact"
     logical_source_key: str | None = None
     source_ordinal: int | None = None
+    value_provenance: Provenance = "exact"
+    selection_caveat: str | None = None
+    retain_value_without_timestamp: bool = False
 
     def __post_init__(self) -> None:
         if self.observed_at is not None:
             _require_aware(self.observed_at, "observed_at")
         validate_provenance(self.placement_provenance, "placement provenance")
+        validate_provenance(self.value_provenance, "value provenance")
         if self.observed_at is None and self.placement_provenance != "estimated":
             raise ValueError("timestamp-missing token placement must be estimated")
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) or self.sequence < 0:
@@ -188,6 +192,12 @@ class TokenObservation:
             raise ValueError("source ordinal must be a non-negative integer or null")
         if (self.logical_source_key is None) != (self.source_ordinal is None):
             raise ValueError("token source lineage must provide both key and ordinal")
+        if self.selection_caveat is not None and (
+            not isinstance(self.selection_caveat, str) or not self.selection_caveat
+        ):
+            raise ValueError("selection caveat must be non-empty text or null")
+        if not isinstance(self.retain_value_without_timestamp, bool):
+            raise ValueError("retain timestamp-missing value must be boolean")
 
 
 @dataclass(frozen=True)
@@ -207,6 +217,7 @@ class LifecycleObservation:
     observed_at: datetime
     logical_source_key: str | None = None
     source_ordinal: int | None = None
+    turn_key: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
@@ -218,6 +229,10 @@ class LifecycleObservation:
             raise ValueError("source ordinal must be a non-negative integer or null")
         if (self.logical_source_key is None) != (self.source_ordinal is None):
             raise ValueError("lifecycle source lineage must provide both key and ordinal")
+        if self.turn_key is not None and (
+            not isinstance(self.turn_key, str) or not self.turn_key
+        ):
+            raise ValueError("lifecycle turn key must be non-empty text or null")
 
 
 @dataclass(frozen=True)

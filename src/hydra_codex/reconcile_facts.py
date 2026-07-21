@@ -16,6 +16,8 @@ from .task_tree_storage import (
     _trusted_semantic_activities,
 )
 from .reconcile_types import TaskPlan
+from .reconcile_helpers import has_later_root_start, task_family as _task_family
+from .reconcile_helpers import within_task_cutoff as _within_task_cutoff
 from .task_tree_types import (
     LifecycleObservation,
     NormalizedSession,
@@ -101,7 +103,9 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
             completions[item.session_id].append(item)
     plans: list[TaskPlan] = []
     for root, members in grouped.items():
-        if completions.get(root):
+        if completions.get(root) and not has_later_root_start(
+            root, lifecycle, completions[root],
+        ):
             completion = max(completions[root], key=lambda item: (
                 item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1,
             ))
@@ -181,9 +185,11 @@ def build_token_deltas(
     rows = list(connection.execute(
         f"""SELECT t.session_key,t.source_digest,t.line_number,t.epoch,t.observed_at,
                     t.input_tokens,t.cached_input_tokens,t.output_tokens,t.reasoning_tokens
-                    ,r.logical_source_key
+                    ,r.logical_source_key,t.event_key,t.source_family,
+                    t.selection_provenance,t.selection_caveat
                FROM token_snapshots t LEFT JOIN rollout_sources r ON r.source_digest=t.source_digest
-              WHERE t.project_id=? AND t.session_key IN ({placeholders})
+              WHERE t.project_id=? AND t.contributes_total=1
+                AND t.session_key IN ({placeholders})
               ORDER BY t.session_key,t.epoch,
                        CASE WHEN t.observed_at IS NULL THEN 1 ELSE 0 END,t.observed_at,
                        t.source_digest,t.line_number""",
@@ -215,7 +221,7 @@ def build_token_deltas(
         ):
             diagnostics["token_before_session_start"] += 1
             continue
-        if observed is None and not (
+        if observed is None and row[11] != "app_server" and not (
             plan.cutoff_source_key is not None
             and plan.cutoff_source_ordinal is not None
             and row[9] == plan.cutoff_source_key
@@ -226,7 +232,10 @@ def build_token_deltas(
         epoch = int(row[3])
         vector = TokenVector(row[5], row[6], row[7], row[8])
         state_key = (session_key, epoch)
-        provenance = "exact" if observed is not None and None not in vector.values else "estimated"
+        provenance = (
+            "exact" if observed is not None and None not in vector.values
+            and row[12] != "estimated" else "estimated"
+        )
         amount_estimated = False
         if state_key not in previous:
             before = TokenVector.zero()
@@ -263,32 +272,37 @@ def build_token_deltas(
                 phase = cause = None
                 provenance = "estimated"
         deltas.append(DeltaFact(
-            session_key, f"{row[1]}:{row[2]}", observed, ordinal,
+            session_key, str(row[10] or f"{row[1]}:{row[2]}"), observed, ordinal,
             delta, provenance, phase, cause,
         ))
+    from .otel_allocation import allocate_otel_hints
+
+    allocation = allocate_otel_hints(
+        connection, project_id, plan.session_ids, plan.cutoff_at, deltas,
+        lambda session, observed: _phase_at(intervals.get(session, []), observed),
+    )
+    if allocation.replaced_sessions:
+        deltas = [
+            item for item in deltas
+            if item.session_key not in allocation.replaced_sessions
+        ]
+        deltas.extend(DeltaFact(
+            item.session_key, item.event_key, item.observed_at, 0, item.vector,
+            item.provenance, item.phase, item.cause,
+        ) for item in allocation.facts)
+        deltas.sort(key=lambda item: (
+            item.observed_at is None, item.observed_at or plan.cutoff_at,
+            item.session_key, item.event_key,
+        ))
+        deltas = [
+            DeltaFact(
+                item.session_key, item.event_key, item.observed_at, ordinal,
+                item.vector, item.provenance, item.phase, item.cause,
+            )
+            for ordinal, item in enumerate(deltas, start=1)
+        ]
+    diagnostics.update(allocation.diagnostics)
     return tuple(deltas), diagnostics
-
-
-def _task_family(
-    connection: sqlite3.Connection, project_id: str, sessions: tuple[str, ...], cutoff: datetime,
-) -> tuple[str | None, bool, int, int]:
-    placeholders = ",".join("?" for _ in sessions)
-    rows = list(connection.execute(
-        f"""SELECT a.task_family,a.observed_at,a.sequence,a.annotation_id
-               FROM annotations a
-              WHERE a.project_id=? AND a.session_id IN ({placeholders})""",
-        (project_id, *sessions),
-    ))
-    invalid = sum(_optional_timestamp(row[1]) is None for row in rows)
-    valid = [
-        (observed, int(row[2]), str(row[3]), str(row[0]))
-        for row in rows
-        if (observed := _optional_timestamp(row[1])) is not None and observed <= cutoff
-    ]
-    valid.sort()
-    real = [item for item in valid if item[3] != "unclassified"]
-    families = {item[3] for item in real}
-    return (real[-1][3] if real else None), len(families) > 1, invalid, len(valid)
 
 
 def _test_cause_conflicts(
@@ -317,21 +331,6 @@ def _test_cause_conflicts(
         if not overlap and model_cause is not None and model_cause != expected[str(failure)]:
             conflicts.add(f"{source}:{line}")
     return conflicts, invalid
-
-
-def _within_task_cutoff(
-    plan: TaskPlan, observed_value: object, logical_source: object, source_ordinal: object,
-) -> bool:
-    observed = _optional_timestamp(observed_value)
-    if observed is not None:
-        return observed <= plan.cutoff_at
-    return bool(
-        plan.cutoff_source_key is not None
-        and plan.cutoff_source_ordinal is not None
-        and logical_source == plan.cutoff_source_key
-        and isinstance(source_ordinal, int)
-        and source_ordinal <= plan.cutoff_source_ordinal
-    )
 
 
 def semantic_assembly(

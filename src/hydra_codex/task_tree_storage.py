@@ -50,10 +50,11 @@ def _sessions(connection: sqlite3.Connection, project_id: str) -> tuple[Normaliz
 def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObservation, ...]:
     rows = connection.execute(
         """SELECT t.session_key,t.observed_at,t.epoch,t.input_tokens,t.cached_input_tokens,
-                  t.output_tokens,t.reasoning_tokens,s.logical_source_key,t.line_number
+                  t.output_tokens,t.reasoning_tokens,s.logical_source_key,t.line_number,
+                  t.selection_provenance,t.selection_caveat,t.source_family
              FROM token_snapshots t
              LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
-            WHERE t.project_id=?
+            WHERE t.project_id=? AND t.contributes_total=1
             ORDER BY CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END,
                      observed_at,t.source_digest,t.line_number""",
         (project_id,),
@@ -67,6 +68,8 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
             "estimated" if observed_at is None else "exact",
             str(row[7]) if row[7] is not None else None,
             int(row[8]) if row[7] is not None else None,
+            str(row[9]), str(row[10]) if row[10] is not None else None,
+            row[11] == "app_server",
         ))
     return tuple(observations)
 
@@ -93,7 +96,7 @@ def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[Lifecyc
     mapping = {"started": "task_started", "completed": "task_complete", "aborted": "turn_aborted"}
     rows = connection.execute(
         """SELECT e.session_key,e.event_kind,e.observed_at,
-                  e.logical_source_key,e.source_ordinal
+                  e.logical_source_key,e.source_ordinal,e.turn_key
              FROM turn_lifecycle_events e
              JOIN rollout_sessions s ON s.session_key=e.session_key
             WHERE s.project_id=? ORDER BY e.source_digest,e.source_ordinal""",
@@ -105,7 +108,7 @@ def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[Lifecyc
         if observed_at is not None:
             observations.append(LifecycleObservation(
                 str(row[0]), mapping[str(row[1])], observed_at,
-                str(row[3]), int(row[4]),
+                str(row[3]), int(row[4]), str(row[5]),
             ))
     return tuple(observations)
 

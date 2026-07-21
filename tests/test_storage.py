@@ -308,6 +308,7 @@ class SQLiteStorageTests(unittest.TestCase):
             "/Users/alice/private", "alice@example.com", "raw family with spaces",
             "019f75d4-5125-7343-8537-49b80f27f286", "token=private",
             "customer-123456", "alice", "secret-token", "private-looking",
+            "alice-review", "acme-workflow", "alice-termination-review",
         ), start=1):
             with self.subTest(family=family):
                 with self.assertRaisesRegex(ValueError, "privacy-safe category"):

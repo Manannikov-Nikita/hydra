@@ -10,6 +10,7 @@ import shlex
 FileFact = tuple[str, str]
 
 _SHELL_META = frozenset({"|", "||", "&", "&&", ";", "<", "<<", "<<<"})
+_SHELL_PUNCTUATION = frozenset("|&;<>")
 _EXPANSION_MARKERS = ("$", "`", "\n", "\r", "\0")
 _PATH_META = ("*", "?", "[", "]", "{", "}")
 
@@ -18,6 +19,8 @@ def _tokens(command: str) -> tuple[str, ...] | None:
     if (
         "#" in command
         or "<" in command
+        or "(" in command
+        or ")" in command
         or any(operator in command for operator in (">|", ">&", "&>"))
         or any(marker in command for marker in _EXPANSION_MARKERS)
     ):
@@ -29,7 +32,15 @@ def _tokens(command: str) -> tuple[str, ...] | None:
         values = tuple(lexer)
     except ValueError:
         return None
-    if not values or any(value in _SHELL_META for value in values):
+    if not values or any(
+        value in _SHELL_META
+        or (
+            value not in {">", ">>"}
+            and value
+            and set(value) <= _SHELL_PUNCTUATION
+        )
+        for value in values
+    ):
         return None
     return values
 

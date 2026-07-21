@@ -225,7 +225,7 @@ class TestEvidenceBuffer:
             return False
         command_hash = self.pseudonymize("command", command)
         evidence_key = self.pseudonymize(
-            "event", f"test/{session_key}/{logical_call_id}/{command_hash}",
+            "event", f"test/{session_key}/{tool_call_key}/{command_hash}",
         )
         self.intents[logical_call_id] = (
             TestIntent(

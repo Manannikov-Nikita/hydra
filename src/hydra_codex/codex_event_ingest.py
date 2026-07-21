@@ -19,6 +19,7 @@ from .codex_events import (
 from .rollout_identity import ACTIVE_HASHER, Pseudonymizer
 from .rollout_persistence import persist_file
 from .rollout_privacy import canonical_timestamp
+from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs
 from .shell_facts import shell_file_facts
 from .storage import HydraStore
 from .test_evidence import TestEvidenceBuffer
@@ -87,6 +88,17 @@ def _prepare(
 
 def _format(schema: str) -> str:
     return "app_server" if schema == APP_SERVER_V2 else "otel"
+
+
+def _persist_epoch_diagnostic(
+    connection: sqlite3.Connection, source: str, line: int, kind: str,
+) -> None:
+    connection.execute(
+        """INSERT INTO rollout_diagnostics(
+               source_digest,line_number,envelope_kind,fingerprint)
+           VALUES (?,?,?,'codex-event-token-epoch-v1') ON CONFLICT DO NOTHING""",
+        (source, line, kind),
+    )
 
 
 def _iso_min(first: object, second: str | None) -> str | None:
@@ -291,7 +303,11 @@ def _persist_normalized_event(
     )
     _persist_tool(connection, event, normalized_source, session)
     tool = event.tool
-    if tool is not None and tool.ephemeral_command is not None:
+    # App Server repeats the full item on started/completed notifications.
+    # Persist file evidence only from the authoritative terminal item so one
+    # logical tool call cannot inflate read/write amplification.
+    terminal_tool = tool is not None and tool.phase == "completed"
+    if terminal_tool and tool.ephemeral_command is not None:
         for operation, path in shell_file_facts(
             tool.ephemeral_command,
             project_root=project_root,
@@ -301,7 +317,7 @@ def _persist_normalized_event(
                 connection, normalized_source, event.source_ordinal, session,
                 operation, path, project_root, event.observed_at, event.turn_key,
             )
-    if tool is not None:
+    if terminal_tool:
         for path in tool.ephemeral_file_writes:
             persist_file(
                 connection, normalized_source, event.source_ordinal, session,
@@ -502,6 +518,13 @@ def ingest_codex_events(
                         (item.source_digest, location),
                     )
             refresh_token_source_selection(connection, project_id)
+            reconcile_token_epochs(
+                connection, project_id,
+                lambda source, line, kind: _persist_epoch_diagnostic(
+                    connection, source, line, kind,
+                ),
+            )
+            reconcile_fork_baselines(connection, project_id)
         return CodexEventIngestReport(
             len(items), len(unique),
             sum(len(batch.events) for _item, batch in unique.values()),

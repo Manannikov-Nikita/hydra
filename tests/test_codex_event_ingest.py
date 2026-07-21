@@ -197,6 +197,136 @@ class CodexEventPersistenceTests(unittest.TestCase):
         ))
         self.assertEqual([(row[0], row[1]) for row in selected], [(100, 0), (200, 1)])
 
+    def test_timestamped_app_totals_remain_available_at_the_task_cutoff(self) -> None:
+        thread, turn = "temporal-thread", "temporal-turn"
+
+        def usage(value: int) -> dict[str, object]:
+            totals = {
+                "inputTokens": value, "cachedInputTokens": 0,
+                "outputTokens": 0, "reasoningOutputTokens": 0,
+                "totalTokens": value,
+            }
+            return {
+                "method": "thread/tokenUsage/updated", "params": {
+                    "threadId": thread, "turnId": turn,
+                    "tokenUsage": {"total": totals, "last": totals},
+                },
+            }
+
+        source = self.base / "temporal-app-totals.jsonl"
+        rows = (
+            {"received_at": "2024-07-03T09:46:40Z", "message": {
+                "method": "turn/started", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "status": "inProgress",
+                    },
+                },
+            }},
+            {"received_at": "2024-07-03T09:46:41Z", "message": usage(100)},
+            {"received_at": "2024-07-03T09:46:42Z", "message": {
+                "method": "turn/completed", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "status": "completed",
+                    },
+                },
+            }},
+            {"received_at": "2024-07-03T09:46:43Z", "message": usage(200)},
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+        event_source = CodexEventSource(source, APP_SERVER_V2)
+        self.ingest(event_source)
+        self.ingest(event_source)
+        root = Pseudonymizer(KEY).digest("identity", thread)
+
+        completed = aggregate_stored_task_tree(
+            self.store.connection, project_id=PROJECT, root_id=root,
+        )
+        after_resume = aggregate_stored_task_tree(
+            self.store.connection, project_id=PROJECT, root_id=root,
+            cutoff_at=datetime(2024, 7, 3, 9, 46, 44, tzinfo=timezone.utc),
+        )
+        selected = list(self.store.connection.execute(
+            """SELECT input_tokens,contributes_total FROM token_snapshots
+                 WHERE session_key=? ORDER BY input_tokens""",
+            (root,),
+        ))
+        reconcile_project(
+            self.store, project_id=PROJECT, installation_key=b"r" * 32,
+        )
+        reconciled = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
+
+        self.assertEqual(completed.recorded.input.value, 100)
+        self.assertEqual(after_resume.recorded.input.value, 200)
+        self.assertEqual(reconciled.metrics.recorded.input.value, 100)
+        self.assertEqual(
+            [(row[0], row[1]) for row in selected], [(100, 1), (200, 1)],
+        )
+
+    def test_timestamped_app_counter_reset_creates_a_new_contributing_epoch(self) -> None:
+        thread, turn = "reset-thread", "reset-turn"
+
+        def event(timestamp: str, value: int) -> dict[str, object]:
+            totals = {
+                "inputTokens": value, "cachedInputTokens": 0,
+                "outputTokens": 0, "reasoningOutputTokens": 0,
+                "totalTokens": value,
+            }
+            return {
+                "received_at": timestamp,
+                "message": {
+                    "method": "thread/tokenUsage/updated", "params": {
+                        "threadId": thread, "turnId": turn,
+                        "tokenUsage": {"total": totals, "last": totals},
+                    },
+                },
+            }
+
+        source = self.base / "app-counter-reset.jsonl"
+        rows = (
+            {"received_at": "2024-07-03T09:46:40Z", "message": {
+                "method": "turn/started", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "status": "inProgress",
+                    },
+                },
+            }},
+            event("2024-07-03T09:46:41Z", 100),
+            event("2024-07-03T09:46:42Z", 150),
+            event("2024-07-03T09:46:43Z", 20),
+            {"received_at": "2024-07-03T09:46:44Z", "message": {
+                "method": "turn/completed", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "status": "completed",
+                    },
+                },
+            }},
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+        root = Pseudonymizer(KEY).digest("identity", thread)
+
+        metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id=PROJECT, root_id=root,
+        )
+        epochs = [tuple(row) for row in self.store.connection.execute(
+            """SELECT input_tokens,epoch,contributes_total FROM token_snapshots
+                 WHERE session_key=? ORDER BY observed_at""",
+            (root,),
+        )]
+        diagnostics = {row[0] for row in self.store.connection.execute(
+            "SELECT envelope_kind FROM rollout_diagnostics"
+        )}
+
+        self.assertEqual(metrics.recorded.input.value, 170)
+        self.assertEqual(epochs, [(100, 0, 1), (150, 0, 1), (20, 1, 1)])
+        self.assertIn("counter_reset", diagnostics)
+
     def test_incomplete_app_stream_retains_timestamp_missing_total_as_unclassified(self) -> None:
         thread, turn = "incomplete-app-thread", "incomplete-app-turn"
         totals = {
@@ -687,6 +817,133 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.assertEqual(task.status, "incomplete")
         self.assertIsNone(task.metrics.root_wall_clock_ms.value)
 
+    def test_receiver_only_collaboration_items_never_create_lineage_edges(self) -> None:
+        source = self.base / "official-receiver-only-collaboration.jsonl"
+        rows = [
+            {
+                "received_at": "2024-07-03T09:46:40.000000Z", "message": {
+                    "method": "turn/started", "params": {
+                        "threadId": thread, "turn": {
+                            "id": f"{thread}-turn", "status": "inProgress",
+                        },
+                    },
+                },
+            }
+            for thread in ("official-parent", "official-child")
+        ]
+        rows.extend(
+            {
+                "received_at": f"2024-07-03T09:46:40.{index}00000Z", "message": {
+                    "method": "item/completed", "params": {
+                        "threadId": sender, "turnId": f"{sender}-turn",
+                        "item": {
+                            "id": f"receiver-only-{operation}",
+                            "type": "collabToolCall", "tool": operation,
+                            "senderThreadId": sender,
+                            "receiverThreadId": receiver,
+                            "status": "completed",
+                        },
+                    },
+                },
+            }
+            for index, (operation, sender, receiver) in enumerate((
+                ("followup_task", "official-parent", "official-child"),
+                ("send_message", "official-child", "official-parent"),
+                ("wait_agent", "official-parent", "official-child"),
+                ("close_agent", "official-child", "official-parent"),
+            ), start=1)
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual(self.store.count("session_edges"), 0)
+        self.assertEqual(self.store.count("rollout_sessions"), 2)
+
+    def test_app_spawn_and_child_snapshot_rebuild_fork_baseline_during_ingest(self) -> None:
+        source = self.base / "official-spawn-baseline.jsonl"
+        total = {
+            "inputTokens": 100, "cachedInputTokens": 50,
+            "outputTokens": 20, "reasoningOutputTokens": 10,
+            "totalTokens": 120,
+        }
+        zero = {
+            "inputTokens": 0, "cachedInputTokens": 0,
+            "outputTokens": 0, "reasoningOutputTokens": 0,
+            "totalTokens": 0,
+        }
+        rows = (
+            {
+                "received_at": "2024-07-03T09:46:40.000000Z", "message": {
+                    "method": "turn/started", "params": {
+                        "threadId": "official-parent", "turn": {
+                            "id": "official-parent-turn", "status": "inProgress",
+                        },
+                    },
+                },
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.100000Z", "message": {
+                    "method": "item/completed", "params": {
+                        "threadId": "official-parent", "turnId": "official-parent-turn",
+                        "item": {
+                            "id": "spawn-call", "type": "collabToolCall",
+                            "tool": "spawn_agent", "senderThreadId": "official-parent",
+                            "newThreadId": "official-child", "status": "completed",
+                        },
+                    },
+                },
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.200000Z", "message": {
+                    "method": "thread/tokenUsage/updated", "params": {
+                        "threadId": "official-parent", "turnId": "official-parent-turn",
+                        "tokenUsage": {"total": zero, "last": zero},
+                    },
+                },
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.500000Z", "message": {
+                    "method": "thread/tokenUsage/updated", "params": {
+                        "threadId": "official-child", "turnId": "official-child-turn",
+                        "tokenUsage": {"total": total, "last": total},
+                    },
+                },
+            },
+            {
+                "received_at": "2024-07-03T09:46:41.500000Z", "message": {
+                    "method": "turn/completed", "params": {
+                        "threadId": "official-parent", "turn": {
+                            "id": "official-parent-turn", "status": "completed",
+                        },
+                    },
+                },
+            },
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        baseline = self.store.connection.execute(
+            """SELECT input_tokens,cached_input_tokens,output_tokens,reasoning_tokens
+                 FROM fork_baselines"""
+        ).fetchone()
+        self.assertIsNotNone(baseline)
+        self.assertEqual(tuple(baseline), (100, 50, 20, 10))
+        root = Pseudonymizer(KEY).digest("identity", "official-parent")
+        metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id=PROJECT, root_id=root,
+        )
+        self.assertEqual(metrics.recorded.working.value, 70)
+        self.assertEqual(metrics.replay_baseline.working.value, 70)
+        self.assertEqual(metrics.unique.working.value, 0)
+
     def test_official_app_items_emit_safe_files_and_confirmed_subagent_edge(self) -> None:
         source = self.base / "official-items.jsonl"
         rows = (
@@ -711,6 +968,17 @@ class CodexEventPersistenceTests(unittest.TestCase):
                 }},
             },
             {
+                "received_at": "2024-07-03T09:46:40.150000Z", "message": {
+                "method": "item/started", "params": {
+                    "threadId": "official-parent", "turnId": "official-turn",
+                    "item": {
+                        "id": "cat-call", "type": "commandExecution",
+                        "command": "cat src/a.py", "cwd": str(self.project),
+                        "status": "inProgress",
+                    },
+                }},
+            },
+            {
                 "received_at": "2024-07-03T09:46:40.200000Z", "message": {
                 "method": "item/completed", "params": {
                     "threadId": "official-parent", "turnId": "official-turn",
@@ -719,6 +987,19 @@ class CodexEventPersistenceTests(unittest.TestCase):
                         "command": "cat src/a.py", "cwd": str(self.project),
                         "status": "completed", "durationMs": 2, "exitCode": 0,
                         "aggregatedOutput": "private tool output",
+                    },
+                }},
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.250000Z", "message": {
+                "method": "item/started", "params": {
+                    "threadId": "official-parent", "turnId": "official-turn",
+                    "item": {
+                        "id": "patch-call", "type": "fileChange",
+                        "changes": [{
+                            "path": "src/b.py", "kind": "update", "diff": "private diff",
+                        }],
+                        "status": "inProgress",
                     },
                 }},
             },
@@ -760,6 +1041,63 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.assertNotIn("cat src/a.py", persisted)
         self.assertNotIn("private tool output", persisted)
         self.assertNotIn("private diff", persisted)
+
+    def test_hybrid_rollout_and_app_tool_call_emit_one_test_evidence_row(self) -> None:
+        session = "hybrid-test-thread"
+        call_id = "shared-test-call"
+        command = "python3.12 -m unittest tests.test_safe"
+        rollout = self.base / "hybrid-rollout.jsonl"
+        rollout_rows = (
+            {
+                "timestamp": "2024-07-03T09:46:40Z",
+                "type": "session_meta",
+                "payload": {"id": session, "cwd": str(self.project)},
+            },
+            {
+                "timestamp": "2024-07-03T09:46:40.100000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call", "call_id": call_id,
+                    "name": "exec_command", "arguments": json.dumps({"cmd": command}),
+                },
+            },
+            {
+                "timestamp": "2024-07-03T09:46:40.200000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output", "call_id": call_id,
+                    "output": json.dumps({"exit_code": 0, "output": "rollout output"}),
+                },
+            },
+        )
+        rollout.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rollout_rows),
+            encoding="utf-8",
+        )
+        ingest_rollouts(
+            self.store, (rollout,), self.project, PROJECT, hash_key=KEY,
+        )
+
+        app = self.base / "hybrid-app.jsonl"
+        app.write_text(json.dumps({
+            "received_at": "2024-07-03T09:46:40.300000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": session, "turnId": "hybrid-turn",
+                    "item": {
+                        "id": call_id, "type": "commandExecution",
+                        "command": command, "cwd": str(self.project),
+                        "status": "completed", "exitCode": 0,
+                        "aggregatedOutput": "app output",
+                    },
+                },
+            },
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        self.ingest(CodexEventSource(app, APP_SERVER_V2))
+
+        self.assertEqual(self.store.count("tool_spans"), 1)
+        self.assertEqual(self.store.count("rollout_test_runs"), 1)
 
     def test_malformed_and_schema_drift_persist_only_safe_issues(self) -> None:
         malformed = self.base / "malformed.jsonl"

@@ -11,19 +11,14 @@ _SAFE_TASK_FAMILY = re.compile(
 _PRIVATE_IDENTIFIER = re.compile(
     r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z", re.IGNORECASE,
 )
-_PRIVATE_FAMILY_SEGMENTS = frozenset({
-    "account", "client", "credential", "customer", "email", "name", "password",
-    "person", "phone", "private", "secret", "token", "user",
-})
-_SINGLE_FAMILY_CATEGORIES = frozenset({
-    "analysis", "architecture", "auth", "cleanup", "docs", "essay", "foundation",
-    "legacy", "migration", "quiz", "refactor", "release", "telemetry", "test",
+_PUBLIC_FAMILY_SEGMENTS = frozenset({
+    "accounting", "analysis", "annotation", "answer", "architecture", "audit",
+    "auth", "block", "browser", "cleanup", "cli", "closeout", "codex", "core",
+    "docs", "essay", "feature", "fix", "foundation", "hardening", "hooks",
+    "integration", "legacy", "lesson", "local", "migration", "monitoring", "multi",
+    "multiple", "quiz", "refactor", "release", "report", "review", "runtime",
+    "service", "services", "telemetry", "test", "tests", "tooling", "ui",
     "unclassified", "workflow",
-})
-_FAMILY_CATEGORY_SUFFIXES = _SINGLE_FAMILY_CATEGORIES | frozenset({
-    "accounting", "audit", "browser", "core", "feature", "fix", "hardening",
-    "hooks", "integration", "monitoring", "report", "review", "runtime", "service",
-    "services", "tests", "tooling", "ui",
 })
 
 
@@ -57,16 +52,8 @@ def validate_task_family(value: object) -> str:
         or len(value) > 80
         or _SAFE_TASK_FAMILY.fullmatch(value) is None
         or _PRIVATE_IDENTIFIER.fullmatch(value) is not None
-        or any(segment in _PRIVATE_FAMILY_SEGMENTS for segment in segments)
+        or any(segment not in _PUBLIC_FAMILY_SEGMENTS for segment in segments)
         or any(re.search(r"\d{3,}", segment) for segment in segments)
-        or (
-            len(segments) == 1
-            and segments[0] not in _SINGLE_FAMILY_CATEGORIES
-        )
-        or (
-            len(segments) > 1
-            and segments[-1] not in _FAMILY_CATEGORY_SUFFIXES
-        )
     ):
         raise ValueError("task_family must be a privacy-safe category")
     return value

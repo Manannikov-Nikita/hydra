@@ -163,6 +163,23 @@ class ShellFileObservationTests(unittest.TestCase):
                 )
                 self.assertEqual(result.calls[0].file_observations, ())
 
+    def test_grouped_shell_control_operators_fail_closed(self) -> None:
+        root = Path("/workspace/project")
+        commands = (
+            "cat input.txt |& sed -n 1p",
+            "cat input.txt ;; echo hi",
+            "cat input.txt ;& echo hi",
+            "cat input.txt ;;& echo hi",
+            "cat input.txt (echo hi)",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = normalize_custom_exec(
+                    exec_program(command, workdir=str(root)), project_root=root,
+                )
+                self.assertEqual(result.calls[0].file_observations, ())
+
     def test_hash_shell_syntax_fails_closed_instead_of_changing_a_filename(self) -> None:
         root = Path("/workspace/project")
         for command in (

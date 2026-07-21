@@ -167,9 +167,8 @@ content classifier. Agents must never paste prompt, transcript, or tool output
 into it. Annotation
 arguments cannot contain tokens, times, file/test counts, paths, session IDs,
 turn IDs, or timestamps. `task_family` is a lowercase categorical code such as
-`multiple-answer-quiz`; single-word categories use Hydra's small public
-taxonomy, multi-word categories end in a public category suffix, and unsafe or
-private-looking values are rejected before
+`multiple-answer-quiz`; every separator-delimited segment must come from
+Hydra's small public taxonomy, and unsafe or private-looking values are rejected before
 storage and unsafe legacy values never form a trend cohort.
 Common accepted terminals include `quiz`, `workflow`, `architecture`,
 `hardening`, `review`, `report`, `tests`, `runtime`, and `docs`; use

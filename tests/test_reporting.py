@@ -272,6 +272,7 @@ class CompareAndRendererTests(unittest.TestCase):
         for private_family in (
             "/workspace/acme/private", r"C:\Users\private\project",
             "019f75d4-5125-7343-8537-49b80f27f286", "raw note with spaces",
+            "alice-review", "acme-workflow", "alice-termination-review",
         ):
             with self.subTest(private_family=private_family):
                 report = self.report("safe-root", 10, task_family=private_family)

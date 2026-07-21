@@ -1,11 +1,54 @@
-"""Persist the single token-total authority selected for each Codex session."""
+"""Persist one token-total source and its cutoff-safe cumulative history."""
 
 from __future__ import annotations
 
 import sqlite3
 
+from .rollout_privacy import canonical_timestamp
+
 
 _RANK = {"otel": 1, "app_server": 2, "rollout": 3}
+
+
+def _app_vector(item: tuple[object, ...]) -> tuple[int, int, int, int]:
+    return int(item[3]), int(item[4]), int(item[5]), int(item[6])
+
+
+def _app_winner(item: tuple[object, ...]) -> tuple[object, ...]:
+    input_tokens, cached, output, reasoning = _app_vector(item)
+    return (
+        input_tokens, output, reasoning, cached, str(item[2]), str(item[7]), int(item[8]),
+    )
+
+
+def _app_row_key(item: tuple[object, ...]) -> tuple[str, int]:
+    return str(item[7]), int(item[8])
+
+
+def _selected_app_rows(
+    candidates: list[tuple[object, ...]],
+) -> set[tuple[str, int]]:
+    """Keep an ordered cumulative history when every App receipt is timestamped."""
+    timestamped = [
+        (canonical_timestamp(item[1]).epoch, item)
+        for item in candidates
+    ]
+    if any(epoch is None for epoch, _item in timestamped):
+        return {_app_row_key(max(candidates, key=_app_winner))}
+
+    by_instant: dict[float, list[tuple[object, ...]]] = {}
+    for epoch, item in timestamped:
+        if epoch is not None:
+            by_instant.setdefault(epoch, []).append(item)
+    selected: set[tuple[str, int]] = set()
+    previous: tuple[int, int, int, int] | None = None
+    for epoch in sorted(by_instant):
+        winner = max(by_instant[epoch], key=_app_winner)
+        vector = _app_vector(winner)
+        if vector != previous:
+            selected.add(_app_row_key(winner))
+        previous = vector
+    return selected
 
 
 def refresh_token_source_selection(connection: sqlite3.Connection, project_id: str) -> None:
@@ -23,14 +66,12 @@ def refresh_token_source_selection(connection: sqlite3.Connection, project_id: s
     for session, facts in by_session.items():
         families = {str(item[0]) for item in facts}
         selected = max(families, key=_RANK.__getitem__)
-        selected_event = None
+        selected_app_rows: set[tuple[str, int]] | None = None
         app_conflict = False
         if selected == "app_server":
             candidates = [item for item in facts if item[0] == "app_server"]
-            winner = max(candidates, key=lambda item: (
-                int(item[3]), int(item[5]), int(item[6]), int(item[4]), str(item[2]),
-            ))
-            selected_event = str(winner[2])
+            winner = max(candidates, key=_app_winner)
+            selected_app_rows = _selected_app_rows(candidates)
             app_conflict = any(
                 any(int(winner[index]) < int(item[index]) for index in (3, 4, 5, 6))
                 for item in candidates
@@ -71,17 +112,27 @@ def refresh_token_source_selection(connection: sqlite3.Connection, project_id: s
             provenance = "exact"
         connection.execute(
             """UPDATE token_snapshots
-                  SET contributes_total=CASE
-                        WHEN source_family=? AND (? IS NULL OR event_key=?) THEN 1 ELSE 0 END,
-                      selection_provenance=CASE
-                        WHEN source_family=? AND (? IS NULL OR event_key=?) THEN ? ELSE 'derived' END,
-                      selection_caveat=CASE
-                        WHEN source_family=? AND (? IS NULL OR event_key=?) THEN ? ELSE NULL END
+                  SET contributes_total=0,
+                      selection_provenance='derived',
+                      selection_caveat=NULL
                 WHERE project_id=? AND session_key=?""",
-            (
-                selected, selected_event, selected_event,
-                selected, selected_event, selected_event, provenance,
-                selected, selected_event, selected_event, caveat,
-                project_id, session,
-            ),
+            (project_id, session),
         )
+        if selected_app_rows is None:
+            connection.execute(
+                """UPDATE token_snapshots
+                      SET contributes_total=1,selection_provenance=?,selection_caveat=?
+                    WHERE project_id=? AND session_key=? AND source_family=?""",
+                (provenance, caveat, project_id, session, selected),
+            )
+        else:
+            connection.executemany(
+                """UPDATE token_snapshots
+                      SET contributes_total=1,selection_provenance=?,selection_caveat=?
+                    WHERE project_id=? AND session_key=? AND source_family='app_server'
+                      AND source_digest=? AND line_number=?""",
+                (
+                    (provenance, caveat, project_id, session, source_digest, line_number)
+                    for source_digest, line_number in selected_app_rows
+                ),
+            )

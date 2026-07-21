@@ -360,7 +360,9 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     status = _status((turn or item).get("status"))
     collab = item.get("type") in {"collabToolCall", "collabAgentToolCall"}
     parent = item.get("senderThreadId") if collab else None
-    child = (item.get("newThreadId") or item.get("receiverThreadId")) if collab else None
+    # App Server uses receiverThreadId for messages and lifecycle operations on
+    # an existing agent.  Only newThreadId is affirmative spawn-lineage proof.
+    child = item.get("newThreadId") if collab else None
     return CodexEventFact(
         "app_server", APP_SERVER_V2, ordinal, event_key, event_type, observed_at, observed_ns,
         _opaque(key, "thread", thread), _opaque(key, "turn", turn_id), duration,

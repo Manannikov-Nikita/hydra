@@ -1,8 +1,14 @@
 # Hydra for Codex plugin
 
-This plugin bundle is a post-pilot interface for Hydra reports, semantic hooks,
-and the typed MCP tools. It does not replace the project-local CLI and hooks
-used during the initial five-task pilot.
+This plugin bundle is a post-pilot interface for Hydra reports and semantic
+hooks. It does not replace the project-local CLI and hooks used during the
+initial five-task pilot.
+
+The bundled MCP server advertises `hydra.report` by default. It deliberately
+does not advertise `hydra.annotate` until Codex supplies a trusted turn
+transport that can bind identity outside model-controlled arguments. During
+the pilot, the capability-bearing CLI command injected by the hook is the only
+supported annotation path.
 
 ## Installation prerequisite
 

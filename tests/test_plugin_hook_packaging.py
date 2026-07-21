@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -110,6 +111,46 @@ class PackagedHookEntrypointTests(unittest.TestCase):
             command, self.stop(session="plugin-session", turn="plugin-turn"),
         ))
 
+    def test_hook_capability_drives_real_phase_finish_and_nonblocking_stop(self) -> None:
+        command = [sys.executable, "-m", "hydra_codex.hook_runtime"]
+        context = self.assert_prompt_shape(self.invoke(
+            command, self.prompt(session="lifecycle-session", turn="lifecycle-turn"),
+        ))
+        match = re.search(
+            r"HYDRA_TURN_CAPABILITY=([A-Za-z0-9_-]+) hydra-codex annotate",
+            context,
+        )
+        self.assertIsNotNone(match)
+        environment = {**self.environment, "HYDRA_TURN_CAPABILITY": match.group(1)}
+
+        common = [
+            "--scope-change", "none", "--task-family", "telemetry",
+            "--confidence", "1",
+        ]
+        for semantic in (
+            ["--kind", "phase", "--phase", "implement", "--cause", "plan",
+             "--note", "implementation", *common],
+            ["--kind", "finish", "--phase", "test_full", "--cause", "final_verification",
+             "--outcome", "success", "--note", "verified", *common],
+        ):
+            completed = subprocess.run(
+                [sys.executable, "-m", "hydra_codex", "annotate", *semantic],
+                cwd=self.root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout), {
+                "command": "annotate", "status": "ok",
+            })
+
+        self.assertEqual(self.invoke(
+            command, self.stop(session="lifecycle-session", turn="lifecycle-turn"),
+        ), {})
+
     def test_project_hook_owns_events_when_plugin_is_enabled_in_same_checkout(self) -> None:
         (self.root / ".codex").mkdir()
         (self.root / ".codex" / "hooks.json").write_text(
@@ -174,6 +215,16 @@ class PluginHookContractTests(unittest.TestCase):
         self.assertIn("post-pilot", normalized)
         self.assertIn("hydra-codex must be installed", normalized)
         self.assertIn("hydra-codex-hook", normalized)
+        self.assertIn("hydra.report", normalized)
+        self.assertIn("trusted turn transport", normalized)
+        self.assertIn("does not advertise `hydra.annotate`", normalized)
+
+        schema = (
+            ROOT / "plugins" / "hydra-codex" / "skills" / "hydra-report"
+            / "references" / "report-schema.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("`hydra.report/v2`", schema)
+        self.assertIn("semantic_breakdown", schema)
 
 
 if __name__ == "__main__":

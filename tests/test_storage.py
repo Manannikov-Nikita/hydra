@@ -275,13 +275,30 @@ class SQLiteStorageTests(unittest.TestCase):
                 self.assertNotIn("VALUE", stored)
 
     def test_task_family_persists_and_round_trips(self) -> None:
-        self.store.write_annotation(annotation("ann-family", 1, task_family="privacy-hardening"))
+        self.store.write_annotation(annotation(
+            "ann-family", 1, task_family="release-workflow-hardening",
+        ))
 
         row = self.store.connection.execute(
             "SELECT task_family FROM annotations WHERE annotation_id = ?", ("ann-family",)
         ).fetchone()
-        self.assertEqual(row[0], "privacy-hardening")
-        self.assertEqual(self.store.list_annotations("session-1")[0].task_family, "privacy-hardening")
+        self.assertEqual(row[0], "release-workflow-hardening")
+        self.assertEqual(
+            self.store.list_annotations("session-1")[0].task_family,
+            "release-workflow-hardening",
+        )
+
+    def test_unsafe_task_family_is_rejected_before_annotation_storage(self) -> None:
+        for sequence, family in enumerate((
+            "/Users/alice/private", "alice@example.com", "raw family with spaces",
+            "019f75d4-5125-7343-8537-49b80f27f286", "token=private",
+        ), start=1):
+            with self.subTest(family=family):
+                with self.assertRaisesRegex(ValueError, "privacy-safe category"):
+                    self.store.write_annotation(annotation(
+                        f"unsafe-family-{sequence}", sequence, task_family=family,
+                    ))
+        self.assertEqual(self.store.count("annotations"), 0)
 
     def test_conflicts_do_not_store_the_raw_note(self) -> None:
         raw_note = "password=unpersistable-secret-123456"

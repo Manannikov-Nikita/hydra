@@ -7,6 +7,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Mapping
 
+from .reconcile_annotations import AnnotationFacts
 from .task_tree_types import ScalarFact, TaskTreeMetrics
 
 
@@ -28,6 +29,7 @@ class TaskPlan:
 @dataclass(frozen=True)
 class SemanticTaskFacts:
     task_family: str | None
+    annotations: AnnotationFacts
     coverage: ScalarFact
     classified_working: int
     unclassified_working: ScalarFact
@@ -43,6 +45,8 @@ class SemanticTaskFacts:
     diagnostics: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.annotations, AnnotationFacts):
+            raise ValueError("annotations must be AnnotationFacts")
         for name in (
             "classified_working", "marker_count", "self_report_missing",
             "semantic_conflicts", "schema_diagnostics",

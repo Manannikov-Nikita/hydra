@@ -43,6 +43,59 @@ def _md_fact(fact: NumericFact) -> str:
     )
 
 
+def _trend_text(report: TaskReport) -> str:
+    signal = report.trend_result.corroborating_signal or "none"
+    return f"Trend warning: {'yes' if report.trend_result.warning else 'no'}; signal: {signal}"
+
+
+def _pilot_text(report: TaskReport) -> str:
+    receipt = "yes" if report.pilot_health.receipt_verified else "no"
+    return f"Pilot status: {report.pilot_health.status}; receipt verified: {receipt}"
+
+
+def _marker_values(marker: object) -> tuple[object, ...]:
+    return (
+        marker.kind, marker.phase, marker.cause, marker.scope_change,
+        marker.outcome or "none", marker.confidence, marker.note, marker.provenance,
+    )
+
+
+def _semantic_markdown(report: TaskReport) -> list[str]:
+    summary = report.semantic_breakdown.annotations
+    lines: list[str] = []
+    if summary.timeline:
+        lines.extend([
+            "", "## Semantic marker timeline", "",
+            (
+                f"Showing {len(summary.timeline)} of {_number(summary.total_count.value)} model markers; "
+                f"truncated={_number(summary.truncated_count.value)}."
+            ),
+            "",
+            "| Kind | Phase | Cause | Scope change | Outcome | Confidence | Note | Provenance |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        lines.extend(
+            "| " + " | ".join(_md(value) for value in _marker_values(marker)) + " |"
+            for marker in summary.timeline
+        )
+    if summary.test_evidence.rows:
+        lines.extend([
+            "", "## Deterministic test evidence", "",
+            "| Scope | Failure cause | Retry kind | Semantic phase | Semantic cause | Count |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ])
+        lines.extend(
+            "| " + " | ".join((
+                *(_md(value) for value in (
+                    row.scope, row.failure_cause, row.retry_kind, row.phase, row.cause,
+                )),
+                _md_fact(row.count),
+            )) + " |"
+            for row in summary.test_evidence.rows
+        )
+    return lines
+
+
 def _report_markdown(report: TaskReport) -> str:
     family = report.task_family if report.task_family is not None else "unavailable"
     lines = [
@@ -52,6 +105,8 @@ def _report_markdown(report: TaskReport) -> str:
         f"- Status: {_md(report.status)}",
         f"- Last activity: {_md(report.last_activity_at)}",
         f"- Task family: {_md(family)}",
+        f"- {_md(_trend_text(report))}",
+        f"- {_md(_pilot_text(report))}",
         "",
         "| Metric | Value; provenance; lower bound; caveats |",
         "| --- | --- |",
@@ -60,6 +115,7 @@ def _report_markdown(report: TaskReport) -> str:
         f"| {_md(name)} | {_md_fact(fact)} |"
         for name, fact in report.public_facts().items()
     )
+    lines.extend(_semantic_markdown(report))
     return "\n".join(lines) + "\n"
 
 
@@ -112,11 +168,51 @@ def _document(title: str, heading: str, summary: str, headers: tuple[str, ...], 
     )
 
 
+def _semantic_html(report: TaskReport) -> str:
+    summary = report.semantic_breakdown.annotations
+    sections: list[str] = []
+    if summary.timeline:
+        header = "".join(
+            f"<th>{item}</th>" for item in
+            ("Kind", "Phase", "Cause", "Scope change", "Outcome", "Confidence", "Note", "Provenance")
+        )
+        rows = "".join(
+            "<tr>" + "".join(
+                f"<td>{escape(str(value))}</td>" for value in _marker_values(marker)
+            ) + "</tr>"
+            for marker in summary.timeline
+        )
+        sections.append(
+            "<h2>Semantic marker timeline</h2>"
+            f"<p>Showing {len(summary.timeline)} of {escape(_number(summary.total_count.value))} "
+            f"model markers; truncated={escape(_number(summary.truncated_count.value))}.</p>"
+            f"<table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table>"
+        )
+    if summary.test_evidence.rows:
+        header = "".join(
+            f"<th>{item}</th>" for item in
+            ("Scope", "Failure cause", "Retry kind", "Semantic phase", "Semantic cause", "Count")
+        )
+        rows = "".join(
+            "<tr>" + "".join(f"<td>{escape(str(value))}</td>" for value in (
+                row.scope, row.failure_cause, row.retry_kind, row.phase, row.cause,
+            )) + f"<td>{_html_fact(row.count)}</td></tr>"
+            for row in summary.test_evidence.rows
+        )
+        sections.append(
+            "<h2>Deterministic test evidence</h2>"
+            f"<table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table>"
+        )
+    return "".join(sections)
+
+
 def _report_html(report: TaskReport) -> str:
     family = report.task_family if report.task_family is not None else "unavailable"
     summary = (
         f"<p>Task <code>{escape(report.task_ref)}</code>; status {escape(report.status)}; "
         f"last activity {escape(report.last_activity_at)}; family {escape(family)}.</p>"
+        f"<p>{escape(_trend_text(report))}</p>"
+        f"<p>{escape(_pilot_text(report))}</p>{_semantic_html(report)}"
     )
     rows = [
         (escape(name), _html_fact(fact))
@@ -178,6 +274,39 @@ def render_report_collection(reports: tuple[TaskReport, ...], output_format: str
             for report in reports
             for name, fact in report.public_facts().items()
         ]
+        rows.extend(
+            (
+                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                "trend.warning", escape(_trend_text(report)),
+            )
+            for report in reports
+        )
+        rows.extend(
+            (
+                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                "pilot.status", escape(_pilot_text(report)),
+            )
+            for report in reports
+        )
+        rows.extend(
+            (
+                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                "semantic.marker", escape("; ".join(str(value) for value in _marker_values(marker))),
+            )
+            for report in reports
+            for marker in report.semantic_breakdown.annotations.timeline
+        )
+        rows.extend(
+            (
+                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                "semantic.test_evidence", escape("; ".join((
+                    item.scope, item.failure_cause, item.retry_kind, item.phase, item.cause,
+                    str(item.count.value), item.count.provenance,
+                ))),
+            )
+            for report in reports
+            for item in report.semantic_breakdown.annotations.test_evidence.rows
+        )
         summary = f"<p>{len(reports)} reconciled tasks.</p>"
         return _document(
             "Hydra task reports", "Hydra task reports", summary,

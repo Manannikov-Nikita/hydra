@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 
+from hydra_codex import report_operations
 from hydra_codex.report_renderers import (
     render_html,
     render_json,
@@ -107,7 +108,7 @@ class PublicReportContractTests(unittest.TestCase):
         )
         payload = json.loads(render_json(report))
 
-        self.assertEqual(REPORT_SCHEMA, "hydra.report/v2")
+        self.assertEqual(REPORT_SCHEMA, "hydra.report/v3")
         self.assertEqual(payload["schema_version"], REPORT_SCHEMA)
         self.assertEqual(payload["task_ref"], public_ref)
         self.assertEqual(payload["status"], "complete")
@@ -144,8 +145,9 @@ class PublicReportContractTests(unittest.TestCase):
         self.assertIn("semantic_conflicts_unavailable", report.semantic_conflicts.caveats)
         self.assertIsNone(report.schema_diagnostics.value)
         self.assertIsNone(report.instrumentation_overhead.value)
-        self.assertEqual(report.pilot_health.task_count.value, 1)
-        self.assertIsNone(report.pilot_health.missing_marker_rate.value)
+        self.assertEqual(report.pilot_health.task_count.value, 0)
+        self.assertEqual(report.pilot_health.missing_marker_rate.value, 0.0)
+        self.assertEqual(report.pilot_health.status, "not_started")
 
     def test_adapter_rejects_wrong_public_metric_units(self) -> None:
         with self.assertRaisesRegex(ValueError, "semantic_conflicts must be a count"):
@@ -245,14 +247,16 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertIn("<style>", html)
         self.assertNotIn("https://", html)
         self.assertNotIn("file://", html)
-        self.assertEqual(malicious.task_family, "redacted")
+        self.assertIsNone(malicious.task_family)
         self.assertNotIn("[click]", render_markdown(malicious))
         self.assertNotIn("example.invalid", render_html(malicious))
 
     def test_rendered_payload_has_no_private_field_names(self) -> None:
         report = self.report("private-root", 10)
         comparison = compare_reports(report, self.report("other-root", 20))
-        forbidden = ("root_id", "session_ids", "absolute_path", "prompt", "message", "note")
+        forbidden = (
+            "root_id", "session_ids", "absolute_path", "message", "observed_at", "note_hash",
+        )
 
         for artifact in (
             render_json(report), render_markdown(report), render_html(report),
@@ -264,17 +268,27 @@ class CompareAndRendererTests(unittest.TestCase):
                 self.assertNotIn("private-root", artifact)
                 self.assertNotIn("other-root", artifact)
 
-    def test_sensitive_task_family_is_redacted_before_public_rendering(self) -> None:
+    def test_sensitive_task_family_is_unavailable_and_cannot_form_false_cohort(self) -> None:
         for private_family in (
             "/workspace/acme/private", r"C:\Users\private\project",
             "019f75d4-5125-7343-8537-49b80f27f286", "raw note with spaces",
         ):
             with self.subTest(private_family=private_family):
                 report = self.report("safe-root", 10, task_family=private_family)
-                self.assertEqual(report.task_family, "redacted")
-                self.assertEqual(report.trend_input.task_family, "redacted")
+                self.assertIsNone(report.task_family)
+                self.assertIsNone(report.trend_input.task_family)
                 for artifact in (render_json(report), render_markdown(report), render_html(report)):
                     self.assertNotIn(private_family, artifact)
+
+        reports = tuple(
+            self.report(
+                f"private-{index}", 200 if index == 4 else 100,
+                task_family=f"/workspace/private-family-{index % 2}",
+            )
+            for index in range(5)
+        )
+        evaluated = report_operations.evaluate_report_trends(reports)
+        self.assertFalse(any(item.trend_result.warning for item in evaluated))
 
     def test_all_formats_and_comparison_share_pilot_and_trend_facts(self) -> None:
         baseline = self.report("baseline", 10)
@@ -288,10 +302,13 @@ class CompareAndRendererTests(unittest.TestCase):
             self.assertIn(name, render_html(baseline))
         payload = json.loads(render_json(baseline))
         self.assertIn("missing_marker_rate", payload["pilot_health"])
-        self.assertIn("review_fix_cycles", payload["trend_input"])
+        self.assertIn("review_fix_cycles", payload["trend"]["input"])
 
     def test_trend_window_selects_current_and_four_prior_completed_family_matches(self) -> None:
-        current = self.report("current", 200)
+        current = replace(
+            self.report("current", 200),
+            last_activity_at="2026-07-22T00:00:00Z",
+        )
         history = [
             self.report(f"quiz-{index}", 100 + index, complete=index != 1)
             for index in range(7)
@@ -319,7 +336,10 @@ class CompareAndRendererTests(unittest.TestCase):
         )
 
     def test_trend_window_uses_instants_deduplicates_and_rejects_incomplete_current(self) -> None:
-        current = self.report("current", 200)
+        current = replace(
+            self.report("current", 200),
+            last_activity_at="2026-07-21T10:00:00Z",
+        )
         earlier = replace(self.report("earlier", 100), last_activity_at="2026-07-21T10:30:00+02:00")
         later = replace(self.report("later", 110), last_activity_at="2026-07-21T09:00:00Z")
         duplicate_later = replace(later, last_activity_at="2026-07-21T09:30:00Z")

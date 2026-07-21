@@ -292,7 +292,7 @@ class ReconcileEngineTests(unittest.TestCase):
             self.store, project_id=PROJECT, public_ref=task.public_ref,
         )
         self.assertEqual(report.semantic_coverage.value, 1.0)
-        self.assertEqual(report.schema_version, "hydra.report/v2")
+        self.assertEqual(report.schema_version, "hydra.report/v3")
         self.assertEqual(report.semantic_breakdown.phases["understand"].working.value, 90)
         self.assertEqual(report.semantic_breakdown.phases["understand"].full_context.value, 110)
         self.assertEqual(report.semantic_breakdown.phases["understand"].reasoning.value, 5)
@@ -339,8 +339,8 @@ class ReconcileEngineTests(unittest.TestCase):
         self.assertEqual(tasks[0].semantic.phase_working, {})
         reports = list_reconciled_reports(self.store, project_id=PROJECT, limit=1)
         self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0].pilot_health.task_count.value, 2)
-        self.assertEqual(reports[0].pilot_health.missing_marker_rate.value, 0.5)
+        self.assertEqual(reports[0].pilot_health.task_count.value, 1)
+        self.assertEqual(reports[0].pilot_health.missing_marker_rate.value, 1.0)
 
     def test_query_fails_closed_when_sources_change_after_reconciliation(self) -> None:
         self.session("root", 0)
@@ -533,7 +533,8 @@ class ReconcileEngineTests(unittest.TestCase):
             manifest["expected"]["full_context"],
         )
         self.assertEqual(report.semantic_breakdown.marker_count.value, 0)
-        self.assertEqual(report.pilot_health.missing_marker_rate.value, 1.0)
+        self.assertEqual(report.pilot_health.task_count.value, 0)
+        self.assertEqual(report.pilot_health.missing_marker_rate.value, 0.0)
         self.assertNotIn(manifest["root"], render_json(report))
 
 

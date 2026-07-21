@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
+from .redaction import validate_task_family
+
 
 class AnnotationKind(str, Enum):
     PHASE = "phase"
@@ -85,11 +87,7 @@ def _note(value: str) -> str:
 
 
 def _task_family(value: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("task_family must be non-empty text")
-    if len(value) > 80:
-        raise ValueError("task_family must not exceed 80 characters")
-    return value
+    return validate_task_family(value)
 
 
 def _non_negative_integer(value: int, field: str) -> int:

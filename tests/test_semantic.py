@@ -219,7 +219,7 @@ class TrendRuleTests(unittest.TestCase):
                 self.assertFalse(result.warning)
                 self.assertIn("incomparable_working_tokens", result.caveats)
 
-    def test_trend_keeps_corroborating_signal_exact(self) -> None:
+    def test_trend_rejects_derived_signal_without_completeness_proof(self) -> None:
         history = tuple(
             self.task(
                 value,

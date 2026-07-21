@@ -5,6 +5,12 @@ from __future__ import annotations
 import re
 
 
+_SAFE_TASK_FAMILY = re.compile(r"[a-z][a-z0-9_.-]{0,79}\Z")
+_PRIVATE_IDENTIFIER = re.compile(
+    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z", re.IGNORECASE,
+)
+
+
 def redact_note(note: str) -> str:
     normalized = " ".join("".join(
         " " if ord(character) < 32 or ord(character) == 127 else character
@@ -22,3 +28,22 @@ def redact_note(note: str) -> str:
     if not normalized or any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in sensitive_patterns):
         return "[redacted]"
     return normalized
+
+
+def validate_task_family(value: object) -> str:
+    """Accept only short categorical codes safe to persist and cohort."""
+    if (
+        not isinstance(value, str)
+        or _SAFE_TASK_FAMILY.fullmatch(value) is None
+        or _PRIVATE_IDENTIFIER.fullmatch(value) is not None
+    ):
+        raise ValueError("task_family must be a privacy-safe category")
+    return value
+
+
+def project_task_family(value: object) -> str | None:
+    """Hide unsafe legacy values instead of collapsing them into one cohort."""
+    try:
+        return validate_task_family(value)
+    except ValueError:
+        return None

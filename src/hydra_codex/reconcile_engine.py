@@ -11,6 +11,7 @@ import sqlite3
 from typing import Iterable
 
 from .public_refs import project_public_references
+from .reconcile_annotations import AnnotationFacts
 from .reconcile_facts import (
     DeltaFact,
     SemanticAssembly,
@@ -84,6 +85,21 @@ def _task_fingerprint(
         "unique_provenance": [unique.provenance, list(unique.caveats)],
         "facts": scalar_facts,
         "family": semantic.task_family,
+        "annotations": {
+            "instrumented": semantic.annotations.instrumented,
+            "finish_count": semantic.annotations.finish_count,
+            "kind_counts": sorted(semantic.annotations.kind_counts.items()),
+            "cause_counts": sorted(semantic.annotations.cause_counts.items()),
+            "scope_counts": sorted(semantic.annotations.scope_change_counts.items()),
+            "outcome_counts": sorted(semantic.annotations.finish_outcome_counts.items()),
+            "deterministic_causes": sorted(semantic.annotations.deterministic_test_causes.items()),
+            "test_evidence": [
+                item.fingerprint() for item in semantic.annotations.test_evidence
+            ],
+            "timeline": [item.fingerprint() for item in semantic.annotations.timeline],
+            "truncated": semantic.annotations.truncated_count,
+            "source": semantic.annotations.source_fingerprint,
+        },
         "coverage": semantic.coverage.value,
         "classified": semantic.classified_working,
         "unclassified": _fact_fingerprint(semantic.unclassified_working),
@@ -274,7 +290,8 @@ def reconcile_project(
 
 
 def _semantic_from_store(
-    connection: sqlite3.Connection, project_id: str, root_key: str, task_family: str | None,
+    connection: sqlite3.Connection, project_id: str, root_key: str,
+    task_family: str | None, annotations: AnnotationFacts,
 ) -> SemanticTaskFacts:
     summary = connection.execute(
         """SELECT * FROM reconciled_semantic_summaries
@@ -331,7 +348,7 @@ def _semantic_from_store(
         )
 
     return SemanticTaskFacts(
-        task_family, coverage, int(summary["classified_working"]),
+        task_family, annotations, coverage, int(summary["classified_working"]),
         unclassified_fact("working"),
         unclassified_fact("full_context"),
         unclassified_fact("reasoning"),
@@ -368,6 +385,7 @@ def list_reconciled_tasks(
         ):
             raise ReconciliationStale("source facts changed; run reconcile before reporting")
         metrics_by_root = {item[0].root_key: item[1] for item in assembled}
+        annotations_by_root = {item[0].root_key: item[3].annotations for item in assembled}
         rows.sort(key=lambda row: (
             -_timestamp(row["last_activity_at"]).timestamp(), str(row["public_ref"]),
         ))
@@ -379,6 +397,7 @@ def list_reconciled_tasks(
             metrics = metrics_by_root[str(row["root_key"])]
             semantic = _semantic_from_store(
                 store.connection, project_id, row["root_key"], row["task_family"],
+                annotations_by_root[str(row["root_key"])],
             )
             tasks.append(ReconciledTask(
                 str(row["public_ref"]), str(row["status"]), cutoff,

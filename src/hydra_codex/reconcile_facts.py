@@ -8,6 +8,12 @@ from datetime import datetime, timedelta
 import sqlite3
 from typing import Iterable
 
+from .reconcile_annotations import (
+    AnnotationFacts,
+    build_annotation_facts,
+    load_intervals,
+    phase_at,
+)
 from .task_tree_storage import (
     _activities,
     _lifecycle,
@@ -42,6 +48,7 @@ class DeltaFact:
 @dataclass(frozen=True)
 class SemanticAssembly:
     task_family: str | None
+    annotations: AnnotationFacts
     coverage: ScalarFact
     classified_working: int
     unclassified_working: ScalarFact
@@ -138,39 +145,6 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
     return tuple(sorted(plans, key=lambda item: item.root_key))
 
 
-def _intervals(
-    connection: sqlite3.Connection, project_id: str, sessions: tuple[str, ...], cutoff: datetime,
-) -> dict[str, list[tuple[datetime, datetime | None, str, str]]]:
-    if not sessions:
-        return {}
-    placeholders = ",".join("?" for _ in sessions)
-    rows = connection.execute(
-        f"""SELECT session_key,started_at,ended_at,phase,cause
-                FROM semantic_intervals
-               WHERE project_id=? AND session_key IN ({placeholders})""",
-        (project_id, *sessions),
-    )
-    result: dict[str, list[tuple[datetime, datetime | None, str, str]]] = defaultdict(list)
-    for row in rows:
-        start = _optional_timestamp(row[1])
-        end = _optional_timestamp(row[2])
-        if start is not None and start <= cutoff:
-            result[str(row[0])].append((start, end, str(row[3]), str(row[4])))
-    for values in result.values():
-        values.sort(key=lambda item: (item[0], item[1] or cutoff, item[2], item[3]))
-    return result
-
-
-def _phase_at(
-    intervals: list[tuple[datetime, datetime | None, str, str]], observed: datetime,
-) -> tuple[str | None, str | None, bool]:
-    matches = [item for item in intervals if item[0] <= observed and (item[1] is None or observed < item[1])]
-    if not matches:
-        return None, None, False
-    selected = max(matches, key=lambda item: (item[0], item[2], item[3]))
-    return selected[2], selected[3], len(matches) > 1
-
-
 def _subtract(current: TokenVector, previous: TokenVector) -> TokenVector | None:
     try:
         return current.subtract(previous)
@@ -205,7 +179,9 @@ def build_token_deltas(
             plan.session_ids,
         )
     }
-    intervals = _intervals(connection, project_id, plan.session_ids, plan.cutoff_at)
+    intervals, _invalid_intervals = load_intervals(
+        connection, project_id, plan.session_ids, plan.cutoff_at,
+    )
     diagnostics: Counter[str] = Counter()
     previous: dict[tuple[str, int], TokenVector] = {}
     deltas: list[DeltaFact] = []
@@ -266,7 +242,7 @@ def build_token_deltas(
             continue
         phase = cause = None
         if observed is not None and not amount_estimated:
-            phase, cause, overlap = _phase_at(intervals.get(session_key, []), observed)
+            phase, cause, overlap = phase_at(intervals.get(session_key, []), observed)
             if overlap:
                 diagnostics["overlapping_semantic_intervals"] += 1
                 phase = cause = None
@@ -279,7 +255,7 @@ def build_token_deltas(
 
     allocation = allocate_otel_hints(
         connection, project_id, plan.session_ids, plan.cutoff_at, deltas,
-        lambda session, observed: _phase_at(intervals.get(session, []), observed),
+        lambda session, observed: phase_at(intervals.get(session, []), observed),
     )
     if allocation.replaced_sessions:
         deltas = [
@@ -303,34 +279,6 @@ def build_token_deltas(
         ]
     diagnostics.update(allocation.diagnostics)
     return tuple(deltas), diagnostics
-
-
-def _test_cause_conflicts(
-    connection: sqlite3.Connection, project_id: str, plan: TaskPlan,
-) -> tuple[set[str], set[str]]:
-    placeholders = ",".join("?" for _ in plan.session_ids)
-    intervals = _intervals(connection, project_id, plan.session_ids, plan.cutoff_at)
-    conflicts: set[str] = set()
-    invalid: set[str] = set()
-    rows = connection.execute(
-        f"""SELECT evidence_key,session_key,observed_at,failure_cause,source_digest,line_number
-               FROM rollout_test_runs
-              WHERE session_key IN ({placeholders}) AND completeness='complete'
-                AND failure_cause IN ('product_failure','infra_failure')""",
-        plan.session_ids,
-    )
-    expected = {"product_failure": "test_failure", "infra_failure": "infra_failure"}
-    for evidence, session, value, failure, source, line in rows:
-        observed = _optional_timestamp(value)
-        if observed is None:
-            invalid.add(str(evidence))
-            continue
-        if observed > plan.cutoff_at:
-            continue
-        _phase, model_cause, overlap = _phase_at(intervals.get(str(session), []), observed)
-        if not overlap and model_cause is not None and model_cause != expected[str(failure)]:
-            conflicts.add(f"{source}:{line}")
-    return conflicts, invalid
 
 
 def semantic_assembly(
@@ -455,11 +403,11 @@ def semantic_assembly(
             old_conflicts.add(f"{source}:{line}")
         else:
             diagnostics["ambiguous_legacy_conflict_placement"] += 1
-    detected_conflicts, invalid_test_times = _test_cause_conflicts(
-        connection, project_id, plan,
+    annotations = build_annotation_facts(
+        connection, project_id, plan.session_ids, plan.cutoff_at,
     )
-    if invalid_test_times:
-        diagnostics["semantic:invalid_test_timestamp"] += len(invalid_test_times)
+    if annotations.invalid_test_times:
+        diagnostics["semantic:invalid_test_timestamp"] += len(annotations.invalid_test_times)
     schema_rows = list(connection.execute(
         f"""SELECT d.envelope_kind,e.observed_at,l.logical_source_key,d.line_number
               FROM rollout_diagnostics d
@@ -480,18 +428,17 @@ def semantic_assembly(
     for code, count in staged.items():
         if code not in {"self_report_missing", "semantic_conflict"}:
             diagnostics[f"semantic:{code}"] += int(count)
-    family, family_conflict, invalid_family_times, marker_count = _task_family(
-        connection, project_id, plan.session_ids, plan.cutoff_at,
-    )
-    if family_conflict:
+    if annotations.family_conflict:
         diagnostics["task_family_conflict"] += 1
-    if invalid_family_times:
-        diagnostics["semantic:invalid_annotation_timestamp"] += invalid_family_times
+    if annotations.invalid_annotation_timestamps:
+        diagnostics["semantic:invalid_annotation_timestamp"] += annotations.invalid_annotation_timestamps
+    if annotations.invalid_interval_timestamps:
+        diagnostics["semantic:invalid_interval_timestamp"] += annotations.invalid_interval_timestamps
     schema_count = sum(count for code, count in diagnostics.items() if code.startswith(("schema:", "semantic:")))
     return SemanticAssembly(
-        family, coverage, classified, unclassified, unclassified_full,
+        annotations.task_family, annotations, coverage, classified, unclassified, unclassified_full,
         unclassified_reasoning, dict(phase_working), dict(phase_full),
-        dict(phase_reasoning), marker_count, staged["self_report_missing"],
-        staged["semantic_conflict"] + len(old_conflicts | detected_conflicts), schema_count,
+        dict(phase_reasoning), annotations.marker_count, staged["self_report_missing"],
+        staged["semantic_conflict"] + len(old_conflicts | set(annotations.detected_conflicts)), schema_count,
         tuple(sorted(diagnostics)), dict(diagnostics),
     )

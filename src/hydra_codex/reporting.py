@@ -10,16 +10,14 @@ from types import MappingProxyType
 from typing import Mapping
 
 from .public_refs import PublicReferenceProjection, project_public_references
-from .redaction import redact_note
-from .report_semantics import SemanticBreakdown
+from .redaction import project_task_family
+from .report_semantics import SemanticBreakdown, TrendAssessment
 from .task_tree_types import ScalarFact, TokenVectorFact, validate_provenance
 
 
-REPORT_SCHEMA = "hydra.report/v2"
+REPORT_SCHEMA = "hydra.report/v3"
 _PUBLIC_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z")
-_SAFE_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
-_PRIVATE_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z", re.IGNORECASE)
 _UNITS = frozenset({"tokens", "milliseconds", "count", "ratio", "percent"})
 
 
@@ -39,13 +37,8 @@ def _caveats(values: tuple[str, ...]) -> tuple[str, ...]:
     return values
 
 
-def _safe_family(value: str) -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > 80:
-        raise ValueError("task_family must be non-empty text up to 80 characters")
-    return value if (
-        redact_note(value) == value and _SAFE_FAMILY.fullmatch(value)
-        and _PRIVATE_ID.fullmatch(value) is None
-    ) else "redacted"
+def _safe_family(value: str) -> str | None:
+    return project_task_family(value)
 
 
 def _expect_fact(
@@ -150,6 +143,9 @@ class PilotHealth:
     instrumentation_calls: NumericFact
     instrumentation_overhead: NumericFact
     schema_diagnostics: NumericFact
+    status: str
+    receipt_verified: bool
+    caveats: tuple[str, ...]
 
     def __post_init__(self) -> None:
         for field in (
@@ -160,9 +156,16 @@ class PilotHealth:
         for field in ("missing_marker_rate", "semantic_coverage"):
             _expect_fact(getattr(self, field), field, "ratio", maximum=1)
         _expect_fact(self.instrumentation_overhead, "instrumentation_overhead", "tokens", integer=True)
+        if self.status not in {"not_started", "measuring", "awaiting_receipt", "verified", "unverified"}:
+            raise ValueError("invalid pilot status")
+        if not isinstance(self.receipt_verified, bool):
+            raise ValueError("pilot receipt flag must be boolean")
+        _caveats(self.caveats)
+        if self.status == "verified" and not self.receipt_verified:
+            raise ValueError("verified pilot requires a receipt")
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             field: getattr(self, field).as_dict()
             for field in (
                 "task_count", "missing_marker_rate", "semantic_coverage",
@@ -170,6 +173,12 @@ class PilotHealth:
                 "instrumentation_overhead", "schema_diagnostics",
             )
         }
+        result.update({
+            "status": self.status,
+            "receipt_verified": self.receipt_verified,
+            "caveats": list(self.caveats),
+        })
+        return result
 
 
 @dataclass(frozen=True)
@@ -235,6 +244,7 @@ class TaskReport:
     instrumentation_overhead: NumericFact
     pilot_health: PilotHealth
     trend_input: TrendInput
+    trend_result: TrendAssessment
 
     def __post_init__(self) -> None:
         if self.schema_version != REPORT_SCHEMA:
@@ -270,7 +280,11 @@ class TaskReport:
         if not isinstance(self.semantic_breakdown, SemanticBreakdown):
             raise ValueError("semantic_breakdown must be a SemanticBreakdown")
         _expect_fact(self.instrumentation_overhead, "instrumentation_overhead", "tokens", integer=True)
-        if not isinstance(self.pilot_health, PilotHealth) or not isinstance(self.trend_input, TrendInput):
+        if (
+            not isinstance(self.pilot_health, PilotHealth)
+            or not isinstance(self.trend_input, TrendInput)
+            or not isinstance(self.trend_result, TrendAssessment)
+        ):
             raise ValueError("report pilot and trend contracts are required")
         if (
             self.trend_input.task_ref != self.task_ref
@@ -311,6 +325,7 @@ class TaskReport:
             "instrumentation_overhead_tokens": self.instrumentation_overhead,
         })
         metrics.update(self.semantic_breakdown.public_facts())
+        metrics.update(self.trend_result.public_facts())
         return dict(sorted(metrics.items()))
 
     def public_facts(self) -> dict[str, NumericFact]:
@@ -357,12 +372,16 @@ class TaskReport:
             "semantic": {
                 "coverage": self.semantic_coverage.as_dict(),
                 "breakdown": self.semantic_breakdown.as_dict(),
+                "annotations": self.semantic_breakdown.annotations.as_dict(),
                 "conflicts": self.semantic_conflicts.as_dict(),
                 "schema_diagnostics": self.schema_diagnostics.as_dict(),
             },
             "instrumentation_overhead": self.instrumentation_overhead.as_dict(),
             "pilot_health": self.pilot_health.as_dict(),
-            "trend_input": self.trend_input.as_dict(),
+            "trend": {
+                "input": self.trend_input.as_dict(),
+                "result": self.trend_result.as_dict(),
+            },
         }
 
 
@@ -453,4 +472,9 @@ class TrendWindow:
         }
 
 
-from .report_operations import build_trend_window, compare_reports, report_from_task_tree
+from .report_operations import (
+    build_trend_window,
+    compare_reports,
+    evaluate_report_trends,
+    report_from_task_tree,
+)

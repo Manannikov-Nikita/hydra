@@ -345,7 +345,7 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertEqual(len(payload["reports"]), 2)
         self.assertEqual(
             {item["schema_version"] for item in payload["reports"]},
-            {"hydra.report/v2"},
+            {"hydra.report/v3"},
         )
         refs = [item["task_ref"] for item in payload["reports"]]
         self.assertTrue(all(re.fullmatch(r"task_[0-9a-f]+", item) for item in refs))

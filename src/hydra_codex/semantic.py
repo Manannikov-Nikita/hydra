@@ -124,11 +124,15 @@ class ComparableTask:
     read_amplification_provenance: str = "exact"
     review_fix_cycles_provenance: str = "exact"
     compactions_provenance: str = "exact"
+    test_reruns_complete: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_family, str) or not self.task_family:
             raise ValueError("task_family must be non-empty text")
-        for field in ("completed", "compaction_normalized", "metrics_complete"):
+        for field in (
+            "completed", "compaction_normalized", "metrics_complete",
+            "test_reruns_complete",
+        ):
             if not isinstance(getattr(self, field), bool):
                 raise ValueError(f"{field} must be boolean")
         for field in (
@@ -398,9 +402,19 @@ def evaluate_trend(current: ComparableTask, history: Iterable[ComparableTask]) -
             continue
         values = [getattr(item, field) for item in cohort]
         provenances = [getattr(item, provenance_field) for item in cohort]
-        if any(value is None for value in values) or any(value != "exact" for value in provenances):
+        comparable_provenance = [
+            provenance == "exact" or (
+                field == "test_reruns"
+                and provenance == "derived"
+                and item.test_reruns_complete
+            )
+            for item, provenance in zip(cohort, provenances)
+        ]
+        if any(value is None for value in values) or not all(comparable_provenance):
             caveats.add(f"incomparable_{field}")
             continue
+        if field == "test_reruns" and any(value == "derived" for value in provenances):
+            caveats.add("deterministic_derived_test_reruns")
         signal_baseline = median(value for value in values[:-1] if value is not None)
         growth = values[-1] - signal_baseline  # type: ignore[operator]
         if growth > 0:

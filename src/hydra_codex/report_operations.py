@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable
 
 from .task_tree_types import TaskTreeMetrics
 
 if TYPE_CHECKING:
-    from .report_semantics import SemanticBreakdown
+    from .report_semantics import SemanticBreakdown, TrendAssessment
     from .reporting import ComparisonReport, NumericFact, TaskReport, TrendWindow
 
 
@@ -35,7 +36,7 @@ def report_from_task_tree(
         _safe_family,
         _unavailable,
     )
-    from .report_semantics import SemanticBreakdown
+    from .report_semantics import SemanticBreakdown, TrendAssessment
 
     safe_family = None if task_family is None else _safe_family(task_family)
     breakdown = semantic_breakdown or SemanticBreakdown.empty()
@@ -47,20 +48,23 @@ def report_from_task_tree(
     semantic_coverage = _from_scalar(metrics.semantic_coverage, "ratio")
     instrumentation_calls = _from_scalar(metrics.instrumentation_calls, "count")
     pilot = PilotHealth(
-        NumericFact(1, "count", "exact", lower_bound=1),
-        _unavailable("ratio", "missing_marker_rate_unavailable"),
+        NumericFact(0, "count", "exact", lower_bound=0),
+        NumericFact(0.0, "ratio", "derived", ("no_instrumented_tasks",)),
         semantic_coverage,
-        _unavailable("count", "self_report_missing_unavailable"),
+        NumericFact(0, "count", "exact"),
         conflicts,
         instrumentation_calls,
         overhead,
         diagnostics,
+        "not_started",
+        False,
+        ("pilot_receipt_required",),
     )
     trend = TrendInput(
         public_ref, safe_family, bool(complete),
         _from_scalar(metrics.unique.working, "tokens"),
         _from_scalar(metrics.test_retries, "count"),
-        _from_scalar(metrics.file_reads, "count"),
+        _unavailable("count", "read_amplification_unavailable"),
         _unavailable("count", "review_fix_cycles_unavailable"),
         _unavailable("count", "compactions_unavailable"),
     )
@@ -76,6 +80,7 @@ def report_from_task_tree(
         _from_scalar(metrics.test_runs, "count"), _from_scalar(metrics.targeted_test_runs, "count"),
         _from_scalar(metrics.full_test_runs, "count"), _from_scalar(metrics.test_retries, "count"),
         semantic_coverage, breakdown, conflicts, diagnostics, overhead, pilot, trend,
+        TrendAssessment.unavailable(),
     )
 
 
@@ -122,10 +127,16 @@ def compare_reports(baseline: TaskReport, current: TaskReport) -> ComparisonRepo
     )
 
 
+def _instant(item: TaskReport) -> float:
+    return datetime.fromisoformat(
+        item.last_activity_at.replace("Z", "+00:00"),
+    ).timestamp()
+
+
 def _order(item: TaskReport) -> tuple[float, str, int | float]:
     value = item.deduplicated_tokens.working.value
     return (
-        datetime.fromisoformat(item.last_activity_at.replace("Z", "+00:00")).timestamp(),
+        _instant(item),
         item.task_ref, value if value is not None else -1,
     )
 
@@ -137,8 +148,90 @@ def build_trend_window(current: TaskReport, history: Iterable[TaskReport]) -> Tr
     if not current.completed or current.task_family is None:
         return TrendWindow(current.trend_input, ())
     unique = {item.task_ref: item for item in sorted(history, key=_order)}
+    current_instant = _instant(current)
     comparable = tuple(sorted((
         item for item in unique.values()
-        if item.task_ref != current.task_ref and item.completed and item.task_family == current.task_family
+        if (
+            item.task_ref != current.task_ref
+            and item.completed
+            and item.task_family == current.task_family
+            and _instant(item) < current_instant
+        )
     ), key=_order))
     return TrendWindow(current.trend_input, tuple(item.trend_input for item in comparable[-4:]))
+
+
+def _comparable(value: TrendInput):
+    from .semantic import ComparableTask
+
+    if value.task_family is None:
+        return None
+    retries_complete = (
+        value.test_retries.value is not None
+        and value.test_retries.lower_bound == value.test_retries.value
+        and value.test_retries.provenance == "derived"
+        and value.test_retries.caveats == ("reconciled_test_retries",)
+    )
+    return ComparableTask(
+        value.task_family,
+        value.completed,
+        value.working_tokens.value,
+        value.test_retries.value,
+        value.read_amplification.value,
+        value.review_fix_cycles.value,
+        value.compactions.value,
+        value.compactions.value is not None and value.compactions.provenance == "exact",
+        value.working_tokens.value is not None,
+        value.working_tokens.provenance,
+        value.test_retries.provenance,
+        value.read_amplification.provenance,
+        value.review_fix_cycles.provenance,
+        value.compactions.provenance,
+        retries_complete,
+    )
+
+
+def _assessment(window: TrendWindow):
+    from .report_semantics import TrendAssessment
+    from .reporting import NumericFact
+    from .semantic import evaluate_trend
+
+    current = _comparable(window.current)
+    if current is None:
+        return TrendAssessment.unavailable("task_family_unavailable")
+    prior = tuple(
+        candidate for item in window.prior if (candidate := _comparable(item)) is not None
+    )
+    result = evaluate_trend(current, prior)
+    signal = "test_retries" if result.corroborating_signal == "test_reruns" else result.corroborating_signal
+    return TrendAssessment(
+        result.warning,
+        signal,
+        NumericFact(
+            result.baseline_working_tokens.value, "tokens",
+            result.baseline_working_tokens.provenance, result.baseline_working_tokens.caveats,
+        ),
+        NumericFact(
+            result.token_growth.value, "tokens",
+            result.token_growth.provenance, result.token_growth.caveats,
+        ),
+        NumericFact(
+            result.signal_growth.value, "count",
+            result.signal_growth.provenance, result.signal_growth.caveats,
+        ),
+        result.caveats,
+    )
+
+
+def evaluate_report_trends(reports: Iterable[TaskReport]) -> tuple[TaskReport, ...]:
+    """Attach conservative assessments using only four earlier comparable tasks."""
+    supplied = tuple(reports)
+    chronological = tuple(sorted(supplied, key=_order))
+    evaluated = {
+        current.task_ref: replace(
+            current,
+            trend_result=_assessment(build_trend_window(current, chronological[:index])),
+        )
+        for index, current in enumerate(chronological)
+    }
+    return tuple(evaluated[item.task_ref] for item in supplied)

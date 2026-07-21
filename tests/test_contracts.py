@@ -93,6 +93,32 @@ class AnnotationContractTests(unittest.TestCase):
                 note="too broad",
             )
 
+    def test_task_family_is_a_storage_safe_category(self) -> None:
+        for family in (
+            "quiz", "multi_answer_quiz", "review.fix",
+            "multiple-answer-quiz", "release-workflow-hardening",
+            "lesson-block-architecture", "feature_closeout_workflow",
+        ):
+            with self.subTest(valid=family):
+                model = ModelAnnotationInput(
+                    kind="phase", phase="implement", cause="prompt",
+                    scope_change="none", task_family=family, confidence=0.9,
+                    note="start",
+                )
+                self.assertEqual(model.task_family, family)
+        for family in (
+            "/Users/alice/private", "alice@example.com", "raw family with spaces",
+            "019f75d4-5125-7343-8537-49b80f27f286", "password=private",
+            "ABCD1234EFGH5678WXYZ",
+        ):
+            with self.subTest(invalid=family):
+                with self.assertRaisesRegex(ValueError, "privacy-safe category"):
+                    ModelAnnotationInput(
+                        kind="phase", phase="implement", cause="prompt",
+                        scope_change="none", task_family=family, confidence=0.9,
+                        note="start",
+                    )
+
     def test_model_input_rejects_untrusted_measurement_and_identity_fields(self) -> None:
         payload = {
             "kind": "phase",

@@ -24,6 +24,8 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("working_tokens = input_tokens - cached_input_tokens + output_tokens", normalized)
         self.assertIn("full_context = input_tokens + output_tokens", normalized)
         self.assertIn("hydra.report/v2", normalized)
+        self.assertIn("--event-source app-server-v2=", normalized)
+        self.assertIn("--event-source otel-v1=", normalized)
         self.assertIn("five subsequent real codex tasks", normalized)
         self.assertIn("does not advertise `hydra.annotate`", normalized)
         self.assertIn("does not store raw prompts", normalized)

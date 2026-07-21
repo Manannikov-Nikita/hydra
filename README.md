@@ -53,6 +53,21 @@ defaults:
 hydra-codex ingest --source explicit=/absolute/path/to/rollouts
 ```
 
+Versioned App Server and OTel JSONL exports can be imported in the same
+transaction:
+
+```bash
+hydra-codex ingest \
+  --event-source app-server-v2=/absolute/path/to/app-server.jsonl \
+  --event-source otel-v1=/absolute/path/to/otel.jsonl
+```
+
+For one canonical session, exactly one token-total authority is selected:
+rollout cumulative counters, then App Server cumulative totals, then OTel
+per-call events as an explicitly estimated fallback. Lower-priority events stay
+available as timestamped allocation hints but are never added to the selected
+total.
+
 `hydra-codex annotate` is normally invoked through the capability-bearing
 command injected by `UserPromptSubmit`; it rejects calls without the trusted
 turn capability. A model changes phase or reports a blocker with a short
@@ -72,7 +87,7 @@ Reports print opaque public references such as `task_…`. Compare two of those
 references without exposing internal session IDs:
 
 ```bash
-hydra-codex compare task_A task_B --format markdown
+hydra-codex compare task_a1b2 task_c3d4 --format markdown
 ```
 
 ## What is exact and what is semantic

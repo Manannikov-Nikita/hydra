@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hydra Report"
+  short_description: "Build privacy-safe Codex telemetry reports."
+  default_prompt: "Use Hydra to reconcile local Codex telemetry and explain the report without inventing measurements."

@@ -1,0 +1,19 @@
+{
+  "name": "hydra-codex",
+  "version": "0.1.0",
+  "description": "Privacy-safe local telemetry and task-cost reports for Codex.",
+  "author": {
+    "name": "Hydra"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Hydra for Codex",
+    "shortDescription": "Measure Codex task cost without storing transcripts.",
+    "longDescription": "Hydra combines exact local telemetry with short model phase annotations and provenance-aware task reports.",
+    "developerName": "Hydra",
+    "category": "Productivity",
+    "capabilities": ["Local telemetry", "Task reports"],
+    "defaultPrompt": "Use $hydra-report to reconcile local Codex telemetry and summarize the latest task report."
+  },
+  "mcpServers": "./.mcp.json"
+}

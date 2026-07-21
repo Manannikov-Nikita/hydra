@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hydra": {
+      "command": "hydra-codex-mcp",
+      "args": []
+    }
+  }
+}

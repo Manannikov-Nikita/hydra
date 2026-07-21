@@ -252,7 +252,13 @@ def _tools(connection: sqlite3.Connection, project_id: str) -> tuple[ToolObserva
     rows = connection.execute(
         """SELECT t.session_key,t.call_key,t.category,COALESCE(t.finished_at,t.started_at)
              FROM tool_spans t JOIN rollout_sessions s ON s.session_key=t.session_key
-            WHERE s.project_id=?""",
+            WHERE s.project_id=?
+              AND NOT EXISTS (
+                    SELECT 1 FROM tool_span_roles r
+                     WHERE r.session_key=t.session_key
+                       AND r.call_key=t.call_key
+                       AND r.role='nested_inferred'
+              )""",
         (project_id,),
     )
     return tuple(

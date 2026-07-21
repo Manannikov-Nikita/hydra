@@ -51,6 +51,12 @@ def persist_custom_tool_call(
             turn_key=turn_key, source_digest=source_digest, source_ordinal=source_ordinal,
             provenance="lower_bound",
         )
+        connection.execute(
+            """INSERT INTO tool_span_roles(session_key,call_key,role)
+               VALUES (?,?,'nested_inferred')
+               ON CONFLICT(session_key,call_key,role) DO NOTHING""",
+            (session_key, nested_key),
+        )
         # The outer broker exposes only one aggregate outcome.  It cannot prove
         # which nested invocation succeeded, so nested file operands remain
         # transient normalization data and never become deterministic facts.

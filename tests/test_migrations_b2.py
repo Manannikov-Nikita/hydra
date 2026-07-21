@@ -375,6 +375,86 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_v28_backfills_nested_custom_exec_roles_without_deleting_spans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "custom-exec-role-v27.sqlite3"
+            build_schema(database, 27)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,
+                           conversation_key,started_at,last_activity_at)
+                       VALUES ('role-session','role-project','safe',1,'safe',
+                               '2026-07-21T00:00:00Z','2026-07-21T00:00:10Z')"""
+                )
+                connection.executemany(
+                    """INSERT INTO tool_spans(
+                           session_key,call_key,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,source_digest,
+                           source_ordinal,completeness,provenance)
+                       VALUES ('role-session',?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        (
+                            "outer", "opaque_exec", "success", 1, "custom_exec",
+                            "2026-07-21T00:00:01Z", "2026-07-21T00:00:02Z", "turn",
+                            "shared-safe-digest", 7, "complete", "exact",
+                        ),
+                        (
+                            "nested", "tool", "unknown", None, "exec_command",
+                            "2026-07-21T00:00:01Z", None, "turn",
+                            "shared-safe-digest", 7, "incomplete", "lower_bound",
+                        ),
+                        (
+                            "legacy", "tool", "success", 1, "unknown",
+                            "2026-07-21T00:00:03Z", "2026-07-21T00:00:04Z", "turn",
+                            "legacy-safe-digest", 8, "complete", "lower_bound",
+                        ),
+                    ),
+                )
+                connection.commit()
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM tool_spans WHERE session_key='role-session'"
+                ).fetchone()[0], 3)
+            finally:
+                connection.close()
+
+            store = HydraStore(database)
+            try:
+                after = aggregate_stored_task_tree(
+                    store.connection,
+                    project_id="role-project",
+                    root_id="role-session",
+                    cutoff_at=datetime(2026, 7, 21, 0, 0, 10, tzinfo=timezone.utc),
+                )
+                self.assertEqual(after.tool_calls.value, 2)
+                self.assertEqual(store.connection.execute(
+                    "SELECT COUNT(*) FROM tool_spans WHERE session_key='role-session'"
+                ).fetchone()[0], 3)
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        "SELECT call_key,role FROM tool_span_roles ORDER BY call_key"
+                    )],
+                    [("nested", "nested_inferred")],
+                )
+            finally:
+                store.close()
+
+    def test_missing_tool_span_roles_table_fails_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "missing-tool-span-roles.sqlite3"
+            store = HydraStore(database)
+            store.close()
+            connection = sqlite3.connect(database)
+            connection.execute("DROP TABLE tool_span_roles")
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(
+                StorageUnavailable, "missing required columns for tool_span_roles",
+            ):
+                HydraStore(database)
+
     def test_v24_migration_immediately_suppresses_declined_legacy_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "legacy-declined-intent.sqlite3"

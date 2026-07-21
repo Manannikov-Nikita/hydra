@@ -256,7 +256,7 @@ class FinalReconciliationFindingsTests(unittest.TestCase):
         migrated = HydraStore(database)
         self.addCleanup(migrated.close)
 
-        self.assertEqual(MIGRATIONS[-1][0], 27)
+        self.assertEqual(migrated.schema_version(), MIGRATIONS[-1][0])
         self.assertEqual(migrated.count("rollout_test_runs"), 0)
         self.assertEqual(migrated.connection.execute(
             "SELECT COUNT(*) FROM test_evidence_candidates"

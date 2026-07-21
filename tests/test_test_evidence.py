@@ -11,7 +11,7 @@ from hydra_codex.codex_events import APP_SERVER_V2
 from hydra_codex.migrations_h8 import H8_MIGRATIONS
 from hydra_codex.reconcile_engine import reconcile_project
 from hydra_codex.rollout import ingest_rollouts
-from hydra_codex.storage import HydraStore
+from hydra_codex.storage import MIGRATIONS, HydraStore
 from hydra_codex.test_evidence import materialize_test_evidence, parse_structured_result
 
 
@@ -236,13 +236,13 @@ class StructuralTerminalRepairTests(unittest.TestCase):
                          FROM test_evidence_candidates"""
                 )
             ]
-            self.assertEqual(store.schema_version(), 27)
+            self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
             self.assertEqual(store.count("rollout_test_runs"), 0)
             store.close()
 
             reopened = HydraStore(database)
             self.addCleanup(reopened.close)
-            self.assertEqual(reopened.schema_version(), 27)
+            self.assertEqual(reopened.schema_version(), MIGRATIONS[-1][0])
             self.assertEqual(reopened.count("rollout_test_runs"), 0)
             reconcile_project(reopened, "v27-project", b"v" * 32)
 

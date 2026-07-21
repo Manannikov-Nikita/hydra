@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 
 from hydra_codex.rollout import ingest_rollouts
+from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.storage import HydraStore
+from hydra_codex.task_tree_storage import aggregate_stored_task_tree
+from hydra_codex.tool_spans import persist_tool_start
 
 
 def envelope(kind: str, payload: dict, second: int) -> dict:
@@ -108,6 +111,97 @@ class CustomToolPersistenceTests(unittest.TestCase):
         database_dump = "\n".join(self.store.connection.iterdump())
         for private_value in (secret_name, secret_argument, secret_output, "pytest tests/test_safe.py"):
             self.assertNotIn(private_value, database_dump)
+
+    def test_custom_exec_children_are_retained_but_not_reported_as_peer_calls(self) -> None:
+        self.ingest([
+            self.meta(),
+            envelope("turn_context", {"turn_id": "turn"}, 1),
+            envelope("event_msg", {"type": "task_started", "turn_id": "turn"}, 2),
+            envelope("response_item", {
+                "type": "custom_tool_call", "call_id": "broker-a", "name": "exec",
+                "input": (
+                    'tools.exec_command({"cmd":"python -m unittest tests.test_alpha"});'
+                    'tools.exec_command({"cmd":"python -m unittest tests.test_beta"});'
+                ),
+            }, 3),
+            envelope("response_item", {
+                "type": "custom_tool_call_output", "call_id": "broker-a",
+                "output": [{"type": "input_text", "text": "Script completed"}],
+            }, 4),
+            envelope("response_item", {
+                "type": "custom_tool_call", "call_id": "broker-b", "name": "exec",
+                "input": 'tools.exec_command({"cmd":"python -m unittest tests.test_gamma"});',
+            }, 5),
+            envelope("response_item", {
+                "type": "custom_tool_call_output", "call_id": "broker-b",
+                "output": [{"type": "input_text", "text": "Script completed"}],
+            }, 6),
+            envelope("response_item", {
+                "type": "function_call", "call_id": "native-exec", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "python -m unittest tests.test_native"}),
+            }, 7),
+            envelope("response_item", {
+                "type": "function_call_output", "call_id": "native-exec",
+                "output": json.dumps({"exit_code": 0}),
+            }, 8),
+            envelope("response_item", {
+                "type": "function_call", "call_id": "native-hydra", "name": "hydra_annotate",
+                "arguments": json.dumps({"kind": "phase"}),
+            }, 9),
+            envelope("response_item", {
+                "type": "function_call_output", "call_id": "native-hydra",
+                "output": json.dumps({"success": True}),
+            }, 10),
+            envelope("event_msg", {"type": "task_complete", "turn_id": "turn"}, 11),
+        ])
+
+        root = Pseudonymizer(b"c" * 32).digest("identity", "thread")
+        metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id="custom-tool-project", root_id=root,
+        )
+        self.assertEqual(metrics.tool_calls.value, 4)
+        self.assertEqual(metrics.instrumentation_calls.value, 1)
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                """SELECT tool_name,provenance,COUNT(*)
+                     FROM tool_spans
+                    GROUP BY tool_name,provenance
+                    ORDER BY tool_name,provenance"""
+            )],
+            [
+                ("custom_exec", "exact", 2),
+                ("exec_command", "exact", 1),
+                ("exec_command", "lower_bound", 3),
+                ("hydra", "exact", 1),
+            ],
+        )
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                "SELECT role,COUNT(*) FROM tool_span_roles GROUP BY role"
+            )],
+            [("nested_inferred", 3)],
+        )
+
+        # Lower-bound is an evidence-strength marker, not itself a reason to
+        # hide a genuine legacy/native observation from task-tree reporting.
+        with self.store.rollout_transaction() as connection:
+            keys = Pseudonymizer(b"c" * 32)
+            persist_tool_start(
+                connection,
+                session_key=root,
+                call_key=keys.digest("call", "legacy-lower-bound"),
+                category="tool",
+                tool_name="unknown",
+                started_at="2026-07-21T00:00:05Z",
+                turn_key=keys.digest("turn", "turn"),
+                source_digest="legacy-safe-source",
+                source_ordinal=1,
+                provenance="lower_bound",
+            )
+        legacy_metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id="custom-tool-project", root_id=root,
+        )
+        self.assertEqual(legacy_metrics.tool_calls.value, 5)
 
     def test_custom_exec_does_not_persist_unproven_nested_file_facts(self) -> None:
         self.ingest([

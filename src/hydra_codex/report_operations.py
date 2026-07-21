@@ -145,7 +145,7 @@ def build_trend_window(current: TaskReport, history: Iterable[TaskReport]) -> Tr
     """Return deterministic current plus at most four earlier comparable inputs."""
     from .reporting import TrendWindow
 
-    if not current.completed or current.task_family is None:
+    if not current.completed or current.trend_input.task_family is None:
         return TrendWindow(current.trend_input, ())
     unique = {item.task_ref: item for item in sorted(history, key=_order)}
     current_instant = _instant(current)
@@ -154,7 +154,7 @@ def build_trend_window(current: TaskReport, history: Iterable[TaskReport]) -> Tr
         if (
             item.task_ref != current.task_ref
             and item.completed
-            and item.task_family == current.task_family
+            and item.trend_input.task_family == current.trend_input.task_family
             and _instant(item) < current_instant
         )
     ), key=_order))

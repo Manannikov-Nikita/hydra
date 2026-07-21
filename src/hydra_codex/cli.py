@@ -35,6 +35,20 @@ class CommandServices(Protocol):
         database_path: Path | None, cwd: Path,
     ) -> str: ...
 
+    def pilot_start(
+        self, target: int, task_family: str,
+        database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
+    def pilot_status(
+        self, output_format: str, database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
+    def pilot_close(
+        self, pilot_id: str, audit_json: Path, decision: str,
+        database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
 
 class _SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
@@ -87,6 +101,25 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("right")
     compare.add_argument("--format", choices=("json", "markdown", "html"), default="json")
     compare.add_argument("--output")
+
+    pilot = commands.add_parser("pilot")
+    pilot_commands = pilot.add_subparsers(dest="pilot_command", required=True)
+    pilot_start = pilot_commands.add_parser("start")
+    _common_options(pilot_start)
+    pilot_start.add_argument("--target", type=_positive_integer, required=True)
+    pilot_start.add_argument("--task-family", required=True)
+    pilot_status = pilot_commands.add_parser("status")
+    _common_options(pilot_status)
+    pilot_status.add_argument(
+        "--format", choices=("json", "markdown", "html"), default="json",
+    )
+    pilot_close = pilot_commands.add_parser("close")
+    _common_options(pilot_close)
+    pilot_close.add_argument("--pilot", required=True)
+    pilot_close.add_argument("--audit-json", type=Path, required=True)
+    pilot_close.add_argument(
+        "--decision", choices=("verified", "rejected"), required=True,
+    )
     return parser
 
 
@@ -289,6 +322,28 @@ def _render(
         _write_rendered(stdout, content)
 
 
+def _pilot(
+    arguments: argparse.Namespace,
+    stdout: TextIO,
+    services: CommandServices,
+) -> None:
+    database, cwd = _paths(arguments)
+    if arguments.pilot_command == "start":
+        content = services.pilot_start(
+            arguments.target, arguments.task_family, database, cwd,
+        )
+    elif arguments.pilot_command == "status":
+        content = services.pilot_status(arguments.format, database, cwd)
+    else:
+        content = services.pilot_close(
+            arguments.pilot, arguments.audit_json, arguments.decision,
+            database, cwd,
+        )
+    if not isinstance(content, str):
+        raise RuntimeError("pilot service returned invalid content")
+    _write_rendered(stdout, content)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -335,6 +390,8 @@ def main(
             database, cwd = _paths(arguments)
             command_services.reconcile(database, cwd)
             _write_json(output_stream, {"command": "reconcile", "status": "ok"})
+        elif arguments.command == "pilot":
+            _pilot(arguments, output_stream, command_services)
         else:
             _render(arguments, output_stream, command_services)
         return 0

@@ -175,3 +175,94 @@ class LocalCommandServices:
             return _renderer(output_format)(compare_reports(baseline, current))
         finally:
             store.close()
+
+    def pilot_start(
+        self,
+        target: int,
+        task_family: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        import json
+
+        from .pilot import start_pilot
+
+        project = self._project(cwd)
+        store = HydraStore(self._database_path(database_path))
+        try:
+            run = start_pilot(
+                store,
+                project_id=project.project_id,
+                target=target,
+                task_family=task_family,
+                now=self._clock(),
+            )
+            return json.dumps({
+                "command": "pilot start",
+                "pilot_id": run.pilot_id,
+                "started_at": _utc_now(lambda: run.started_at),
+                "state": run.state,
+                "target": run.target,
+                "task_family": run.task_family,
+            }, sort_keys=True, separators=(",", ":"))
+        finally:
+            store.close()
+
+    def pilot_status(
+        self,
+        output_format: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        from .pilot import pilot_status
+        from .pilot_renderers import render_pilot_status
+
+        project = self._project(cwd)
+        store = HydraStore(self._database_path(database_path))
+        try:
+            row = store.connection.execute(
+                """SELECT pilot_id FROM pilot_runs WHERE project_id=?
+                     ORDER BY CASE state WHEN 'open' THEN 0 ELSE 1 END,
+                              started_at DESC,pilot_id DESC LIMIT 1""",
+                (project.project_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("project has no pilot")
+            return render_pilot_status(
+                pilot_status(store, project.project_id, str(row[0])),
+                output_format,
+            )
+        finally:
+            store.close()
+
+    def pilot_close(
+        self,
+        pilot_id: str,
+        audit_json: Path,
+        decision: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        import json
+
+        from .pilot import close_pilot
+
+        project = self._project(cwd)
+        audit_path = audit_json.expanduser()
+        if not audit_path.is_absolute():
+            audit_path = cwd / audit_path
+        store = HydraStore(self._database_path(database_path))
+        try:
+            receipt = close_pilot(
+                store,
+                project_id=project.project_id,
+                pilot_id=pilot_id,
+                audit_json=audit_path,
+                decision=decision,
+                now=self._clock(),
+            )
+            return json.dumps(
+                receipt.as_dict(), sort_keys=True, separators=(",", ":"),
+            )
+        finally:
+            store.close()

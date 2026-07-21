@@ -260,7 +260,7 @@ def build_annotation_facts(
     ).encode("utf-8")).hexdigest()
     families = set(real_families)
     return AnnotationFacts(
-        real_families[-1] if real_families else None,
+        real_families[-1] if len(families) == 1 else None,
         len(families) > 1,
         invalid,
         invalid_intervals,

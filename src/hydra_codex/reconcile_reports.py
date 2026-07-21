@@ -251,8 +251,47 @@ def list_reconciled_reports(
                 task.semantic.schema_diagnostics, "count", "derived",
             ),
         )
+        if any(
+            task.semantic.annotations.scope_change_counts.get(scope, 0) > 0
+            for scope in ("expanded", "redefined")
+        ):
+            report = replace(
+                report,
+                trend_input=replace(report.trend_input, task_family=None),
+            )
         reports.append(replace(report, pilot_health=pilot))
     evaluated = evaluate_report_trends(reports)
+    pilot_rows = tuple(store.connection.execute(
+        """SELECT pilot_id FROM pilot_runs
+             WHERE project_id=? ORDER BY started_at,pilot_id""",
+        (project_id,),
+    ))
+    if pilot_rows:
+        from .pilot import pilot_status
+
+        readiness: dict[str, bool] = {}
+        for (pilot_id,) in pilot_rows:
+            status = pilot_status(store, project_id, str(pilot_id)).as_dict()
+            ready = bool(status["trend_ready"])
+            for item in status["tasks"]:
+                task_ref = str(item["task_ref"])
+                readiness[task_ref] = readiness.get(task_ref, False) or ready
+        evaluated = tuple(
+            replace(
+                report,
+                trend_result=replace(
+                    report.trend_result,
+                    warning=False,
+                    caveats=tuple(dict.fromkeys(
+                        report.trend_result.caveats
+                        + ("candidate_warning", "pilot_receipt_required")
+                    )),
+                ),
+            )
+            if report.trend_result.warning and not readiness.get(report.task_ref, True)
+            else report
+            for report in evaluated
+        )
     return evaluated if limit is None else evaluated[:limit]
 
 

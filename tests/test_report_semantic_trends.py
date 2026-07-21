@@ -508,6 +508,10 @@ class SemanticReportIntegrationTests(StoredReportScenario):
                 f"task-{index}", index * 20, 200 if index == 4 else 100,
                 retries=3 if index == 4 else 1,
             )
+            self.db.execute(
+                "UPDATE annotations SET scope_change='none' WHERE session_id=?",
+                (f"task-{index}",),
+            )
 
         reports = self.reconcile()
         latest = reports[0]

@@ -289,7 +289,7 @@ class TaskReport:
         if (
             self.trend_input.task_ref != self.task_ref
             or self.trend_input.completed != self.completed
-            or self.trend_input.task_family != self.task_family
+            or self.trend_input.task_family not in {None, self.task_family}
         ):
             raise ValueError("trend input must describe this report")
 

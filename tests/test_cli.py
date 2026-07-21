@@ -30,6 +30,7 @@ class FakeServices:
         self.calls: list[tuple] = []
         self.report_content = "rendered report"
         self.compare_content = "rendered comparison"
+        self.pilot_content = "rendered pilot"
         self.failure: Exception | None = None
 
     def _fail(self) -> None:
@@ -53,6 +54,23 @@ class FakeServices:
         self._fail()
         self.calls.append(("compare", left, right, output_format, database_path, cwd))
         return self.compare_content
+
+    def pilot_start(self, target, task_family, database_path, cwd):
+        self._fail()
+        self.calls.append(("pilot_start", target, task_family, database_path, cwd))
+        return self.pilot_content
+
+    def pilot_status(self, output_format, database_path, cwd):
+        self._fail()
+        self.calls.append(("pilot_status", output_format, database_path, cwd))
+        return self.pilot_content
+
+    def pilot_close(self, pilot_id, audit_json, decision, database_path, cwd):
+        self._fail()
+        self.calls.append((
+            "pilot_close", pilot_id, audit_json, decision, database_path, cwd,
+        ))
+        return self.pilot_content
 
 
 def invoke(
@@ -211,6 +229,39 @@ class ServiceDelegationTests(unittest.TestCase):
         )
         self.assertEqual((code, stdout, stderr), (0, "rendered comparison\n", ""))
         self.assertEqual(self.services.calls[-1][:4], ("compare", "htask_a", "htask_b", "html"))
+
+    def test_pilot_commands_delegate_public_lifecycle_arguments(self) -> None:
+        code, stdout, stderr = invoke(
+            [
+                "pilot", "start", "--target", "5",
+                "--task-family", "telemetry-analysis", "--db", "pilot.sqlite3",
+            ],
+            services=self.services,
+        )
+        self.assertEqual((code, stdout, stderr), (0, "rendered pilot\n", ""))
+        self.assertEqual(
+            self.services.calls[-1][:3],
+            ("pilot_start", 5, "telemetry-analysis"),
+        )
+
+        code, stdout, stderr = invoke(
+            ["pilot", "status", "--format", "html"], services=self.services,
+        )
+        self.assertEqual((code, stdout, stderr), (0, "rendered pilot\n", ""))
+        self.assertEqual(self.services.calls[-1][0:2], ("pilot_status", "html"))
+
+        code, stdout, stderr = invoke(
+            [
+                "pilot", "close", "--pilot", "hpilot_v1_public",
+                "--audit-json", "audit.json", "--decision", "verified",
+            ],
+            services=self.services,
+        )
+        self.assertEqual((code, stdout, stderr), (0, "rendered pilot\n", ""))
+        self.assertEqual(
+            self.services.calls[-1][0:4],
+            ("pilot_close", "hpilot_v1_public", Path("audit.json"), "verified"),
+        )
 
     def test_service_errors_do_not_echo_exception_paths_or_secrets(self) -> None:
         private = "/private/database.sqlite3 capability-secret raw-note"

@@ -514,14 +514,21 @@ def _persist_batch(
                         turn_key=event.turn_key,
                         tool_call_key=logical_call,
                     )
-                if (
-                    not rejected_test and tool.phase == "completed"
-                    and tool.exit_status is not None
-                ):
+                if not rejected_test and tool.phase == "completed":
                     test_evidence.result(
                         logical_call,
-                        {"exit_code": tool.exit_status, "output": tool.ephemeral_output or ""},
+                        (
+                            {
+                                "exit_code": tool.exit_status,
+                                "output": tool.ephemeral_output or "",
+                            }
+                            if tool.exit_status is not None else {}
+                        ),
                         event.observed_at,
+                        session_key=session,
+                        line_number=event.source_ordinal,
+                        turn_key=event.turn_key,
+                        tool_call_key=logical_call,
                     )
             if event.child_thread_key is not None:
                 connection.execute(

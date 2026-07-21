@@ -2086,6 +2086,288 @@ class CodexEventPersistenceTests(unittest.TestCase):
             ("success", 0, "none", "complete", "app_server"),
         ])
 
+    def test_completed_app_command_without_exit_is_one_unknown_execution(self) -> None:
+        command = "pytest tests/test_unknown_exit.py"
+
+        def notification(phase: str) -> CodexEventSource:
+            return self.app_source(f"unknown-exit-{phase}", {
+                "received_at": (
+                    "2024-07-03T09:46:40.100000Z"
+                    if phase == "started" else "2024-07-03T09:46:40.200000Z"
+                ),
+                "message": {
+                    "method": f"item/{phase}",
+                    "params": {
+                        "threadId": "unknown-exit-thread",
+                        "turnId": "unknown-exit-turn",
+                        "item": {
+                            "id": "unknown-exit-call",
+                            "type": "commandExecution",
+                            "command": command,
+                            "cwd": str(self.project),
+                            "status": (
+                                "inProgress" if phase == "started" else "completed"
+                            ),
+                        },
+                    },
+                },
+            })
+
+        cases = (
+            (notification("completed"),),
+            (notification("started"), notification("completed")),
+            (notification("completed"), notification("started")),
+        )
+        for index, sources in enumerate(cases, start=1):
+            with self.subTest(case=index):
+                store = HydraStore(self.base / f"unknown-exit-{index}.sqlite3")
+                self.addCleanup(store.close)
+                for source in sources:
+                    ingest_codex_events(
+                        store, (source,), self.project, PROJECT, hash_key=KEY,
+                    )
+                self.assertEqual(store.count("rollout_test_runs"), 1)
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        """SELECT exit_status,outcome,failure_cause,completeness
+                             FROM rollout_test_runs"""
+                    ).fetchone()),
+                    (None, "unknown", "unknown", "result_without_exit"),
+                )
+
+    def test_app_non_execution_status_without_exit_never_counts_as_test(self) -> None:
+        for status in ("cancelled", "declined", "interrupted"):
+            with self.subTest(status=status):
+                store = HydraStore(self.base / f"non-execution-{status}.sqlite3")
+                self.addCleanup(store.close)
+                source = self.app_source(f"non-execution-{status}", {
+                    "received_at": "2024-07-03T09:46:40.200000Z",
+                    "message": {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": f"{status}-thread",
+                            "turnId": f"{status}-turn",
+                            "item": {
+                                "id": f"{status}-call",
+                                "type": "commandExecution",
+                                "command": "pytest tests/test_never_ran.py",
+                                "cwd": str(self.project),
+                                "status": status,
+                            },
+                        },
+                    },
+                })
+                ingest_codex_events(
+                    store, (source,), self.project, PROJECT, hash_key=KEY,
+                )
+                self.assertEqual(store.count("rollout_test_runs"), 0)
+
+    def test_split_app_terminal_without_repeated_command_restores_known_result(self) -> None:
+        start = self.app_source("split-known-start", {
+            "received_at": "2024-07-03T09:46:40.100000Z",
+            "message": {
+                "method": "item/started",
+                "params": {
+                    "threadId": "split-known-thread", "turnId": "split-known-turn",
+                    "item": {
+                        "id": "split-known-call", "type": "commandExecution",
+                        "command": "pytest tests/test_split_known.py",
+                        "cwd": str(self.project), "status": "inProgress",
+                    },
+                },
+            },
+        })
+        terminal = self.app_source("split-known-terminal", {
+            "received_at": "2024-07-03T09:46:40.200000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "split-known-thread", "turnId": "split-known-turn",
+                    "item": {
+                        "id": "split-known-call", "type": "commandExecution",
+                        "status": "completed", "exitCode": 0,
+                    },
+                },
+            },
+        })
+
+        for index, sources in enumerate(((start, terminal), (terminal, start)), start=1):
+            with self.subTest(order=index):
+                store = HydraStore(self.base / f"split-known-{index}.sqlite3")
+                self.addCleanup(store.close)
+                for source in sources:
+                    ingest_codex_events(
+                        store, (source,), self.project, PROJECT, hash_key=KEY,
+                    )
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        """SELECT exit_status,outcome,failure_cause,completeness
+                             FROM rollout_test_runs"""
+                    ).fetchone()),
+                    (0, "success", "none", "complete"),
+                )
+
+    def test_exact_execution_is_not_erased_by_prior_non_execution_receipt(self) -> None:
+        start = self.app_source("reused-call-start", {
+            "received_at": "2024-07-03T09:46:40.100000Z",
+            "message": {
+                "method": "item/started",
+                "params": {
+                    "threadId": "reused-call-thread", "turnId": "reused-call-turn",
+                    "item": {
+                        "id": "reused-call", "type": "commandExecution",
+                        "command": "pytest tests/test_reused_call.py",
+                        "status": "inProgress",
+                    },
+                },
+            },
+        })
+        cancelled = self.app_source("reused-call-cancelled", {
+            "received_at": "2024-07-03T09:46:40.200000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "reused-call-thread", "turnId": "reused-call-turn",
+                    "item": {
+                        "id": "reused-call", "type": "commandExecution",
+                        "status": "cancelled",
+                    },
+                },
+            },
+        })
+        completed = self.app_source("reused-call-completed", {
+            "received_at": "2024-07-03T09:46:40.300000Z",
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "reused-call-thread", "turnId": "reused-call-turn",
+                    "item": {
+                        "id": "reused-call", "type": "commandExecution",
+                        "status": "completed", "exitCode": 0,
+                    },
+                },
+            },
+        })
+
+        for source in (completed, cancelled, start):
+            self.ingest(source)
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT exit_status,outcome,failure_cause,completeness
+                     FROM rollout_test_runs"""
+            ).fetchone()),
+            (0, "success", "none", "complete"),
+        )
+
+    def test_conflicting_nested_app_ids_are_rejected_before_lifecycle_persistence(self) -> None:
+        rollout = self.base / "authoritative-abort.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "identity-thread", "cwd": str(self.project),
+                    },
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.100000Z",
+                    "type": "turn_context",
+                    "payload": {"turn_id": "rollout-turn"},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40.200000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted", "turn_id": "rollout-turn"},
+                },
+            )
+        ), encoding="utf-8")
+        ingest_rollouts(
+            self.store, (rollout,), self.project, PROJECT, hash_key=KEY,
+        )
+        conflicting = self.base / "conflicting-identities.jsonl"
+        conflicting.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "identity-thread",
+                        "thread": {"id": "conflicting-thread"},
+                        "turn": {
+                            "id": "rollout-turn", "status": "completed",
+                            "completedAt": 1720000001,
+                        },
+                    },
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "identity-thread",
+                        "turnId": "rollout-turn",
+                        "turn": {
+                            "id": "conflicting-turn", "status": "completed",
+                            "completedAt": 1720000002,
+                        },
+                    },
+                },
+            )
+        ), encoding="utf-8")
+
+        report = self.ingest(CodexEventSource(conflicting, APP_SERVER_V2))
+
+        self.assertEqual((report.events, report.issues), (0, 2))
+        self.assertEqual(self.store.count("codex_events"), 0)
+        self.assertEqual(
+            [row[0] for row in self.store.connection.execute(
+                "SELECT state FROM turn_attempts ORDER BY attempt_ordinal"
+            )],
+            ["aborted"],
+        )
+        dump = "\n".join(self.store.connection.iterdump())
+        for raw in (
+            "identity-thread", "conflicting-thread", "rollout-turn",
+            "conflicting-turn",
+        ):
+            self.assertNotIn(raw, dump)
+
+    def test_equal_or_single_nested_app_ids_remain_valid(self) -> None:
+        source = self.base / "valid-identity-forms.jsonl"
+        source.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "equal-thread",
+                        "thread": {"id": "equal-thread"},
+                        "turnId": "equal-turn",
+                        "turn": {
+                            "id": "equal-turn", "status": "inProgress",
+                            "startedAt": 1720000000,
+                        },
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "equal-thread", "turnId": "equal-turn",
+                        "item": {
+                            "id": "single-id-call", "type": "commandExecution",
+                            "command": "echo safe", "status": "completed",
+                        },
+                    },
+                },
+            )
+        ), encoding="utf-8")
+
+        report = self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual((report.events, report.issues), (2, 0))
+        self.assertEqual(self.store.count("codex_events"), 2)
+
     def test_malformed_and_schema_drift_persist_only_safe_issues(self) -> None:
         malformed = self.base / "malformed.jsonl"
         malformed.write_text(

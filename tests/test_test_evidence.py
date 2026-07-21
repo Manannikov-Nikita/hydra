@@ -11,7 +11,7 @@ from hydra_codex.codex_events import APP_SERVER_V2
 from hydra_codex.migrations_h8 import H8_MIGRATIONS
 from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.storage import HydraStore
-from hydra_codex.test_evidence import parse_structured_result
+from hydra_codex.test_evidence import materialize_test_evidence, parse_structured_result
 
 
 def event(kind: str, payload: dict[str, object], second: int) -> dict[str, object]:
@@ -89,6 +89,76 @@ class StructuredResultTests(unittest.TestCase):
                          (None, "unknown", "conflicted"))
         self.assertEqual((header_only.exit_status, header_only.outcome, header_only.completeness),
                          (None, "unknown", "result_without_exit"))
+
+
+class StructuralTerminalRepairTests(unittest.TestCase):
+    def test_v27_intent_is_repaired_from_matching_immutable_tool_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            connection = store.connection
+            connection.execute(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,conversation_key)
+                   VALUES ('legacy-session','legacy-project','safe',1,'')"""
+            )
+            connection.execute(
+                """INSERT INTO codex_event_sources(
+                       source_digest,project_id,schema_version,source_format,
+                       line_count,byte_count)
+                   VALUES ('legacy-app','legacy-project','codex.app-server/v2',
+                           'app_server',2,2)"""
+            )
+            connection.execute(
+                """INSERT INTO test_evidence_candidates(
+                       candidate_key,candidate_kind,evidence_key,source_digest,
+                       line_number,session_key,observed_at,turn_key,tool_call_key,
+                       command_hash,runner,scope,exit_status,outcome,failure_cause,
+                       provenance,completeness)
+                   VALUES ('legacy-candidate','evidence','legacy-evidence','legacy-app',
+                           1,'legacy-session',NULL,'legacy-turn','legacy-call',
+                           'legacy-command','pytest','targeted',NULL,'unknown','unknown',
+                           'derived','intent_only')"""
+            )
+            connection.execute(
+                """INSERT INTO tool_span_candidates(
+                       session_key,call_key,source_digest,source_ordinal,candidate_kind,
+                       category,terminal_state,latency_ms,tool_name,started_at,
+                       finished_at,turn_key,provenance)
+                   VALUES ('legacy-session','legacy-call','legacy-app',2,'end',
+                           'tool','unknown',NULL,'exec_command',NULL,
+                           '2026-07-21T00:00:02Z','legacy-turn','exact')"""
+            )
+            connection.commit()
+            before = [
+                tuple(row) for row in connection.execute(
+                    """SELECT candidate_key,candidate_kind,evidence_key,source_digest,
+                              line_number,session_key,observed_at,turn_key,tool_call_key,
+                              command_hash,runner,scope,exit_status,outcome,failure_cause,
+                              provenance,completeness
+                         FROM test_evidence_candidates"""
+                )
+            ]
+
+            materialize_test_evidence(connection)
+
+            after = [
+                tuple(row) for row in connection.execute(
+                    """SELECT candidate_key,candidate_kind,evidence_key,source_digest,
+                              line_number,session_key,observed_at,turn_key,tool_call_key,
+                              command_hash,runner,scope,exit_status,outcome,failure_cause,
+                              provenance,completeness
+                         FROM test_evidence_candidates"""
+                )
+            ]
+            self.assertEqual(after, before)
+            self.assertEqual(
+                tuple(connection.execute(
+                    """SELECT exit_status,outcome,failure_cause,completeness
+                         FROM rollout_test_runs"""
+                ).fetchone()),
+                (None, "unknown", "unknown", "result_without_exit"),
+            )
 
 
 class TestEvidenceCandidateMigrationTests(unittest.TestCase):

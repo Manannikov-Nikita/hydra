@@ -179,6 +179,9 @@ def aggregate_task_tree(
         for item in lifecycle_items
     ):
         completion = None
+    authoritative_abort = (
+        completion is not None and completion.kind == "turn_aborted"
+    )
     if cutoff_at is None:
         if completion is None:
             raise ValueError("root task_complete observation is required")
@@ -221,7 +224,7 @@ def aggregate_task_tree(
                     token_by_session[item.session_id].append(item)
                 else:
                     excluded_post_cutoff_tokens += 1
-            elif item.retain_value_without_timestamp:
+            elif item.retain_value_without_timestamp and not authoritative_abort:
                 token_by_session[item.session_id].append(item)
             else:
                 ambiguous_timestamp_tokens += 1

@@ -205,9 +205,44 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
             for row in evidence
         )
         has_non_execution = any(row[1] == "non_execution" for row in candidates)
-        if has_non_execution and not completed:
+        exact_results = list(connection.execute(
+            """SELECT source_digest,source_ordinal,observed_at,turn_key,
+                      tool_exit_status
+                 FROM codex_events
+                WHERE session_key=? AND tool_call_key=? AND tool_phase='completed'
+                  AND tool_exit_status IS NOT NULL""",
+            (session_key, tool_call_key),
+        ))
+        exact_result = max(
+            exact_results,
+            key=lambda row: (
+                SOURCE_AUTHORITY[source_family(connection, str(row[0]))],
+                int(row[1]), str(row[0]),
+            ),
+        ) if exact_results else None
+        # A stable exact exit proves that this command executed at least once;
+        # a separate cancellation receipt for the reused call key cannot erase
+        # that metric.  Cancellation-only structural ends remain non-execution.
+        if has_non_execution and not completed and exact_result is None:
             continue
-        if not terminal and not mismatched_complete:
+        structural_terminals = list(connection.execute(
+            """SELECT source_digest,source_ordinal,finished_at,turn_key
+                 FROM tool_span_candidates
+                WHERE session_key=? AND call_key=? AND candidate_kind='end'
+                  AND tool_name IN ('exec_command','nested_exec','function','unknown')""",
+            (session_key, tool_call_key),
+        ))
+        structural_terminal = max(
+            structural_terminals,
+            key=lambda row: (
+                SOURCE_AUTHORITY[source_family(connection, str(row[0]))],
+                int(row[1]), str(row[0]),
+            ),
+        ) if structural_terminals else None
+        if (
+            not terminal and not mismatched_complete
+            and exact_result is None and structural_terminal is None
+        ):
             continue
         selected = max(
             completed or terminal or matching,
@@ -216,6 +251,15 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
         result = (
             unknown_result("conflicted")
             if not completed and mismatched_complete
+            else StructuredTestResult(
+                int(exact_result[4]),
+                "success" if int(exact_result[4]) == 0 else "failed",
+                "none" if int(exact_result[4]) == 0 else "unknown",
+                "complete",
+            )
+            if not terminal and exact_result is not None
+            else unknown_result("result_without_exit")
+            if not terminal and structural_terminal is not None
             else StructuredTestResult(
                 selected[12], selected[13], selected[14], selected[16],
             )
@@ -228,8 +272,32 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
                    completeness)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'none',1,?,?)""",
             (
-                description[2], selected[3], selected[4], session_key,
-                selected[6] or description[6], selected[7] or description[7],
+                description[2],
+                exact_result[0]
+                if not terminal and exact_result is not None
+                else structural_terminal[0]
+                if not terminal and structural_terminal is not None
+                else selected[3],
+                exact_result[1]
+                if not terminal and exact_result is not None
+                else structural_terminal[1]
+                if not terminal and structural_terminal is not None
+                else selected[4],
+                session_key,
+                (
+                    exact_result[2]
+                    if not terminal and exact_result is not None
+                    else
+                    structural_terminal[2]
+                    if not terminal and structural_terminal is not None else selected[6]
+                ) or description[6],
+                (
+                    exact_result[3]
+                    if not terminal and exact_result is not None
+                    else
+                    structural_terminal[3]
+                    if not terminal and structural_terminal is not None else selected[7]
+                ) or description[7],
                 tool_call_key, description[9], description[10], description[11],
                 result.exit_status, result.outcome, result.failure_cause,
                 selected[15], result.completeness,

@@ -177,6 +177,90 @@ class TaskTreeMetricTests(unittest.TestCase):
         self.assertEqual(metrics.session_ids, ("child", "root"))
         self.assertEqual(metrics.recorded.vector, TokenVector(30, 7, 7, 3))
 
+    def test_authoritative_abort_excludes_only_cross_source_timestampless_totals(self) -> None:
+        session = (NormalizedSession("root", None, at(0)),)
+        timestamped = TokenObservation(
+            "root", at(5), 1, TokenVector(50, 10, 5, 2),
+        )
+        cross_source_app = TokenObservation(
+            "root", None, 2, TokenVector(100, 20, 10, 5), 0,
+            "estimated", "logical-app", 1, "exact",
+            "app_total_timestamp_missing", True,
+        )
+        same_source_app = TokenObservation(
+            "root", None, 2, TokenVector(100, 20, 10, 5), 0,
+            "estimated", "logical-rollout", 2, "exact",
+            "app_total_timestamp_missing", True,
+        )
+        abort = LifecycleObservation(
+            "root", "turn_aborted", at(10), "logical-rollout", 3, "turn-a",
+        )
+
+        excluded = aggregate_task_tree(
+            root_id="root", sessions=session,
+            tokens=(timestamped, cross_source_app), lifecycle=(abort,),
+            activities=(),
+        )
+        retained = aggregate_task_tree(
+            root_id="root", sessions=session,
+            tokens=(timestamped, same_source_app), lifecycle=(abort,),
+            activities=(),
+        )
+
+        self.assertIsNone(excluded.recorded.input.value)
+        self.assertEqual(excluded.recorded.input.known_lower_bound, 50)
+        self.assertIn("ambiguous_timestamp_token:1", excluded.recorded.caveats)
+        self.assertEqual(retained.recorded.input.value, 100)
+        self.assertEqual(retained.recorded.working.value, 90)
+        self.assertIn("timestamp_missing_token:1", retained.recorded.caveats)
+
+    def test_non_abort_cutoffs_keep_cross_source_timestampless_app_total(self) -> None:
+        session = (NormalizedSession("root", None, at(0)),)
+        tokens = (
+            TokenObservation("root", at(5), 1, TokenVector(50, 10, 5, 2)),
+            TokenObservation(
+                "root", None, 2, TokenVector(100, 20, 10, 5), 0,
+                "estimated", "logical-app", 1, "exact",
+                "app_total_timestamp_missing", True,
+            ),
+        )
+        cases = (
+            (
+                "completed",
+                (LifecycleObservation(
+                    "root", "task_complete", at(10), "logical-rollout", 3,
+                    "turn-a",
+                ),),
+                None,
+            ),
+            ("open", (), at(10)),
+            (
+                "reopened",
+                (
+                    LifecycleObservation(
+                        "root", "turn_aborted", at(8), "logical-rollout", 3,
+                        "turn-a",
+                    ),
+                    LifecycleObservation(
+                        "root", "task_started", at(9), "logical-rollout", 4,
+                        "turn-b",
+                    ),
+                ),
+                at(10),
+            ),
+        )
+        for name, lifecycle, cutoff in cases:
+            with self.subTest(name=name):
+                metrics = aggregate_task_tree(
+                    root_id="root", sessions=session, tokens=tokens,
+                    lifecycle=lifecycle, activities=(), cutoff_at=cutoff,
+                )
+                self.assertEqual(metrics.recorded.input.value, 100)
+                self.assertEqual(metrics.recorded.working.value, 90)
+                self.assertNotIn(
+                    "ambiguous_timestamp_token:1", metrics.recorded.caveats,
+                )
+
     def test_cached_input_cannot_exceed_total_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "cached_input_tokens"):
             TokenVector(5, 6, 1, 0)

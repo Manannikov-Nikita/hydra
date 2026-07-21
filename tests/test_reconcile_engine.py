@@ -436,6 +436,76 @@ class ReconcileEngineTests(unittest.TestCase):
         ).fetchone()[0], 11)
         self.assertIn("ambiguous_token_placement", task.semantic.diagnostics)
 
+    def test_authoritative_abort_excludes_cross_source_timestampless_app_total(self) -> None:
+        self.session("root", 0)
+        self.token("root", 1, 5, 50, 10, 5, 2)
+        self.connection.execute(
+            """INSERT INTO codex_event_sources(
+                   source_digest,project_id,schema_version,source_format,
+                   line_count,byte_count)
+               VALUES ('app-total-source',?,'codex.app-server/v2','app_server',1,1)""",
+            (PROJECT,),
+        )
+        self.connection.execute(
+            """INSERT INTO token_snapshots(
+                   source_digest,line_number,session_key,project_id,epoch,input_tokens,
+                   cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,
+                   completeness,observed_at,source_family,counter_scope,event_key,
+                   contributes_total,selection_provenance,selection_caveat)
+               VALUES ('app-total-source',1,'root',?,0,100,20,10,5,0,
+                       'complete',NULL,'app_server','thread_total','app-total',1,
+                       'exact','app_total_timestamp_missing')""",
+            (PROJECT,),
+        )
+        self.connection.execute(
+            """INSERT INTO rollout_events(
+                   event_key,logical_source_key,source_ordinal,envelope_kind,
+                   observed_at,timestamp_quality,fingerprint)
+               VALUES ('abort-start','logical-root',0,'event_msg',?,'valid','start')""",
+            (stamp(0),),
+        )
+        self.connection.execute(
+            """INSERT INTO turn_lifecycle_events(
+                   event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+                   emitted_duration_ms,source_digest,logical_source_key,source_ordinal)
+               VALUES ('abort-start','root','abort-turn','started',?,0,NULL,
+                       'source-root','logical-root',0)""",
+            (stamp(0),),
+        )
+        self.connection.execute(
+            """INSERT INTO rollout_events(
+                   event_key,logical_source_key,source_ordinal,envelope_kind,
+                   observed_at,timestamp_quality,fingerprint)
+               VALUES ('abort-terminal','logical-root',100,'event_msg',?,'valid','abort')""",
+            (stamp(10),),
+        )
+        self.connection.execute(
+            """INSERT INTO turn_lifecycle_events(
+                   event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+                   emitted_duration_ms,source_digest,logical_source_key,source_ordinal)
+               VALUES ('abort-terminal','root','abort-turn','aborted',?,10,NULL,
+                       'source-root','logical-root',100)""",
+            (stamp(10),),
+        )
+        self.connection.commit()
+
+        reconcile_project(self.store, PROJECT, b"a" * 32)
+        task = list_reconciled_tasks(self.store, PROJECT)[0]
+
+        self.assertEqual(task.status, "incomplete")
+        self.assertIsNone(task.metrics.unique.working.value)
+        self.assertEqual(task.metrics.unique.working.known_lower_bound, 45)
+        self.assertEqual(task.semantic.unclassified_working.known_lower_bound, 45)
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT SUM(working_tokens) FROM reconciled_token_deltas
+                    WHERE project_id=?""",
+                (PROJECT,),
+            ).fetchone()[0],
+            45,
+        )
+        self.assertIn("ambiguous_token_placement", task.semantic.diagnostics)
+
     def test_token_before_session_start_is_not_persisted_as_a_reconciled_delta(self) -> None:
         self.session("root", 10)
         self.token("root", 1, 5, 100, 20, 10, 5)

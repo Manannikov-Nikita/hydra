@@ -202,6 +202,11 @@ def build_token_deltas(
         connection, project_id, plan.session_ids, plan.cutoff_at,
     )
     diagnostics: Counter[str] = Counter()
+    authoritative_abort = bool(
+        plan.status == "incomplete"
+        and plan.cutoff_source_key is not None
+        and plan.cutoff_source_ordinal is not None
+    )
     previous: dict[tuple[str, int], TokenVector] = {}
     deltas: list[DeltaFact] = []
     for ordinal, row in enumerate(rows, start=1):
@@ -228,7 +233,10 @@ def build_token_deltas(
             safely_ordered = (
                 same_cutoff_source and int(row[2]) <= plan.cutoff_source_ordinal
             )
-            if beyond_same_source_cutoff or not safely_ordered and row[11] != "app_server":
+            if beyond_same_source_cutoff or (
+                not safely_ordered
+                and (row[11] != "app_server" or authoritative_abort)
+            ):
                 diagnostics["ambiguous_token_placement"] += 1
                 continue
         epoch = int(row[3])

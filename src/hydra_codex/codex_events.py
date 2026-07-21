@@ -344,9 +344,25 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     if method not in _APP_METHODS:
         return None, ("unsupported_envelope",)
     thread_object = params.get("thread") if isinstance(params.get("thread"), Mapping) else None
-    thread = params.get("threadId") if isinstance(params.get("threadId"), str) else thread_object.get("id") if thread_object else None
+    parameter_thread = params.get("threadId")
+    nested_thread = thread_object.get("id") if thread_object else None
+    if (
+        isinstance(parameter_thread, str)
+        and isinstance(nested_thread, str)
+        and parameter_thread != nested_thread
+    ):
+        return None, ("invalid_envelope",)
+    thread = parameter_thread if isinstance(parameter_thread, str) else nested_thread
     turn = params.get("turn") if isinstance(params.get("turn"), Mapping) else None
-    turn_id = params.get("turnId") if isinstance(params.get("turnId"), str) else turn.get("id") if turn else None
+    parameter_turn = params.get("turnId")
+    nested_turn = turn.get("id") if turn else None
+    if (
+        isinstance(parameter_turn, str)
+        and isinstance(nested_turn, str)
+        and parameter_turn != nested_turn
+    ):
+        return None, ("invalid_envelope",)
+    turn_id = parameter_turn if isinstance(parameter_turn, str) else nested_turn
     if not isinstance(thread, str) or not thread:
         return None, ("invalid_envelope",)
     if method in {"turn/started", "turn/completed", "item/started", "item/completed"} and (

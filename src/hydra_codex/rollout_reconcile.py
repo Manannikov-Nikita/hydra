@@ -143,8 +143,25 @@ def reconcile_turn_attempts(
         attempts: list[_Attempt] = []
         active: _Attempt | None = None
         for event in events:
+            previous = next(
+                (
+                    attempt for attempt in reversed(attempts)
+                    if attempt is not active and attempt.terminal_event is not None
+                ),
+                None,
+            )
             if event.event_kind == "started":
                 if active is None:
+                    # This loop is scoped to one raw turn key.  A lower-authority
+                    # duplicate start must not reopen a turn already closed by a
+                    # more authoritative adapter; peers and stronger sources can
+                    # still prove a real retry.
+                    if (
+                        previous is not None
+                        and _event_authority(connection, event)
+                        < _event_authority(connection, previous.terminal_event)
+                    ):
+                        continue
                     active = _Attempt(
                         started_at=event.observed_at,
                         started_epoch=event.timestamp_epoch,
@@ -158,13 +175,6 @@ def reconcile_turn_attempts(
                     )
                 continue
             state = "completed" if event.event_kind == "completed" else "aborted"
-            previous = next(
-                (
-                    attempt for attempt in reversed(attempts)
-                    if attempt is not active and attempt.terminal_event is not None
-                ),
-                None,
-            )
             event_authority = _event_authority(connection, event)
             if active is not None:
                 # A lower-authority terminal arriving after an authoritative

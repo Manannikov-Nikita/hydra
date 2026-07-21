@@ -382,6 +382,159 @@ class LifecycleTimingAuthorityTests(unittest.TestCase):
             datetime(2024, 7, 3, 9, 47, tzinfo=timezone.utc),
         )
 
+    def test_lower_authority_same_turn_start_does_not_reopen_rollout_terminal(self) -> None:
+        terminals = (
+            ("task_complete", "completed", 1, "complete"),
+            ("turn_aborted", "aborted", 0, "incomplete"),
+        )
+        for terminal_kind, attempt_state, complete_count, task_status in terminals:
+            terminal = terminal_kind.removeprefix("task_").removeprefix("turn_")
+            for timing in ("receipt-only", "timestamped"):
+                scenario = f"same-turn-{terminal}-{timing}"
+                thread = f"{scenario}-thread"
+                turn = f"{scenario}-turn"
+                rollout = _write(self.base / f"{scenario}.rollout.jsonl", (
+                    {
+                        "timestamp": "2024-07-03T09:46:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": thread, "cwd": str(self.project)},
+                    },
+                    {
+                        "timestamp": "2024-07-03T09:46:10Z",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": turn},
+                    },
+                    {
+                        "timestamp": "2024-07-03T09:46:20Z",
+                        "type": "event_msg",
+                        "payload": {"type": terminal_kind, "turn_id": turn},
+                    },
+                ))
+                app_turn: dict[str, object] = {
+                    "id": turn,
+                    "status": "inProgress",
+                }
+                if timing == "timestamped":
+                    app_turn["startedAt"] = 1720000003
+                app = _write(self.base / f"{scenario}.app.jsonl", ({
+                    "received_at": "2024-07-03T09:46:30Z",
+                    "message": {"method": "turn/started", "params": {
+                        "threadId": thread,
+                        "turn": app_turn,
+                    }},
+                },))
+
+                for app_first in (True, False):
+                    order = "app-first" if app_first else "rollout-first"
+                    with self.subTest(
+                        terminal=terminal, timing=timing, order=order,
+                    ):
+                        store = HydraStore(
+                            self.base / f"{scenario}-{order}.sqlite3"
+                        )
+                        self.addCleanup(store.close)
+                        if app_first:
+                            ingest_codex_events(
+                                store, (CodexEventSource(app, APP_SERVER_V2),),
+                                self.project, PROJECT_ID, hash_key=KEY,
+                            )
+                            ingest_rollouts(
+                                store, (rollout,), self.project, PROJECT_ID,
+                                hash_key=KEY,
+                            )
+                        else:
+                            ingest_rollouts(
+                                store, (rollout,), self.project, PROJECT_ID,
+                                hash_key=KEY,
+                            )
+                            ingest_codex_events(
+                                store, (CodexEventSource(app, APP_SERVER_V2),),
+                                self.project, PROJECT_ID, hash_key=KEY,
+                            )
+
+                        self.assertEqual(
+                            [tuple(row) for row in store.connection.execute(
+                                "SELECT attempt_ordinal,state FROM turn_attempts "
+                                "ORDER BY attempt_ordinal"
+                            )],
+                            [(1, attempt_state)],
+                        )
+                        summary = reconcile_project(
+                            store, PROJECT_ID, installation_key=b"r" * 32,
+                        )
+                        task = list_reconciled_tasks(store, PROJECT_ID)[0]
+                        report = list_reconciled_reports(store, PROJECT_ID)[0]
+                        self.assertEqual(
+                            (summary.complete_count, task.status, report.status),
+                            (complete_count, task_status, task_status),
+                        )
+
+    def test_higher_authority_same_turn_start_reopens_lower_terminal(self) -> None:
+        thread = "rollout-retry-thread"
+        turn = "rollout-retry-turn"
+        app = _write(self.base / "rollout-retry.app.jsonl", (
+            {
+                "method": "turn/started", "params": {
+                    "threadId": thread,
+                    "turn": {
+                        "id": turn, "status": "inProgress",
+                        "startedAt": 1720000000,
+                    },
+                },
+            },
+            {
+                "method": "turn/completed", "params": {
+                    "threadId": thread,
+                    "turn": {
+                        "id": turn, "status": "cancelled",
+                        "completedAt": 1720000002,
+                    },
+                },
+            },
+        ))
+        rollout = _write(self.base / "rollout-retry.rollout.jsonl", (
+            {
+                "timestamp": "2024-07-03T09:46:39Z",
+                "type": "session_meta",
+                "payload": {"id": thread, "cwd": str(self.project)},
+            },
+            {
+                "timestamp": "2024-07-03T09:46:50Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn},
+            },
+        ))
+
+        for app_first in (True, False):
+            order = "app-first" if app_first else "rollout-first"
+            with self.subTest(order=order):
+                store = HydraStore(self.base / f"rollout-retry-{order}.sqlite3")
+                self.addCleanup(store.close)
+                if app_first:
+                    ingest_codex_events(
+                        store, (CodexEventSource(app, APP_SERVER_V2),),
+                        self.project, PROJECT_ID, hash_key=KEY,
+                    )
+                    ingest_rollouts(
+                        store, (rollout,), self.project, PROJECT_ID, hash_key=KEY,
+                    )
+                else:
+                    ingest_rollouts(
+                        store, (rollout,), self.project, PROJECT_ID, hash_key=KEY,
+                    )
+                    ingest_codex_events(
+                        store, (CodexEventSource(app, APP_SERVER_V2),),
+                        self.project, PROJECT_ID, hash_key=KEY,
+                    )
+
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        "SELECT attempt_ordinal,state FROM turn_attempts "
+                        "ORDER BY attempt_ordinal"
+                    )],
+                    [(1, "aborted"), (2, "open")],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

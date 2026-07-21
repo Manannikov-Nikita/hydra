@@ -179,6 +179,69 @@ class RolloutLineageB2Tests(unittest.TestCase):
         for secret in ("private-event-secret", "event-value", "private-response-secret", "response-value"):
             self.assertNotIn(secret, dump)
 
+    def test_recognized_privacy_ignored_shapes_do_not_persist_content_or_diagnostics(self) -> None:
+        sentinels = {
+            "world_state": "private-world-state-sentinel",
+            "agent_reasoning": "private-agent-reasoning-sentinel",
+            "agent_message": "private-agent-message-sentinel",
+            "user_message": "private-user-message-sentinel",
+            "reasoning": "private-reasoning-sentinel",
+            "message": "private-message-sentinel",
+        }
+        source = self.base / "rollouts" / "ignored-shapes.jsonl"
+        write(source, [
+            self.meta(),
+            envelope("world_state", {"state": {"content": sentinels["world_state"]}}),
+            envelope("event_msg", {"type": "agent_reasoning", "message": sentinels["agent_reasoning"]}),
+            envelope("event_msg", {"type": "agent_message", "message": sentinels["agent_message"]}),
+            envelope("event_msg", {"type": "user_message", "message": sentinels["user_message"]}),
+            envelope("response_item", {"type": "reasoning", "summary": [{"text": sentinels["reasoning"]}]}),
+            envelope("response_item", {"type": "message", "content": [{"text": sentinels["message"]}]}),
+        ])
+
+        report = ingest_rollouts(
+            self.store, (source,), self.project, "project-b2", hash_key=self.key,
+        )
+
+        self.assertEqual(report.diagnostics, 0)
+        self.assertEqual(self.store.count("rollout_diagnostics"), 0)
+        dump = "\n".join(self.store.connection.iterdump())
+        for sentinel in sentinels.values():
+            self.assertNotIn(sentinel, dump)
+
+    def test_unknown_schema_values_remain_diagnostic_without_raw_content(self) -> None:
+        unknown_envelope = "private-unknown-envelope"
+        unknown_event = "private-unknown-event"
+        unknown_response = "private-unknown-response"
+        sentinels = (
+            "private-unknown-envelope-content",
+            "private-unknown-event-content",
+            "private-unknown-response-content",
+        )
+        source = self.base / "rollouts" / "unknown-schema.jsonl"
+        write(source, [
+            self.meta(),
+            envelope(unknown_envelope, {"content": sentinels[0]}),
+            envelope("event_msg", {"type": unknown_event, "content": sentinels[1]}),
+            envelope("response_item", {"type": unknown_response, "content": sentinels[2]}),
+        ])
+
+        report = ingest_rollouts(
+            self.store, (source,), self.project, "project-b2", hash_key=self.key,
+        )
+
+        self.assertEqual(report.diagnostics, 3)
+        kinds = {row[0] for row in self.store.connection.execute(
+            "SELECT envelope_kind FROM rollout_diagnostics"
+        )}
+        self.assertEqual(
+            kinds,
+            {"unknown_envelope", "unknown_event_type", "unknown_response_type"},
+        )
+        dump = "\n".join(self.store.connection.iterdump())
+        for private_value in (unknown_envelope, unknown_event, unknown_response, *sentinels):
+            self.assertNotIn(private_value, dump)
+
     def test_divergent_copy_at_new_location_conflicts_instead_of_double_counting(self) -> None:
         active = self.base / "active" / "thread.jsonl"
         copy = self.base / "archived" / "thread.jsonl"

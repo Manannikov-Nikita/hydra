@@ -8,14 +8,22 @@ from typing import Any
 
 
 LOCATION_TYPES = frozenset({"active", "archived", "explicit"})
-KNOWN_ENVELOPES = frozenset({"session_meta", "turn_context", "event_msg", "response_item"})
-KNOWN_EVENT_TYPES = frozenset({
+EXTRACTED_ENVELOPES = frozenset({"session_meta", "turn_context", "event_msg", "response_item"})
+IGNORED_ENVELOPES = frozenset({"world_state"})
+KNOWN_ENVELOPES = EXTRACTED_ENVELOPES | IGNORED_ENVELOPES
+
+EXTRACTED_EVENT_TYPES = frozenset({
     "token_count", "sub_agent_activity", "task_started", "task_complete", "turn_aborted",
     "mcp_tool_call_end", "patch_apply_end", "web_search_end",
 })
-KNOWN_RESPONSE_TYPES = frozenset({
+IGNORED_EVENT_TYPES = frozenset({"agent_reasoning", "agent_message", "user_message"})
+KNOWN_EVENT_TYPES = EXTRACTED_EVENT_TYPES | IGNORED_EVENT_TYPES
+
+EXTRACTED_RESPONSE_TYPES = frozenset({
     "custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output",
 })
+IGNORED_RESPONSE_TYPES = frozenset({"reasoning", "message"})
+KNOWN_RESPONSE_TYPES = EXTRACTED_RESPONSE_TYPES | IGNORED_RESPONSE_TYPES
 DIAGNOSTIC_KINDS = frozenset({
     "malformed", "unknown_envelope", "unknown_event_type", "unknown_response_type",
     "invalid_timestamp", "session_meta", "unresolved_project", "unrelated_project",

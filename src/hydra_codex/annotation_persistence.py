@@ -36,9 +36,14 @@ def stage_fact(
 
 def binding_for_capability(connection: sqlite3.Connection, digest: str) -> sqlite3.Row:
     row = connection.execute(
-        """SELECT turn_capabilities.*,trusted_turn_bindings.project_id,
-                  trusted_turn_bindings.session_key,trusted_turn_bindings.state,
-                  trusted_turn_bindings.last_sequence,trusted_turn_bindings.finished_at
+        """SELECT turn_capabilities.capability_digest,turn_capabilities.turn_key,
+                  turn_capabilities.created_at AS capability_created_at,
+                  turn_capabilities.expires_at,turn_capabilities.used_at,
+                  turn_capabilities.revoked_at,turn_capabilities.stop_retry,
+                  trusted_turn_bindings.project_id,trusted_turn_bindings.session_key,
+                  trusted_turn_bindings.created_at AS binding_created_at,
+                  trusted_turn_bindings.state,trusted_turn_bindings.last_sequence,
+                  trusted_turn_bindings.finished_at,trusted_turn_bindings.first_stop_at
              FROM turn_capabilities JOIN trusted_turn_bindings USING(turn_key)
             WHERE capability_digest=?""",
         (digest,),

@@ -68,11 +68,16 @@ C3_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             provenance TEXT NOT NULL CHECK(provenance IN ('exact','derived'))
         )""",
     )),
+    (19, (
+        "ALTER TABLE trusted_turn_bindings ADD COLUMN first_stop_at TEXT",
+    )),
 )
 
 
 C3_REQUIRED_SCHEMA = {
-    "trusted_turn_bindings": {"project_id", "session_key", "turn_key", "last_sequence"},
+    "trusted_turn_bindings": {
+        "project_id", "session_key", "turn_key", "last_sequence", "first_stop_at",
+    },
     "turn_capabilities": {"capability_digest", "expires_at", "used_at", "revoked_at", "stop_retry"},
     "annotation_receipts": {"request_digest", "payload_digest", "retry_count"},
     "semantic_intervals": {"start_annotation_id", "end_annotation_id", "phase", "provenance"},

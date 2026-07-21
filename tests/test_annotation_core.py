@@ -97,6 +97,11 @@ class AnnotationCapabilitySchemaTests(unittest.TestCase):
             }
 
             self.assertTrue(expected.issubset(actual))
+            binding_columns = {
+                row[1]
+                for row in store.connection.execute("PRAGMA table_info(trusted_turn_bindings)")
+            }
+            self.assertIn("first_stop_at", binding_columns)
 
     def test_previous_database_upgrades_without_rewriting_annotations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -128,6 +133,18 @@ class AnnotationCapabilitySchemaTests(unittest.TestCase):
                        '2026-07-21T00:00:00Z','phase','understand','prompt','none',1.0,
                        NULL,'model_reported','safe','old-hash',4,'upgrade')"""
             )
+            connection.execute(
+                """INSERT INTO trusted_turn_bindings(
+                       turn_key,project_id,session_key,created_at,state,last_sequence)
+                   VALUES ('old-turn','hprj_upgrade','old-session',
+                       '2026-07-21T00:00:00Z','open',-1)"""
+            )
+            connection.execute(
+                """INSERT INTO turn_capabilities(
+                       capability_digest,turn_key,created_at,expires_at,stop_retry)
+                   VALUES ('legacy-capability','old-turn','2026-07-21T00:00:00Z',
+                       '2026-07-21T01:00:00Z',1)"""
+            )
             connection.commit()
             connection.close()
 
@@ -139,7 +156,10 @@ class AnnotationCapabilitySchemaTests(unittest.TestCase):
             ).fetchone()[0], "upgrade")
             self.assertEqual(store.connection.execute(
                 "SELECT COUNT(*) FROM trusted_turn_bindings"
-            ).fetchone()[0], 0)
+            ).fetchone()[0], 1)
+            self.assertIsNone(store.connection.execute(
+                "SELECT first_stop_at FROM trusted_turn_bindings WHERE turn_key='old-turn'"
+            ).fetchone()[0])
 
 
 class AnnotationCapabilityCoreTests(unittest.TestCase):
@@ -237,6 +257,49 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
         self.assertEqual(capability["used_at"], request(0).observed_at)
         self.assertIsNone(capability["revoked_at"])
 
+    def test_new_annotation_cannot_predate_binding_or_issuing_capability(self) -> None:
+        issued = self.issue()
+
+        with self.assertRaisesRegex(CapabilityRejected, "predates"):
+            record_initial_understand(
+                self.store,
+                self.keys,
+                issued.token,
+                request(0, observed_at="2026-07-21T08:59:59Z"),
+                task_family="annotation-core",
+            )
+
+        later_capability = issue_capability(
+            self.store,
+            self.keys,
+            TrustedTurnContext(
+                project_id=PROJECT_ID,
+                session_id=RAW_SESSION,
+                turn_id=RAW_TURN,
+                observed_at="2026-07-21T09:05:00Z",
+            ),
+            expires_at=EXPIRES_AT,
+        )
+        with self.assertRaisesRegex(CapabilityRejected, "predates"):
+            record_initial_understand(
+                self.store,
+                self.keys,
+                later_capability.token,
+                request(0, observed_at="2026-07-21T09:04:59Z"),
+                task_family="annotation-core",
+            )
+
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM annotations").fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM semantic_fact_staging"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_finish_revokes_new_writes_but_identical_finish_retry_is_idempotent(self) -> None:
         issued = self.issue()
         record_initial_understand(
@@ -256,6 +319,14 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
             request(1, key="finish-request", observed_at="2026-07-21T10:01:00Z"),
             finish_payload(),
         )
+        with self.assertRaisesRegex(CapabilityRejected, "predates"):
+            finish_turn(
+                self.store,
+                self.keys,
+                issued.token,
+                request(1, key="finish-request", observed_at="2026-07-21T08:59:59Z"),
+                finish_payload(),
+            )
 
         receipt = self.store.connection.execute("SELECT retry_count,last_received_at FROM annotation_receipts WHERE sequence=1").fetchone()
         capability = self.store.connection.execute("SELECT revoked_at FROM turn_capabilities").fetchone()
@@ -290,10 +361,72 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
         self.assertEqual(tuple(row), ("implement", "working"))
         self.assertEqual(fact[0], "annotation_sequence_conflict")
 
+    def test_nonidentical_duplicate_must_pass_state_and_expiry_before_conflict_staging(self) -> None:
+        expired = issue_capability(
+            self.store,
+            self.keys,
+            turn_context(),
+            expires_at="2026-07-21T09:00:30Z",
+        )
+        record_initial_understand(
+            self.store,
+            self.keys,
+            expired.token,
+            request(0, key="expired-request"),
+            task_family="annotation-core",
+        )
+        with self.assertRaises(CapabilityExpired):
+            annotate_with_capability(
+                self.store,
+                self.keys,
+                expired.token,
+                request(
+                    0,
+                    key="expired-request",
+                    observed_at="2026-07-21T09:00:30Z",
+                ),
+                phase_payload("research"),
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM semantic_fact_staging"
+            ).fetchone()[0],
+            0,
+        )
+
+        finish_turn(
+            self.store,
+            self.keys,
+            expired.token,
+            request(1, key="finish", observed_at="2026-07-21T09:00:20Z"),
+            finish_payload(),
+        )
+        with self.assertRaises(CapabilityRejected):
+            finish_turn(
+                self.store,
+                self.keys,
+                expired.token,
+                request(1, key="different-finish", observed_at="2026-07-21T09:00:25Z"),
+                finish_payload(note="different"),
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM semantic_fact_staging"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_trusted_timestamp_regression_is_diagnosed_without_corrupting_interval(self) -> None:
         issued = self.issue()
         record_initial_understand(
             self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        annotate_with_capability(
+            self.store,
+            self.keys,
+            issued.token,
+            request(1, observed_at="2026-07-21T09:02:00Z"),
+            phase_payload(),
         )
 
         with self.assertRaises(AnnotationConflict):
@@ -301,19 +434,20 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
                 self.store,
                 self.keys,
                 issued.token,
-                request(1, observed_at="2026-07-21T08:59:59Z"),
-                phase_payload(),
+                request(2, observed_at="2026-07-21T09:01:59Z"),
+                phase_payload("docs"),
             )
 
         interval = self.store.connection.execute(
-            "SELECT start_sequence,ended_at FROM semantic_intervals"
+            """SELECT start_sequence,ended_at FROM semantic_intervals
+                WHERE ended_at IS NULL"""
         ).fetchone()
         fact = self.store.connection.execute(
             "SELECT fact_kind FROM semantic_fact_staging"
         ).fetchone()
-        self.assertEqual(tuple(interval), (0, None))
+        self.assertEqual(tuple(interval), (1, None))
         self.assertEqual(fact[0], "annotation_out_of_order")
-        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM annotations").fetchone()[0], 1)
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM annotations").fetchone()[0], 2)
 
     def test_blocker_phase_disagreement_keeps_active_phase_and_stages_conflict(self) -> None:
         issued = self.issue()
@@ -420,6 +554,106 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
         self.assertEqual(tuple(capability), (1, "2026-07-21T09:02:00Z"))
         self.assertEqual([tuple(row) for row in facts], [("self_report_missing", 1)])
         self.assertEqual(tuple(binding), ("finished", "2026-07-21T09:02:00Z"))
+
+    def test_stop_is_monotonic_against_annotations_intervals_and_first_stop(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+        annotate_with_capability(
+            self.store,
+            self.keys,
+            issued.token,
+            request(1, observed_at="2026-07-21T09:05:00Z"),
+            phase_payload(),
+        )
+
+        with self.assertRaisesRegex(CapabilityRejected, "out of order"):
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:04:59Z",
+            )
+        binding = self.store.connection.execute(
+            "SELECT first_stop_at,state FROM trusted_turn_bindings"
+        ).fetchone()
+        self.assertEqual(tuple(binding), (None, "open"))
+        self.assertEqual(
+            self.store.connection.execute("SELECT MAX(stop_retry) FROM turn_capabilities").fetchone()[0],
+            0,
+        )
+
+        self.store.connection.execute(
+            "UPDATE semantic_intervals SET started_at='2026-07-21T09:06:00Z' WHERE ended_at IS NULL"
+        )
+        self.store.connection.commit()
+        with self.assertRaisesRegex(CapabilityRejected, "out of order"):
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:05:30Z",
+            )
+
+        self.assertEqual(
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:07:00Z",
+            ),
+            StopState.RETRY_REQUIRED,
+        )
+        first_stop = self.store.connection.execute(
+            "SELECT first_stop_at FROM trusted_turn_bindings"
+        ).fetchone()[0]
+        self.assertEqual(first_stop, "2026-07-21T09:07:00Z")
+        self.store.close()
+        self.store = HydraStore(self.database)
+
+        with self.assertRaisesRegex(CapabilityRejected, "out of order"):
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:06:30Z",
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT state FROM trusted_turn_bindings"
+            ).fetchone()[0],
+            "open",
+        )
+        self.assertEqual(
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:08:00Z",
+            ),
+            StopState.SELF_REPORT_MISSING,
+        )
+        with self.assertRaisesRegex(CapabilityRejected, "out of order"):
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:06:59Z",
+            )
+
+    def test_legacy_consumed_stop_retry_without_timestamp_fails_closed(self) -> None:
+        issued = self.issue()
+        self.store.connection.execute("UPDATE turn_capabilities SET stop_retry=1")
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(CapabilityRejected, "state is inconsistent"):
+            observe_stop(
+                self.store,
+                self.keys,
+                issued.token,
+                observed_at="2026-07-21T09:01:00Z",
+            )
 
     def test_finish_makes_stop_complete_without_consuming_retry(self) -> None:
         issued = self.issue()

@@ -14,8 +14,8 @@ from typing import Any, Mapping, Protocol, Sequence, TextIO
 from .contracts import ModelAnnotationInput
 from .project import ProjectNotFound, resolve_project
 from .rollout import ingest_rollouts
-from .rollout_identity import RolloutRoot
-from .storage import HydraStore, StorageUnavailable
+from .rollout_identity import Pseudonymizer, RolloutRoot
+from .storage import HydraStore, StorageUnavailable, default_database_path
 
 
 class CommandServices(Protocol):
@@ -128,13 +128,31 @@ def _default_sources(environ: Mapping[str, str]) -> tuple[RolloutRoot, ...]:
     return tuple(RolloutRoot(path, label) for path, label in candidates if path.is_dir())
 
 
-def _run_ingest(arguments: argparse.Namespace, environ: Mapping[str, str]) -> dict[str, object]:
+def _installation_key_path(
+    environ: Mapping[str, str], injected: Path | None,
+) -> Path:
+    if injected is not None:
+        return injected.expanduser()
+    home = Path(environ["HOME"]).expanduser() if environ.get("HOME") else Path.home()
+    return default_database_path(home).parent / "rollout-hmac.key"
+
+
+def _run_ingest(
+    arguments: argparse.Namespace,
+    environ: Mapping[str, str],
+    installation_key_path: Path | None,
+) -> dict[str, object]:
     database, cwd = _paths(arguments)
     project = resolve_project(cwd)
     roots = _default_sources(environ) + tuple(_source(value, project.project_root) for value in arguments.source)
     store = HydraStore(database)
     try:
-        report = ingest_rollouts(store, roots, project.project_root, project.project_id)
+        hash_key = Pseudonymizer.installation_key(
+            _installation_key_path(environ, installation_key_path),
+        ).key
+        report = ingest_rollouts(
+            store, roots, project.project_root, project.project_id, hash_key=hash_key,
+        )
     finally:
         store.close()
     return {
@@ -167,12 +185,10 @@ def _annotation(arguments: argparse.Namespace, stdin: TextIO) -> ModelAnnotation
         "note": arguments.note,
     }
     supplied = {key: value for key, value in flag_fields.items() if value is not None}
-    body = _stdin_text(stdin).strip()
-    if supplied and body:
-        raise ValueError("annotation accepts flags or stdin")
     if supplied:
         payload: Any = supplied
     else:
+        body = _stdin_text(stdin).strip()
         try:
             payload = json.loads(body)
         except (TypeError, ValueError) as error:
@@ -197,12 +213,17 @@ def atomic_write(path: Path | str, content: str) -> None:
     target = Path(path).expanduser()
     descriptor, temporary_name = tempfile.mkstemp(prefix=".hydra-output-", dir=target.parent)
     temporary = Path(temporary_name)
+    descriptor_open = True
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor_open = False
+        try:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        finally:
+            handle.close()
         os.replace(temporary, target)
         directory = os.open(target.parent, os.O_RDONLY)
         try:
@@ -210,6 +231,11 @@ def atomic_write(path: Path | str, content: str) -> None:
         finally:
             os.close(directory)
     finally:
+        if descriptor_open:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temporary.unlink()
         except FileNotFoundError:
@@ -244,6 +270,7 @@ def main(
     stderr: TextIO | None = None,
     environ: Mapping[str, str] | None = None,
     services: CommandServices | None = None,
+    installation_key_path: Path | None = None,
 ) -> int:
     input_stream = sys.stdin if stdin is None else stdin
     output_stream = sys.stdout if stdout is None else stdout
@@ -257,7 +284,10 @@ def main(
             return int(exit_request.code or 0)
     try:
         if arguments.command == "ingest":
-            _write_json(output_stream, _run_ingest(arguments, environment))
+            _write_json(
+                output_stream,
+                _run_ingest(arguments, environment, installation_key_path),
+            )
         elif arguments.command == "annotate":
             capability = environment.get("HYDRA_TURN_CAPABILITY")
             if not isinstance(capability, str) or not capability:

@@ -63,10 +63,14 @@ class Pseudonymizer:
 
     @classmethod
     def installation(cls, directory: Path) -> "Pseudonymizer":
+        return cls.installation_key(directory / "rollout-hmac.key")
+
+    @classmethod
+    def installation_key(cls, path: Path) -> "Pseudonymizer":
+        directory = path.parent
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name == "posix":
             os.chmod(directory, 0o700)
-        path = directory / "rollout-hmac.key"
         if path.exists():
             return cls(_read_private_key(path))
         key = secrets.token_bytes(32)

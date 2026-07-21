@@ -152,6 +152,23 @@ def finish_turn(
     )
 
 
+def _require_observation_after_issue(binding: Mapping[str, Any], observed_at: str) -> None:
+    observed = timestamp(observed_at)
+    if observed < timestamp(binding["binding_created_at"]):
+        raise CapabilityRejected("trusted observation predates turn binding")
+    if observed < timestamp(binding["capability_created_at"]):
+        raise CapabilityRejected("trusted observation predates capability")
+
+
+def _require_new_request_authorized(
+    binding: Mapping[str, Any], observed_at: str
+) -> None:
+    if binding["state"] == "finished" or binding["revoked_at"] is not None:
+        raise CapabilityRejected("capability is unavailable")
+    if timestamp(observed_at) >= timestamp(binding["expires_at"]):
+        raise CapabilityExpired("capability has expired")
+
+
 def _record_annotation(
     store: HydraStore,
     keys: Pseudonymizer,
@@ -171,6 +188,7 @@ def _record_annotation(
 
     with store.rollout_transaction() as connection:
         binding = binding_for_capability(connection, capability_key)
+        _require_observation_after_issue(binding, context.observed_at)
         request_digest = "hreq_v1_" + keys.digest(
             "event", f"{binding['turn_key']}/{context.request_key}"
         )
@@ -186,26 +204,28 @@ def _record_annotation(
             (binding["turn_key"], binding["last_sequence"]),
         ).fetchone()
         existing = by_sequence or by_request
-        if existing is not None:
-            if (
-                existing["sequence"] == context.sequence
-                and existing["request_digest"] == request_digest
-                and existing["payload_digest"] == payload_digest
-            ):
-                last_seen = max(
-                    (existing["last_received_at"], context.observed_at),
-                    key=timestamp,
-                )
-                connection.execute(
-                    """UPDATE annotation_receipts
-                          SET retry_count=retry_count+1,last_received_at=?
-                        WHERE annotation_id=?""",
-                    (last_seen, existing["annotation_id"]),
-                )
-                result = AnnotationWrite(
-                    existing["annotation_id"], context.sequence, AnnotationDisposition.RETRIED
-                )
-            else:
+        is_exact_retry = existing is not None and (
+            existing["sequence"] == context.sequence
+            and existing["request_digest"] == request_digest
+            and existing["payload_digest"] == payload_digest
+        )
+        if is_exact_retry:
+            last_seen = max(
+                (existing["last_received_at"], context.observed_at),
+                key=timestamp,
+            )
+            connection.execute(
+                """UPDATE annotation_receipts
+                      SET retry_count=retry_count+1,last_received_at=?
+                    WHERE annotation_id=?""",
+                (last_seen, existing["annotation_id"]),
+            )
+            result = AnnotationWrite(
+                existing["annotation_id"], context.sequence, AnnotationDisposition.RETRIED
+            )
+        else:
+            _require_new_request_authorized(binding, context.observed_at)
+            if existing is not None:
                 conflict_kind = (
                     "annotation_sequence_conflict"
                     if by_sequence is not None
@@ -221,36 +241,32 @@ def _record_annotation(
                     discriminator=payload_digest,
                 )
                 result = ConflictDecision("annotation request conflicts with an accepted observation")
-        elif binding["state"] == "finished" or binding["revoked_at"] is not None:
-            raise CapabilityRejected("capability is unavailable")
-        elif observed >= timestamp(binding["expires_at"]):
-            raise CapabilityExpired("capability has expired")
-        elif (
-            context.sequence != binding["last_sequence"] + 1
-            or (previous is not None and observed < timestamp(previous["observed_at"]))
-        ):
-            stage_fact(
-                connection,
-                keys,
-                binding,
-                sequence=context.sequence,
-                kind="annotation_out_of_order",
-                observed_at=context.observed_at,
-                discriminator=payload_digest,
-            )
-            result = ConflictDecision("annotation sequence is out of order")
-        else:
-            result = insert_annotation(
-                connection,
-                keys,
-                binding,
-                capability_key,
-                request_digest,
-                payload_digest,
-                context,
-                model,
-                provenance,
-            )
+            elif (
+                context.sequence != binding["last_sequence"] + 1
+                or (previous is not None and observed < timestamp(previous["observed_at"]))
+            ):
+                stage_fact(
+                    connection,
+                    keys,
+                    binding,
+                    sequence=context.sequence,
+                    kind="annotation_out_of_order",
+                    observed_at=context.observed_at,
+                    discriminator=payload_digest,
+                )
+                result = ConflictDecision("annotation sequence is out of order")
+            else:
+                result = insert_annotation(
+                    connection,
+                    keys,
+                    binding,
+                    capability_key,
+                    request_digest,
+                    payload_digest,
+                    context,
+                    model,
+                    provenance,
+                )
     if isinstance(result, ConflictDecision):
         raise AnnotationConflict(result.message)
     return result
@@ -263,10 +279,37 @@ def observe_stop(
     *,
     observed_at: str,
 ) -> StopState:
-    timestamp(observed_at)
+    observed = timestamp(observed_at)
     capability_key = capability_digest(keys, capability)
     with store.rollout_transaction() as connection:
         binding = binding_for_capability(connection, capability_key)
+        _require_observation_after_issue(binding, observed_at)
+        latest_annotation = connection.execute(
+            """SELECT annotations.observed_at FROM annotations
+                JOIN annotation_receipts USING(annotation_id)
+                WHERE annotation_receipts.turn_key=?
+                ORDER BY annotation_receipts.sequence DESC LIMIT 1""",
+            (binding["turn_key"],),
+        ).fetchone()
+        open_interval = connection.execute(
+            """SELECT started_at FROM semantic_intervals
+                WHERE turn_key=? AND ended_at IS NULL""",
+            (binding["turn_key"],),
+        ).fetchone()
+        stop_floors = [
+            binding["first_stop_at"],
+            binding["finished_at"],
+            None if latest_annotation is None else latest_annotation["observed_at"],
+            None if open_interval is None else open_interval["started_at"],
+        ]
+        if any(floor is not None and observed < timestamp(floor) for floor in stop_floors):
+            raise CapabilityRejected("trusted stop observation is out of order")
+        turn_retry = connection.execute(
+            "SELECT MAX(stop_retry) FROM turn_capabilities WHERE turn_key=?",
+            (binding["turn_key"],),
+        ).fetchone()[0]
+        if (turn_retry > 0) != (binding["first_stop_at"] is not None):
+            raise CapabilityRejected("stop retry state is inconsistent")
         finish = connection.execute(
             """SELECT 1 FROM annotations
                 JOIN annotation_receipts USING(annotation_id)
@@ -277,11 +320,12 @@ def observe_stop(
             return StopState.FINISHED
         if binding["state"] == "finished":
             return StopState.SELF_REPORT_MISSING
-        turn_retry = connection.execute(
-            "SELECT MAX(stop_retry) FROM turn_capabilities WHERE turn_key=?",
-            (binding["turn_key"],),
-        ).fetchone()[0]
         if turn_retry == 0:
+            connection.execute(
+                """UPDATE trusted_turn_bindings
+                      SET first_stop_at=? WHERE turn_key=? AND first_stop_at IS NULL""",
+                (observed_at, binding["turn_key"]),
+            )
             connection.execute(
                 "UPDATE turn_capabilities SET stop_retry=1 WHERE turn_key=?",
                 (binding["turn_key"],),

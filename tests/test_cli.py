@@ -55,18 +55,34 @@ class FakeServices:
         return self.compare_content
 
 
-def invoke(argv, *, stdin="", environ=None, services=None):
+def invoke(
+    argv, *, stdin="", environ=None, services=None, installation_key_path=None,
+):
     stdout = io.StringIO()
     stderr = io.StringIO()
+    input_stream = io.StringIO(stdin) if isinstance(stdin, str) else stdin
+    key_options = (
+        {"installation_key_path": installation_key_path}
+        if installation_key_path is not None else {}
+    )
     code = main(
         argv,
-        stdin=io.StringIO(stdin),
+        stdin=input_stream,
         stdout=stdout,
         stderr=stderr,
         environ={} if environ is None else environ,
         services=services,
+        **key_options,
     )
     return code, stdout.getvalue(), stderr.getvalue()
+
+
+class NoReadStdin:
+    def isatty(self):
+        raise AssertionError("flag annotation must not inspect stdin")
+
+    def read(self):
+        raise AssertionError("flag annotation must not read stdin")
 
 
 class CliParserTests(unittest.TestCase):
@@ -135,23 +151,24 @@ class AnnotateCliTests(unittest.TestCase):
         self.assertNotIn(self.capability, stdout)
         self.assertNotIn(VALID_ANNOTATION["note"], stdout)
 
-    def test_accepts_exact_semantic_flags(self) -> None:
+    def test_accepts_exact_semantic_flags_without_reading_stdin(self) -> None:
         argv = [
             "annotate", "--kind", "finish", "--phase", "test_full",
             "--cause", "final_verification", "--scope-change", "none",
             "--task-family", "cli-tests", "--confidence", "1", "--note", "done",
             "--outcome", "success",
         ]
-        code, _, stderr = invoke(argv, environ=self.environment, services=self.services)
+        code, _, stderr = invoke(
+            argv, stdin=NoReadStdin(), environ=self.environment, services=self.services,
+        )
 
         self.assertEqual((code, stderr), (0, ""))
         annotation = self.services.calls[0][1]
         self.assertEqual((annotation.kind.value, annotation.outcome.value), ("finish", "success"))
 
-    def test_rejects_mixed_forbidden_and_malformed_payloads_privately(self) -> None:
+    def test_rejects_forbidden_and_malformed_json_payloads_privately(self) -> None:
         private = "private-note-and-key"
         cases = (
-            (["annotate", "--kind", "phase"], json.dumps(VALID_ANNOTATION)),
             (["annotate"], json.dumps({**VALID_ANNOTATION, "input_tokens": 12, "note": private})),
             (["annotate"], "not-json-" + private),
             (["annotate"], json.dumps({**VALID_ANNOTATION, "unexpected": private})),
@@ -236,6 +253,92 @@ class AtomicOutputTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "old")
             self.assertEqual(list(target.parent.glob(".hydra-output-*")), [])
 
+    def test_fchmod_failure_closes_descriptor_preserves_target_and_removes_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "report.json"
+            target.write_text("old", encoding="utf-8")
+            with (
+                mock.patch("hydra_codex.cli.os.fchmod", side_effect=OSError("denied")),
+                mock.patch("hydra_codex.cli.os.close", wraps=os.close) as close,
+            ):
+                with self.assertRaises(OSError):
+                    atomic_write(target, "new")
+
+            close.assert_called_once()
+            with self.assertRaises(OSError):
+                os.fstat(close.call_args.args[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(target.parent.glob(".hydra-output-*")), [])
+
+    def test_fdopen_failure_closes_descriptor_preserves_target_and_removes_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "report.json"
+            target.write_text("old", encoding="utf-8")
+            with (
+                mock.patch("hydra_codex.cli.os.fdopen", side_effect=OSError("denied")),
+                mock.patch("hydra_codex.cli.os.close", wraps=os.close) as close,
+            ):
+                with self.assertRaises(OSError):
+                    atomic_write(target, "new")
+
+            close.assert_called_once()
+            with self.assertRaises(OSError):
+                os.fstat(close.call_args.args[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(target.parent.glob(".hydra-output-*")), [])
+
+    def test_descriptor_close_error_does_not_mask_failure_or_leave_temp(self) -> None:
+        real_close = os.close
+
+        def close_then_fail(descriptor: int) -> None:
+            real_close(descriptor)
+            raise OSError("close failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "report.json"
+            target.write_text("old", encoding="utf-8")
+            with (
+                mock.patch("hydra_codex.cli.os.fchmod", side_effect=OSError("denied")),
+                mock.patch("hydra_codex.cli.os.close", side_effect=close_then_fail),
+            ):
+                with self.assertRaises(OSError) as raised:
+                    atomic_write(target, "new")
+
+            self.assertEqual(str(raised.exception), "denied")
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(target.parent.glob(".hydra-output-*")), [])
+
+    def test_write_failure_closes_handle_preserves_target_and_removes_temp(self) -> None:
+        class FailingHandle:
+            def __init__(self, descriptor: int) -> None:
+                self.descriptor = descriptor
+                self.closed = False
+
+            def close(self):
+                os.close(self.descriptor)
+                self.closed = True
+
+            def write(self, _content: str) -> None:
+                raise OSError("write failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "report.json"
+            target.write_text("old", encoding="utf-8")
+            handles: list[FailingHandle] = []
+
+            def failing_fdopen(descriptor, *_args, **_kwargs):
+                handle = FailingHandle(descriptor)
+                handles.append(handle)
+                return handle
+
+            with mock.patch("hydra_codex.cli.os.fdopen", side_effect=failing_fdopen):
+                with self.assertRaises(OSError):
+                    atomic_write(target, "new")
+
+            self.assertTrue(handles[0].closed)
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(target.parent.glob(".hydra-output-*")), [])
+
 
 class IngestCliTests(unittest.TestCase):
     def create_project(self, base: Path) -> Path:
@@ -261,6 +364,65 @@ class IngestCliTests(unittest.TestCase):
                 "command": "ingest", "diagnostics": 0, "files_seen": 0,
                 "status": "ok", "unique_sources": 0,
             })
+
+    def test_zero_source_ingest_keeps_db_source_and_project_directories_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = self.create_project(base)
+            project.chmod(0o755)
+            home = base / "home"
+            active = home / ".codex" / "sessions"
+            active.mkdir(parents=True)
+            active.chmod(0o755)
+            database_parent = base / "shared-db"
+            database_parent.mkdir()
+            database_parent.chmod(0o755)
+
+            code, stdout, stderr = invoke([
+                "ingest", "--cwd", str(project),
+                "--db", str(database_parent / "hydra.sqlite3"),
+            ], environ={"HOME": str(home)})
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["files_seen"], 0)
+            self.assertEqual(stat.S_IMODE(project.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(active.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(database_parent.stat().st_mode), 0o755)
+            self.assertEqual(
+                sorted(path.relative_to(project).as_posix() for path in project.rglob("*")),
+                [".hydra", ".hydra/project.toml"],
+            )
+            self.assertEqual(list(active.iterdir()), [])
+            self.assertNotIn("rollout-hmac.key", {path.name for path in database_parent.iterdir()})
+            installation_key = home / "Library" / "Application Support" / "Hydra" / "rollout-hmac.key"
+            self.assertTrue(installation_key.is_file())
+            self.assertEqual(stat.S_IMODE(installation_key.stat().st_mode), 0o600)
+
+    def test_ingest_can_use_an_injected_installation_key_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = self.create_project(base)
+            home = base / "home"
+            key_path = base / "private-keys" / "custom-hydra.key"
+            database_parent = base / "database"
+            database_parent.mkdir()
+
+            code, stdout, stderr = invoke(
+                [
+                    "ingest", "--cwd", str(project),
+                    "--db", str(database_parent / "hydra.sqlite3"),
+                ],
+                environ={"HOME": str(home)},
+                installation_key_path=key_path,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["files_seen"], 0)
+            self.assertTrue(key_path.is_file())
+            self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+            self.assertFalse(
+                (home / "Library" / "Application Support" / "Hydra" / "rollout-hmac.key").exists(),
+            )
 
     def test_explicit_and_default_sources_use_existing_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

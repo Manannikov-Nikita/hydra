@@ -88,6 +88,7 @@ def _turn_context(
         session_id=_required_text(payload, "session_id"),
         turn_id=_required_text(payload, "turn_id"),
         observed_at=observed_at,
+        worktree_path=project.worktree_path.as_posix(),
     )
 
 

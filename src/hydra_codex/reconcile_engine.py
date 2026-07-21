@@ -26,6 +26,7 @@ from .reconcile_types import (
     TaskPlan,
 )
 from .storage import HydraStore
+from .rollout_reconcile import reconcile_turn_attempts
 from .task_tree_storage import aggregate_stored_task_tree
 from .task_tree_types import ScalarFact, TaskTreeMetrics
 
@@ -168,8 +169,24 @@ def _assemble_project(
             (project_id,),
         )
     ]
+    lifecycle_source_facts = [
+        [str(row[0]), str(row[1]), row[2], row[3], str(row[4]), int(row[5])]
+        for row in store.connection.execute(
+            """SELECT e.event_key,e.event_kind,e.observed_at,e.timestamp_epoch,
+                      e.logical_source_key,e.source_ordinal
+                 FROM turn_lifecycle_events e
+                 JOIN rollout_sessions s ON s.session_key=e.session_key
+                WHERE s.project_id=?
+                ORDER BY e.event_key""",
+            (project_id,),
+        )
+    ]
     payload = json.dumps(
-        {"tasks": fingerprints, "project_event_issues": project_event_issues},
+        {
+            "tasks": fingerprints,
+            "project_event_issues": project_event_issues,
+            "lifecycle_source_facts": lifecycle_source_facts,
+        },
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return plans, tuple(assembled), hashlib.sha256(payload).hexdigest()
@@ -273,6 +290,8 @@ def reconcile_project(
         raise ValueError("project_id must be non-empty text")
     if not isinstance(installation_key, bytes) or len(installation_key) < 16:
         raise ValueError("installation_key must contain at least 16 bytes")
+    with store.rollout_transaction() as connection:
+        reconcile_turn_attempts(connection)
     plans, assembled, input_digest = _assemble_project(store, project_id)
     references = project_public_references((item.root_key for item in plans), installation_key)
     run_id = "hrec_v1_" + _digest(

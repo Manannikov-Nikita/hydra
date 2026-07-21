@@ -161,16 +161,17 @@ def aggregate_task_tree(
     tool_observations = tuple(tools)
     file_observations = tuple(files)
     test_observations = tuple(tests)
-    completions = tuple(
+    terminals = tuple(
         item for item in lifecycle_items
-        if item.session_id == root_id and item.kind == "task_complete"
+        if item.session_id == root_id
+        and item.kind in {"task_complete", "turn_aborted"}
     )
     root_starts = tuple(
         item for item in lifecycle_items
         if item.session_id == root_id and item.kind == "task_started"
     )
     completion, lifecycle_timing_conflicts = select_lifecycle_boundary(
-        completions, root_starts,
+        terminals, root_starts,
     )
     if completion is not None and any(
         item.session_id == root_id and item.kind == "task_started"

@@ -199,6 +199,7 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
             continue
         matching = [row for row in evidence if row[9] == description[9]]
         completed = [row for row in matching if row[16] == "complete"]
+        terminal = [row for row in matching if row[16] != "intent_only"]
         mismatched_complete = any(
             row[16] == "complete" and row[9] != description[9]
             for row in evidence
@@ -206,7 +207,12 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
         has_non_execution = any(row[1] == "non_execution" for row in candidates)
         if has_non_execution and not completed:
             continue
-        selected = max(completed or matching, key=lambda row: _evidence_rank(connection, row))
+        if not terminal and not mismatched_complete:
+            continue
+        selected = max(
+            completed or terminal or matching,
+            key=lambda row: _evidence_rank(connection, row),
+        )
         result = (
             unknown_result("conflicted")
             if not completed and mismatched_complete

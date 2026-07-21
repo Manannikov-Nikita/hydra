@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from .custom_tool_persistence import persist_custom_tool_call
@@ -40,6 +40,31 @@ def _insert_diagnostic(connection: Any, source: str, line: int, kind: str, paylo
     )
 
 
+def _trusted_hook_binding(
+    connection: Any, session_key: str,
+) -> tuple[str, str] | None:
+    """Return a hook-attested project/worktree binding, never a rollout claim."""
+    row = connection.execute(
+        """SELECT sessions.project_id,sessions.worktree_path
+             FROM sessions JOIN trusted_turn_bindings
+               ON trusted_turn_bindings.session_key=sessions.session_id
+              AND trusted_turn_bindings.project_id=sessions.project_id
+            WHERE sessions.session_id=?
+            ORDER BY trusted_turn_bindings.created_at LIMIT 1""",
+        (session_key,),
+    ).fetchone()
+    if row is None or not isinstance(row[1], str):
+        return None
+    path = PurePosixPath(row[1])
+    if (
+        not row[1] or path.is_absolute() or ".." in path.parts
+        or bool(path.parts and path.parts[0].endswith(":"))
+        or any(character in row[1] for character in ("\\", "\0", "\r", "\n"))
+    ):
+        return None
+    return str(row[0]), row[1]
+
+
 def _parse_source(
     store: HydraStore, path: Path, source: str, project_root: Path, project_id: str,
     model_causes: dict[str, str], *, logical_source: str | None = None,
@@ -51,6 +76,17 @@ def _parse_source(
     current_turn: str | None = None
     seen_session = False
     with store.rollout_transaction() as connection, path.open("rb") as handle:
+        logical_binding = (
+            connection.execute(
+                "SELECT session_key FROM rollout_logical_sources "
+                "WHERE logical_source_key=?",
+                (logical_source,),
+            ).fetchone()
+            if logical_source is not None else None
+        )
+        retry_unbound = bool(
+            logical_binding is not None and logical_binding[0] is None
+        )
         test_evidence = TestEvidenceBuffer(connection, source, model_causes, opaque)
         # File operands from fallible direct tools stay in memory until the
         # matching structured terminal record proves success.  Values contain
@@ -148,13 +184,52 @@ def _parse_source(
                     continue
                 next_key = opaque("identity", identity)
                 conversation = nonempty_string(payload.get("session_id"), identity)
+                trusted_binding = _trusted_hook_binding(connection, next_key)
                 try:
                     resolved = resolve_project(payload.get("cwd"))
-                except (ProjectNotFound, TypeError, ValueError, OSError):
+                except (ProjectNotFound, OSError):
+                    if trusted_binding is None:
+                        diagnostics += 1
+                        _insert_diagnostic(
+                            connection, source, line_number,
+                            "unresolved_project", payload,
+                        )
+                        continue
+                    if trusted_binding[0] != project_id:
+                        diagnostics += 1
+                        _insert_diagnostic(
+                            connection, source, line_number,
+                            "unrelated_project", payload,
+                        )
+                        continue
+                    session_path = trusted_binding[1]
+                except (TypeError, ValueError):
                     diagnostics += 1
-                    _insert_diagnostic(connection, source, line_number, "unresolved_project", payload)
+                    _insert_diagnostic(
+                        connection, source, line_number,
+                        "unresolved_project", payload,
+                    )
                     continue
-                if resolved.project_id != project_id:
+                else:
+                    if resolved.project_id != project_id:
+                        diagnostics += 1
+                        _insert_diagnostic(
+                            connection, source, line_number,
+                            "unrelated_project", payload,
+                        )
+                        continue
+                    if (
+                        trusted_binding is not None
+                        and trusted_binding[0] != resolved.project_id
+                    ):
+                        diagnostics += 1
+                        _insert_diagnostic(
+                            connection, source, line_number,
+                            "unrelated_project", payload,
+                        )
+                        continue
+                    session_path = path_key(payload.get("cwd"), project_root, opaque)
+                if trusted_binding is not None and trusted_binding[0] != project_id:
                     diagnostics += 1
                     _insert_diagnostic(connection, source, line_number, "unrelated_project", payload)
                     continue
@@ -166,7 +241,6 @@ def _parse_source(
                 payload_time = canonical_timestamp(payload.get("timestamp"))
                 if not seen_session:
                     session_meta_at = payload_time.text or observed_at
-                session_path = path_key(payload.get("cwd"), project_root, opaque)
                 connection.execute(
                     """INSERT INTO rollout_sessions(
                            session_key,project_id,path_key,resume_segments,conversation_key,started_at,last_activity_at)
@@ -222,7 +296,7 @@ def _parse_source(
             if kind == "turn_context" and isinstance(payload.get("turn_id"), str):
                 current_turn = payload["turn_id"]
                 continue
-            if known_event is not None:
+            if known_event is not None and not retry_unbound:
                 continue
             if kind == "event_msg" and payload.get("type") == "token_count":
                 usage = parse_usage(payload)
@@ -351,6 +425,7 @@ def _parse_source(
                             observed_at, opaque("turn", current_turn) if current_turn else None,
                             observation_call_key=call_key,
                             observation_tool_name=normalized.safe_name,
+                            requires_success=operation == "write",
                         )
                 if normalized.ephemeral_command is not None:
                     test_evidence.intent(
@@ -487,9 +562,12 @@ def ingest_rollouts(
                     )
                 )
                 logical_row = connection.execute(
-                    "SELECT canonical_revision_digest FROM rollout_logical_sources WHERE logical_source_key=?", (logical,),
+                    "SELECT canonical_revision_digest,session_key "
+                    "FROM rollout_logical_sources WHERE logical_source_key=?",
+                    (logical,),
                 ).fetchone()
                 canonical = logical_row[0] if logical_row is not None else None
+                bound_before = logical_row[1] if logical_row is not None else None
                 relation = "initial" if canonical is None else relation_to(revision_lines(connection, canonical), scan.line_fingerprints)
                 connection.execute(
                     """INSERT INTO rollout_logical_sources(
@@ -525,17 +603,34 @@ def ingest_rollouts(
                         (logical,),
                     )
                     _insert_diagnostic(connection, digest, 0, "source_rewrite", {})
-                else:
+                if relation not in {"truncate", "rewrite"} or bound_before is None:
                     diagnostics += _parse_source(
                         store, path, digest, root, project_id, model_causes or {},
                         logical_source=logical, line_fingerprints=scan.line_fingerprints,
                         authoritative_identity=scan.identity,
                     )
+                    bound = connection.execute(
+                        "SELECT session_key FROM rollout_logical_sources "
+                        "WHERE logical_source_key=?",
+                        (logical,),
+                    ).fetchone()
+                    if bound is not None and bound[0] is not None:
+                        connection.execute(
+                            "UPDATE rollout_logical_sources SET "
+                            "canonical_revision_digest=?,lineage_state='clean' "
+                            "WHERE logical_source_key=?",
+                            (digest, logical),
+                        )
+                bound = connection.execute(
+                    "SELECT session_key FROM rollout_logical_sources "
+                    "WHERE logical_source_key=?",
+                    (logical,),
+                ).fetchone()
+                if bound is not None and bound[0] is not None:
                     connection.execute(
-                        "UPDATE rollout_logical_sources SET canonical_revision_digest=? WHERE logical_source_key=?",
-                        (digest, logical),
+                        "UPDATE rollout_sources SET materialized=1 "
+                        "WHERE source_digest=?", (digest,),
                     )
-                connection.execute("UPDATE rollout_sources SET materialized=1 WHERE source_digest=?", (digest,))
                 from .token_selection import refresh_token_source_selection
 
                 refresh_token_source_selection(connection, project_id)

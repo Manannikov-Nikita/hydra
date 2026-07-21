@@ -18,6 +18,8 @@ class _Attempt:
     finished_at: str | None = None
     finished_epoch: float | None = None
     emitted_duration_ms: int | None = None
+    started_event: _LifecycleEvent | None = None
+    terminal_event: _LifecycleEvent | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,14 @@ def _event_order(event: _LifecycleEvent) -> tuple[int, float, str, int, str]:
         event.source_ordinal,
         event.event_key,
     )
+
+
+def _event_authority(
+    connection: sqlite3.Connection, event: _LifecycleEvent | None,
+) -> int:
+    if event is None:
+        return -1
+    return SOURCE_AUTHORITY[source_family(connection, event.source_digest)]
 
 
 def _deduplicated_lifecycle_events(
@@ -138,6 +148,7 @@ def reconcile_turn_attempts(
                     active = _Attempt(
                         started_at=event.observed_at,
                         started_epoch=event.timestamp_epoch,
+                        started_event=event,
                     )
                     attempts.append(active)
                 elif diagnose:
@@ -147,14 +158,48 @@ def reconcile_turn_attempts(
                     )
                 continue
             state = "completed" if event.event_kind == "completed" else "aborted"
-            if active is None:
-                active = _Attempt()
-                attempts.append(active)
-            active.state = state
-            active.finished_at = event.observed_at
-            active.finished_epoch = event.timestamp_epoch
-            active.emitted_duration_ms = event.emitted_duration_ms
-            active = None
+            previous = next(
+                (
+                    attempt for attempt in reversed(attempts)
+                    if attempt is not active and attempt.terminal_event is not None
+                ),
+                None,
+            )
+            event_authority = _event_authority(connection, event)
+            if active is not None:
+                # A lower-authority terminal arriving after an authoritative
+                # terminal must not close a newer authoritative retry.  A
+                # same-source retry remains a real attempt and is preserved.
+                if (
+                    previous is not None
+                    and event_authority
+                    < _event_authority(connection, previous.terminal_event)
+                    and event_authority
+                    < _event_authority(connection, active.started_event)
+                ):
+                    continue
+                target = active
+            elif previous is not None:
+                previous_authority = _event_authority(
+                    connection, previous.terminal_event,
+                )
+                if event_authority < previous_authority:
+                    continue
+                if event_authority > previous_authority:
+                    target = previous
+                else:
+                    target = _Attempt()
+                    attempts.append(target)
+            else:
+                target = _Attempt()
+                attempts.append(target)
+            target.state = state
+            target.finished_at = event.observed_at
+            target.finished_epoch = event.timestamp_epoch
+            target.emitted_duration_ms = event.emitted_duration_ms
+            target.terminal_event = event
+            if target is active:
+                active = None
         connection.execute("DELETE FROM turn_attempts WHERE session_key=? AND turn_key=?", (session, turn))
         for ordinal, attempt in enumerate(attempts, start=1):
             wall = None
@@ -164,10 +209,19 @@ def reconcile_turn_attempts(
             connection.execute(
                 """INSERT INTO turn_attempts(
                        session_key,turn_key,attempt_ordinal,state,emitted_duration_ms,wall_duration_ms,
-                       started_at,finished_at,timing_provenance)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                       started_at,finished_at,timing_provenance,
+                       started_event_key,terminal_event_key,
+                       started_logical_source_key,terminal_logical_source_key,
+                       started_source_ordinal,terminal_source_ordinal)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (session, turn, ordinal, attempt.state, attempt.emitted_duration_ms, wall,
-                 attempt.started_at, attempt.finished_at, provenance),
+                 attempt.started_at, attempt.finished_at, provenance,
+                 attempt.started_event.event_key if attempt.started_event else None,
+                 attempt.terminal_event.event_key if attempt.terminal_event else None,
+                 attempt.started_event.logical_source_key if attempt.started_event else None,
+                 attempt.terminal_event.logical_source_key if attempt.terminal_event else None,
+                 attempt.started_event.source_ordinal if attempt.started_event else None,
+                 attempt.terminal_event.source_ordinal if attempt.terminal_event else None),
             )
 
 

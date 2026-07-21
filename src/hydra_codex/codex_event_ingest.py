@@ -297,7 +297,7 @@ def _persist_normalized_event(
         (normalized_source, normalized_event, event.source_ordinal),
     )
     lifecycle = {
-        "thread_started": "started", "turn_started": "started",
+        "turn_started": "started",
         "conversation_started": "started", "user_prompt": "started",
     }.get(event.event_type)
     if event.event_type == "turn_completed":
@@ -425,7 +425,12 @@ def _persist_tool(
     tool = event.tool
     if tool is None:
         return
-    call_key = tool.call_key or event.event_key
+    # Item events without a stable item id are rejected by the adapter.  Keep
+    # this boundary fail-closed so a future schema cannot silently turn each
+    # notification into a different synthetic call.
+    if tool.call_key is None:
+        return
+    call_key = tool.call_key
     complete = tool.phase == "completed"
     if not complete:
         persist_tool_start(
@@ -484,8 +489,11 @@ def _persist_batch(
                 normalized_source, logical, hasher, project_root,
             )
             tool = event.tool
-            if tool is not None and tool.safe_name == "exec_command":
-                logical_call = tool.call_key or event.event_key
+            if (
+                tool is not None and tool.call_key is not None
+                and tool.safe_name == "exec_command"
+            ):
+                logical_call = tool.call_key
                 rejected_test = (
                     tool.phase == "completed"
                     and tool.exit_status is None

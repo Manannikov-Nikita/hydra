@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import PurePosixPath
 import re
 
 from .rollout_identity import Pseudonymizer
@@ -39,12 +40,25 @@ class TrustedTurnContext:
     session_id: str
     turn_id: str
     observed_at: str
+    worktree_path: str = "."
 
     def __post_init__(self) -> None:
         trusted_text(self.project_id, "project_id")
         trusted_text(self.session_id, "session_id")
         trusted_text(self.turn_id, "turn_id")
         timestamp(self.observed_at)
+        if not isinstance(self.worktree_path, str) or not self.worktree_path:
+            raise ValueError("worktree_path must be a safe relative path")
+        path = PurePosixPath(self.worktree_path)
+        if (
+            path.is_absolute() or ".." in path.parts
+            or bool(path.parts and path.parts[0].endswith(":"))
+            or any(
+                character in self.worktree_path
+                for character in ("\\", "\0", "\r", "\n")
+            )
+        ):
+            raise ValueError("worktree_path must be a safe relative path")
 
 
 @dataclass(frozen=True)

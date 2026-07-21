@@ -93,32 +93,93 @@ def _baselines(connection: sqlite3.Connection, project_id: str) -> tuple[ReplayB
 
 
 def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[LifecycleObservation, ...]:
-    mapping = {"started": "task_started", "completed": "task_complete", "aborted": "turn_aborted"}
+    mapping = {"completed": "task_complete", "aborted": "turn_aborted"}
     rows = connection.execute(
-        """SELECT e.session_key,e.event_kind,e.observed_at,
-                  e.logical_source_key,e.source_ordinal,e.turn_key,r.observed_at
-             FROM turn_lifecycle_events e
-             JOIN rollout_sessions s ON s.session_key=e.session_key
-             JOIN rollout_events r ON r.event_key=e.event_key
-            WHERE s.project_id=? ORDER BY e.source_digest,e.source_ordinal""",
+        """SELECT a.session_key,a.turn_key,a.attempt_ordinal,a.state,
+                  a.started_at,a.finished_at,
+                  a.started_logical_source_key,a.terminal_logical_source_key,
+                  a.started_source_ordinal,a.terminal_source_ordinal,
+                  started_receipt.observed_at,terminal_receipt.observed_at
+             FROM turn_attempts a
+             JOIN rollout_sessions s ON s.session_key=a.session_key
+             LEFT JOIN rollout_events started_receipt
+                    ON started_receipt.event_key=a.started_event_key
+             LEFT JOIN rollout_events terminal_receipt
+                    ON terminal_receipt.event_key=a.terminal_event_key
+            WHERE s.project_id=?
+            ORDER BY a.session_key,a.turn_key,a.attempt_ordinal""",
         (project_id,),
     )
     observations: list[LifecycleObservation] = []
+    terminal_attempts: dict[
+        tuple[str, str], list[LifecycleObservation]
+    ] = {}
     for row in rows:
-        observed_at = _optional_timestamp(row[2])
-        timing_provenance = "exact"
-        if observed_at is None:
-            # App Server wrappers can provide a receipt timestamp while the
-            # embedded lifecycle item has no clock. Retain the exact state and
-            # use the receipt only as an explicitly estimated report cutoff;
-            # the persisted lifecycle timestamp remains NULL.
-            observed_at = _optional_timestamp(row[6])
-            timing_provenance = "estimated"
-        if observed_at is not None:
+        attempt_key = f"{row[1]}/{row[2]}"
+        started_at = _optional_timestamp(row[4])
+        started_provenance = "exact"
+        if started_at is None:
+            started_at = _optional_timestamp(row[10])
+            started_provenance = "estimated"
+        if started_at is not None:
             observations.append(LifecycleObservation(
-                str(row[0]), mapping[str(row[1])], observed_at,
-                str(row[3]), int(row[4]), str(row[5]), timing_provenance,
+                str(row[0]), "task_started", started_at,
+                str(row[6]) if row[6] is not None else None,
+                int(row[8]) if row[8] is not None else None,
+                attempt_key, started_provenance,
             ))
+        if row[3] not in mapping:
+            continue
+        terminal_at = _optional_timestamp(row[5])
+        terminal_provenance = "exact"
+        if terminal_at is None:
+            terminal_at = _optional_timestamp(row[11])
+            terminal_provenance = "estimated"
+        if terminal_at is not None:
+            terminal = LifecycleObservation(
+                str(row[0]), mapping[str(row[3])], terminal_at,
+                str(row[7]) if row[7] is not None else None,
+                int(row[9]) if row[9] is not None else None,
+                attempt_key, terminal_provenance,
+            )
+            observations.append(terminal)
+            terminal_attempts.setdefault((str(row[0]), str(row[1])), []).append(
+                terminal,
+            )
+
+    # Keep an explicitly estimated timing-conflict receipt for discarded App
+    # terminals.  It can contribute a caveat, but sharing the canonical
+    # attempt key ensures it can never replace the exact reconciled boundary.
+    discarded = connection.execute(
+        """SELECT e.session_key,e.event_kind,r.observed_at,
+                  e.logical_source_key,e.source_ordinal,e.turn_key
+             FROM turn_lifecycle_events e
+             JOIN rollout_sessions s ON s.session_key=e.session_key
+             JOIN rollout_events r ON r.event_key=e.event_key
+            WHERE s.project_id=? AND e.timestamp_epoch IS NULL
+              AND e.event_kind IN ('completed','aborted')
+              AND NOT EXISTS (
+                  SELECT 1 FROM turn_attempts a
+                   WHERE a.terminal_event_key=e.event_key
+              )""",
+        (project_id,),
+    )
+    for row in discarded:
+        observed_at = _optional_timestamp(row[2])
+        candidates = terminal_attempts.get((str(row[0]), str(row[5])), ())
+        if observed_at is None or not candidates:
+            continue
+        prior = tuple(
+            candidate for candidate in candidates
+            if candidate.observed_at <= observed_at
+        )
+        canonical = max(
+            prior or tuple(candidates), key=lambda item: item.observed_at,
+        )
+        observations.append(LifecycleObservation(
+            str(row[0]), mapping[str(row[1])], observed_at,
+            str(row[3]), int(row[4]), canonical.turn_key, "estimated",
+        ))
     return tuple(observations)
 
 
@@ -126,13 +187,24 @@ def _activities(connection: sqlite3.Connection, project_id: str) -> tuple[Activi
     rows = connection.execute(
         """SELECT ls.session_key,e.observed_at
              FROM rollout_events e
-             JOIN rollout_logical_sources ls ON ls.logical_source_key=e.logical_source_key
+             JOIN rollout_logical_sources ls
+                  ON ls.logical_source_key=e.logical_source_key
+             LEFT JOIN turn_lifecycle_events lifecycle
+                  ON lifecycle.event_key=e.event_key
             WHERE ls.project_id=? AND ls.session_key IS NOT NULL
+              AND lifecycle.event_key IS NULL
             UNION ALL
-           SELECT e.session_key,e.observed_at
-             FROM turn_lifecycle_events e
-             JOIN rollout_sessions s ON s.session_key=e.session_key
-            WHERE s.project_id=?
+           SELECT a.session_key,COALESCE(a.started_at,r.observed_at)
+             FROM turn_attempts a
+             JOIN rollout_sessions s ON s.session_key=a.session_key
+             LEFT JOIN rollout_events r ON r.event_key=a.started_event_key
+            WHERE s.project_id=? AND COALESCE(a.started_at,r.observed_at) IS NOT NULL
+            UNION ALL
+           SELECT a.session_key,COALESCE(a.finished_at,r.observed_at)
+             FROM turn_attempts a
+             JOIN rollout_sessions s ON s.session_key=a.session_key
+             LEFT JOIN rollout_events r ON r.event_key=a.terminal_event_key
+            WHERE s.project_id=? AND COALESCE(a.finished_at,r.observed_at) IS NOT NULL
             UNION ALL
            SELECT t.session_key,t.observed_at
              FROM token_snapshots t WHERE t.project_id=?
@@ -148,7 +220,7 @@ def _activities(connection: sqlite3.Connection, project_id: str) -> tuple[Activi
            SELECT t.session_key,t.observed_at
              FROM rollout_test_runs t JOIN rollout_sessions s ON s.session_key=t.session_key
             WHERE s.project_id=?""",
-        (project_id,) * 6,
+        (project_id,) * 7,
     )
     return tuple(
         ActivityObservation(str(row[0]), observed_at)

@@ -68,8 +68,11 @@ def issue_capability(
             raise CapabilityRejected("trusted session binding is inconsistent")
         connection.execute(
             """INSERT INTO sessions(session_id,project_id,worktree_path,started_at,provenance)
-               VALUES (?,?,'.',?,'derived') ON CONFLICT(session_id) DO NOTHING""",
-            (session_key, context.project_id, context.observed_at),
+               VALUES (?,?,?,?, 'derived') ON CONFLICT(session_id) DO NOTHING""",
+            (
+                session_key, context.project_id, context.worktree_path,
+                context.observed_at,
+            ),
         )
         turn = connection.execute(
             "SELECT session_id FROM turns WHERE turn_id=?", (turn_key,)

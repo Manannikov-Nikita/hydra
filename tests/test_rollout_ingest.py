@@ -235,7 +235,7 @@ class RolloutIngestTests(unittest.TestCase):
             {tuple(row) for row in self.store.connection.execute(
                 "SELECT operation, relative_path FROM file_observations"
             )},
-            {("write", "src/safe.py"), ("read", "src/read.py")},
+            {("write", "src/safe.py")},
         )
         self.assertNotIn(private_text, "\n".join(self.store.connection.iterdump()))
 

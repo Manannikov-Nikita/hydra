@@ -8,6 +8,7 @@ import unittest
 
 from hydra_codex.storage import HydraStore
 from hydra_codex.rollout import Pseudonymizer, ingest_rollouts
+from hydra_codex.rollout_reconcile import reconcile_turn_attempts
 from hydra_codex.task_tree import TokenVector
 from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 
@@ -115,6 +116,7 @@ class StoredTaskTreeTests(unittest.TestCase):
             )
             connection.commit()
 
+            reconcile_turn_attempts(connection)
             metrics = aggregate_stored_task_tree(connection, project_id="project-a", root_id="root")
 
             self.assertEqual(metrics.session_ids, ("confirmed", "inferred", "root"))
@@ -298,6 +300,7 @@ class StoredTaskTreeTests(unittest.TestCase):
             )
             connection.commit()
 
+            reconcile_turn_attempts(connection)
             metrics = aggregate_stored_task_tree(
                 connection, project_id="project-cross-source", root_id="root",
             )
@@ -358,6 +361,7 @@ class StoredTaskTreeTests(unittest.TestCase):
             )
             connection.commit()
 
+            reconcile_turn_attempts(connection)
             metrics = aggregate_stored_task_tree(
                 connection, project_id="project-activity", root_id="root",
             )

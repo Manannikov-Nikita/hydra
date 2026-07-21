@@ -80,6 +80,33 @@ def _compatible_tool(candidate: str, canonical: str) -> bool:
     return {candidate, canonical} == {"apply_patch", "patch"}
 
 
+def _has_structural_terminal(
+    connection: Any, *, session_key: str, call_key: str, canonical_name: str,
+) -> bool:
+    """Require an observed end record without treating missing outcome as no run."""
+    candidate_terminal = any(
+        candidate_kind == "end" and (
+            _compatible_tool(tool_name, canonical_name)
+            or tool_name == "function"
+        )
+        for candidate_kind, tool_name in connection.execute(
+            "SELECT candidate_kind,tool_name FROM tool_span_candidates "
+            "WHERE session_key=? AND call_key=?",
+            (session_key, call_key),
+        )
+    )
+    if candidate_terminal:
+        return True
+    # Pre-candidate schemas already persisted a canonical complete span.  That
+    # normalized terminal is sufficient migration evidence even when no
+    # immutable end candidate existed at the time.
+    legacy = connection.execute(
+        "SELECT completeness FROM tool_spans WHERE session_key=? AND call_key=?",
+        (session_key, call_key),
+    ).fetchone()
+    return legacy is not None and legacy[0] == "complete"
+
+
 def _timestamp_value(value: str | None) -> tuple[datetime, str] | None:
     safe = canonical_timestamp(value)
     if safe.text is None:
@@ -221,7 +248,10 @@ def materialize_file_observations(
             "DELETE FROM file_observations WHERE source_digest=? AND line_number=0",
             (materialized_source,),
         )
-    if terminal_state == "failed":
+    if not _has_structural_terminal(
+        connection, session_key=session_key, call_key=call_key,
+        canonical_name=canonical_name,
+    ) or terminal_state == "failed":
         return
     if materialized_source is None:
         return

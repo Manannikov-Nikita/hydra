@@ -22,6 +22,7 @@ from .migrations_g7 import G7_MIGRATIONS, G7_REQUIRED_SCHEMA
 from .migrations_h8 import H8_MIGRATIONS, H8_REQUIRED_SCHEMA
 from .migrations_i9 import I9_MIGRATIONS, I9_REQUIRED_SCHEMA
 from .migrations_j10 import J10_MIGRATIONS, J10_REQUIRED_SCHEMA
+from .migrations_k11 import K11_MIGRATIONS, K11_REQUIRED_SCHEMA
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -261,7 +262,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -404,6 +405,16 @@ class HydraStore:
                                 call_key=str(call_key),
                                 source_identity=migration_identity,
                             )
+                    if version == 27:
+                        from .rollout_reconcile import reconcile_turn_attempts
+                        from .test_evidence import (
+                            materialize_test_evidence,
+                            reconcile_test_retries,
+                        )
+
+                        reconcile_turn_attempts(connection)
+                        materialize_test_evidence(connection)
+                        reconcile_test_retries(connection)
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
                         (version,),
@@ -433,6 +444,7 @@ class HydraStore:
         required.update(H8_REQUIRED_SCHEMA)
         required.update(I9_REQUIRED_SCHEMA)
         required.update(J10_REQUIRED_SCHEMA)
+        required.update(K11_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):

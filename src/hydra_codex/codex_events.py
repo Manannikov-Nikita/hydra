@@ -349,6 +349,15 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     turn_id = params.get("turnId") if isinstance(params.get("turnId"), str) else turn.get("id") if turn else None
     if not isinstance(thread, str) or not thread:
         return None, ("invalid_envelope",)
+    if method in {"turn/started", "turn/completed", "item/started", "item/completed"} and (
+        not isinstance(turn_id, str) or not turn_id
+    ):
+        return None, ("invalid_envelope",)
+    item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
+    if method in {"item/started", "item/completed"} and (
+        not isinstance(item.get("id"), str) or not item.get("id")
+    ):
+        return None, ("invalid_envelope",)
     payload_at, payload_ns, bad_time = _app_timestamp(method, params)
     observed_at, observed_ns = payload_at, payload_ns
     lifecycle_at, lifecycle_at_ns = (
@@ -359,7 +368,6 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     if receipt_timestamp is not None:
         observed_at, observed_ns = receipt_timestamp
     issues: list[str] = ["invalid_timestamp"] if receipt_invalid or bad_time else []
-    item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
     contents = _app_contents(item, turn, key)
     if thread_object is not None and (preview := _content("user_prompt", thread_object.get("preview"), key)) is not None:
         contents += (preview,)

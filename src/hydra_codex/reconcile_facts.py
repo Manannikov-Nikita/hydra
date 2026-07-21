@@ -105,36 +105,36 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
     for item in _trusted_semantic_activities(connection, project_id):
         if item.session_id in sessions:
             activity_by_session[item.session_id].append(item.observed_at)
-    completions: dict[str, list[LifecycleObservation]] = defaultdict(list)
+    terminals: dict[str, list[LifecycleObservation]] = defaultdict(list)
     starts: dict[str, list[LifecycleObservation]] = defaultdict(list)
     for item in lifecycle:
-        if item.kind == "task_complete":
-            completions[item.session_id].append(item)
+        if item.kind in {"task_complete", "turn_aborted"}:
+            terminals[item.session_id].append(item)
         elif item.kind == "task_started":
             starts[item.session_id].append(item)
     plans: list[TaskPlan] = []
     for root, members in grouped.items():
-        eligible_completions = [
-            completion for completion in completions.get(root, ())
+        eligible_terminals = [
+            terminal for terminal in terminals.get(root, ())
             if (
                 sessions[root].started_at is not None
-                and sessions[root].started_at <= completion.observed_at
+                and sessions[root].started_at <= terminal.observed_at
             ) or any(
-                start.observed_at <= completion.observed_at
+                start.observed_at <= terminal.observed_at
                 for start in starts.get(root, ())
             )
         ]
-        completion, _timing_conflicts = select_lifecycle_boundary(
-            eligible_completions, starts.get(root, ()),
+        terminal, _timing_conflicts = select_lifecycle_boundary(
+            eligible_terminals, starts.get(root, ()),
         )
-        if completion is not None and not has_later_root_start(
-            root, lifecycle, completion,
+        if terminal is not None and not has_later_root_start(
+            root, lifecycle, terminal,
         ):
-            cutoff = completion.observed_at
-            status = "complete"
-            cutoff_source = completion.logical_source_key
-            cutoff_ordinal = completion.source_ordinal
-            cutoff_timing_provenance = completion.timing_provenance
+            cutoff = terminal.observed_at
+            status = "complete" if terminal.kind == "task_complete" else "incomplete"
+            cutoff_source = terminal.logical_source_key
+            cutoff_ordinal = terminal.source_ordinal
+            cutoff_timing_provenance = terminal.timing_provenance
         else:
             candidates = [
                 value for member in members

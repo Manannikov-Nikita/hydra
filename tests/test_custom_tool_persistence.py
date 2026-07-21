@@ -95,7 +95,11 @@ class CustomToolPersistenceTests(unittest.TestCase):
             )},
             set(),
         )
-        self.assertEqual(self.store.count("rollout_test_runs"), 1)
+        self.assertEqual(self.store.count("rollout_test_runs"), 0)
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM test_evidence_candidates "
+            "WHERE completeness='intent_only'"
+        ).fetchone()[0], 1)
         self.assertIn("custom_exec_unsupported", {
             row[0] for row in self.store.connection.execute(
                 "SELECT envelope_kind FROM rollout_diagnostics"
@@ -135,7 +139,10 @@ class CustomToolPersistenceTests(unittest.TestCase):
         ])
 
         rows = [tuple(row) for row in self.store.connection.execute(
-            "SELECT tool_call_key,command_hash,outcome FROM rollout_test_runs ORDER BY evidence_key"
+            """SELECT tool_call_key,command_hash,outcome
+                 FROM test_evidence_candidates
+                WHERE candidate_kind='evidence'
+                ORDER BY evidence_key"""
         )]
         self.assertEqual(len(rows), 2)
         self.assertNotEqual(rows[0][0], rows[1][0])

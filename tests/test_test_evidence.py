@@ -306,10 +306,9 @@ class PersistedTestEvidenceTests(unittest.TestCase):
         ]
         write_rollout(rollout, prefix)
         self.ingest(rollout)
-        self.assertEqual(tuple(self.store.connection.execute(
-            """SELECT runner,scope,outcome,exit_status,completeness
-                 FROM rollout_test_runs"""
-        ).fetchone()), ("pytest", "targeted", "unknown", None, "intent_only"))
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM rollout_test_runs"
+        ).fetchone()[0], 0)
 
         lower = self.app_source(
             "append-result", session=session, call_id=call_id,
@@ -514,14 +513,15 @@ class PersistedTestEvidenceTests(unittest.TestCase):
                       attempt_ordinal, provenance, completeness, observed_at, turn_key
                  FROM rollout_test_runs ORDER BY runner"""
         ).fetchall()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({row[0] for row in rows}, nested)
+        self.assertEqual(rows, [])
         self.assertNotIn(outer, nested)
-        for row in rows:
-            self.assertEqual(tuple(row[:8]),
-                             (row[0], None, "unknown", "unknown", "none", 1, "derived", "intent_only"))
-            self.assertEqual(row[8], "2026-07-21T00:00:02Z")
-            self.assertIsNotNone(row[9])
+        candidates = self.store.connection.execute(
+            """SELECT tool_call_key,completeness FROM test_evidence_candidates
+                 ORDER BY tool_call_key"""
+        ).fetchall()
+        self.assertEqual({row[0] for row in candidates}, nested)
+        self.assertTrue(candidates)
+        self.assertTrue(all(row[1] == "intent_only" for row in candidates))
         dump = "\n".join(self.store.connection.iterdump())
         self.assertNotIn("pytest tests/a.py", dump)
         self.assertNotIn("Script completed", dump)
@@ -573,7 +573,9 @@ class PersistedTestEvidenceTests(unittest.TestCase):
         ).fetchone()[0]
         # Select by retry kind rather than opaque command hashes.
         retries = {row[5]: row for row in rows if row[0] == root_key and row[5] != "none"}
-        self.assertEqual(set(retries), {"flaky_retry", "product_fix_verification", "infra_recovery", "unknown_recovery"})
+        self.assertEqual(set(retries), {
+            "flaky_retry", "product_fix_verification", "infra_recovery",
+        })
         for retry, row in retries.items():
             self.assertEqual((row[3], row[6], row[7], row[8], row[9]),
                              ("success", 2, 0, "derived", "complete"), retry)

@@ -76,6 +76,18 @@ def _classify_tokens(tokens: list[str], depth: int) -> tuple[str, str]:
             return UNKNOWN
         return _classify_command(tokens[2], depth + 1)
 
+    if (
+        re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
+        and len(tokens) >= 3
+        and tokens[1:3] == ["-m", "unittest"]
+    ):
+        arguments = tokens[3:]
+        targeted = _targeted_flags(arguments, ("-k",)) or bool(
+            arguments
+            and arguments[0] != "discover"
+            and _has_positional(arguments, ("-k",))
+        )
+        return "unittest", "targeted" if targeted else "full"
     if executable == "pytest":
         arguments = tokens[1:]
         targeted = _targeted_flags(arguments, ("-k", "-m", "--keyword", "--mark")) or _has_positional(

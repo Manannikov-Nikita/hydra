@@ -228,7 +228,7 @@ def _final_epoch_vectors(
                   COALESCE(s.logical_source_key,t.source_digest),t.line_number
              FROM token_snapshots t
              LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
-            WHERE t.project_id=?
+            WHERE t.project_id=? AND t.contributes_total=1
             ORDER BY t.session_key,t.epoch,t.source_digest,t.line_number""", (project_id,),
     ).fetchall()
     grouped: dict[tuple[str, int], list[tuple[object, ...]]] = {}

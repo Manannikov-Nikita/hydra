@@ -15,7 +15,12 @@ _PATH_META = ("*", "?", "[", "]", "{", "}")
 
 
 def _tokens(command: str) -> tuple[str, ...] | None:
-    if "#" in command or any(marker in command for marker in _EXPANSION_MARKERS):
+    if (
+        "#" in command
+        or "<" in command
+        or any(operator in command for operator in (">|", ">&", "&>"))
+        or any(marker in command for marker in _EXPANSION_MARKERS)
+    ):
         return None
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")

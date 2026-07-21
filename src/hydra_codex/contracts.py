@@ -159,7 +159,7 @@ class ModelAnnotationInput:
 
 @dataclass(frozen=True)
 class AnnotationContext:
-    """Observed identity and timing supplied only by trusted integration code."""
+    """Observed identity and timing supplied by the configured integration path."""
 
     annotation_id: str
     project_id: str
@@ -241,9 +241,9 @@ class AnnotationRecord:
 
 
 def materialize_annotation(model: ModelAnnotationInput, context: AnnotationContext) -> AnnotationRecord:
-    """Join untrusted semantic input with trusted hook/CLI observation context."""
+    """Join model semantics with cooperative hook/CLI observation context."""
     if not isinstance(model, ModelAnnotationInput) or not isinstance(context, AnnotationContext):
-        raise ValueError("annotation requires validated model input and trusted context")
+        raise ValueError("annotation requires validated model input and integration context")
     return AnnotationRecord(
         annotation_id=context.annotation_id,
         project_id=context.project_id,

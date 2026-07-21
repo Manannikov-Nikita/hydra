@@ -25,8 +25,37 @@ from .storage import HydraStore
 from .task_tree_types import ScalarFact
 
 
-def _project_pilot_health(tasks: tuple[ReconciledTask, ...]) -> PilotHealth:
-    cohort = tuple(item for item in tasks if item.semantic.annotations.instrumented)
+def _project_event_schema_counts(
+    store: HydraStore, project_id: str,
+) -> tuple[int, dict[str, int]]:
+    total = int(store.connection.execute(
+        """SELECT COUNT(*)
+             FROM codex_event_issues i
+             JOIN codex_event_sources s ON s.source_digest=i.source_digest
+            WHERE s.project_id=?""",
+        (project_id,),
+    ).fetchone()[0])
+    attributed = {
+        str(row[0]): int(row[1])
+        for row in store.connection.execute(
+            """SELECT t.public_ref,COALESCE(SUM(d.occurrence_count),0)
+                 FROM reconciled_tasks t
+                 JOIN reconciled_task_diagnostics d
+                   ON d.project_id=t.project_id AND d.root_key=t.root_key
+                WHERE t.project_id=? AND d.diagnostic_code LIKE 'schema:event:%'
+                GROUP BY t.public_ref""",
+            (project_id,),
+        )
+    }
+    return total, attributed
+
+
+def _project_pilot_health(
+    store: HydraStore, project_id: str, tasks: tuple[ReconciledTask, ...],
+) -> PilotHealth:
+    instrumented = tuple(item for item in tasks if item.semantic.annotations.instrumented)
+    cohort = tuple(item for item in instrumented if item.status == "complete")
+    incomplete_count = len(instrumented) - len(cohort)
     task_count = len(cohort)
     missing = sum(
         item.semantic.annotations.finish_count == 0 or item.semantic.self_report_missing > 0
@@ -62,11 +91,33 @@ def _project_pilot_health(tasks: tuple[ReconciledTask, ...]) -> PilotHealth:
             None, "count", "estimated", ("instrumentation_count_unavailable",),
             sum(item.metrics.instrumentation_calls.known_lower_bound for item in cohort),
         )
+    project_event_issues, attributed_event_issues = _project_event_schema_counts(
+        store, project_id,
+    )
+    non_event_schema = sum(
+        max(
+            0,
+            item.semantic.schema_diagnostics
+            - attributed_event_issues.get(item.public_ref, 0),
+        )
+        for item in cohort
+    )
+    denominator_caveat = ("completed_instrumented_tasks_denominator",)
+    pilot_caveats = ["pilot_receipt_required"]
+    if incomplete_count:
+        pilot_caveats.append("incomplete_instrumented_tasks_excluded")
+    schema_caveats = (
+        ("project_event_schema_diagnostics",) if project_event_issues else ()
+    )
     return PilotHealth(
-        NumericFact(task_count, "count", "exact", lower_bound=task_count),
+        NumericFact(
+            task_count, "count", "exact", denominator_caveat,
+            lower_bound=task_count,
+        ),
         NumericFact(
             0.0 if task_count == 0 else missing / task_count,
-            "ratio", "derived", ("task_level_marker_rate",),
+            "ratio", "derived",
+            ("task_level_marker_rate",) + denominator_caveat,
         ),
         coverage,
         NumericFact(
@@ -82,12 +133,16 @@ def _project_pilot_health(tasks: tuple[ReconciledTask, ...]) -> PilotHealth:
             None, "tokens", "estimated", ("instrumentation_overhead_not_calibrated",),
         ),
         NumericFact(
-            sum(item.semantic.schema_diagnostics for item in cohort),
-            "count", "derived",
+            non_event_schema + project_event_issues,
+            "count", "derived", schema_caveats,
         ),
-        "not_started" if task_count == 0 else "measuring" if task_count < 5 else "awaiting_receipt",
+        (
+            "not_started" if not instrumented
+            else "measuring" if task_count < 5
+            else "awaiting_receipt"
+        ),
         False,
-        ("pilot_receipt_required",),
+        tuple(pilot_caveats),
     )
 
 
@@ -180,7 +235,7 @@ def list_reconciled_reports(
     from .reconcile_engine import list_reconciled_tasks
 
     tasks = list_reconciled_tasks(store, project_id=project_id)
-    pilot = _project_pilot_health(tasks)
+    pilot = _project_pilot_health(store, project_id, tasks)
     reports = []
     for task in tasks:
         report = report_from_task_tree(

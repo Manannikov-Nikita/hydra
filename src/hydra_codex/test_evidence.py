@@ -76,7 +76,7 @@ def parse_structured_result(output: object) -> StructuredTestResult:
     if exit_status == 0:
         return StructuredTestResult(0, "success", "none", "complete")
     diagnostic = " ".join(
-        value for field in ("stdout", "stderr", "message")
+        value[:4096] for field in ("stdout", "stderr", "message", "output")
         if isinstance((value := parsed.get(field)), str)
     ).lower()
     cause = "infra_failure" if any(marker in diagnostic for marker in _INFRA_MARKERS) else "product_failure"

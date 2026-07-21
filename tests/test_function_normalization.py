@@ -63,6 +63,35 @@ class DirectFunctionNormalizationTests(unittest.TestCase):
         self.assertEqual(command.ephemeral_command, "pytest tests/private_test.py")
         self.assertNotIn("pytest", repr(command))
 
+    def test_direct_exec_derives_only_unambiguous_project_file_lower_bounds(self) -> None:
+        root = Path("/workspace/project")
+        direct = normalize_function_call(
+            "exec_command",
+            json.dumps({"cmd": "cat -n a.py", "workdir": "/workspace/project/src"}),
+            project_root=root,
+        )
+        ambiguous = normalize_function_call(
+            "exec_command",
+            json.dumps({"cmd": "cat src/a.py && cat private.py", "workdir": str(root)}),
+            project_root=root,
+        )
+        unsafe_workdir = normalize_function_call(
+            "exec_command",
+            json.dumps({"cmd": "cat private.py", "workdir": "/private/outside"}),
+            project_root=root,
+        )
+
+        self.assertEqual(
+            [(access.operation, access.relative_path) for access in direct.file_accesses],
+            [("read", "src/a.py")],
+        )
+        self.assertEqual(ambiguous.file_accesses, ())
+        self.assertEqual(unsafe_workdir.file_accesses, ())
+        for private in ("cat -n", "cat private.py", "/workspace/project"):
+            self.assertNotIn(private, repr(direct))
+            self.assertNotIn(private, repr(ambiguous))
+            self.assertNotIn(private, repr(unsafe_workdir))
+
     def test_known_read_tools_emit_only_verified_filesystem_reads(self) -> None:
         root = Path("/workspace/project")
         view = normalize_function_call(

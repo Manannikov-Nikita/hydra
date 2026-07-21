@@ -45,7 +45,9 @@ class StructuredResultTests(unittest.TestCase):
     def test_only_an_exact_non_boolean_integer_exit_is_authoritative(self) -> None:
         success = parse_structured_result(json.dumps({"exit_code": 0, "stdout": "private"}))
         product = parse_structured_result(json.dumps({"exit_code": 2, "stderr": "assertion failed"}))
-        infra = parse_structured_result(json.dumps({"exit_code": 1, "stderr": "sandbox unavailable"}))
+        infra = parse_structured_result(json.dumps({
+            "exit_code": 1, "output": "sandbox unavailable",
+        }))
 
         self.assertEqual((success.exit_status, success.outcome, success.failure_cause, success.completeness),
                          (0, "success", "none", "complete"))
@@ -148,7 +150,7 @@ class PersistedTestEvidenceTests(unittest.TestCase):
             call("fixed-1", "pytest tests/fixed.py", 3),
             result("fixed-1", {"exit_code": 1, "stderr": "assertion failed"}, 4),
             call("infra-1", "pytest tests/infra.py", 5),
-            result("infra-1", {"exit_code": 1, "stderr": "sandbox unavailable"}, 6),
+            result("infra-1", {"exit_code": 1, "output": "sandbox unavailable"}, 6),
             event("response_item", {"type": "custom_tool_call", "call_id": "unknown-1", "name": "exec",
                                     "input": 'tools.exec_command({"cmd":"pytest tests/unknown.py"});'}, 7),
         ])

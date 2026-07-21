@@ -262,6 +262,21 @@ class SQLiteStorageTests(unittest.TestCase):
         self.assertEqual(row[2], len(private_note))
         self.assertFalse({"raw_note", "prompt", "message", "tool_output"} & columns)
 
+    def test_common_phone_numbers_are_redacted_before_storage(self) -> None:
+        for sequence, note in enumerate((
+            "Call +7 (999) 123-45-67 after the run",
+            "Reach me at 8 999 123 45 67",
+            "US contact +1 415-555-2671",
+        ), start=1):
+            with self.subTest(note=note):
+                annotation_id = f"ann-phone-{sequence}"
+                self.store.write_annotation(annotation(annotation_id, sequence, note))
+                stored = self.store.connection.execute(
+                    "SELECT note_redacted FROM annotations WHERE annotation_id=?",
+                    (annotation_id,),
+                ).fetchone()[0]
+                self.assertEqual(stored, "[redacted]")
+
     def test_keyword_and_header_secret_forms_are_fail_closed(self) -> None:
         risky_notes = SECRET_FORM_MATRIX + ("credential VALUE", "passwd VALUE", "access-key VALUE")
         for sequence, note in enumerate(risky_notes, start=1):
@@ -292,6 +307,7 @@ class SQLiteStorageTests(unittest.TestCase):
         for sequence, family in enumerate((
             "/Users/alice/private", "alice@example.com", "raw family with spaces",
             "019f75d4-5125-7343-8537-49b80f27f286", "token=private",
+            "customer-123456", "alice", "secret-token", "private-looking",
         ), start=1):
             with self.subTest(family=family):
                 with self.assertRaisesRegex(ValueError, "privacy-safe category"):

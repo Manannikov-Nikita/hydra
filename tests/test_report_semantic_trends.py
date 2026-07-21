@@ -125,6 +125,21 @@ class StoredReportScenario(unittest.TestCase):
                VALUES (?,1,?,?,0,?,0,0,0,0,'complete',?)""",
             (source, name, PROJECT, tokens, stamp(offset + 5)),
         )
+        start_event = f"start-{name}"
+        self.db.execute(
+            """INSERT INTO rollout_events(
+                   event_key,logical_source_key,source_ordinal,envelope_kind,observed_at,
+                   timestamp_quality,fingerprint)
+               VALUES (?,?,99,'event_msg',?,'valid','shape')""",
+            (start_event, logical, stamp(offset)),
+        )
+        self.db.execute(
+            """INSERT INTO turn_lifecycle_events(
+                   event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+                   source_digest,logical_source_key,source_ordinal)
+               VALUES (?,?,?,'started',?,0,?,?,99)""",
+            (start_event, name, f"turn-{name}", stamp(offset), source, logical),
+        )
         event = f"complete-{name}"
         self.db.execute(
             """INSERT INTO rollout_events(
@@ -419,14 +434,66 @@ class SemanticReportIntegrationTests(StoredReportScenario):
         self.add_task("historical", 0, 100, instrumented=False)
         self.add_task("missing", 20, 100, finish=False)
         self.add_task("finished", 40, 100, finish=True)
+        self.add_task("unfinished", 60, 100, finish=False)
+        self.db.execute(
+            "DELETE FROM turn_lifecycle_events WHERE session_key='unfinished'"
+        )
 
         pilot = self.reconcile()[0].pilot_health.as_dict()
 
         self.assertEqual(pilot["task_count"]["value"], 2)
+        self.assertIn(
+            "completed_instrumented_tasks_denominator",
+            pilot["task_count"]["caveats"],
+        )
         self.assertEqual(pilot["missing_marker_rate"]["value"], 0.5)
+        self.assertIn(
+            "completed_instrumented_tasks_denominator",
+            pilot["missing_marker_rate"]["caveats"],
+        )
         self.assertEqual(pilot["status"], "measuring")
         self.assertFalse(pilot["receipt_verified"])
         self.assertIn("pilot_receipt_required", pilot["caveats"])
+        self.assertIn("incomplete_instrumented_tasks_excluded", pilot["caveats"])
+
+    def test_only_incomplete_instrumented_tasks_start_measurement_without_counting_them(self) -> None:
+        self.add_task("unfinished", 0, 100, finish=False)
+        self.db.execute(
+            "DELETE FROM turn_lifecycle_events WHERE session_key='unfinished'"
+        )
+
+        pilot = self.reconcile()[0].pilot_health.as_dict()
+
+        self.assertEqual(pilot["task_count"]["value"], 0)
+        self.assertEqual(pilot["missing_marker_rate"]["value"], 0.0)
+        self.assertEqual(pilot["status"], "measuring")
+        self.assertIn("incomplete_instrumented_tasks_excluded", pilot["caveats"])
+
+    def test_project_event_schema_issue_invalidates_reconciliation_and_reaches_pilot(self) -> None:
+        self.add_task("finished", 0, 100)
+        self.reconcile()
+        self.db.execute(
+            """INSERT INTO codex_event_sources(
+                   source_digest,project_id,schema_version,source_format,line_count,byte_count)
+               VALUES ('event-source',?,'app_server/v2','app_server',1,1)""",
+            (PROJECT,),
+        )
+        self.db.execute(
+            """INSERT INTO codex_event_issues(
+                   source_digest,source_ordinal,event_key,issue_code)
+               VALUES ('event-source',1,'issue-event','schema_drift')"""
+        )
+        self.db.commit()
+
+        with self.assertRaises(ReconciliationStale):
+            list_reconciled_reports(self.store, PROJECT)
+
+        pilot = self.reconcile()[0].pilot_health.as_dict()
+        self.assertEqual(pilot["schema_diagnostics"]["value"], 1)
+        self.assertIn(
+            "project_event_schema_diagnostics",
+            pilot["schema_diagnostics"]["caveats"],
+        )
 
     def test_five_instrumented_tasks_await_receipt_and_cli_warns_from_complete_retries(self) -> None:
         for index in range(5):

@@ -5,9 +5,9 @@ hooks. It does not replace the project-local CLI and hooks used during the
 initial five-task pilot.
 
 The bundled MCP server advertises `hydra.report` by default. It deliberately
-does not advertise `hydra.annotate` until Codex supplies a trusted turn
-transport that can bind identity outside model-controlled arguments. During
-the pilot, the capability-bearing CLI command injected by the hook is the only
+does not advertise `hydra.annotate` until Codex supplies an authenticated turn
+transport outside model-controlled arguments. During the pilot, the
+capability-bearing CLI command injected by the cooperative hook is the only
 supported annotation path.
 
 The report tool returns the same `hydra.report/v3` contract as the CLI,

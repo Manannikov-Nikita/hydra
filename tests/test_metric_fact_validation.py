@@ -18,6 +18,43 @@ from hydra_codex.storage import HydraStore
 
 
 class MetricFactValidationTests(unittest.TestCase):
+    def test_compatibility_aggregator_ignores_snapshots_excluded_from_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            connection = store.connection
+            connection.execute(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,conversation_key)
+                   VALUES ('root','project','worktree',1,'')"""
+            )
+            connection.executemany(
+                """INSERT INTO token_snapshots(
+                       source_digest,line_number,session_key,project_id,epoch,input_tokens,
+                       cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,
+                       completeness,observed_at,source_family,contributes_total)
+                   VALUES (?,?,?,?,0,?,?,?,?,0,'complete',?,?,?)""",
+                (
+                    (
+                        "selected", 1, "root", "project", 100, 20, 10, 5,
+                        "2026-07-21T00:00:01+00:00", "rollout", 1,
+                    ),
+                    (
+                        "excluded", 2, "root", "project", 900, 0, 100, 50,
+                        "2026-07-21T00:00:02+00:00", "otel", 0,
+                    ),
+                ),
+            )
+            connection.commit()
+
+            facts = aggregate_project_facts(connection, "project")
+            metrics = aggregate_project(connection, "project")
+
+            self.assertEqual(facts["recorded_working"].value, 90)
+            self.assertEqual(facts["recorded_full"].value, 110)
+            self.assertEqual(facts["recorded_reasoning"].value, 5)
+            self.assertEqual(metrics.recorded_working_tokens, 90)
+
     def test_project_metrics_are_adapted_from_component_aware_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = HydraStore(Path(temporary) / "hydra.sqlite3")

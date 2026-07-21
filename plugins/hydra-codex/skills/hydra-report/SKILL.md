@@ -34,16 +34,23 @@ raw prompts or turn an agent's prose summary into an exact measurement.
 
 During an instrumented task, call `hydra.annotate` only when the semantic phase
 changes, a blocker appears, or the task finishes. Keep `note` under 240
-characters. Report purpose and outcome only. Never supply tokens, elapsed time,
+characters. Redaction is not a general content classifier: report purpose and
+outcome only, and never paste prompt, transcript, or tool output. Never supply tokens, elapsed time,
 test or file counts, paths, `session_id`, `thread_id`, `turn_id`, or timestamps;
-trusted hooks add identity and time.
+configured hooks add identity and time in the cooperative local workflow. This
+is hook-attested telemetry, not cryptographic authentication against another
+process running as the same user.
 
 Use a lowercase categorical `task_family` such as `multiple-answer-quiz`, not a
 prompt excerpt, user identifier, path, email address, UUID, or secret.
+Use a public terminal category such as `quiz`, `workflow`, `architecture`,
+`hardening`, `review`, `report`, `tests`, `runtime`, or `docs`; otherwise use
+`unclassified` rather than inventing a person- or customer-derived label.
 
 For the MVP, follow the exact capability-bearing CLI command injected by the
 turn hook. The typed MCP annotation tool is post-pilot: use it only when the
-Codex integration supplies trusted turn capability out of band. Never add a
+Codex integration supplies an authenticated turn capability outside model
+arguments. Never add a
 capability to the semantic tool arguments or choose a turn by `cwd`.
 
 Do not annotate historical tasks after the fact. A historical report with zero

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .rollout_identity import Pseudonymizer
+from .rollout_privacy import canonical_timestamp
 
 
 APP_SERVER_V2 = "codex.app-server/v2"
@@ -94,6 +95,22 @@ class ToolFact:
     duration_ms: int | None
     exit_status: int | None
 
+    @property
+    def ephemeral_command(self) -> str | None:
+        return getattr(self, "_ephemeral_command", None)
+
+    @property
+    def ephemeral_output(self) -> str | None:
+        return getattr(self, "_ephemeral_output", None)
+
+    @property
+    def ephemeral_workdir(self) -> str | None:
+        return getattr(self, "_ephemeral_workdir", None)
+
+    @property
+    def ephemeral_file_writes(self) -> tuple[str, ...]:
+        return getattr(self, "_ephemeral_file_writes", ())
+
 
 @dataclass(frozen=True)
 class CodexEventFact:
@@ -112,6 +129,8 @@ class CodexEventFact:
     tool: ToolFact | None = None
     contents: tuple[ContentFingerprint, ...] = ()
     provenance: str = "exact"
+    parent_thread_key: str | None = None
+    child_thread_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,7 +229,7 @@ def _app_contents(item: Mapping[str, Any], turn: Mapping[str, Any] | None, key: 
         candidates.extend((("tool_input", item.get("command")), ("tool_output", item.get("aggregatedOutput"))))
     elif kind in {"mcpToolCall", "dynamicToolCall"}:
         candidates.extend((("tool_input", item.get("arguments")), ("tool_output", item.get("result") or item.get("contentItems") or item.get("error"))))
-    elif kind == "collabAgentToolCall":
+    elif kind in {"collabToolCall", "collabAgentToolCall"}:
         candidates.append(("tool_input", item.get("prompt")))
     elif kind == "webSearch":
         candidates.append(("tool_input", item.get("query")))
@@ -226,7 +245,9 @@ def _safe_tool(item: Mapping[str, Any], phase: str, key: bytes) -> ToolFact | No
     names = {
         "commandExecution": ("exec_command", "tool"), "fileChange": ("apply_patch", "tool"),
         "webSearch": ("web", "web"), "imageView": ("view_image", "tool"),
-        "collabAgentToolCall": ("collaboration", "tool"), "dynamicToolCall": ("mcp", "tool"),
+        "collabToolCall": ("collaboration", "tool"),
+        "collabAgentToolCall": ("collaboration", "tool"),
+        "dynamicToolCall": ("mcp", "tool"),
     }
     safe_name, category = names.get(kind, ("mcp", "tool"))
     if kind == "mcpToolCall":
@@ -240,10 +261,37 @@ def _safe_tool(item: Mapping[str, Any], phase: str, key: bytes) -> ToolFact | No
     exit_status = item.get("exitCode")
     if not isinstance(exit_status, int) or isinstance(exit_status, bool):
         exit_status = None
-    return ToolFact(
+    writes: tuple[str, ...] = ()
+    changes = item.get("changes")
+    if kind == "fileChange" and isinstance(changes, list) and all(
+        isinstance(change, Mapping) and isinstance(change.get("path"), str)
+        for change in changes
+    ):
+        writes = tuple(str(change["path"]) for change in changes)
+    fact = ToolFact(
         _opaque(key, "call", item.get("id")), safe_name, category, phase,
         _status(item.get("status")), duration, exit_status,
     )
+    object.__setattr__(
+        fact, "_ephemeral_command",
+        item.get("command")
+        if kind == "commandExecution" and isinstance(item.get("command"), str)
+        else None,
+    )
+    object.__setattr__(
+        fact, "_ephemeral_output",
+        item.get("aggregatedOutput")
+        if kind == "commandExecution" and isinstance(item.get("aggregatedOutput"), str)
+        else None,
+    )
+    object.__setattr__(
+        fact, "_ephemeral_workdir",
+        item.get("cwd")
+        if kind == "commandExecution" and isinstance(item.get("cwd"), str)
+        else None,
+    )
+    object.__setattr__(fact, "_ephemeral_file_writes", writes)
+    return fact
 
 
 def _usage(value: Any, scope: str, cumulative: bool) -> TokenSnapshotFact | None:
@@ -260,6 +308,15 @@ def _usage(value: Any, scope: str, cumulative: bool) -> TokenSnapshotFact | None
 
 
 def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple[CodexEventFact | None, tuple[str, ...]]:
+    receipt_timestamp: tuple[str, int] | None = None
+    receipt_invalid = False
+    if isinstance(envelope, Mapping) and set(envelope) == {"received_at", "message"}:
+        received = canonical_timestamp(envelope.get("received_at"))
+        if received.text is None or received.epoch is None:
+            receipt_invalid = True
+        else:
+            receipt_timestamp = (received.text, int(round(received.epoch * 1_000_000_000)))
+        envelope = envelope.get("message")
     if not isinstance(envelope, Mapping) or set(envelope) - {"method", "params"} or not isinstance(envelope.get("params"), Mapping):
         return None, ("invalid_envelope",)
     method, params = envelope.get("method"), envelope["params"]
@@ -272,7 +329,11 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     if not isinstance(thread, str) or not thread:
         return None, ("invalid_envelope",)
     observed_at, observed_ns, bad_time = _app_timestamp(method, params)
-    issues: list[str] = ["invalid_timestamp"] if bad_time else []
+    if receipt_timestamp is not None:
+        observed_at, observed_ns = receipt_timestamp
+    issues: list[str] = ["invalid_timestamp"] if receipt_invalid or (
+        receipt_timestamp is None and bad_time
+    ) else []
     item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
     contents = _app_contents(item, turn, key)
     if thread_object is not None and (preview := _content("user_prompt", thread_object.get("preview"), key)) is not None:
@@ -297,10 +358,14 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     event_types = {"thread/tokenUsage/updated": "token_usage_updated"}
     event_type = event_types.get(method, method.replace("/", "_"))
     status = _status((turn or item).get("status"))
+    collab = item.get("type") in {"collabToolCall", "collabAgentToolCall"}
+    parent = item.get("senderThreadId") if collab else None
+    child = (item.get("newThreadId") or item.get("receiverThreadId")) if collab else None
     return CodexEventFact(
         "app_server", APP_SERVER_V2, ordinal, event_key, event_type, observed_at, observed_ns,
         _opaque(key, "thread", thread), _opaque(key, "turn", turn_id), duration,
-        status, snapshots, tool, contents,
+        status, snapshots, tool, contents, "exact" if observed_at is not None else "estimated",
+        _opaque(key, "thread", parent), _opaque(key, "thread", child),
     ), tuple(issues)
 
 

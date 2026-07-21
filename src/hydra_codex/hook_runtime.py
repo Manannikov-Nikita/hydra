@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.12
-"""Privacy-safe, fail-open UserPromptSubmit and Stop hook runtime."""
+"""Privacy-safe, fail-open cooperative UserPromptSubmit and Stop hook runtime."""
 
 from __future__ import annotations
 
@@ -133,11 +133,11 @@ def _instruction(capability: str, annotation_command: str) -> dict[str, object]:
         "Hydra telemetry for this turn. On each phase change run "
         f"`{command} "
         "--kind phase --phase implement --cause plan --scope-change none "
-        "--task-family task --confidence 0.9 --note \"phase change\"`. "
+        "--task-family unclassified --confidence 0.9 --note \"phase change\"`. "
         "Before the final answer run "
         f"`{command} "
         "--kind finish --phase test_full --cause final_verification --outcome success "
-        "--scope-change none --task-family task --confidence 1 --note \"done\"`. "
+        "--scope-change none --task-family unclassified --confidence 1 --note \"done\"`. "
         "Replace only semantic values; never submit tokens, time, file/test counts, "
         "session_id, or turn_id."
     )
@@ -197,6 +197,7 @@ def _handle_stop(
         issued.token,
         observed_at=observed_at,
         retry_active=active,
+        retry_expires_at=issued.expires_at,
     )
     if state is StopState.RETRY_REQUIRED:
         return {"decision": "block", "reason": _STOP_REASON}
@@ -213,7 +214,11 @@ def handle_event(
     project_resolver: ProjectResolver = resolve_project,
     annotation_command: str = _INSTALLED_ANNOTATION_COMMAND,
 ) -> dict[str, object]:
-    """Handle one trusted Codex hook envelope; every error fails open."""
+    """Handle one configured Codex hook envelope; every error fails open.
+
+    The envelope is hook-attested in the normal Codex workflow, not
+    cryptographically authenticated against a local process invoking this CLI.
+    """
     try:
         if not isinstance(payload, Mapping):
             return {}

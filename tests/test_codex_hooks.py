@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
@@ -206,6 +206,50 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(binding["state"], "finished")
         self.assertNotIn(b"private assistant response", self.database.read_bytes())
 
+    def test_stop_after_capability_expiry_renews_the_command_already_given_to_model(self) -> None:
+        prompt = handle_event(
+            prompt_payload(cwd=str(self.root)), environ=self.environ, clock=lambda: NOW,
+        )
+        original = self.capability(prompt)
+        late = NOW + timedelta(hours=25)
+
+        response = handle_event(
+            stop_payload(cwd=str(self.root)), environ=self.environ, clock=lambda: late,
+        )
+
+        self.assertEqual(response.get("decision"), "block")
+        keys = Pseudonymizer.installation_key(self.key_path)
+        store = HydraStore(self.database)
+        try:
+            finish = finish_turn(
+                store,
+                keys,
+                original,
+                TrustedAnnotationContext(
+                    request_key="finish-after-expiry",
+                    sequence=1,
+                    observed_at=(late + timedelta(minutes=1)).isoformat().replace(
+                        "+00:00", "Z"
+                    ),
+                ),
+                {
+                    "kind": "finish", "phase": "test_full",
+                    "cause": "final_verification", "outcome": "success",
+                    "scope_change": "none", "task_family": "codex-hooks",
+                    "note": "done", "confidence": 1.0,
+                },
+            )
+            session = store.connection.execute(
+                "SELECT provenance FROM sessions"
+            ).fetchone()[0]
+            turn = store.connection.execute(
+                "SELECT provenance FROM turns"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(finish.sequence, 1)
+        self.assertEqual((session, turn), ("derived", "derived"))
+
     def test_duplicate_project_and_plugin_stop_hooks_share_one_retry(self) -> None:
         self.handle(prompt_payload(cwd=str(self.root)))
 
@@ -373,6 +417,25 @@ class CodexHookManifestTests(unittest.TestCase):
             self.assertIn("integrations/codex/hook.py", hook["command"])
             self.assertIn("git rev-parse --show-toplevel", hook["command"])
             self.assertLessEqual(hook["timeout"], 10)
+
+    def test_documentation_does_not_overclaim_local_hook_authentication(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sources = (
+            (root / "README.md").read_text(encoding="utf-8"),
+            (root / "plugins" / "hydra-codex" / "README.md").read_text(
+                encoding="utf-8"
+            ),
+            (
+                root / "plugins" / "hydra-codex" / "skills" /
+                "hydra-report" / "SKILL.md"
+            ).read_text(encoding="utf-8"),
+        )
+
+        combined = "\n".join(sources).lower()
+        self.assertIn("cooperative", combined)
+        self.assertIn("not cryptographic", combined)
+        self.assertNotIn("trusted turn capability out of band", combined)
+        self.assertNotIn("without the trusted turn capability", combined)
 
 
 if __name__ == "__main__":

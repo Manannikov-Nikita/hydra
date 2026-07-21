@@ -61,7 +61,7 @@ class CodexEventAdapterTests(unittest.TestCase):
         self.assertEqual(set(command_contents), {"tool_input", "tool_output"})
         self.assertEqual(command_contents["tool_output"].characters, len("fixture test output"))
         message = batch.events[4]
-        self.assertEqual(message.observed_at, "2024-07-03T09:46:41.400000Z")
+        self.assertEqual(message.observed_at, "2024-07-03T09:46:41.700000Z")
         self.assertEqual(message.contents[0].field, "assistant_message")
 
         serialized = json.dumps(asdict(batch), sort_keys=True)
@@ -71,6 +71,28 @@ class CodexEventAdapterTests(unittest.TestCase):
             "/fixture/project",
         ):
             self.assertNotIn(raw, serialized)
+
+    def test_unwrapped_official_notification_without_timestamp_stays_estimated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "app.jsonl"
+            source.write_text(json.dumps({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread", "turnId": "turn",
+                    "item": {
+                        "id": "call", "type": "commandExecution",
+                        "command": "echo safe", "status": "completed",
+                        "durationMs": 1, "exitCode": 0,
+                    },
+                },
+            }) + "\n", encoding="utf-8")
+
+            event = read_codex_event_jsonl(
+                source, schema=APP_SERVER_V2, privacy_key=KEY,
+            ).events[0]
+
+        self.assertIsNone(event.observed_at)
+        self.assertEqual(event.provenance, "estimated")
 
     def test_otel_v1_preserves_source_order_and_model_call_usage(self) -> None:
         batch = read_codex_event_jsonl(

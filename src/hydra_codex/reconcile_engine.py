@@ -154,7 +154,21 @@ def _assemble_project(
         metrics = replace(metrics, semantic_coverage=semantic.coverage)
         assembled.append((plan, metrics, deltas, semantic))
         fingerprints.append(_task_fingerprint(plan, metrics, semantic, deltas))
-    payload = json.dumps(fingerprints, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    project_event_issues = [
+        [str(row[0]), int(row[1]), str(row[2]), str(row[3]), str(row[4])]
+        for row in store.connection.execute(
+            """SELECT i.source_digest,i.source_ordinal,i.event_key,i.issue_code,i.provenance
+                 FROM codex_event_issues i
+                 JOIN codex_event_sources s ON s.source_digest=i.source_digest
+                WHERE s.project_id=?
+                ORDER BY i.source_digest,i.source_ordinal,i.event_key,i.issue_code""",
+            (project_id,),
+        )
+    ]
+    payload = json.dumps(
+        {"tasks": fingerprints, "project_event_issues": project_event_issues},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
     return plans, tuple(assembled), hashlib.sha256(payload).hexdigest()
 
 

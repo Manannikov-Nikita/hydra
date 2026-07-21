@@ -8,6 +8,8 @@ from pathlib import Path, PurePosixPath
 import re
 from typing import Any
 
+from .shell_facts import shell_file_facts
+
 
 _HYDRA_NAMES = frozenset({
     "hydra.annotate", "hydra.report", "hydra_annotate", "hydra_report",
@@ -72,9 +74,11 @@ class NormalizedFunctionCall:
             "file_read": "read", "view_image": "read",
         }
         expected_operation = allowed_operations.get(self.safe_name)
-        if self.file_accesses and expected_operation is None:
+        if self.file_accesses and expected_operation is None and self.safe_name != "exec_command":
             raise ValueError("safe tool family cannot own file accesses")
-        if any(access.operation != expected_operation for access in self.file_accesses):
+        if self.safe_name != "exec_command" and any(
+            access.operation != expected_operation for access in self.file_accesses
+        ):
             raise ValueError("file operation disagrees with safe tool family")
 
 
@@ -137,6 +141,19 @@ def _file_accesses(
     arguments: dict[str, Any],
     project_root: Path | None,
 ) -> tuple[NormalizedFileAccess, ...]:
+    if safe_name == "exec_command":
+        command = arguments.get("cmd")
+        workdir = arguments.get("workdir")
+        if not isinstance(command, str) or not (
+            workdir is None or isinstance(workdir, str)
+        ):
+            return ()
+        return tuple(
+            NormalizedFileAccess(operation, path)
+            for operation, path in shell_file_facts(
+                command, project_root=project_root, workdir=workdir,
+            )
+        )
     if safe_name in {"view_image", "file_read"}:
         path = _relative_path(arguments.get("path"), project_root)
         return (NormalizedFileAccess("read", path),) if path is not None else ()

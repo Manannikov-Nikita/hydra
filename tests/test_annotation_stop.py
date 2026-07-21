@@ -284,6 +284,37 @@ class AnnotationStopTests(unittest.TestCase):
         self.assertEqual(state, StopState.FINISHED)
         self.assertEqual(retry, 0)
 
+    def test_first_stop_retry_renews_the_original_expired_capability(self) -> None:
+        issued = self.issue()
+        record_initial_understand(
+            self.store, self.keys, issued.token, request(0), task_family="annotation-core"
+        )
+
+        state = observe_stop(
+            self.store,
+            self.keys,
+            issued.token,
+            observed_at="2026-07-21T10:00:00Z",
+            retry_active=False,
+            retry_expires_at="2026-07-22T10:00:00Z",
+        )
+        write = finish_turn(
+            self.store,
+            self.keys,
+            issued.token,
+            request(1, observed_at="2026-07-21T10:01:00Z"),
+            finish_payload(),
+        )
+
+        self.assertEqual(state, StopState.RETRY_REQUIRED)
+        self.assertEqual(write.sequence, 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT expires_at FROM turn_capabilities"
+            ).fetchone()[0],
+            "2026-07-22T10:00:00Z",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Safe value objects for trusted semantic annotation writes."""
+"""Safe value objects for hook-attested semantic annotation writes."""
 
 from __future__ import annotations
 

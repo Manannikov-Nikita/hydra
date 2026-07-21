@@ -88,6 +88,28 @@ class ReconcileEngineTests(unittest.TestCase):
         )
 
     def complete(self, session: str, second: int, ordinal: int = 100) -> None:
+        started_at = self.connection.execute(
+            "SELECT started_at FROM rollout_sessions WHERE session_key=?", (session,),
+        ).fetchone()[0]
+        start_event = f"start-{session}-{ordinal}"
+        self.connection.execute(
+            """INSERT INTO rollout_events(
+                   event_key,logical_source_key,source_ordinal,envelope_kind,observed_at,
+                   timestamp_quality,fingerprint)
+               VALUES (?, ?, 0, 'event_msg', ?, 'valid', 'shape-start')""",
+            (start_event, f"logical-{session}", started_at),
+        )
+        self.connection.execute(
+            """INSERT INTO turn_lifecycle_events(
+                   event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+                   emitted_duration_ms,source_digest,logical_source_key,source_ordinal)
+               VALUES (?,?,'turn','started',?,?,NULL,?,?,0)""",
+            (
+                start_event, session, started_at,
+                datetime.fromisoformat(started_at).timestamp(),
+                f"source-{session}", f"logical-{session}",
+            ),
+        )
         event = f"complete-{session}-{ordinal}"
         self.connection.execute(
             """INSERT INTO rollout_events(
@@ -339,8 +361,8 @@ class ReconcileEngineTests(unittest.TestCase):
         self.assertEqual(tasks[0].semantic.phase_working, {})
         reports = list_reconciled_reports(self.store, project_id=PROJECT, limit=1)
         self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0].pilot_health.task_count.value, 1)
-        self.assertEqual(reports[0].pilot_health.missing_marker_rate.value, 1.0)
+        self.assertEqual(reports[0].pilot_health.task_count.value, 0)
+        self.assertEqual(reports[0].pilot_health.missing_marker_rate.value, 0.0)
 
     def test_query_fails_closed_when_sources_change_after_reconciliation(self) -> None:
         self.session("root", 0)

@@ -17,7 +17,9 @@ from hydra_codex.codex_event_ingest import (
 )
 from hydra_codex.codex_events import APP_SERVER_V2, OTEL_LOG_V1
 from hydra_codex.reconcile_engine import list_reconciled_tasks, reconcile_project
+from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.rollout_identity import Pseudonymizer
+from hydra_codex.rollout_reconcile import reconcile_token_epochs
 from hydra_codex.storage import MIGRATIONS, HydraStore, StorageUnavailable
 from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 
@@ -132,7 +134,10 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.assertEqual(metrics.recorded.full.value, 130)
         self.assertEqual(metrics.recorded.reasoning.value, 5)
         self.assertEqual(metrics.tool_calls.value, 1)
-        self.assertIn("app_total_timestamp_missing", metrics.recorded.caveats)
+        self.assertEqual(metrics.test_runs.value, 1)
+        self.assertEqual(metrics.targeted_test_runs.value, 1)
+        self.assertNotIn("app_total_timestamp_missing", metrics.recorded.caveats)
+        self.assertEqual(metrics.recorded.provenance, "exact")
 
         summary = reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
         task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
@@ -477,6 +482,284 @@ class CodexEventPersistenceTests(unittest.TestCase):
             [(row[0], row[1]) for row in selected],
             [("app_server", 0), ("otel", 0), ("rollout", 1)],
         )
+
+    def test_fork_baseline_uses_selected_rollout_instead_of_later_otel_fallback(self) -> None:
+        self.ingest(CodexEventSource(_otel_for_app_thread(self.base), OTEL_LOG_V1))
+        rollout = self.base / "child-rollout.jsonl"
+        records = (
+            {
+                "timestamp": "2024-07-03T09:46:40Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "fixture-thread-a", "parent_thread_id": "fixture-parent",
+                    "cwd": str(self.project),
+                },
+            },
+            {
+                "timestamp": "2024-07-03T09:46:40.500000Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 100, "cached_input_tokens": 50,
+                    "output_tokens": 20, "reasoning_output_tokens": 10,
+                }}},
+            },
+            {
+                "timestamp": "2024-07-03T09:46:41.200000Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 150, "cached_input_tokens": 60,
+                    "output_tokens": 30, "reasoning_output_tokens": 15,
+                }}},
+            },
+        )
+        rollout.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in records),
+            encoding="utf-8",
+        )
+
+        ingest_rollouts(
+            self.store, (rollout,), self.project, PROJECT, hash_key=KEY,
+        )
+
+        selected = self.store.connection.execute(
+            """SELECT snapshots.source_family,baselines.input_tokens,
+                      baselines.cached_input_tokens,baselines.output_tokens,
+                      baselines.reasoning_tokens
+                 FROM fork_baselines AS baselines
+                 JOIN token_snapshots AS snapshots
+                   ON snapshots.source_digest=baselines.source_digest
+                  AND snapshots.line_number=baselines.line_number"""
+        ).fetchone()
+        self.assertIsNotNone(selected, [tuple(row) for row in self.store.connection.execute(
+            """SELECT sessions.session_key,sessions.started_at,edges.confidence_kind,
+                      snapshots.source_family,snapshots.contributes_total,
+                      snapshots.observed_at,snapshots.input_tokens
+                 FROM rollout_sessions AS sessions
+                 LEFT JOIN session_edges AS edges ON edges.child_key=sessions.session_key
+                 LEFT JOIN token_snapshots AS snapshots
+                   ON snapshots.session_key=sessions.session_key
+                ORDER BY snapshots.source_family"""
+        )])
+        self.assertEqual(tuple(selected), ("rollout", 100, 50, 20, 10))
+        session = Pseudonymizer(KEY).digest("identity", "fixture-thread-a")
+        metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id=PROJECT, root_id=session,
+            cutoff_at=datetime(2024, 7, 3, 9, 46, 41, 200000, tzinfo=timezone.utc),
+        )
+        self.assertEqual(metrics.recorded.input.value, 150)
+        self.assertEqual(
+            [row[0] for row in self.store.connection.execute(
+                """SELECT epoch FROM token_snapshots
+                     WHERE session_key=? AND source_family='rollout'
+                     ORDER BY observed_at""",
+                (session,),
+            )],
+            [0, 0],
+        )
+
+    def test_otel_model_calls_keep_distinct_epochs_after_cumulative_reconciliation(self) -> None:
+        template = json.loads(
+            (FIXTURES / "otel_log_v1.jsonl").read_text(encoding="utf-8").splitlines()[2]
+        )
+        rows: list[dict[str, object]] = []
+        for index, input_tokens in enumerate((50, 100), start=1):
+            item = json.loads(json.dumps(template))
+            item["timeUnixNano"] = str(1720000000000000000 + index * 100000000)
+            for attribute in item["attributes"]:
+                if attribute["key"] == "input_tokens":
+                    attribute["value"]["intValue"] = str(input_tokens)
+                elif attribute["key"] == "cached_input_tokens":
+                    attribute["value"]["intValue"] = "0"
+                elif attribute["key"] == "output_tokens":
+                    attribute["value"]["intValue"] = "0"
+                elif attribute["key"] == "reasoning_output_tokens":
+                    attribute["value"]["intValue"] = "0"
+            rows.append(item)
+        source = self.base / "two-otel-calls.jsonl"
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+        self.ingest(CodexEventSource(source, OTEL_LOG_V1))
+        reconcile_token_epochs(self.store.connection, PROJECT)
+
+        root = Pseudonymizer(KEY).digest("identity", "fixture-thread-b")
+        metrics = aggregate_stored_task_tree(
+            self.store.connection, project_id=PROJECT, root_id=root,
+            cutoff_at=datetime(2024, 7, 3, 9, 46, 41, tzinfo=timezone.utc),
+        )
+        self.assertEqual(metrics.recorded.input.value, 150)
+        epochs = [row[0] for row in self.store.connection.execute(
+            "SELECT epoch FROM token_snapshots ORDER BY line_number"
+        )]
+        self.assertEqual(len(set(epochs)), 2)
+
+    def test_timestamp_missing_app_total_after_same_source_completion_is_excluded(self) -> None:
+        totals = lambda value: {
+            "inputTokens": value, "cachedInputTokens": 0,
+            "outputTokens": 0, "reasoningOutputTokens": 0,
+            "totalTokens": value,
+        }
+        source = self.base / "after-completion-total.jsonl"
+        rows = (
+            {"method": "turn/started", "params": {
+                "threadId": "cutoff-thread", "turn": {
+                    "id": "cutoff-turn", "startedAt": 1720000000,
+                    "status": "inProgress",
+                },
+            }},
+            {"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "cutoff-thread", "turnId": "cutoff-turn",
+                "tokenUsage": {"total": totals(100), "last": totals(100)},
+            }},
+            {"method": "turn/completed", "params": {
+                "threadId": "cutoff-thread", "turn": {
+                    "id": "cutoff-turn", "completedAt": 1720000002,
+                    "status": "completed",
+                },
+            }},
+            {"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "cutoff-thread", "turnId": "cutoff-turn",
+                "tokenUsage": {"total": totals(200), "last": totals(200)},
+            }},
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+        reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
+
+        task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
+        self.assertEqual(task.status, "complete")
+        self.assertIsNone(task.metrics.recorded.input.value)
+        self.assertIn(
+            "post_cutoff_timestamp_missing_token:1", task.metrics.recorded.caveats,
+        )
+
+    def test_app_schema_issues_reach_task_and_project_pilot_diagnostics(self) -> None:
+        malformed = self.base / "malformed-app.jsonl"
+        malformed.write_text("not-json-private\n", encoding="utf-8")
+        invalid_duration = self.app_source("invalid-duration", {
+            "method": "item/completed",
+            "params": {
+                "threadId": "diagnostic-thread", "turnId": "diagnostic-turn",
+                "completedAtMs": 1720000001500,
+                "item": {
+                    "id": "diagnostic-call", "type": "commandExecution",
+                    "command": "echo safe", "cwd": str(self.project),
+                    "status": "completed", "durationMs": "bad", "exitCode": 0,
+                },
+            },
+        })
+        self.ingest(
+            CodexEventSource(malformed, APP_SERVER_V2), invalid_duration,
+        )
+
+        reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
+        task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
+        from hydra_codex.reconcile_reports import list_reconciled_reports
+
+        report = list_reconciled_reports(self.store, project_id=PROJECT)[0]
+        self.assertEqual(task.semantic.schema_diagnostics, 1)
+        self.assertIn("schema:event:invalid_duration", task.semantic.diagnostics)
+        self.assertEqual(report.schema_diagnostics.value, 1)
+        self.assertEqual(report.pilot_health.schema_diagnostics.value, 2)
+        self.assertIn(
+            "project_event_schema_diagnostics",
+            report.pilot_health.schema_diagnostics.caveats,
+        )
+
+    def test_completion_only_app_stream_stays_incomplete_without_synthetic_start(self) -> None:
+        self.ingest(self.app_source("completion-only", {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "completion-only-thread",
+                "turn": {
+                    "id": "completion-only-turn", "completedAt": 1720000002,
+                    "durationMs": 2000, "status": "completed",
+                },
+            },
+        }))
+
+        reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
+        task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
+        self.assertEqual(task.status, "incomplete")
+        self.assertIsNone(task.metrics.root_wall_clock_ms.value)
+
+    def test_official_app_items_emit_safe_files_and_confirmed_subagent_edge(self) -> None:
+        source = self.base / "official-items.jsonl"
+        rows = (
+            {
+                "received_at": "2024-07-03T09:46:40.000000Z", "message": {
+                "method": "turn/started", "params": {
+                    "threadId": "official-parent", "turn": {
+                        "id": "official-turn",
+                        "status": "inProgress",
+                    },
+                }},
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.100000Z", "message": {
+                "method": "item/started", "params": {
+                    "threadId": "official-parent", "turnId": "official-turn",
+                    "item": {
+                        "id": "collab-call", "type": "collabToolCall",
+                        "senderThreadId": "official-parent",
+                        "newThreadId": "official-child", "status": "inProgress",
+                    },
+                }},
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.200000Z", "message": {
+                "method": "item/completed", "params": {
+                    "threadId": "official-parent", "turnId": "official-turn",
+                    "item": {
+                        "id": "cat-call", "type": "commandExecution",
+                        "command": "cat src/a.py", "cwd": str(self.project),
+                        "status": "completed", "durationMs": 2, "exitCode": 0,
+                        "aggregatedOutput": "private tool output",
+                    },
+                }},
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.300000Z", "message": {
+                "method": "item/completed", "params": {
+                    "threadId": "official-parent", "turnId": "official-turn",
+                    "item": {
+                        "id": "patch-call", "type": "fileChange",
+                        "changes": [{
+                            "path": "src/b.py", "kind": "update", "diff": "private diff",
+                        }],
+                        "status": "completed",
+                    },
+                }},
+            },
+        )
+        source.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+            encoding="utf-8",
+        )
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                "SELECT operation,relative_path FROM file_observations ORDER BY relative_path"
+            )],
+            [("read", "src/a.py"), ("write", "src/b.py")],
+        )
+        edge = self.store.connection.execute(
+            "SELECT confidence_kind,confidence FROM session_edges"
+        ).fetchone()
+        self.assertEqual(tuple(edge), ("confirmed", 1.0))
+        self.assertEqual(
+            {row[0] for row in self.store.connection.execute("SELECT tool_name FROM tool_spans")},
+            {"apply_patch", "collaboration", "exec_command"},
+        )
+        persisted = "\n".join(self.store.connection.iterdump())
+        self.assertNotIn("cat src/a.py", persisted)
+        self.assertNotIn("private tool output", persisted)
+        self.assertNotIn("private diff", persisted)
 
     def test_malformed_and_schema_drift_persist_only_safe_issues(self) -> None:
         malformed = self.base / "malformed.jsonl"

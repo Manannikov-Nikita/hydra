@@ -138,9 +138,11 @@ def _parse_source(
                     """INSERT INTO rollout_sessions(
                            session_key,project_id,path_key,resume_segments,conversation_key,started_at,last_activity_at)
                        VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_key) DO UPDATE SET
-                         started_at=CASE WHEN rollout_sessions.started_at IS NULL OR excluded.started_at < rollout_sessions.started_at
+                         started_at=CASE WHEN rollout_sessions.started_at IS NULL
+                                              OR julianday(excluded.started_at) < julianday(rollout_sessions.started_at)
                                          THEN excluded.started_at ELSE rollout_sessions.started_at END,
-                         last_activity_at=CASE WHEN rollout_sessions.last_activity_at IS NULL OR excluded.last_activity_at > rollout_sessions.last_activity_at
+                         last_activity_at=CASE WHEN rollout_sessions.last_activity_at IS NULL
+                                                   OR julianday(excluded.last_activity_at) > julianday(rollout_sessions.last_activity_at)
                                               THEN excluded.last_activity_at ELSE rollout_sessions.last_activity_at END""",
                     (session_key, project_id, session_path, 1, opaque("conversation", conversation) if conversation else next_key,
                      session_meta_at, observed_at),
@@ -340,10 +342,6 @@ def _parse_source(
         test_evidence.flush()
         if parsed_lines != len(line_fingerprints):
             raise RuntimeError("rollout source changed during ingest")
-        reconcile_token_epochs(
-            connection, project_id,
-            lambda digest, ordinal, kind: _insert_diagnostic(connection, digest, ordinal, kind, {}),
-        )
         reconcile_turn_attempts(
             connection,
             lambda digest, ordinal, kind: _insert_diagnostic(connection, digest, ordinal, kind, {}),
@@ -450,12 +448,27 @@ def ingest_rollouts(
                         (digest, logical),
                     )
                 connection.execute("UPDATE rollout_sources SET materialized=1 WHERE source_digest=?", (digest,))
+                from .token_selection import refresh_token_source_selection
+
+                refresh_token_source_selection(connection, project_id)
+                reconcile_token_epochs(
+                    connection, project_id,
+                    lambda source_digest, ordinal, kind: _insert_diagnostic(
+                        connection, source_digest, ordinal, kind, {},
+                    ),
+                )
                 reconcile_fork_baselines(connection, project_id)
         with store.rollout_transaction() as connection:
-            reconcile_fork_baselines(connection, project_id)
             from .token_selection import refresh_token_source_selection
 
             refresh_token_source_selection(connection, project_id)
+            reconcile_token_epochs(
+                connection, project_id,
+                lambda source_digest, ordinal, kind: _insert_diagnostic(
+                    connection, source_digest, ordinal, kind, {},
+                ),
+            )
+            reconcile_fork_baselines(connection, project_id)
         return IngestReport(len(files), len(unique), diagnostics)
     finally:
         ACTIVE_HASHER.reset(hash_token)

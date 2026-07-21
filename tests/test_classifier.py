@@ -63,6 +63,7 @@ class TestCommandGrammarTests(unittest.TestCase):
             "rg pytest src", "echo pytest", "pytest && npm test", "pytest | tee result.txt", "pytest; echo done",
             "bash -c 'pytest && npm test'", "pytest tests/*.py", "pytest 'tests/*.py'", "pytest $(cat target)",
             'pytest "$(cat target)"', "echo `pytest`",
+            "pytest\nfalse", "pytest\rfalse",
         )
 
         for command in commands:

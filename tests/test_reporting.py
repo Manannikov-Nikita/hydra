@@ -234,7 +234,7 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertNotIn("Infinity", payload)
 
     def test_markdown_and_standalone_html_escape_all_dynamic_text(self) -> None:
-        report = self.report("escape", 10, task_family="quiz_family")
+        report = self.report("escape", 10, task_family="quiz_report")
         malicious = self.report(
             "malicious", 10, task_family="[click](https://example.invalid) `code`",
         )
@@ -242,7 +242,7 @@ class CompareAndRendererTests(unittest.TestCase):
         markdown = render_markdown(report)
         html = render_html(report)
 
-        self.assertIn(r"quiz\_family", markdown)
+        self.assertIn(r"quiz\_report", markdown)
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn("<style>", html)
         self.assertNotIn("https://", html)

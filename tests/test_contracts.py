@@ -109,7 +109,8 @@ class AnnotationContractTests(unittest.TestCase):
         for family in (
             "/Users/alice/private", "alice@example.com", "raw family with spaces",
             "019f75d4-5125-7343-8537-49b80f27f286", "password=private",
-            "ABCD1234EFGH5678WXYZ",
+            "ABCD1234EFGH5678WXYZ", "customer-123456", "alice",
+            "secret-token", "private-looking",
         ):
             with self.subTest(invalid=family):
                 with self.assertRaisesRegex(ValueError, "privacy-safe category"):

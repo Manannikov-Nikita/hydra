@@ -146,6 +146,23 @@ class ShellFileObservationTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_FILE", repr(result))
         self.assertNotIn("/private/outside.txt", repr(result))
 
+    def test_input_and_ambiguous_output_redirections_fail_closed(self) -> None:
+        root = Path("/workspace/project")
+        commands = (
+            "cat < private.txt",
+            "cat <> private.txt",
+            "cat safe.txt >| private.txt",
+            "cat safe.txt >& private.txt",
+            "cat safe.txt &> private.txt",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = normalize_custom_exec(
+                    exec_program(command, workdir=str(root)), project_root=root,
+                )
+                self.assertEqual(result.calls[0].file_observations, ())
+
     def test_hash_shell_syntax_fails_closed_instead_of_changing_a_filename(self) -> None:
         root = Path("/workspace/project")
         for command in (

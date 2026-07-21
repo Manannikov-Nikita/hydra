@@ -56,7 +56,7 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
              LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
             WHERE t.project_id=? AND t.contributes_total=1
             ORDER BY CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END,
-                     observed_at,t.source_digest,t.line_number""",
+                     julianday(observed_at),t.source_digest,t.line_number""",
         (project_id,),
     )
     observations: list[TokenObservation] = []

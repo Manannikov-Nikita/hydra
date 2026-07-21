@@ -12,6 +12,8 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=.*", re.ASCII)
 
 
 def _unsafe_shell_syntax(command: str) -> bool:
+    if "\n" in command or "\r" in command:
+        return True
     quote: str | None = None
     index = 0
     while index < len(command):

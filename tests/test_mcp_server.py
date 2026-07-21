@@ -94,8 +94,9 @@ class StdioMcpServerTests(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(runner.calls, [])
 
-    def test_report_reconciles_then_renders_and_never_accepts_paths(self) -> None:
+    def test_report_ingests_reconciles_then_renders_and_never_accepts_paths(self) -> None:
         runner = FakeRunner([
+            ProcessResult(0, '{"command":"ingest","status":"ok"}\n', ""),
             ProcessResult(0, '{"status":"ok"}\n', ""),
             ProcessResult(0, "# Hydra task report\n", ""),
         ])
@@ -104,6 +105,7 @@ class StdioMcpServerTests(unittest.TestCase):
             "name": "hydra.report", "arguments": {"last": 5, "format": "markdown"},
         }))
         self.assertEqual(runner.calls, [
+            (("hydra-test", "ingest"), None),
             (("hydra-test", "reconcile"), None),
             (("hydra-test", "report", "--last", "5", "--format", "markdown"), None),
         ])
@@ -112,6 +114,19 @@ class StdioMcpServerTests(unittest.TestCase):
             "name": "hydra.report", "arguments": {"last": 1, "cwd": "/tmp/private"},
         }))
         self.assertTrue(invalid["result"]["isError"])
+
+    def test_report_fails_closed_when_fresh_ingest_fails(self) -> None:
+        runner = FakeRunner([ProcessResult(1, "", "private ingest failure")])
+
+        response = StdioMcpServer(runner, executable="hydra-test").handle(request(
+            15, "tools/call", {
+                "name": "hydra.report", "arguments": {"last": 1, "format": "json"},
+            },
+        ))
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(runner.calls, [(("hydra-test", "ingest"), None)])
+        self.assertNotIn("private", response["result"]["content"][0]["text"])
 
     def test_subprocess_errors_are_generic_and_do_not_echo_stderr(self) -> None:
         runner = FakeRunner([ProcessResult(1, "", "raw secret from database")])

@@ -16,8 +16,12 @@ from .codex_events import (
     EventAdapterError,
     read_codex_event_jsonl,
 )
-from .rollout_identity import Pseudonymizer
+from .rollout_identity import ACTIVE_HASHER, Pseudonymizer
+from .rollout_persistence import persist_file
+from .rollout_privacy import canonical_timestamp
+from .shell_facts import shell_file_facts
 from .storage import HydraStore
+from .test_evidence import TestEvidenceBuffer
 from .token_selection import refresh_token_source_selection
 
 
@@ -86,13 +90,19 @@ def _format(schema: str) -> str:
 
 
 def _iso_min(first: object, second: str | None) -> str | None:
-    values = [value for value in (first, second) if isinstance(value, str) and value]
-    return min(values) if values else None
+    values = [
+        parsed for value in (first, second)
+        if (parsed := canonical_timestamp(value)).epoch is not None
+    ]
+    return min(values, key=lambda item: item.epoch).text if values else None
 
 
 def _iso_max(first: object, second: str | None) -> str | None:
-    values = [value for value in (first, second) if isinstance(value, str) and value]
-    return max(values) if values else None
+    values = [
+        parsed for value in (first, second)
+        if (parsed := canonical_timestamp(value)).epoch is not None
+    ]
+    return max(values, key=lambda item: item.epoch).text if values else None
 
 
 def _persist_source(
@@ -159,8 +169,19 @@ def _upsert_session(
     session_key: str, events: tuple[CodexEventFact, ...], hasher: Pseudonymizer,
 ) -> None:
     observed = [event.observed_at for event in events if event.observed_at is not None]
-    started = min(observed) if observed else None
-    latest = max(observed) if observed else None
+    explicit_starts = {
+        "thread_started", "turn_started", "conversation_started", "user_prompt",
+    }
+    starts = [
+        event.observed_at for event in events
+        if event.observed_at is not None and event.event_type in explicit_starts
+    ]
+    started = None
+    for value in starts:
+        started = _iso_min(started, value)
+    latest = None
+    for value in observed:
+        latest = _iso_max(latest, value)
     path_key = hasher.digest("path", str(project_root.resolve()))
     connection.execute(
         """INSERT INTO rollout_sessions(
@@ -224,7 +245,7 @@ def _persist_event(
 def _persist_normalized_event(
     connection: sqlite3.Connection, prepared: _PreparedSource, project_id: str,
     event: CodexEventFact, normalized_source: str, logical: str,
-    hasher: Pseudonymizer,
+    hasher: Pseudonymizer, project_root: Path,
 ) -> None:
     session = event.thread_key
     if session is None:
@@ -248,7 +269,9 @@ def _persist_normalized_event(
         (normalized_source, normalized_event, event.source_ordinal),
     )
     lifecycle = {
-        "turn_started": "started", "turn_completed": "completed",
+        "thread_started": "started", "turn_started": "started",
+        "conversation_started": "started", "user_prompt": "started",
+        "turn_completed": "completed",
     }.get(event.event_type)
     if lifecycle is not None and event.observed_at is not None:
         connection.execute(
@@ -267,6 +290,23 @@ def _persist_normalized_event(
         connection, prepared, project_id, event, normalized_source, logical, hasher,
     )
     _persist_tool(connection, event, normalized_source, session)
+    tool = event.tool
+    if tool is not None and tool.ephemeral_command is not None:
+        for operation, path in shell_file_facts(
+            tool.ephemeral_command,
+            project_root=project_root,
+            workdir=tool.ephemeral_workdir,
+        ):
+            persist_file(
+                connection, normalized_source, event.source_ordinal, session,
+                operation, path, project_root, event.observed_at, event.turn_key,
+            )
+    if tool is not None:
+        for path in tool.ephemeral_file_writes:
+            persist_file(
+                connection, normalized_source, event.source_ordinal, session,
+                "write", path, project_root, event.observed_at, event.turn_key,
+            )
 
 
 def _persist_tokens(
@@ -361,6 +401,9 @@ def _persist_batch(
         _persist_event(connection, prepared, project_id, event)
         if event.thread_key is not None:
             grouped.setdefault(event.thread_key, []).append(event)
+    test_evidence = TestEvidenceBuffer(
+        connection, prepared.source_digest, {}, hasher.digest,
+    )
     for session, events in grouped.items():
         _upsert_session(connection, project_id, project_root, session, tuple(events), hasher)
         normalized_source, logical = _normalized_source(
@@ -369,8 +412,50 @@ def _persist_batch(
         for event in events:
             _persist_normalized_event(
                 connection, prepared, project_id, event,
-                normalized_source, logical, hasher,
+                normalized_source, logical, hasher, project_root,
             )
+            tool = event.tool
+            if tool is not None and tool.safe_name == "exec_command":
+                logical_call = tool.call_key or event.event_key
+                if tool.ephemeral_command is not None:
+                    test_evidence.intent(
+                        logical_call_id=logical_call,
+                        model_call_id=logical_call,
+                        command=tool.ephemeral_command,
+                        session_key=session,
+                        line_number=event.source_ordinal,
+                        observed_at=event.observed_at,
+                        turn_key=event.turn_key,
+                        tool_call_key=logical_call,
+                    )
+                if tool.phase == "completed" and tool.exit_status is not None:
+                    test_evidence.result(
+                        logical_call,
+                        {"exit_code": tool.exit_status, "output": tool.ephemeral_output or ""},
+                        event.observed_at,
+                    )
+            if event.child_thread_key is not None:
+                connection.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,
+                           conversation_key,started_at,last_activity_at)
+                       VALUES (?,?,'unresolved',1,?,?,?) ON CONFLICT DO NOTHING""",
+                    (
+                        event.child_thread_key, project_id, event.child_thread_key,
+                        event.observed_at, event.observed_at,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO session_edges(
+                           child_key,parent_key,baseline_working_tokens,
+                           confidence_kind,confidence)
+                       VALUES (?,?,NULL,'confirmed',1.0)
+                       ON CONFLICT(child_key) DO UPDATE SET
+                         parent_key=excluded.parent_key,baseline_working_tokens=NULL,
+                         confidence_kind='confirmed',confidence=1.0""",
+                    (event.child_thread_key, event.parent_thread_key or session),
+                )
+    test_evidence.flush()
     connection.executemany(
         """INSERT INTO codex_event_issues(
                source_digest,source_ordinal,event_key,issue_code)
@@ -390,33 +475,37 @@ def ingest_codex_events(
     if not isinstance(project_id, str) or not project_id:
         raise ValueError("project_id must be non-empty")
     hasher = Pseudonymizer(hash_key)
-    items = tuple(sources)
-    prepared = tuple(_prepare(item, hasher, project_id) for item in items)
-    unique: dict[str, tuple[_PreparedSource, CodexEventBatch]] = {}
-    locations: dict[str, set[str]] = {}
-    for item in prepared:
-        locations.setdefault(item.source_digest, set()).add(item.location_key)
-        if item.source_digest in unique:
-            continue
-        batch = read_codex_event_jsonl(item.path, schema=item.schema, privacy_key=hash_key)
-        fingerprint = _stream_fingerprint(item.path)
-        if fingerprint != (item.raw_digest, item.line_count, item.byte_count):
-            raise EventAdapterError("event source changed while reading")
-        unique[item.source_digest] = (item, batch)
-    with store.rollout_transaction() as connection:
-        for item, batch in unique.values():
-            _persist_batch(
-                connection, item, batch, Path(project_root), project_id, hasher,
-            )
-            for location in locations[item.source_digest]:
-                connection.execute(
-                    """INSERT INTO codex_event_source_locations(source_digest,location_key)
-                       VALUES (?,?) ON CONFLICT DO NOTHING""",
-                    (item.source_digest, location),
+    hash_token = ACTIVE_HASHER.set(hasher)
+    try:
+        items = tuple(sources)
+        prepared = tuple(_prepare(item, hasher, project_id) for item in items)
+        unique: dict[str, tuple[_PreparedSource, CodexEventBatch]] = {}
+        locations: dict[str, set[str]] = {}
+        for item in prepared:
+            locations.setdefault(item.source_digest, set()).add(item.location_key)
+            if item.source_digest in unique:
+                continue
+            batch = read_codex_event_jsonl(item.path, schema=item.schema, privacy_key=hash_key)
+            fingerprint = _stream_fingerprint(item.path)
+            if fingerprint != (item.raw_digest, item.line_count, item.byte_count):
+                raise EventAdapterError("event source changed while reading")
+            unique[item.source_digest] = (item, batch)
+        with store.rollout_transaction() as connection:
+            for item, batch in unique.values():
+                _persist_batch(
+                    connection, item, batch, Path(project_root), project_id, hasher,
                 )
-        refresh_token_source_selection(connection, project_id)
-    return CodexEventIngestReport(
-        len(items), len(unique),
-        sum(len(batch.events) for _item, batch in unique.values()),
-        sum(len(batch.issues) for _item, batch in unique.values()),
-    )
+                for location in locations[item.source_digest]:
+                    connection.execute(
+                        """INSERT INTO codex_event_source_locations(source_digest,location_key)
+                           VALUES (?,?) ON CONFLICT DO NOTHING""",
+                        (item.source_digest, location),
+                    )
+            refresh_token_source_selection(connection, project_id)
+        return CodexEventIngestReport(
+            len(items), len(unique),
+            sum(len(batch.events) for _item, batch in unique.values()),
+            sum(len(batch.issues) for _item, batch in unique.values()),
+        )
+    finally:
+        ACTIVE_HASHER.reset(hash_token)

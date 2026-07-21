@@ -216,7 +216,8 @@ class PluginHookContractTests(unittest.TestCase):
         self.assertIn("hydra-codex must be installed", normalized)
         self.assertIn("hydra-codex-hook", normalized)
         self.assertIn("hydra.report", normalized)
-        self.assertIn("trusted turn transport", normalized)
+        self.assertIn("authenticated turn transport", normalized)
+        self.assertNotIn("trusted turn transport", normalized)
         self.assertIn("does not advertise `hydra.annotate`", normalized)
 
         schema = (

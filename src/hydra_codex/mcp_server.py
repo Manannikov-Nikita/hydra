@@ -1,7 +1,7 @@
 """Small stdio MCP facade over the privacy-safe Hydra CLI.
 
-The server deliberately delegates persistence and trusted identity binding to
-the CLI/hooks layer.  MCP arguments can contain semantic annotations or report
+The server deliberately delegates persistence and cooperative identity binding
+to the CLI/hooks layer.  MCP arguments can contain semantic annotations or report
 options only; they cannot name sessions, turns, paths, or timestamps.
 """
 
@@ -59,7 +59,10 @@ _ANNOTATION_PROPERTIES: dict[str, dict[str, object]] = {
     "scope_change": {"type": "string", "enum": [
         "none", "narrowed", "expanded", "redefined",
     ]},
-    "task_family": {"type": "string", "minLength": 1, "maxLength": 80},
+    "task_family": {
+        "type": "string", "minLength": 1, "maxLength": 80,
+        "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+){0,7}$",
+    },
     "note": {"type": "string", "maxLength": 240},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
 }
@@ -75,7 +78,8 @@ def _tool_definitions(*, annotation_enabled: bool) -> list[dict[str, object]]:
             "name": "hydra.annotate",
             "description": (
                 "Record only the current task phase, cause, scope change, or finish outcome. "
-                "Hydra binds identity and time outside model arguments."
+                "A configured hook binds identity and time outside model arguments; "
+                "this is not an authenticated local-process boundary."
             ),
             "inputSchema": {
                 "type": "object", "properties": _ANNOTATION_PROPERTIES,
@@ -158,6 +162,9 @@ class StdioMcpServer:
             raise ValueError("invalid last")
         if output_format not in {"json", "markdown", "html"}:
             raise ValueError("invalid format")
+        ingested = self._runner.run((self._executable, "ingest"))
+        if ingested.returncode != 0:
+            return _result_text("Hydra command failed.", error=True)
         reconciled = self._runner.run((self._executable, "reconcile"))
         if reconciled.returncode != 0:
             return _result_text("Hydra command failed.", error=True)

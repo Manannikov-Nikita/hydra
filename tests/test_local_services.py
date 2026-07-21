@@ -179,7 +179,7 @@ class LocalCommandServiceTests(unittest.TestCase):
                 "annotate", "--db", str(self.database),
                 "--cwd", str(foreign),
                 "--kind", "phase", "--phase", "implement", "--cause", "plan",
-                "--scope-change", "none", "--task-family", "foreign",
+                "--scope-change", "none", "--task-family", "foreign-test",
                 "--confidence", "0.8", "--note", "private foreign note",
             ],
             environ=environment,

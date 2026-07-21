@@ -221,7 +221,9 @@ class RolloutIngestTests(unittest.TestCase):
             v1("event_msg", {"type": "web_search_end", "call_id": "web", "result": {"Ok": {}}}, 10),
             v1("response_item", {
                 "type": "function_call", "call_id": "exec", "name": "exec_command",
-                "arguments": json.dumps({"cmd": "pytest tests/secret_direct.py"}),
+                "arguments": json.dumps({
+                    "cmd": "cat direct.py", "workdir": str(self.project / "src"),
+                }),
             }, 11),
             v1("response_item", {
                 "type": "function_call_output", "call_id": "exec",
@@ -247,13 +249,13 @@ class RolloutIngestTests(unittest.TestCase):
             [tuple(row) for row in self.store.connection.execute(
                 "SELECT operation,relative_path FROM file_observations ORDER BY relative_path"
             )],
-            [("read", "assets/preview.png")],
+            [("read", "assets/preview.png"), ("read", "src/direct.py")],
         )
-        self.assertEqual(self.store.count("rollout_test_runs"), 1)
+        self.assertEqual(self.store.count("rollout_test_runs"), 0)
         persisted = "\n".join(self.store.connection.iterdump())
         for private_value in (
             "dehydrate_cache", "private_server", "private-cache.py", "not-a-file.py",
-            "private-mcp.py", "private-web.py", "secret_direct.py",
+            "private-mcp.py", "private-web.py", "cat direct.py",
         ):
             self.assertNotIn(private_value, persisted)
 

@@ -86,9 +86,10 @@ def reconcile_turn_attempts(
             )
 
 
-def _timestamp_order(row: sqlite3.Row) -> tuple[int, str, str, int]:
+def _timestamp_order(row: sqlite3.Row) -> tuple[int, float, str, int]:
     value = row[7]
-    return (0 if value is not None else 1, value or "", row[0], int(row[1]))
+    epoch = canonical_timestamp(value).epoch
+    return (0 if epoch is not None else 1, float(epoch or 0), row[0], int(row[1]))
 
 
 def reconcile_token_epochs(
@@ -99,9 +100,18 @@ def reconcile_token_epochs(
     rows = list(connection.execute(
         """SELECT source_digest,line_number,session_key,input_tokens,cached_input_tokens,
                   output_tokens,reasoning_tokens,observed_at,cache_write_tokens
-             FROM token_snapshots WHERE project_id=?""",
+             FROM token_snapshots
+            WHERE project_id=? AND contributes_total=1
+              AND source_family IN ('rollout','app_server')""",
         (project_id,),
     ))
+    connection.execute(
+        """DELETE FROM rollout_diagnostics
+              WHERE envelope_kind='counter_reset' AND source_digest IN (
+                    SELECT source_digest FROM token_snapshots WHERE project_id=?
+              )""",
+        (project_id,),
+    )
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         groups.setdefault(row[2], []).append(row)
@@ -150,7 +160,9 @@ def reconcile_fork_baselines(connection: sqlite3.Connection, project_id: str) ->
             """SELECT source_digest,line_number,input_tokens,cached_input_tokens,
                       output_tokens,reasoning_tokens,cache_write_tokens,observed_at
                  FROM token_snapshots
-                WHERE session_key=? AND project_id=? AND completeness='complete'""",
+                WHERE session_key=? AND project_id=? AND completeness='complete'
+                  AND contributes_total=1
+                  AND source_family IN ('rollout','app_server')""",
             (session_key, project_id),
         ):
             observed_epoch = canonical_timestamp(row[7]).epoch

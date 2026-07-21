@@ -82,7 +82,7 @@ def allocate_otel_hints(
               FROM token_snapshots t JOIN rollout_sessions s ON s.session_key=t.session_key
              WHERE t.project_id=? AND t.source_family='otel' AND t.contributes_total=0
                AND t.session_key IN ({placeholders})
-             ORDER BY t.session_key,t.observed_at,t.event_key""",
+             ORDER BY t.session_key,julianday(t.observed_at),t.event_key""",
         (project_id, *session_ids),
     )
     hints: dict[str, list[tuple[str, datetime, TokenVector]]] = defaultdict(list)
@@ -101,9 +101,7 @@ def allocate_otel_hints(
     replaced: set[str] = set()
     for session, candidates in sorted(hints.items()):
         base = by_session.get(session, [])
-        if selected.get(session) == "otel" or not base or any(
-            item.observed_at is not None for item in base
-        ):
+        if selected.get(session) != "app_server" or not base:
             continue
         authoritative_total = _sum(item.vector for item in base)
         hinted_total = _sum(item[2] for item in candidates)

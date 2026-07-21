@@ -1,4 +1,9 @@
-"""Trusted capability boundary for model semantic annotations."""
+"""Capability boundary for cooperative hook-attested semantic annotations.
+
+"Trusted" database/type names are retained for schema compatibility. They mean
+that identity was supplied by the configured hook path rather than by annotation
+arguments; the local hook executable is not an authenticated security boundary.
+"""
 
 from __future__ import annotations
 
@@ -63,7 +68,7 @@ def issue_capability(
             raise CapabilityRejected("trusted session binding is inconsistent")
         connection.execute(
             """INSERT INTO sessions(session_id,project_id,worktree_path,started_at,provenance)
-               VALUES (?,?,'.',?,'exact') ON CONFLICT(session_id) DO NOTHING""",
+               VALUES (?,?,'.',?,'derived') ON CONFLICT(session_id) DO NOTHING""",
             (session_key, context.project_id, context.observed_at),
         )
         turn = connection.execute(
@@ -73,7 +78,7 @@ def issue_capability(
             raise CapabilityRejected("trusted turn binding is inconsistent")
         connection.execute(
             """INSERT INTO turns(turn_id,session_id,ordinal,observed_at,provenance)
-               VALUES (?,?,0,?,'exact') ON CONFLICT(turn_id) DO NOTHING""",
+               VALUES (?,?,0,?,'derived') ON CONFLICT(turn_id) DO NOTHING""",
             (turn_key, session_key, context.observed_at),
         )
         binding = connection.execute(
@@ -279,10 +284,14 @@ def observe_stop(
     *,
     observed_at: str,
     retry_active: bool,
+    retry_expires_at: str | None = None,
 ) -> StopState:
     if not isinstance(retry_active, bool):
         raise ValueError("retry_active must be a boolean")
     observed = timestamp(observed_at)
+    retry_expires = None if retry_expires_at is None else timestamp(retry_expires_at)
+    if retry_expires is not None and retry_expires <= observed:
+        raise ValueError("stop retry expiry must follow observation")
     capability_key = capability_digest(keys, capability)
     with store.rollout_transaction() as connection:
         binding = binding_for_capability(connection, capability_key)
@@ -333,6 +342,12 @@ def observe_stop(
                 "UPDATE turn_capabilities SET stop_retry=1 WHERE turn_key=?",
                 (binding["turn_key"],),
             )
+            if not retry_active and retry_expires_at is not None:
+                connection.execute(
+                    """UPDATE turn_capabilities SET expires_at=?
+                         WHERE turn_key=? AND revoked_at IS NULL""",
+                    (retry_expires_at, binding["turn_key"]),
+                )
         if not retry_active:
             return StopState.RETRY_REQUIRED
         connection.execute(

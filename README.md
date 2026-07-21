@@ -62,6 +62,13 @@ hydra-codex ingest \
   --event-source otel-v1=/absolute/path/to/otel.jsonl
 ```
 
+App Server notifications do not themselves provide a universal event
+timestamp. A live capture therefore writes one strict receipt envelope per
+line: `{"received_at":"<RFC3339 UTC>","message":{...JSON-RPC notification...}}`.
+Hydra treats `received_at` as the observed time. Unwrapped legacy exports remain
+readable for backfill, but events without an embedded timestamp keep estimated
+timestamp provenance rather than receiving a fabricated time.
+
 For one canonical session, exactly one token-total authority is selected:
 rollout cumulative counters, then App Server cumulative totals, then OTel
 per-call events as an explicitly estimated fallback. Lower-priority events stay
@@ -69,10 +76,16 @@ available as timestamped allocation hints but are never added to the selected
 total.
 
 `hydra-codex annotate` is normally invoked through the capability-bearing
-command injected by `UserPromptSubmit`; it rejects calls without the trusted
+command injected by `UserPromptSubmit`; it rejects calls without the hook-issued
 turn capability. A model changes phase or reports a blocker with a short
 marker, then sends one `finish` marker before its final response. Hooks, not the
 model, bind project/session/turn identity and timestamps.
+
+This is a cooperative instrumentation boundary, not local-process
+authentication: another process running as the same user can invoke the hook
+entrypoint with a forged envelope. Hook-derived session/turn observations are
+therefore marked `derived`, and Hydra never describes them as cryptographic or
+out-of-band proof. Annotation arguments still cannot supply session or turn IDs.
 
 Reconciliation is repeatable and stores an immutable input digest:
 
@@ -145,13 +158,22 @@ before any database mutation.
 
 ## Privacy and source policy
 
-Hydra does not store raw prompts, assistant messages, tool output, command text,
-patches, or search results. It retains allowlisted categories, hashes, lengths,
-privacy-safe short notes, relative paths, and schema diagnostics. Annotation
+Hydra's deterministic adapters do not store raw prompts, assistant messages,
+tool output, command text, patches, or search results. They retain allowlisted
+categories, hashes, lengths, relative paths, and schema diagnostics. A short
+model note is the only free-text telemetry field: common secrets, paths, email
+addresses and phone numbers are redacted, but this is not a general-purpose
+content classifier. Agents must never paste prompt, transcript, or tool output
+into it. Annotation
 arguments cannot contain tokens, times, file/test counts, paths, session IDs,
 turn IDs, or timestamps. `task_family` is a lowercase categorical code such as
-`multiple-answer-quiz`; unsafe or private-looking values are rejected before
+`multiple-answer-quiz`; single-word categories use Hydra's small public
+taxonomy, multi-word categories end in a public category suffix, and unsafe or
+private-looking values are rejected before
 storage and unsafe legacy values never form a trend cohort.
+Common accepted terminals include `quiz`, `workflow`, `architecture`,
+`hardening`, `review`, `report`, `tests`, `runtime`, and `docs`; use
+`unclassified` when no public category fits rather than embedding an identity.
 
 The versioned rollout JSONL adapter is read-only. Hydra does not read or mutate
 Codex internal SQLite databases as a telemetry API. Versioned App Server and
@@ -162,8 +184,8 @@ drift is diagnosed without retaining an unknown payload.
 
 The source plugin is packaged under `plugins/hydra-codex/` for the post-pilot
 stage. Its MCP server advertises `hydra.report` by default. It deliberately does
-not advertise `hydra.annotate` until Codex provides a trusted turn transport
-that binds identity outside model-controlled MCP arguments. The capability CLI
+not advertise `hydra.annotate` until Codex provides an authenticated turn
+transport outside model-controlled MCP arguments. The cooperative capability CLI
 remains the annotation fallback.
 
 `$hydra-report` describes how to reconcile, compare, and explain facts without

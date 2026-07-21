@@ -162,6 +162,31 @@ def aggregate_task_tree(
         completions,
         key=lambda item: (item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1),
     ) if completions else None
+    if completion is not None and any(
+        item.session_id == root_id and item.kind == "task_started" and (
+            item.observed_at > completion.observed_at
+            or (
+                item.observed_at == completion.observed_at
+                and (
+                    (
+                        item.logical_source_key == completion.logical_source_key
+                        and item.source_ordinal is not None
+                        and completion.source_ordinal is not None
+                        and item.source_ordinal > completion.source_ordinal
+                    )
+                    or (
+                        item.logical_source_key != completion.logical_source_key
+                        and (
+                            item.turn_key is None or completion.turn_key is None
+                            or item.turn_key != completion.turn_key
+                        )
+                    )
+                )
+            )
+        )
+        for item in lifecycle_items
+    ):
+        completion = None
     if cutoff_at is None:
         if completion is None:
             raise ValueError("root task_complete observation is required")
@@ -170,9 +195,7 @@ def aggregate_task_tree(
         if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
             raise ValueError("cutoff_at must be timezone-aware")
         cutoff = cutoff_at
-    if root.started_at is None:
-        raise ValueError("root session start is required")
-    if root.started_at > cutoff:
+    if root.started_at is not None and root.started_at > cutoff:
         raise ValueError("root starts after its task_complete observation")
     session_ids, cycle_edges = _descendants(
         root_id, session_map, cutoff, include_ambiguous_lineage,
@@ -181,15 +204,13 @@ def aggregate_task_tree(
 
     token_by_session: dict[str, list[TokenObservation]] = defaultdict(list)
     ambiguous_timestamp_tokens = 0
+    excluded_post_cutoff_tokens = 0
     ambiguous_timestamp_sessions: set[str] = set()
     for item in token_items:
         if item.session_id not in included:
             continue
         started_at = session_map[item.session_id].started_at
         if item.observed_at is None:
-            if item.retain_value_without_timestamp:
-                token_by_session[item.session_id].append(item)
-                continue
             same_source_order = (
                 item.logical_source_key is not None
                 and completion is not None
@@ -198,9 +219,14 @@ def aggregate_task_tree(
                 and item.source_ordinal is not None
                 and completion.source_ordinal is not None
             )
-            if same_source_order and item.source_ordinal <= completion.source_ordinal:
+            if same_source_order:
+                if item.source_ordinal <= completion.source_ordinal:
+                    token_by_session[item.session_id].append(item)
+                else:
+                    excluded_post_cutoff_tokens += 1
+            elif item.retain_value_without_timestamp:
                 token_by_session[item.session_id].append(item)
-            elif not same_source_order:
+            else:
                 ambiguous_timestamp_tokens += 1
                 ambiguous_timestamp_sessions.add(item.session_id)
         elif (
@@ -259,20 +285,23 @@ def aggregate_task_tree(
             replay_by_session[session_id] = _Amount(TokenVector.zero(), _bounds(TokenVector.zero()))
             continue
         baseline = explicit.get(session_id) if explicit is not None else None
-        if explicit is None:
+        if explicit is None and session.started_at is not None:
             threshold = session.started_at + timedelta(seconds=1)
             candidates = tuple(
                 item for item in token_by_session.get(session_id, ())
                 if item.observed_at is not None and session.started_at <= item.observed_at <= threshold
             )
             baseline_vector = candidates[-1].vector if candidates else None
-        else:
+        elif explicit is not None:
             baseline_vector = (
                 baseline.vector
                 if baseline is not None
+                and session.started_at is not None
                 and session.started_at <= baseline.observed_at <= session.started_at + timedelta(seconds=1)
                 else None
             )
+        else:
+            baseline_vector = None
         if baseline_vector is None:
             zero_baselines += 1
             uncertain_sessions.add(session_id)
@@ -303,6 +332,10 @@ def aggregate_task_tree(
         recorded_caveats += (f"timestamp_missing_token:{timestamp_missing}",)
     if ambiguous_timestamp_tokens:
         recorded_caveats += (f"ambiguous_timestamp_token:{ambiguous_timestamp_tokens}",)
+    if excluded_post_cutoff_tokens:
+        recorded_caveats += (
+            f"post_cutoff_timestamp_missing_token:{excluded_post_cutoff_tokens}",
+        )
     recorded_caveats += selection_caveats
     baseline_caveats = (f"zero_no_observation:{zero_baselines}",) if zero_baselines else ()
     unique_caveats = list(baseline_caveats + recorded_caveats)
@@ -333,7 +366,10 @@ def aggregate_task_tree(
         for key in last_activity
     )
     missing_starts = sum(session_map[key].started_at is None for key in session_ids)
-    wall_clock_ms = int((cutoff - root.started_at).total_seconds() * 1000)
+    wall_clock_ms = (
+        int((cutoff - root.started_at).total_seconds() * 1000)
+        if root.started_at is not None else None
+    )
 
     if isinstance(classified_working_tokens, bool) or classified_working_tokens < 0:
         raise ValueError("classified_working_tokens must be non-negative")
@@ -393,7 +429,12 @@ def aggregate_task_tree(
         _token_fact(replay, "estimated" if baseline_uncertain else "exact", baseline_caveats + uncertainty),
         _token_fact(unique, "estimated" if unique_uncertain else "derived", tuple(unique_caveats)),
         ScalarFact(len(session_ids), "exact"), ScalarFact(max(0, len(session_ids) - 1), "derived"),
-        ScalarFact(wall_clock_ms, "derived"),
+        ScalarFact(
+            wall_clock_ms,
+            "derived" if wall_clock_ms is not None else "estimated",
+            () if wall_clock_ms is not None else ("missing_root_session_start",),
+            0,
+        ),
         ScalarFact(
             None if missing_starts else agent_time_lower,
             "estimated" if missing_starts else "derived",

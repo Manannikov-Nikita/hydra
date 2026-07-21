@@ -105,15 +105,28 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
         if item.session_id in sessions:
             activity_by_session[item.session_id].append(item.observed_at)
     completions: dict[str, list[LifecycleObservation]] = defaultdict(list)
+    starts: dict[str, list[LifecycleObservation]] = defaultdict(list)
     for item in lifecycle:
         if item.kind == "task_complete":
             completions[item.session_id].append(item)
+        elif item.kind == "task_started":
+            starts[item.session_id].append(item)
     plans: list[TaskPlan] = []
     for root, members in grouped.items():
-        if completions.get(root) and not has_later_root_start(
-            root, lifecycle, completions[root],
+        eligible_completions = [
+            completion for completion in completions.get(root, ())
+            if (
+                sessions[root].started_at is not None
+                and sessions[root].started_at <= completion.observed_at
+            ) or any(
+                start.observed_at <= completion.observed_at
+                for start in starts.get(root, ())
+            )
+        ]
+        if eligible_completions and not has_later_root_start(
+            root, lifecycle, eligible_completions,
         ):
-            completion = max(completions[root], key=lambda item: (
+            completion = max(eligible_completions, key=lambda item: (
                 item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1,
             ))
             cutoff = completion.observed_at
@@ -165,7 +178,8 @@ def build_token_deltas(
               WHERE t.project_id=? AND t.contributes_total=1
                 AND t.session_key IN ({placeholders})
               ORDER BY t.session_key,t.epoch,
-                       CASE WHEN t.observed_at IS NULL THEN 1 ELSE 0 END,t.observed_at,
+                       CASE WHEN t.observed_at IS NULL THEN 1 ELSE 0 END,
+                       julianday(t.observed_at),
                        t.source_digest,t.line_number""",
         (project_id, *plan.session_ids),
     ))
@@ -197,14 +211,21 @@ def build_token_deltas(
         ):
             diagnostics["token_before_session_start"] += 1
             continue
-        if observed is None and row[11] != "app_server" and not (
-            plan.cutoff_source_key is not None
-            and plan.cutoff_source_ordinal is not None
-            and row[9] == plan.cutoff_source_key
-            and int(row[2]) <= plan.cutoff_source_ordinal
-        ):
-            diagnostics["ambiguous_token_placement"] += 1
-            continue
+        if observed is None:
+            same_cutoff_source = (
+                plan.cutoff_source_key is not None
+                and plan.cutoff_source_ordinal is not None
+                and row[9] == plan.cutoff_source_key
+            )
+            beyond_same_source_cutoff = (
+                same_cutoff_source and int(row[2]) > plan.cutoff_source_ordinal
+            )
+            safely_ordered = (
+                same_cutoff_source and int(row[2]) <= plan.cutoff_source_ordinal
+            )
+            if beyond_same_source_cutoff or not safely_ordered and row[11] != "app_server":
+                diagnostics["ambiguous_token_placement"] += 1
+                continue
         epoch = int(row[3])
         vector = TokenVector(row[5], row[6], row[7], row[8])
         state_key = (session_key, epoch)
@@ -425,6 +446,22 @@ def semantic_assembly(
             diagnostics[f"schema:{code}"] += 1
         else:
             diagnostics["ambiguous_schema_diagnostic_placement"] += 1
+    event_schema_rows = list(connection.execute(
+        f"""SELECT i.issue_code,e.observed_at,e.session_key
+              FROM codex_event_issues i
+              JOIN codex_event_sources s ON s.source_digest=i.source_digest
+              LEFT JOIN codex_events e
+                ON e.source_digest=i.source_digest
+               AND e.source_ordinal=i.source_ordinal
+             WHERE s.project_id=? AND e.session_key IN ({placeholders})""",
+        (project_id, *plan.session_ids),
+    ))
+    for code, value, _session_key in event_schema_rows:
+        observed = _optional_timestamp(value)
+        if observed is not None and observed <= plan.cutoff_at:
+            diagnostics[f"schema:event:{code}"] += 1
+        else:
+            diagnostics["ambiguous_event_schema_diagnostic_placement"] += 1
     for code, count in staged.items():
         if code not in {"self_report_missing", "semantic_conflict"}:
             diagnostics[f"semantic:{code}"] += int(count)

@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from hydra_codex.annotation_spool import _record_transport
 from hydra_codex.metrics import aggregate_project, aggregate_project_facts
+from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.storage import MIGRATIONS, V2_TRIGGER_STATEMENTS, HydraStore, StorageUnavailable
 from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 from hydra_codex.token_selection import refresh_token_source_selection
@@ -162,6 +164,54 @@ def replace_empty_table(path: Path, table: str, create_statement: str) -> None:
 
 
 class MigrationMatrixB2Tests(unittest.TestCase):
+    def test_v30_accepted_unacknowledged_retry_uses_existing_request_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v30-accepted.sqlite3"
+            build_schema(database, 30)
+            keys = Pseudonymizer(b"v" * 32)
+            turn_key = "turn-safe"
+            request_digest = "hreq_v1_" + keys.digest("event", "accepted-request")
+            transport_key = "htransport_v1_" + keys.digest(
+                "event", f"{turn_key}/accepted/accepted/{request_digest}",
+            )
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """INSERT INTO annotation_transport_events(
+                       transport_key,project_id,session_key,turn_key,request_digest,
+                       disposition,diagnostic_category,staged_at,staged_at_ns,
+                       staged_order,received_at,latency_ms,provenance)
+                   VALUES (?, 'hprj_safe', 'session-safe', ?, ?, 'accepted', NULL,
+                           '2026-07-21T00:00:00Z', 1, '00000000000000000001:legacy.json',
+                           '2026-07-21T00:00:01Z', 1000, 'derived')""",
+                (transport_key, turn_key, request_digest),
+            )
+            connection.commit()
+            connection.close()
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+            _record_transport(
+                store,
+                keys,
+                project_id="hprj_safe",
+                session_key="session-safe",
+                turn_key=turn_key,
+                request_digest=request_digest,
+                disposition="accepted",
+                category=None,
+                staged_at_ns=2,
+                staged_at="2026-07-21T00:00:02Z",
+                staged_order="00000000000000000002:horder_v1_" + "a" * 64,
+                received_at="2026-07-21T00:00:03Z",
+                file_key="hspool_v1_" + "b" * 64,
+            )
+
+            self.assertEqual(store.schema_version(), 31)
+            self.assertEqual(store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events "
+                "WHERE disposition='accepted'"
+            ).fetchone()[0], 1)
+
     def test_v30_transport_orders_are_sanitized_without_losing_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "v30.sqlite3"

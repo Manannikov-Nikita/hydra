@@ -220,6 +220,39 @@ class AnnotationTransportTests(unittest.TestCase):
             store.close()
         self.assertEqual((receipt, accepted, duplicate_diagnostic), (1, 1, 1))
 
+    def test_accepted_retry_recreated_on_new_inode_is_acknowledged_idempotently(self) -> None:
+        capability = self.prompt()
+        envelope = self.stage(capability)
+        original = envelope.read_bytes()
+
+        with mock.patch(
+            "hydra_codex.annotation_spool._acknowledge",
+            side_effect=OSError("simulated unlink failure"),
+        ):
+            self.assertEqual(self.drain(), {})
+
+        displaced = self.root / "accepted-before-ack.json"
+        envelope.replace(displaced)
+        envelope.write_bytes(original)
+        envelope.chmod(0o600)
+        self.assertNotEqual(envelope.stat().st_ino, displaced.stat().st_ino)
+
+        self.assertEqual(self.drain(now=NOW + timedelta(seconds=3)), {})
+        self.assertFalse(envelope.exists())
+
+        store = HydraStore(self.database)
+        try:
+            receipt = store.connection.execute(
+                "SELECT retry_count FROM annotation_receipts WHERE sequence=1"
+            ).fetchone()[0]
+            accepted = store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events "
+                "WHERE disposition='accepted'"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual((receipt, accepted), (1, 1))
+
     def test_late_older_envelope_is_quarantined_as_out_of_order(self) -> None:
         capability = self.prompt()
         accepted = self.stage(capability)

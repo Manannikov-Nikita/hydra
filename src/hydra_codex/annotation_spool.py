@@ -213,8 +213,12 @@ def _record_transport(
     received_at: str,
     file_key: str | None = None,
 ) -> None:
-    discriminator = file_key or request_digest or keys.digest(
-        "diagnostic", f"transport-file/{turn_key}/{staged_order}",
+    discriminator = (
+        request_digest
+        if disposition == "accepted"
+        else file_key or request_digest or keys.digest(
+            "diagnostic", f"transport-file/{turn_key}/{staged_order}",
+        )
     )
     transport_key = "htransport_v1_" + keys.digest(
         "event", f"{turn_key}/{disposition}/{category or 'accepted'}/{discriminator}",

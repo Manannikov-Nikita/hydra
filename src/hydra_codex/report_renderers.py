@@ -10,6 +10,7 @@ from .reporting import ComparisonReport, NumericFact, TaskReport
 
 
 Renderable = TaskReport | ComparisonReport
+REPORT_LIST_SCHEMA = "hydra.report-list/v1"
 
 
 def _number(value: int | float | None) -> str:
@@ -147,3 +148,39 @@ def _comparison_html(report: ComparisonReport) -> str:
 
 def render_html(value: Renderable) -> str:
     return _report_html(value) if isinstance(value, TaskReport) else _comparison_html(value)
+
+
+def render_report_collection(reports: tuple[TaskReport, ...], output_format: str) -> str:
+    """Render recent reports in caller-supplied deterministic order."""
+    if not isinstance(reports, tuple) or any(not isinstance(item, TaskReport) for item in reports):
+        raise ValueError("reports must be a tuple of TaskReport values")
+    if output_format == "json":
+        return json.dumps(
+            {
+                "schema_version": REPORT_LIST_SCHEMA,
+                "reports": [item.as_dict() for item in reports],
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ) + "\n"
+    if output_format == "markdown":
+        if not reports:
+            return "# Hydra task reports\n\nNo reconciled tasks.\n"
+        return "# Hydra task reports\n\n" + "\n---\n\n".join(
+            _report_markdown(item).removeprefix("# Hydra task report\n\n")
+            for item in reports
+        )
+    if output_format == "html":
+        rows = [
+            (
+                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                escape(name), _html_fact(fact),
+            )
+            for report in reports
+            for name, fact in report.public_facts().items()
+        ]
+        summary = f"<p>{len(reports)} reconciled tasks.</p>"
+        return _document(
+            "Hydra task reports", "Hydra task reports", summary,
+            ("Task", "Status", "Metric", "Value; provenance; lower bound; caveats"), rows,
+        )
+    raise ValueError("unsupported report format")

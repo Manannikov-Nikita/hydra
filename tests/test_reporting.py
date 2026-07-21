@@ -10,7 +10,12 @@ import sys
 import tempfile
 import unittest
 
-from hydra_codex.report_renderers import render_html, render_json, render_markdown
+from hydra_codex.report_renderers import (
+    render_html,
+    render_json,
+    render_markdown,
+    render_report_collection,
+)
 from hydra_codex.reporting import (
     REPORT_SCHEMA,
     NumericFact,
@@ -335,6 +340,36 @@ class CompareAndRendererTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_recent_report_collection_is_versioned_deterministic_and_safe_in_all_formats(self) -> None:
+        reports = (self.report("latest-private-root", 20), self.report("older-private-root", 10))
+
+        rendered = {
+            output_format: render_report_collection(reports, output_format)
+            for output_format in ("json", "markdown", "html")
+        }
+
+        payload = json.loads(rendered["json"])
+        self.assertEqual(payload["schema_version"], "hydra.report-list/v1")
+        self.assertEqual(
+            [item["task_ref"] for item in payload["reports"]],
+            [item.task_ref for item in reports],
+        )
+        self.assertEqual(rendered["html"].count("<!doctype html>"), 1)
+        self.assertIn("Hydra task reports", rendered["markdown"])
+        for artifact in rendered.values():
+            self.assertNotIn("latest-private-root", artifact)
+            self.assertNotIn("older-private-root", artifact)
+
+    def test_empty_report_collection_is_valid_in_all_formats(self) -> None:
+        self.assertEqual(
+            json.loads(render_report_collection((), "json")),
+            {"reports": [], "schema_version": "hydra.report-list/v1"},
+        )
+        self.assertIn("No reconciled tasks", render_report_collection((), "markdown"))
+        self.assertIn("0 reconciled tasks", render_report_collection((), "html"))
+        with self.assertRaisesRegex(ValueError, "format"):
+            render_report_collection((), "xml")
 
 
 if __name__ == "__main__":

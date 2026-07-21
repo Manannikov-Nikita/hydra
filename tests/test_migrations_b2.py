@@ -89,6 +89,19 @@ def seed_rollout_rows(connection: sqlite3.Connection, version: int) -> None:
                    completeness,provenance) VALUES ('legacy-rollout-session','legacy-call','tool','success',1,
                    'function','complete','exact')"""
         )
+        if version >= 22:
+            connection.executemany(
+                """INSERT INTO tool_span_candidates(
+                       session_key,call_key,source_digest,source_ordinal,
+                       candidate_kind,category,terminal_state,latency_ms,
+                       tool_name,started_at,finished_at,turn_key,provenance)
+                   VALUES ('legacy-rollout-session','legacy-call','legacy-source',0,
+                           ?,'tool',?,?, 'function',NULL,NULL,NULL,'exact')""",
+                (
+                    ("legacy_description", "unknown", None),
+                    ("legacy_values", "success", 1),
+                ),
+            )
     if version >= 13:
         connection.execute(
             """INSERT INTO rollout_test_runs(
@@ -97,6 +110,16 @@ def seed_rollout_rows(connection: sqlite3.Connection, version: int) -> None:
                VALUES ('legacy-evidence','legacy-source',2,'legacy-rollout-session','legacy-call',
                        'command','pytest','targeted','success','none','exact','complete')"""
         )
+        if version >= 24:
+            connection.execute(
+                """INSERT INTO test_evidence_candidates(
+                       candidate_key,candidate_kind,evidence_key,source_digest,
+                       line_number,session_key,tool_call_key,command_hash,runner,
+                       scope,exit_status,outcome,failure_cause,provenance,completeness)
+                   VALUES ('legacy:legacy-evidence','evidence','legacy-evidence',
+                           'legacy-source',2,'legacy-rollout-session','legacy-call',
+                           'command','pytest','targeted',0,'success','none','exact','complete')"""
+            )
 
 
 def build_schema(path: Path, version: int) -> None:
@@ -197,7 +220,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
     def test_tool_candidate_migration_normalizes_legacy_app_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "legacy-app-tool-status.sqlite3"
-            build_schema(database, MIGRATIONS[-2][0])
+            build_schema(database, 21)
             connection = sqlite3.connect(database)
             try:
                 connection.executemany(
@@ -235,6 +258,70 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                          WHERE call_key='legacy-estimated'
                            AND candidate_kind='legacy_values'"""
                 ).fetchone()[0], "estimated")
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        """SELECT call_key,terminal_state,provenance
+                             FROM tool_spans
+                            WHERE call_key IN (
+                                'legacy-completed','legacy-declined','legacy-estimated'
+                            ) ORDER BY call_key"""
+                    )],
+                    [
+                        ("legacy-completed", "success", "exact"),
+                        ("legacy-declined", "failed", "exact"),
+                        ("legacy-estimated", "success", "estimated"),
+                    ],
+                )
+            finally:
+                store.close()
+
+    def test_v24_migration_immediately_suppresses_declined_legacy_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "legacy-declined-intent.sqlite3"
+            build_schema(database, 23)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """UPDATE rollout_test_runs
+                          SET exit_status=NULL,outcome='unknown',failure_cause='unknown',
+                              completeness='intent_only'
+                        WHERE evidence_key='legacy-evidence'"""
+                )
+                connection.execute(
+                    """INSERT INTO codex_event_sources(
+                           source_digest,project_id,schema_version,source_format,
+                           line_count,byte_count)
+                       VALUES ('legacy-app-source','preserved-project',
+                               'codex.app-server/v2','app_server',1,1)"""
+                )
+                connection.execute(
+                    """INSERT INTO codex_events(
+                           source_digest,source_ordinal,event_key,project_id,
+                           source_format,schema_version,event_type,session_key,
+                           status,provenance,tool_call_key,tool_name,tool_category,
+                           tool_phase,tool_status)
+                       VALUES ('legacy-app-source',1,'legacy-declined-event',
+                               'preserved-project','app_server','codex.app-server/v2',
+                               'item_completed','legacy-rollout-session','declined',
+                               'exact','legacy-call','exec_command','tool',
+                               'completed','declined')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore(database)
+            try:
+                self.assertEqual(store.count("rollout_test_runs"), 0)
+                self.assertEqual(
+                    [row[0] for row in store.connection.execute(
+                        """SELECT candidate_kind FROM test_evidence_candidates
+                             WHERE session_key='legacy-rollout-session'
+                               AND tool_call_key='legacy-call'
+                             ORDER BY candidate_kind"""
+                    )],
+                    ["evidence", "non_execution"],
+                )
             finally:
                 store.close()
 

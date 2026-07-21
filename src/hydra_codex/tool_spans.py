@@ -260,6 +260,13 @@ def _persist_candidate(
         ),
     )
     _materialize(connection, session_key=session_key, call_key=call_key)
+    # A higher-authority terminal outcome or tool identity can invalidate a
+    # lower adapter's previously materialized file fact even when the new
+    # source emits no file candidate of its own.
+    from .rollout_persistence import materialize_file_observations
+    materialize_file_observations(
+        connection, session_key=session_key, call_key=call_key,
+    )
 
 
 def persist_tool_start(

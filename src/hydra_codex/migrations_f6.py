@@ -51,6 +51,16 @@ F6_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                   CASE WHEN provenance IN ('exact','lower_bound','estimated')
                        THEN provenance ELSE 'estimated' END
              FROM tool_spans""",
+        """UPDATE tool_spans
+              SET terminal_state=CASE
+                    WHEN terminal_state IN ('success','completed') THEN 'success'
+                    WHEN terminal_state IN ('failed','interrupted','cancelled','declined')
+                      THEN 'failed'
+                    ELSE 'unknown'
+                  END,
+                  provenance=CASE
+                    WHEN provenance IN ('exact','lower_bound','estimated')
+                      THEN provenance ELSE 'estimated' END""",
         """CREATE INDEX tool_span_candidates_span
                ON tool_span_candidates(session_key,call_key)""",
     )),

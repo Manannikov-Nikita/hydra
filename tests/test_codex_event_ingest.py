@@ -768,6 +768,59 @@ class CodexEventPersistenceTests(unittest.TestCase):
             "post_cutoff_timestamp_missing_token:1", task.metrics.recorded.caveats,
         )
 
+    def test_mixed_timestamp_quality_keeps_app_cumulative_source_ordinal(self) -> None:
+        def totals(value: int) -> dict[str, int]:
+            return {
+                "inputTokens": value,
+                "cachedInputTokens": 0,
+                "outputTokens": 0,
+                "reasoningOutputTokens": 0,
+                "totalTokens": value,
+            }
+
+        source = self.base / "mixed-app-token-time.jsonl"
+        rows = (
+            {
+                "method": "thread/tokenUsage/updated", "params": {
+                    "threadId": "mixed-time-thread", "turnId": "mixed-time-turn",
+                    "tokenUsage": {"total": totals(100), "last": totals(100)},
+                },
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.200000Z",
+                "message": {"method": "thread/tokenUsage/updated", "params": {
+                    "threadId": "mixed-time-thread", "turnId": "mixed-time-turn",
+                    "tokenUsage": {"total": totals(200), "last": totals(100)},
+                }},
+            },
+            {
+                "received_at": "2024-07-03T09:46:40.300000Z",
+                "message": {"method": "turn/completed", "params": {
+                    "threadId": "mixed-time-thread",
+                    "turn": {
+                        "id": "mixed-time-turn", "status": "completed",
+                        "completedAt": 1720000000,
+                    },
+                }},
+            },
+        )
+        source.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+        reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
+
+        task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
+        self.assertEqual(task.metrics.recorded.input.value, 200)
+        self.assertEqual(
+            [row[0] for row in self.store.connection.execute(
+                "SELECT epoch FROM token_snapshots ORDER BY line_number"
+            )],
+            [0, 0],
+        )
+
     def test_app_schema_issues_reach_task_and_project_pilot_diagnostics(self) -> None:
         malformed = self.base / "malformed-app.jsonl"
         malformed.write_text("not-json-private\n", encoding="utf-8")

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
+from hydra_codex.codex_event_ingest import CodexEventSource, ingest_codex_events
+from hydra_codex.codex_events import APP_SERVER_V2
+from hydra_codex.migrations_h8 import H8_MIGRATIONS
 from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.storage import HydraStore
 from hydra_codex.test_evidence import parse_structured_result
@@ -87,6 +91,95 @@ class StructuredResultTests(unittest.TestCase):
                          (None, "unknown", "result_without_exit"))
 
 
+class TestEvidenceCandidateMigrationTests(unittest.TestCase):
+    def test_v24_backfills_existing_materialized_test_evidence(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            """CREATE TABLE rollout_test_runs (
+                evidence_key TEXT PRIMARY KEY, source_digest TEXT NOT NULL,
+                line_number INTEGER NOT NULL, session_key TEXT NOT NULL,
+                observed_at TEXT, turn_key TEXT, tool_call_key TEXT NOT NULL,
+                command_hash TEXT NOT NULL, runner TEXT NOT NULL, scope TEXT NOT NULL,
+                exit_status INTEGER, outcome TEXT NOT NULL, failure_cause TEXT NOT NULL,
+                retry_kind TEXT NOT NULL DEFAULT 'none',
+                attempt_ordinal INTEGER NOT NULL DEFAULT 1,
+                provenance TEXT NOT NULL, completeness TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE codex_events (
+                source_digest TEXT NOT NULL, source_ordinal INTEGER NOT NULL,
+                event_key TEXT NOT NULL, session_key TEXT, observed_at TEXT,
+                turn_key TEXT, tool_call_key TEXT, tool_name TEXT,
+                tool_phase TEXT, tool_status TEXT
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO rollout_test_runs(
+                   evidence_key,source_digest,line_number,session_key,observed_at,turn_key,
+                   tool_call_key,command_hash,runner,scope,exit_status,outcome,failure_cause,
+                   provenance,completeness)
+               VALUES ('legacy-evidence','legacy-source',7,'legacy-session',
+                       '2026-07-21T00:00:07Z','legacy-turn','legacy-call','legacy-command',
+                       'pytest','targeted',0,'success','none','derived','complete')"""
+        )
+        connection.execute(
+            """INSERT INTO codex_events(
+                   source_digest,source_ordinal,event_key,session_key,observed_at,
+                   turn_key,tool_call_key,tool_name,tool_phase,tool_status)
+               VALUES ('legacy-app-source',8,'legacy-decline','legacy-session',
+                       '2026-07-21T00:00:08Z','legacy-turn','legacy-call',
+                       'exec_command','completed','declined')"""
+        )
+        connection.execute(
+            """INSERT INTO codex_events(
+                   source_digest,source_ordinal,event_key,session_key,observed_at,
+                   turn_key,tool_call_key,tool_name,tool_phase,tool_status)
+               VALUES ('legacy-app-revision',9,'legacy-decline','legacy-session',
+                       '2026-07-21T00:00:08Z','legacy-turn','legacy-call',
+                       'exec_command','completed','declined')"""
+        )
+
+        self.assertTrue(H8_MIGRATIONS, "schema v24 candidate migration is missing")
+        self.assertEqual(H8_MIGRATIONS[0][0], 24)
+        for statement in H8_MIGRATIONS[0][1]:
+            connection.execute(statement)
+
+        row = connection.execute(
+            """SELECT candidate_kind,evidence_key,source_digest,line_number,session_key,
+                      tool_call_key,command_hash,runner,scope,exit_status,outcome,
+                      failure_cause,provenance,completeness
+                 FROM test_evidence_candidates
+                WHERE candidate_kind='evidence'"""
+        ).fetchone()
+        self.assertEqual(row, (
+            "evidence", "legacy-evidence", "legacy-source", 7, "legacy-session",
+            "legacy-call", "legacy-command", "pytest", "targeted", 0,
+            "success", "none", "derived", "complete",
+        ))
+        rejection = connection.execute(
+            """SELECT candidate_kind,source_digest,line_number,session_key,
+                      tool_call_key,completeness
+                 FROM test_evidence_candidates
+                WHERE candidate_kind='non_execution'"""
+        ).fetchone()
+        self.assertEqual(rejection, (
+            "non_execution", "legacy-app-source", 8, "legacy-session",
+            "legacy-call", "non_execution",
+        ))
+        self.assertEqual(connection.execute(
+            """SELECT COUNT(*) FROM test_evidence_candidates
+                 WHERE candidate_kind='non_execution'"""
+        ).fetchone()[0], 2)
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE test_evidence_candidates SET outcome='failed'"
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM test_evidence_candidates")
+
+
 class PersistedTestEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -103,6 +196,173 @@ class PersistedTestEvidenceTests(unittest.TestCase):
             self.store, paths, self.project, "project-tests",
             model_causes=model_causes, hash_key=b"t" * 32,
         )
+
+    def app_source(
+        self, name: str, *, session: str, call_id: str, command: str,
+        status: str, exit_code: int | None = None,
+    ) -> CodexEventSource:
+        path = self.root / f"{name}.app.jsonl"
+        item: dict[str, object] = {
+            "id": call_id,
+            "type": "commandExecution",
+            "command": command,
+            "cwd": str(self.project),
+            "status": status,
+        }
+        if exit_code is not None:
+            item["exitCode"] = exit_code
+        path.write_text(json.dumps({
+            "received_at": "2026-07-21T00:00:03Z",
+            "message": {"method": "item/completed", "params": {
+                "threadId": session, "turnId": "app-turn", "item": item,
+            }},
+        }) + "\n", encoding="utf-8")
+        return CodexEventSource(path, APP_SERVER_V2)
+
+    def ingest_pair(
+        self, store: HydraStore, rollout: Path, app: CodexEventSource,
+        *, app_first: bool,
+    ) -> None:
+        if app_first:
+            ingest_codex_events(
+                store, (app,), self.project, "project-tests", hash_key=b"t" * 32,
+            )
+            ingest_rollouts(
+                store, (rollout,), self.project, "project-tests", hash_key=b"t" * 32,
+            )
+        else:
+            ingest_rollouts(
+                store, (rollout,), self.project, "project-tests", hash_key=b"t" * 32,
+            )
+            ingest_codex_events(
+                store, (app,), self.project, "project-tests", hash_key=b"t" * 32,
+            )
+
+    def test_same_call_uses_canonical_rollout_command_and_result_not_command_hash_identity(self) -> None:
+        session, call_id = "same-call-session", "same-call"
+        rollout = self.root / "same-call.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            call(call_id, "pytest", 1),
+            result(call_id, {"exit_code": 1, "stderr": "assertion failed"}, 2),
+        ])
+        app = self.app_source(
+            "same-call", session=session, call_id=call_id,
+            command="pytest tests/test_other.py", status="completed", exit_code=0,
+        )
+
+        observed: list[list[tuple[object, ...]]] = []
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"same-call-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            observed.append([
+                tuple(row) for row in store.connection.execute(
+                    """SELECT runner,scope,outcome,exit_status,failure_cause
+                         FROM rollout_test_runs"""
+                )
+            ])
+
+        self.assertEqual(observed, [
+            [("pytest", "full", "failed", 1, "product_failure")],
+            [("pytest", "full", "failed", 1, "product_failure")],
+        ])
+
+    def test_authoritative_non_test_description_suppresses_lower_app_test_claim(self) -> None:
+        session, call_id = "non-test-description-session", "non-test-description"
+        rollout = self.root / "non-test-description.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            call(call_id, "false", 1),
+            result(call_id, {"exit_code": 1}, 2),
+        ])
+        app = self.app_source(
+            "non-test-description", session=session, call_id=call_id,
+            command="pytest tests/test_false_positive.py", status="completed",
+            exit_code=0,
+        )
+
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"non-test-description-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            self.assertEqual(store.count("rollout_test_runs"), 0)
+            self.assertEqual(store.connection.execute(
+                "SELECT COUNT(*) FROM test_evidence_candidates"
+            ).fetchone()[0], 2)
+
+    def test_canonical_non_exec_tool_suppresses_lower_app_test_claim(self) -> None:
+        session, call_id = "non-exec-tool-session", "non-exec-tool"
+        rollout = self.root / "non-exec-tool.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            event("response_item", {
+                "type": "function_call", "call_id": call_id,
+                "name": "apply_patch",
+                "arguments": json.dumps({"patch": "safe"}),
+            }, 1),
+            result(call_id, {"exit_code": 0}, 2),
+        ])
+        app = self.app_source(
+            "non-exec-tool", session=session, call_id=call_id,
+            command="pytest tests/test_false_positive.py", status="completed",
+            exit_code=0,
+        )
+
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"non-exec-tool-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            self.assertEqual(tuple(store.connection.execute(
+                "SELECT tool_name,terminal_state FROM tool_spans"
+            ).fetchone()), ("apply_patch", "success"))
+            self.assertEqual(store.count("rollout_test_runs"), 0)
+
+    def test_terminal_app_non_execution_suppresses_rollout_intent_in_both_orders(self) -> None:
+        session, call_id = "declined-intent-session", "declined-intent"
+        rollout = self.root / "declined-intent.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            call(call_id, "pytest tests/test_never_ran.py", 1),
+        ])
+        app = self.app_source(
+            "declined-intent", session=session, call_id=call_id,
+            command="pytest tests/test_never_ran.py", status="declined",
+        )
+
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"declined-intent-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            self.assertEqual(store.count("rollout_test_runs"), 0)
+
+    def test_terminal_app_non_execution_does_not_erase_complete_rollout_result(self) -> None:
+        session, call_id = "declined-complete-session", "declined-complete"
+        rollout = self.root / "declined-complete.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            call(call_id, "pytest tests/test_did_run.py", 1),
+            result(call_id, {"exit_code": 1, "stderr": "assertion failed"}, 2),
+        ])
+        app = self.app_source(
+            "declined-complete", session=session, call_id=call_id,
+            command="pytest tests/test_did_run.py", status="declined",
+        )
+
+        observed: list[list[tuple[object, ...]]] = []
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"declined-complete-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            observed.append([
+                tuple(row) for row in store.connection.execute(
+                    "SELECT outcome,exit_status,failure_cause FROM rollout_test_runs"
+                )
+            ])
+        self.assertEqual(observed, [
+            [("failed", 1, "product_failure")],
+            [("failed", 1, "product_failure")],
+        ])
 
     def test_custom_exec_test_intents_link_to_nested_spans_but_never_inherit_broker_success(self) -> None:
         path = self.root / "modern.jsonl"

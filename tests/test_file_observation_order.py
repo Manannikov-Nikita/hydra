@@ -34,6 +34,34 @@ class FileObservationOrderTests(unittest.TestCase):
 
         self.assertEqual(observed, ["turn-a", "turn-a"])
 
+    def test_sub_millisecond_timestamp_order_does_not_use_sqlite_julianday(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = HydraStore(root / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            token = ACTIVE_HASHER.set(Pseudonymizer(b"file-order-key-0000000000000001"))
+            try:
+                with store.rollout_transaction() as connection:
+                    persist_file(
+                        connection, "source", 1, "session", "read", "src/safe.py",
+                        root, "2026-07-20T00:00:01.000002Z", "turn-later",
+                        observation_call_key="shared-call",
+                    )
+                    persist_file(
+                        connection, "source", 2, "session", "read", "src/safe.py",
+                        root, "2026-07-20T00:00:01.000001Z", "turn-earlier",
+                        observation_call_key="shared-call",
+                    )
+                row = store.connection.execute(
+                    "SELECT observed_at,turn_key FROM file_observations",
+                ).fetchone()
+            finally:
+                ACTIVE_HASHER.reset(token)
+
+        self.assertEqual(tuple(row), (
+            "2026-07-20T00:00:01.000001Z", "turn-earlier",
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

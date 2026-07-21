@@ -92,6 +92,16 @@ def _timestamp_order(row: sqlite3.Row) -> tuple[int, float, str, int]:
     return (0 if epoch is not None else 1, float(epoch or 0), row[0], int(row[1]))
 
 
+def _token_epoch_order(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Preserve progression inside one mixed-quality App cumulative stream."""
+    sources = {str(row[0]) for row in rows}
+    app_only = all(row[9] == "app_server" for row in rows)
+    mixed_time = any(canonical_timestamp(row[7]).epoch is None for row in rows)
+    if app_only and len(sources) == 1 and mixed_time:
+        return sorted(rows, key=lambda row: int(row[1]))
+    return sorted(rows, key=_timestamp_order)
+
+
 def reconcile_token_epochs(
     connection: sqlite3.Connection,
     project_id: str,
@@ -99,7 +109,8 @@ def reconcile_token_epochs(
 ) -> None:
     rows = list(connection.execute(
         """SELECT source_digest,line_number,session_key,input_tokens,cached_input_tokens,
-                  output_tokens,reasoning_tokens,observed_at,cache_write_tokens
+                  output_tokens,reasoning_tokens,observed_at,cache_write_tokens,
+                  source_family
              FROM token_snapshots
             WHERE project_id=? AND contributes_total=1
               AND source_family IN ('rollout','app_server')""",
@@ -116,7 +127,7 @@ def reconcile_token_epochs(
     for row in rows:
         groups.setdefault(row[2], []).append(row)
     for session_rows in groups.values():
-        session_rows.sort(key=_timestamp_order)
+        session_rows = _token_epoch_order(session_rows)
         epoch = 0
         last: list[int | None] = [None] * 5
         for row in session_rows:

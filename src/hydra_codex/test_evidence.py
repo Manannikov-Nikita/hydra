@@ -20,6 +20,9 @@ _INFRA_MARKERS = (
     "sandbox", "network", "econn", "timed out", "timeout", "permission denied",
     "connection refused", "could not resolve", "no space left", "resource temporarily unavailable",
 )
+_TEST_CAPABLE_TOOL_NAMES = frozenset({
+    "exec_command", "nested_exec", "function", "unknown",
+})
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,7 @@ class StructuredTestResult:
 
 @dataclass(frozen=True)
 class TestIntent:
+    candidate_key: str
     evidence_key: str
     source_digest: str
     line_number: int
@@ -88,20 +92,16 @@ def unknown_result(completeness: str = "intent_only") -> StructuredTestResult:
     return StructuredTestResult(None, "unknown", "unknown", completeness)
 
 
-def _candidate_rank(
-    connection: sqlite3.Connection,
-    source_digest: str,
-    completeness: str,
-    line_number: int,
-) -> tuple[int, int, str, int]:
-    # A terminal result is strictly more informative than intent alone.  Source
-    # authority resolves conflicts only between facts with equal completeness;
-    # otherwise an incomplete rollout would erase the sole confirmed App result.
+def _evidence_rank(
+    connection: sqlite3.Connection, row: sqlite3.Row,
+) -> tuple[int, int, str, int, str]:
+    """Rank a complete result first, then deterministic source authority."""
     return (
-        int(completeness == "complete"),
-        SOURCE_AUTHORITY[source_family(connection, source_digest)],
-        source_digest,
-        line_number,
+        int(row[16] == "complete"),
+        SOURCE_AUTHORITY[source_family(connection, str(row[3]))],
+        str(row[3]),
+        int(row[4]),
+        str(row[0]),
     )
 
 
@@ -112,39 +112,105 @@ def persist_test_evidence(
     *,
     observed_at: str | None = None,
 ) -> None:
-    """Upsert one stable item using source authority, never last-writer wins."""
-    existing = connection.execute(
-        "SELECT source_digest,line_number,completeness FROM rollout_test_runs WHERE evidence_key=?",
-        (intent.evidence_key,),
-    ).fetchone()
-    incoming_rank = _candidate_rank(
-        connection, intent.source_digest, result.completeness, intent.line_number,
-    )
-    if existing is not None and incoming_rank <= _candidate_rank(
-        connection, str(existing[0]), str(existing[2]), int(existing[1]),
-    ):
-        return
+    """Persist an immutable source candidate; materialization happens separately."""
+    candidate_kind = "evidence" if intent.runner != "unknown" else "description"
     connection.execute(
-        """INSERT INTO rollout_test_runs(
-               evidence_key, source_digest, line_number, session_key, observed_at, turn_key,
-               tool_call_key, command_hash, runner, scope, exit_status, outcome, failure_cause,
-               retry_kind, attempt_ordinal, provenance, completeness)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', 1, 'derived', ?)
-           ON CONFLICT(evidence_key) DO UPDATE SET
-             source_digest=excluded.source_digest,line_number=excluded.line_number,
-             session_key=excluded.session_key,observed_at=excluded.observed_at,
-             turn_key=excluded.turn_key,tool_call_key=excluded.tool_call_key,
-             command_hash=excluded.command_hash,runner=excluded.runner,scope=excluded.scope,
-             exit_status=excluded.exit_status,outcome=excluded.outcome,
-             failure_cause=excluded.failure_cause,retry_kind='none',attempt_ordinal=1,
-             provenance=excluded.provenance,completeness=excluded.completeness""",
+        """INSERT INTO test_evidence_candidates(
+               candidate_key,candidate_kind,evidence_key,source_digest,line_number,
+               session_key,observed_at,turn_key,tool_call_key,command_hash,runner,
+               scope,exit_status,outcome,failure_cause,provenance,completeness)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'derived',?)
+           ON CONFLICT(candidate_key) DO NOTHING""",
         (
-            intent.evidence_key, intent.source_digest, intent.line_number, intent.session_key,
+            intent.candidate_key, candidate_kind, intent.evidence_key,
+            intent.source_digest,
+            intent.line_number, intent.session_key,
             observed_at or intent.observed_at, intent.turn_key, intent.tool_call_key,
             intent.command_hash, intent.runner, intent.scope, result.exit_status,
             result.outcome, result.failure_cause, result.completeness,
         ),
     )
+
+
+def persist_non_execution(
+    connection: sqlite3.Connection, *, candidate_key: str, evidence_key: str,
+    source_digest: str, session_key: str, tool_call_key: str,
+) -> None:
+    """Persist terminal proof that an App command did not execute."""
+    connection.execute(
+        """INSERT INTO test_evidence_candidates(
+               candidate_key,candidate_kind,evidence_key,source_digest,line_number,
+               session_key,tool_call_key,command_hash,runner,scope,outcome,
+               failure_cause,provenance,completeness)
+           VALUES (?,'non_execution',?,?,0,?,?,'','','','unknown','unknown',
+                   'exact','non_execution')
+           ON CONFLICT(candidate_key) DO NOTHING""",
+        (candidate_key, evidence_key, source_digest, session_key, tool_call_key),
+    )
+
+
+def materialize_test_evidence(connection: sqlite3.Connection) -> None:
+    """Rebuild one canonical test run per session/tool call from immutable facts."""
+    rows = list(connection.execute(
+        """SELECT candidate_key,candidate_kind,evidence_key,source_digest,line_number,
+                  session_key,observed_at,turn_key,tool_call_key,command_hash,runner,
+                  scope,exit_status,outcome,failure_cause,provenance,completeness
+             FROM test_evidence_candidates"""
+    ))
+    groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        groups.setdefault((str(row[5]), str(row[8])), []).append(row)
+
+    connection.execute("DELETE FROM rollout_test_runs")
+    for (session_key, tool_call_key), candidates in sorted(groups.items()):
+        canonical_tool = connection.execute(
+            "SELECT tool_name FROM tool_spans WHERE session_key=? AND call_key=?",
+            (session_key, tool_call_key),
+        ).fetchone()
+        if (
+            canonical_tool is not None
+            and str(canonical_tool[0] or "unknown") not in _TEST_CAPABLE_TOOL_NAMES
+        ):
+            continue
+        descriptions = [
+            row for row in candidates if row[1] in {"description", "evidence"}
+        ]
+        evidence = [row for row in descriptions if row[1] == "evidence"]
+        if not descriptions or not evidence:
+            continue
+
+        # Command classification is a description fact and therefore follows
+        # source authority even when a lower-authority source supplies the only
+        # complete result.  The result itself is completeness-first.
+        description = max(
+            descriptions,
+            key=lambda row: (
+                SOURCE_AUTHORITY[source_family(connection, str(row[3]))],
+                str(row[3]), int(row[4]), str(row[0]),
+            ),
+        )
+        if description[1] != "evidence":
+            continue
+        completed = [row for row in evidence if row[16] == "complete"]
+        has_non_execution = any(row[1] == "non_execution" for row in candidates)
+        if has_non_execution and not completed:
+            continue
+        selected = max(evidence, key=lambda row: _evidence_rank(connection, row))
+        connection.execute(
+            """INSERT INTO rollout_test_runs(
+                   evidence_key,source_digest,line_number,session_key,observed_at,
+                   turn_key,tool_call_key,command_hash,runner,scope,exit_status,
+                   outcome,failure_cause,retry_kind,attempt_ordinal,provenance,
+                   completeness)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'none',1,?,?)""",
+            (
+                description[2], selected[3], selected[4], session_key,
+                selected[6] or description[6], selected[7] or description[7],
+                tool_call_key, description[9], description[10], description[11],
+                selected[12], selected[13], selected[14], selected[15],
+                selected[16],
+            ),
+        )
 
 
 def persist_semantic_conflict(
@@ -250,44 +316,45 @@ class TestEvidenceBuffer:
         if logical_call_id in self.rejected:
             return False
         runner, scope = classify_test_command(command)
-        if runner == "unknown":
-            return False
+        is_test = runner != "unknown"
         command_hash = self.pseudonymize("command", command)
         evidence_key = self.pseudonymize(
-            "event", f"test/{session_key}/{tool_call_key}/{command_hash}",
+            "event", f"test/{session_key}/{tool_call_key}",
+        )
+        candidate_key = self.pseudonymize(
+            "event",
+            f"test-candidate/evidence/{session_key}/{tool_call_key}/"
+            f"{self.source_digest}/{line_number}/{command_hash}",
         )
         self.intents[logical_call_id] = (
             TestIntent(
-                evidence_key, self.source_digest, line_number, session_key, observed_at,
-                turn_key, tool_call_key, command_hash, runner, scope,
+                candidate_key, evidence_key, self.source_digest, line_number,
+                session_key, observed_at, turn_key, tool_call_key, command_hash,
+                runner, scope,
             ),
             model_call_id,
         )
-        return True
+        return is_test
 
     def result(self, logical_call_id: str, output: object, observed_at: str | None) -> None:
         if logical_call_id in self.rejected:
             return
         self.results[logical_call_id] = (parse_structured_result(output), observed_at)
 
-    def _delete_rejected(self, session_key: str, tool_call_key: str) -> None:
-        incoming_authority = SOURCE_AUTHORITY[
-            source_family(self.connection, self.source_digest)
-        ]
-        rows = self.connection.execute(
-            "SELECT evidence_key,source_digest FROM rollout_test_runs "
-            "WHERE session_key=? AND tool_call_key=?",
-            (session_key, tool_call_key),
-        ).fetchall()
-        for evidence_key, source_digest in rows:
-            existing_authority = SOURCE_AUTHORITY[
-                source_family(self.connection, str(source_digest))
-            ]
-            if existing_authority <= incoming_authority:
-                self.connection.execute(
-                    "DELETE FROM rollout_test_runs WHERE evidence_key=?",
-                    (evidence_key,),
-                )
+    def _persist_non_execution(self, session_key: str, tool_call_key: str) -> None:
+        evidence_key = self.pseudonymize(
+            "event", f"test/{session_key}/{tool_call_key}",
+        )
+        candidate_key = self.pseudonymize(
+            "event",
+            f"test-candidate/non-execution/{session_key}/{tool_call_key}/"
+            f"{self.source_digest}",
+        )
+        persist_non_execution(
+            self.connection, candidate_key=candidate_key,
+            evidence_key=evidence_key, source_digest=self.source_digest,
+            session_key=session_key, tool_call_key=tool_call_key,
+        )
 
     def _has_app_terminal_rejection(self, intent: TestIntent) -> bool:
         if source_family(self.connection, self.source_digest) != "app_server":
@@ -306,19 +373,21 @@ class TestEvidenceBuffer:
         self.rejected.add(logical_call_id)
         self.intents.pop(logical_call_id, None)
         self.results.pop(logical_call_id, None)
-        self._delete_rejected(session_key, tool_call_key)
+        self._persist_non_execution(session_key, tool_call_key)
 
     def flush(self) -> None:
         for logical_call_id, (intent, model_call_id) in self.intents.items():
-            if logical_call_id in self.rejected or self._has_app_terminal_rejection(intent):
-                self._delete_rejected(intent.session_key, intent.tool_call_key)
+            if logical_call_id in self.rejected:
                 continue
+            if self._has_app_terminal_rejection(intent):
+                self._persist_non_execution(intent.session_key, intent.tool_call_key)
             result, observed_at = self.results.get(logical_call_id, (unknown_result(), intent.observed_at))
             persist_test_evidence(self.connection, intent, result, observed_at=observed_at)
             model_cause = self.model_causes.get(model_call_id)
-            if model_cause is not None:
+            if model_cause is not None and intent.runner != "unknown":
                 persist_semantic_conflict(
                     self.connection, intent, result, model_cause,
                     self.pseudonymize("diagnostic", f"test-conflict/{intent.evidence_key}"),
                 )
+        materialize_test_evidence(self.connection)
         reconcile_test_retries(self.connection)

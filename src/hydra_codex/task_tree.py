@@ -81,7 +81,11 @@ def _epoch_vectors(observations: list[TokenObservation]) -> tuple[TokenVector, .
         grouped: dict[int, TokenVector] = {}
         for item in observations:
             epoch = int(item.epoch)
-            grouped[epoch] = grouped.get(epoch, TokenVector.unknown()).merge_known(item.vector)
+            previous = grouped.get(epoch, TokenVector.unknown())
+            grouped[epoch] = TokenVector(*(
+                right if left is None else left if right is None else max(left, right)
+                for left, right in zip(previous.values, item.vector.values)
+            ))
         return tuple(grouped[key] for key in sorted(grouped))
     vectors: list[TokenVector] = []
     current = TokenVector.unknown()

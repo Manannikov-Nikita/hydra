@@ -17,7 +17,7 @@ library:
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/python -m pip install --no-build-isolation -e .
+.venv/bin/python -m pip install -e .
 ```
 
 The repository opts in with a stable, non-secret project identifier:

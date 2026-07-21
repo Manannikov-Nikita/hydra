@@ -175,14 +175,21 @@ class RolloutIngestTests(unittest.TestCase):
             v1("response_item", {"type": "function_call_output", "call_id": "call-a", "output": json.dumps({"exit_code": 0, "stdout": private_text})}, 2),
             v1("event_msg", {"type": "mcp_tool_call_end", "call_id": "call-a", "duration": {"secs": 0, "nanos": 9000000}, "result": {"Ok": {}}, "invocation": {"server": "safe", "tool": "safe", "arguments": {}}}, 3),
             v1("response_item", {"type": "function_call", "call_id": "call-b", "name": "hydra_annotate", "arguments": json.dumps({"path": "src/safe.py"})}, 4),
+            v1("response_item", {"type": "function_call_output", "call_id": "call-b", "output": json.dumps({"success": True})}, 5),
             v1("response_item", {"type": "function_call", "call_id": "call-read", "name": "file_read", "arguments": json.dumps({"path": "src/read.py"})}, 4),
-            v1("event_msg", {"type": "patch_apply_end", "call_id": "call-b", "success": True, "status": "ok", "stdout": private_text, "stderr": "", "changes": {str(self.project / "src" / "safe.py"): {"type": "modify", "move_path": None, "unified_diff": private_text}}}, 5),
+            v1("response_item", {"type": "function_call", "call_id": "call-patch", "name": "apply_patch", "arguments": json.dumps({"patch": "safe"})}, 5),
+            v1("event_msg", {"type": "patch_apply_end", "call_id": "call-patch", "success": True, "status": "ok", "stdout": private_text, "stderr": "", "changes": {str(self.project / "src" / "safe.py"): {"type": "modify", "move_path": None, "unified_diff": private_text}}}, 6),
         ])
 
         ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic")
 
         spans = self.store.connection.execute("SELECT category, terminal_state FROM tool_spans ORDER BY call_key").fetchall()
-        self.assertEqual(sorted(tuple(row) for row in spans), [("instrumentation", "success"), ("tool", "success"), ("tool", "unknown")])
+        self.assertEqual(sorted(tuple(row) for row in spans), [
+            ("instrumentation", "unknown"),
+            ("tool", "success"),
+            ("tool", "success"),
+            ("tool", "unknown"),
+        ])
         self.assertEqual(
             {tuple(row) for row in self.store.connection.execute(
                 "SELECT operation, relative_path FROM file_observations"

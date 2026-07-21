@@ -208,8 +208,11 @@ def _upsert_session(
         "SELECT project_id,started_at,last_activity_at FROM rollout_sessions WHERE session_key=?",
         (session_key,),
     ).fetchone()
-    if row is None or row[0] != project_id:
+    if row is None:
         raise ValueError("canonical session identity belongs to another project")
+    assert_session_project(
+        connection, session_key=session_key, project_id=project_id,
+    )
     connection.execute(
         "UPDATE rollout_sessions SET started_at=?,last_activity_at=? WHERE session_key=?",
         (_iso_min(row[1], started), _iso_max(row[2], latest), session_key),
@@ -327,6 +330,8 @@ def _persist_normalized_event(
                 connection, normalized_source, event.source_ordinal, session,
                 operation, path, project_root, event.observed_at, event.turn_key,
                 observation_call_key=tool.call_key,
+                observation_tool_name=tool.safe_name,
+                requires_success=True,
             )
     if successful_file_change:
         for path in tool.ephemeral_file_writes:
@@ -334,6 +339,8 @@ def _persist_normalized_event(
                 connection, normalized_source, event.source_ordinal, session,
                 "write", path, project_root, event.observed_at, event.turn_key,
                 observation_call_key=tool.call_key,
+                observation_tool_name=tool.safe_name,
+                requires_success=True,
             )
 
 
@@ -497,6 +504,7 @@ def _persist_batch(
                 persist_confirmed_parent(
                     connection, child_key=event.child_thread_key,
                     parent_key=event.parent_thread_key or session,
+                    project_id=project_id,
                 )
     test_evidence.flush()
     connection.executemany(

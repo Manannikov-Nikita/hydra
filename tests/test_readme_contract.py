@@ -33,6 +33,8 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("test-evidence cross-tab", normalized)
         self.assertIn("awaiting_receipt", normalized)
         self.assertIn("ambiguous shell expressions contribute no guessed file facts", normalized)
+        self.assertIn("python -m pip install -e .", normalized)
+        self.assertNotIn("pip install --no-build-isolation", normalized)
         self.assertNotIn("rendering, hooks, mcp, and plugin behavior remain intentionally out of scope", normalized)
 
     def test_readme_links_the_authoritative_codex_surfaces(self) -> None:

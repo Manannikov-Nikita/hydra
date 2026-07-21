@@ -75,6 +75,8 @@ def _parse_source(
                     operation, relative_path, project_root, terminal_at,
                     opaque("turn", terminal_turn) if terminal_turn else None,
                     observation_call_key=call_key,
+                    observation_tool_name=expected_tool,
+                    requires_success=True,
                 )
             del pending_file_calls[call_id]
 
@@ -213,6 +215,7 @@ def _parse_source(
                         persist_confirmed_parent(
                             connection, child_key=session_key,
                             parent_key=opaque("identity", parent),
+                            project_id=project_id,
                         )
                 seen_session = True
                 continue
@@ -254,6 +257,7 @@ def _parse_source(
                 )
                 persist_inferred_parent(
                     connection, child_key=child_key, parent_key=session_key,
+                    project_id=project_id,
                 )
                 continue
             if kind == "event_msg" and event_type in {"task_started", "task_complete", "turn_aborted"}:
@@ -346,6 +350,7 @@ def _parse_source(
                             operation, relative_path, project_root,
                             observed_at, opaque("turn", current_turn) if current_turn else None,
                             observation_call_key=call_key,
+                            observation_tool_name=normalized.safe_name,
                         )
                 if normalized.ephemeral_command is not None:
                     test_evidence.intent(
@@ -403,6 +408,8 @@ def _parse_source(
                                 connection, source, line_number, session_key, "write", changed_path, project_root,
                                 observed_at, opaque("turn", current_turn) if current_turn else None,
                                 observation_call_key=opaque("call", call_id),
+                                observation_tool_name="apply_patch",
+                                requires_success=True,
                             )
                 continue
             if kind == "event_msg" and event_type not in KNOWN_EVENT_TYPES:

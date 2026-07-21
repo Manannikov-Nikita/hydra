@@ -17,6 +17,9 @@ from .migrations_c3 import C3_MIGRATIONS, C3_REQUIRED_SCHEMA
 from .migrations_d4 import D4_MIGRATIONS, D4_REQUIRED_SCHEMA
 from .migrations_e5 import E5_MIGRATIONS, E5_REQUIRED_SCHEMA
 from .migrations_f6 import F6_MIGRATIONS, F6_REQUIRED_SCHEMA
+from .migrations_g7 import G7_MIGRATIONS, G7_REQUIRED_SCHEMA
+from .migrations_h8 import H8_MIGRATIONS, H8_REQUIRED_SCHEMA
+from .migrations_i9 import I9_MIGRATIONS, I9_REQUIRED_SCHEMA
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -256,7 +259,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS
 
 
 class HydraStore:
@@ -328,6 +331,14 @@ class HydraStore:
                         self._sanitize_and_quarantine_v1_annotations(connection)
                         for statement in V2_TRIGGER_STATEMENTS:
                             connection.execute(statement)
+                    if version == 24:
+                        from .test_evidence import (
+                            materialize_test_evidence,
+                            reconcile_test_retries,
+                        )
+
+                        materialize_test_evidence(connection)
+                        reconcile_test_retries(connection)
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
                         (version,),
@@ -353,6 +364,9 @@ class HydraStore:
         required.update(D4_REQUIRED_SCHEMA)
         required.update(E5_REQUIRED_SCHEMA)
         required.update(F6_REQUIRED_SCHEMA)
+        required.update(G7_REQUIRED_SCHEMA)
+        required.update(H8_REQUIRED_SCHEMA)
+        required.update(I9_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):

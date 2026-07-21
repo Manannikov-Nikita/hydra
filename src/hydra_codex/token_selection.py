@@ -72,7 +72,7 @@ def refresh_token_source_selection(connection: sqlite3.Connection, project_id: s
         """SELECT session_key,source_family,observed_at,event_key,input_tokens,
                   cached_input_tokens,output_tokens,reasoning_tokens,
                   source_digest,line_number
-             FROM token_snapshots WHERE project_id=?""",
+             FROM token_snapshots WHERE project_id=? AND vector_valid=1""",
         (project_id,),
     )
     by_session: dict[str, list[tuple[object, ...]]] = {}
@@ -130,14 +130,15 @@ def refresh_token_source_selection(connection: sqlite3.Connection, project_id: s
                   SET contributes_total=0,
                       selection_provenance='derived',
                       selection_caveat=NULL
-                WHERE project_id=? AND session_key=?""",
+                WHERE project_id=? AND session_key=? AND vector_valid=1""",
             (project_id, session),
         )
         if selected_app_rows is None:
             connection.execute(
                 """UPDATE token_snapshots
                       SET contributes_total=1,selection_provenance=?,selection_caveat=?
-                    WHERE project_id=? AND session_key=? AND source_family=?""",
+                    WHERE project_id=? AND session_key=? AND source_family=?
+                      AND vector_valid=1""",
                 (provenance, caveat, project_id, session, selected),
             )
         else:
@@ -145,7 +146,7 @@ def refresh_token_source_selection(connection: sqlite3.Connection, project_id: s
                 """UPDATE token_snapshots
                       SET contributes_total=1,selection_provenance=?,selection_caveat=?
                     WHERE project_id=? AND session_key=? AND source_family='app_server'
-                      AND source_digest=? AND line_number=?""",
+                      AND source_digest=? AND line_number=? AND vector_valid=1""",
                 (
                     (provenance, caveat, project_id, session, source_digest, line_number)
                     for source_digest, line_number in selected_app_rows

@@ -112,7 +112,7 @@ class TestEvidenceCandidateMigrationTests(unittest.TestCase):
                 source_digest TEXT NOT NULL, source_ordinal INTEGER NOT NULL,
                 event_key TEXT NOT NULL, session_key TEXT, observed_at TEXT,
                 turn_key TEXT, tool_call_key TEXT, tool_name TEXT,
-                tool_phase TEXT, tool_status TEXT
+                tool_phase TEXT, tool_status TEXT, tool_exit_status INTEGER
             )"""
         )
         connection.execute(
@@ -417,6 +417,7 @@ class PersistedTestEvidenceTests(unittest.TestCase):
         )
 
         observed: list[list[tuple[object, ...]]] = []
+        candidate_shapes: list[list[tuple[object, ...]]] = []
         for index, app_first in enumerate((False, True), start=1):
             store = HydraStore(self.root / f"declined-complete-{index}.sqlite3")
             self.addCleanup(store.close)
@@ -426,10 +427,62 @@ class PersistedTestEvidenceTests(unittest.TestCase):
                     "SELECT outcome,exit_status,failure_cause FROM rollout_test_runs"
                 )
             ])
+            candidate_shapes.append([
+                tuple(row) for row in store.connection.execute(
+                    """SELECT candidate_kind,exit_status,completeness
+                         FROM test_evidence_candidates ORDER BY candidate_kind,source_digest"""
+                )
+            ])
         self.assertEqual(observed, [
             [("failed", 1, "product_failure")],
             [("failed", 1, "product_failure")],
         ])
+        for rows in candidate_shapes:
+            self.assertIn(("evidence", 1, "complete"), rows)
+            self.assertTrue(any(row == ("non_execution", None, "non_execution")
+                                for row in rows))
+
+    def test_app_failed_with_exact_exit_never_becomes_non_execution_in_either_order(self) -> None:
+        session, call_id = "failed-exact-session", "failed-exact-call"
+        command = "pytest tests/test_failed_exact.py"
+        rollout = self.root / "failed-exact.rollout.jsonl"
+        write_rollout(rollout, [
+            start(session, self.project),
+            call(call_id, command, 1),
+            result(call_id, {"exit_code": 1, "stderr": "assertion failed"}, 2),
+        ])
+        app = self.app_source(
+            "failed-exact", session=session, call_id=call_id,
+            command=command, status="failed", exit_code=1,
+        )
+
+        observed: list[tuple[list[tuple[object, ...]], list[tuple[object, ...]]]] = []
+        for index, app_first in enumerate((False, True), start=1):
+            store = HydraStore(self.root / f"failed-exact-{index}.sqlite3")
+            self.addCleanup(store.close)
+            self.ingest_pair(store, rollout, app, app_first=app_first)
+            runs = [
+                tuple(row) for row in store.connection.execute(
+                    """SELECT outcome,exit_status,failure_cause,completeness
+                         FROM rollout_test_runs"""
+                )
+            ]
+            candidates = [
+                tuple(row) for row in store.connection.execute(
+                    """SELECT candidate_kind,exit_status,outcome,completeness
+                         FROM test_evidence_candidates ORDER BY candidate_kind,source_digest"""
+                )
+            ]
+            observed.append((runs, candidates))
+
+        for runs, candidates in observed:
+            self.assertEqual(runs, [
+                ("failed", 1, "product_failure", "complete"),
+            ])
+            self.assertNotIn("non_execution", {row[0] for row in candidates})
+            self.assertTrue(candidates)
+            self.assertTrue(all(row == ("evidence", 1, "failed", "complete")
+                                for row in candidates))
 
     def test_custom_exec_test_intents_link_to_nested_spans_but_never_inherit_broker_success(self) -> None:
         path = self.root / "modern.jsonl"

@@ -47,7 +47,8 @@ H8_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                   'unknown','exact','non_execution'
              FROM codex_events
             WHERE tool_name='exec_command' AND tool_phase='completed'
-              AND tool_status NOT IN ('completed','success')
+              AND tool_status IN ('declined','cancelled','interrupted')
+              AND tool_exit_status IS NULL
               AND session_key IS NOT NULL AND tool_call_key IS NOT NULL""",
         """CREATE INDEX test_evidence_candidates_call
                ON test_evidence_candidates(session_key,tool_call_key)""",

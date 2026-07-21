@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from .reconcile_annotations import AnnotationFacts
-from .task_tree_types import ScalarFact, TaskTreeMetrics
+from .task_tree_types import Provenance, ScalarFact, TaskTreeMetrics, validate_provenance
 
 
 def _aware(value: datetime, field_name: str) -> None:
@@ -24,6 +24,13 @@ class TaskPlan:
     session_ids: tuple[str, ...]
     cutoff_source_key: str | None = None
     cutoff_source_ordinal: int | None = None
+    cutoff_timing_provenance: Provenance = "exact"
+
+    def __post_init__(self) -> None:
+        _aware(self.cutoff_at, "cutoff_at")
+        validate_provenance(
+            self.cutoff_timing_provenance, "cutoff timing provenance",
+        )
 
 
 @dataclass(frozen=True)

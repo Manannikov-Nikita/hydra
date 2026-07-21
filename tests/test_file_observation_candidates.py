@@ -520,6 +520,86 @@ class FileObservationMigrationTests(unittest.TestCase):
                 0,
             )
 
+    def test_v25_without_key_suppresses_stale_app_file_for_successful_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "successful-canonical-no-key.sqlite3"
+            connection = self._create_database_before_v25(database)
+            try:
+                connection.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,conversation_key)
+                       VALUES ('legacy-session','project','path',1,'conversation')"""
+                )
+                for logical in ("rollout-logical", "app-logical"):
+                    connection.execute(
+                        """INSERT INTO rollout_logical_sources(
+                               logical_source_key,project_id,lineage_state)
+                           VALUES (?,'project','clean')""",
+                        (logical,),
+                    )
+                connection.execute(
+                    """INSERT INTO codex_event_sources(
+                           source_digest,project_id,schema_version,source_format,
+                           line_count,byte_count)
+                       VALUES ('app-raw','project','codex.app-server/v2',
+                               'app_server',3,3)"""
+                )
+                connection.executemany(
+                    """INSERT INTO rollout_sources(
+                           source_digest,source_type,logical_source_key,relation,
+                           line_count,byte_count,chain_digest,materialized)
+                       VALUES (?,?,?,'initial',3,3,?,1)""",
+                    (
+                        ("rollout-source", "jsonl", "rollout-logical", "rollout-chain"),
+                        ("app-source", "explicit", "app-logical", "app-raw"),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO tool_spans(
+                           session_key,call_key,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,source_digest,
+                           source_ordinal,completeness,provenance)
+                       VALUES ('legacy-session','shared-call','tool','success',1,
+                               'exec_command','2026-07-21T00:00:00Z',
+                               '2026-07-21T00:00:01Z','rollout-turn',
+                               'rollout-source',2,'complete','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO tool_span_candidates(
+                           session_key,call_key,source_digest,source_ordinal,
+                           candidate_kind,category,terminal_state,latency_ms,
+                           tool_name,started_at,finished_at,turn_key,provenance)
+                       VALUES ('legacy-session','shared-call','app-source',3,
+                               'end','tool','success',1,'exec_command',NULL,
+                               '2026-07-21T00:00:01Z','app-turn','exact')"""
+                )
+                connection.execute(
+                    """INSERT INTO file_observations(
+                           source_digest,line_number,session_key,operation,
+                           relative_path,path_hash,observed_at,turn_key)
+                       VALUES ('app-source',3,'legacy-session','read',
+                               'src/app-only.py','stale-app-path',
+                               '2026-07-21T00:00:01Z','app-turn')"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore(database)
+            self.addCleanup(store.close)
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM file_observations"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM file_observation_candidates"
+                ).fetchone()[0],
+                1,
+            )
+
     def test_v25_recovers_v22_line_zero_identity_without_active_hasher(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

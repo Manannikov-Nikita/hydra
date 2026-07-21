@@ -137,12 +137,26 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.assertEqual(metrics.test_runs.value, 1)
         self.assertEqual(metrics.targeted_test_runs.value, 1)
         self.assertNotIn("app_total_timestamp_missing", metrics.recorded.caveats)
-        self.assertEqual(metrics.recorded.provenance, "exact")
+        self.assertEqual(metrics.recorded.provenance, "estimated")
+        self.assertIn(
+            "estimated_lifecycle_cutoff_from_receipt", metrics.recorded.caveats,
+        )
+        self.assertEqual(metrics.root_wall_clock_ms.provenance, "estimated")
+        self.assertIn(
+            "estimated_lifecycle_cutoff_from_receipt",
+            metrics.root_wall_clock_ms.caveats,
+        )
 
         summary = reconcile_project(self.store, project_id=PROJECT, installation_key=b"r" * 32)
         task = list_reconciled_tasks(self.store, project_id=PROJECT)[0]
         self.assertEqual((summary.task_count, summary.complete_count), (1, 1))
         self.assertEqual(task.metrics.recorded.working.value, 90)
+        self.assertEqual(task.metrics.recorded.provenance, "estimated")
+        self.assertIn(
+            "estimated_lifecycle_cutoff_from_receipt",
+            task.metrics.recorded.caveats,
+        )
+        self.assertEqual(task.metrics.root_wall_clock_ms.provenance, "estimated")
         self.assertEqual(task.semantic.coverage.value, 0.0)
         self.assertEqual(task.semantic.unclassified_working.value, 90)
 
@@ -230,6 +244,165 @@ class CodexEventPersistenceTests(unittest.TestCase):
             [(1, "completed", 2000)],
             [(1, "completed", 2000)],
         ])
+
+    def test_wrapped_app_lifecycle_uses_embedded_time_without_losing_receipt_provenance(self) -> None:
+        thread, turn = "wrapped-lifecycle-thread", "wrapped-lifecycle-turn"
+        app = self.base / "wrapped-lifecycle.app.jsonl"
+        app.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "received_at": "2024-07-03T09:46:40.100000Z",
+                    "message": {"method": "turn/started", "params": {
+                        "threadId": thread, "turn": {
+                            "id": turn, "startedAt": 1720000000,
+                            "status": "inProgress",
+                        },
+                    }},
+                },
+                {
+                    "received_at": "2024-07-03T09:46:42.100000Z",
+                    "message": {"method": "turn/completed", "params": {
+                        "threadId": thread, "turn": {
+                            "id": turn, "completedAt": 1720000002,
+                            "status": "completed",
+                        },
+                    }},
+                },
+            )
+        ), encoding="utf-8")
+        rollout = self.base / "wrapped-lifecycle.rollout.jsonl"
+        rollout.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "timestamp": "2024-07-03T09:46:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": thread, "cwd": str(self.project)},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:40Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn},
+                },
+                {
+                    "timestamp": "2024-07-03T09:46:42Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete", "turn_id": turn,
+                        "duration_ms": 2000,
+                    },
+                },
+            )
+        ), encoding="utf-8")
+        app_source = CodexEventSource(app, APP_SERVER_V2)
+
+        observed: list[tuple[list[tuple[object, ...]], list[str], list[str], set[str]]] = []
+        for index, app_first in enumerate((True, False), start=1):
+            store = HydraStore(self.base / f"wrapped-lifecycle-{index}.sqlite3")
+            self.addCleanup(store.close)
+            if app_first:
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+            else:
+                ingest_rollouts(
+                    store, (rollout,), self.project, PROJECT, hash_key=KEY,
+                )
+                ingest_codex_events(
+                    store, (app_source,), self.project, PROJECT, hash_key=KEY,
+                )
+            observed.append((
+                [tuple(row) for row in store.connection.execute(
+                    "SELECT attempt_ordinal,state,wall_duration_ms FROM turn_attempts"
+                )],
+                [row[0] for row in store.connection.execute(
+                    "SELECT observed_at FROM codex_events ORDER BY source_ordinal"
+                )],
+                [row[0] for row in store.connection.execute(
+                    """SELECT observed_at FROM turn_lifecycle_events
+                         WHERE source_digest IN (
+                             SELECT source_digest FROM rollout_sources
+                              WHERE source_type='explicit'
+                         )
+                         ORDER BY source_ordinal"""
+                )],
+                {row[0] for row in store.connection.execute(
+                    "SELECT envelope_kind FROM rollout_diagnostics"
+                )},
+            ))
+
+        for attempts, receipts, lifecycle_times, diagnostics in observed:
+            self.assertEqual(attempts, [(1, "completed", 2000)])
+            self.assertEqual(receipts, [
+                "2024-07-03T09:46:40.100000Z",
+                "2024-07-03T09:46:42.100000Z",
+            ])
+            self.assertEqual(lifecycle_times, [
+                "2024-07-03T09:46:40Z",
+                "2024-07-03T09:46:42Z",
+            ])
+            self.assertNotIn("duplicate_turn_start", diagnostics)
+
+    def test_app_receipt_never_substitutes_for_missing_or_invalid_lifecycle_time(self) -> None:
+        source = self.base / "missing-lifecycle-time.app.jsonl"
+        source.write_text("".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                {
+                    "received_at": "2024-07-03T09:46:40.100000Z",
+                    "message": {"method": "turn/started", "params": {
+                        "threadId": "missing-time-thread", "turn": {
+                            "id": "missing-time-turn", "status": "inProgress",
+                        },
+                    }},
+                },
+                {
+                    "received_at": "2024-07-03T09:46:42.100000Z",
+                    "message": {"method": "turn/completed", "params": {
+                        "threadId": "missing-time-thread", "turn": {
+                            "id": "missing-time-turn", "completedAt": "invalid",
+                            "status": "completed",
+                        },
+                    }},
+                },
+            )
+        ), encoding="utf-8")
+
+        self.ingest(CodexEventSource(source, APP_SERVER_V2))
+
+        self.assertEqual(
+            [row[0] for row in self.store.connection.execute(
+                "SELECT observed_at FROM codex_events ORDER BY source_ordinal"
+            )],
+            [
+                "2024-07-03T09:46:40.100000Z",
+                "2024-07-03T09:46:42.100000Z",
+            ],
+        )
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                """SELECT event_kind,observed_at,timestamp_epoch
+                     FROM turn_lifecycle_events ORDER BY source_ordinal"""
+            )],
+            [("started", None, None), ("completed", None, None)],
+        )
+        self.assertEqual(
+            [tuple(row) for row in self.store.connection.execute(
+                """SELECT state,started_at,finished_at,wall_duration_ms,
+                          timing_provenance FROM turn_attempts"""
+            )],
+            [("completed", None, None, None, "estimated")],
+        )
+        self.assertEqual(
+            [row[0] for row in self.store.connection.execute(
+                "SELECT issue_code FROM codex_event_issues"
+            )],
+            ["invalid_timestamp"],
+        )
 
     def test_same_rollout_retries_at_one_timestamp_remain_distinct_attempts(self) -> None:
         thread, turn = "same-adapter-retry-thread", "same-adapter-retry-turn"
@@ -1695,6 +1868,15 @@ class CodexEventPersistenceTests(unittest.TestCase):
         self.assertEqual(tuple(row), (
             "pytest", "targeted", "failed", 1, "product_failure", "complete",
         ))
+        candidates = [
+            tuple(candidate) for candidate in self.store.connection.execute(
+                """SELECT candidate_kind,exit_status,outcome,completeness
+                     FROM test_evidence_candidates ORDER BY candidate_kind"""
+            )
+        ]
+        self.assertEqual(candidates, [
+            ("evidence", 1, "failed", "complete"),
+        ])
 
     def test_split_app_decline_removes_started_test_in_both_ingest_orders(self) -> None:
         call_id = "split-declined-test"
@@ -1736,6 +1918,20 @@ class CodexEventPersistenceTests(unittest.TestCase):
                     store, (source,), self.project, PROJECT, hash_key=KEY,
                 )
             self.assertEqual(store.count("rollout_test_runs"), 0)
+            candidate_rows = [
+                tuple(row) for row in store.connection.execute(
+                    """SELECT candidate_kind,exit_status,completeness
+                         FROM test_evidence_candidates ORDER BY candidate_kind"""
+                )
+            ]
+            self.assertTrue(candidate_rows)
+            self.assertTrue(any(row == ("non_execution", None, "non_execution")
+                                for row in candidate_rows))
+            self.assertTrue(all(
+                row[0] == "non_execution"
+                or row == ("evidence", None, "intent_only")
+                for row in candidate_rows
+            ))
 
     def test_rollout_test_result_wins_app_conflict_in_both_ingest_orders(self) -> None:
         session = "conflicting-test-thread"

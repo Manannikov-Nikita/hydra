@@ -71,7 +71,7 @@ def allocate_otel_hints(
         str(session): str(family)
         for session, family in connection.execute(
             f"""SELECT DISTINCT session_key,source_family FROM token_snapshots
-                   WHERE project_id=? AND contributes_total=1
+                   WHERE project_id=? AND contributes_total=1 AND vector_valid=1
                      AND session_key IN ({placeholders})""",
             (project_id, *session_ids),
         )
@@ -81,6 +81,7 @@ def allocate_otel_hints(
                    t.cached_input_tokens,t.output_tokens,t.reasoning_tokens,s.started_at
               FROM token_snapshots t JOIN rollout_sessions s ON s.session_key=t.session_key
              WHERE t.project_id=? AND t.source_family='otel' AND t.contributes_total=0
+               AND t.vector_valid=1
                AND t.session_key IN ({placeholders})
              ORDER BY t.session_key,julianday(t.observed_at),t.event_key""",
         (project_id, *session_ids),

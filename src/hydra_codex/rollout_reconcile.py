@@ -197,7 +197,7 @@ def reconcile_token_epochs(
                   output_tokens,reasoning_tokens,observed_at,cache_write_tokens,
                   source_family
              FROM token_snapshots
-            WHERE project_id=? AND contributes_total=1
+            WHERE project_id=? AND contributes_total=1 AND vector_valid=1
               AND source_family IN ('rollout','app_server')""",
         (project_id,),
     ))
@@ -257,6 +257,7 @@ def reconcile_fork_baselines(connection: sqlite3.Connection, project_id: str) ->
                       output_tokens,reasoning_tokens,cache_write_tokens,observed_at
                  FROM token_snapshots
                 WHERE session_key=? AND project_id=? AND completeness='complete'
+                  AND vector_valid=1
                   AND contributes_total=1
                   AND source_family IN ('rollout','app_server')""",
             (session_key, project_id),

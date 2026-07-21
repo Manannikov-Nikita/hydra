@@ -175,6 +175,7 @@ def materialize_file_observations(
     ).fetchone()
     canonical_name = "unknown" if tool is None else str(tool[0] or "unknown")
     terminal_state = "unknown" if tool is None else str(tool[1])
+    canonical_source = None if tool is None else tool[2]
 
     materialized_source = (
         opaque("event", f"file-observation/{session_key}/{call_key}")
@@ -189,12 +190,18 @@ def materialize_file_observations(
     # synthetic materialized identity.  It may still remove disproven facts
     # and must quarantine unresolved legacy line-zero rows, but it leaves a
     # successful direct legacy observation intact until the next keyed ingest.
+    canonical_authority = SOURCE_AUTHORITY[
+        source_family(connection, canonical_source)
+    ]
     removable = (
         migrated
         if materialized_source is not None or terminal_state == "failed"
         else tuple(
             candidate for candidate in migrated
             if candidate.evidence_kind == "quarantined"
+            or SOURCE_AUTHORITY[
+                source_family(connection, candidate.source_digest)
+            ] < canonical_authority
         )
     )
     connection.executemany(
@@ -238,7 +245,6 @@ def materialize_file_observations(
         )
         for candidate in eligible
     )
-    canonical_source = None if tool is None else tool[2]
     canonical_candidates = tuple(
         candidate for candidate in eligible
         if canonical_source is not None

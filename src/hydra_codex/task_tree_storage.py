@@ -54,7 +54,7 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
                   t.selection_provenance,t.selection_caveat,t.source_family
              FROM token_snapshots t
              LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
-            WHERE t.project_id=? AND t.contributes_total=1
+            WHERE t.project_id=? AND t.contributes_total=1 AND t.vector_valid=1
             ORDER BY CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END,
                      julianday(observed_at),t.source_digest,t.line_number""",
         (project_id,),
@@ -79,7 +79,7 @@ def _baselines(connection: sqlite3.Connection, project_id: str) -> tuple[ReplayB
         """SELECT b.child_key,b.observed_at,b.input_tokens,b.cached_input_tokens,
                   b.output_tokens,b.reasoning_tokens
              FROM fork_baselines b JOIN rollout_sessions s ON s.session_key=b.child_key
-            WHERE s.project_id=? ORDER BY b.child_key""",
+            WHERE s.project_id=? AND b.vector_valid=1 ORDER BY b.child_key""",
         (project_id,),
     )
     observations: list[ReplayBaselineObservation] = []
@@ -96,19 +96,28 @@ def _lifecycle(connection: sqlite3.Connection, project_id: str) -> tuple[Lifecyc
     mapping = {"started": "task_started", "completed": "task_complete", "aborted": "turn_aborted"}
     rows = connection.execute(
         """SELECT e.session_key,e.event_kind,e.observed_at,
-                  e.logical_source_key,e.source_ordinal,e.turn_key
+                  e.logical_source_key,e.source_ordinal,e.turn_key,r.observed_at
              FROM turn_lifecycle_events e
              JOIN rollout_sessions s ON s.session_key=e.session_key
+             JOIN rollout_events r ON r.event_key=e.event_key
             WHERE s.project_id=? ORDER BY e.source_digest,e.source_ordinal""",
         (project_id,),
     )
     observations: list[LifecycleObservation] = []
     for row in rows:
         observed_at = _optional_timestamp(row[2])
+        timing_provenance = "exact"
+        if observed_at is None:
+            # App Server wrappers can provide a receipt timestamp while the
+            # embedded lifecycle item has no clock. Retain the exact state and
+            # use the receipt only as an explicitly estimated report cutoff;
+            # the persisted lifecycle timestamp remains NULL.
+            observed_at = _optional_timestamp(row[6])
+            timing_provenance = "estimated"
         if observed_at is not None:
             observations.append(LifecycleObservation(
                 str(row[0]), mapping[str(row[1])], observed_at,
-                str(row[3]), int(row[4]), str(row[5]),
+                str(row[3]), int(row[4]), str(row[5]), timing_provenance,
             ))
     return tuple(observations)
 
@@ -215,6 +224,7 @@ def aggregate_stored_task_tree(
     connection: sqlite3.Connection, *, project_id: str, root_id: str,
     classified_working_tokens: int = 0,
     cutoff_at: datetime | None = None,
+    cutoff_timing_provenance: str = "exact",
     include_ambiguous_lineage: bool = True,
 ) -> TaskTreeMetrics:
     """Build a task tree exclusively from normalized persisted observations."""
@@ -233,5 +243,6 @@ def aggregate_stored_task_tree(
         files=_files(connection, project_id),
         tests=_tests(connection, project_id),
         cutoff_at=cutoff_at,
+        cutoff_timing_provenance=cutoff_timing_provenance,
         include_ambiguous_lineage=include_ambiguous_lineage,
     )

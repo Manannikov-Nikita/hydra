@@ -298,7 +298,20 @@ def _persist_normalized_event(
             "aborted" if event.status in {"interrupted", "cancelled"}
             else "completed"
         )
-    if lifecycle is not None and event.observed_at is not None:
+    app_lifecycle = (
+        event.source_format == "app_server"
+        and event.event_type in {"thread_started", "turn_started", "turn_completed"}
+    )
+    lifecycle_at = (
+        event.lifecycle_at
+        if app_lifecycle else event.lifecycle_at or event.observed_at
+    )
+    lifecycle_at_ns = (
+        event.lifecycle_at_ns
+        if app_lifecycle or event.lifecycle_at is not None
+        else event.observed_at_ns
+    )
+    if lifecycle is not None and (lifecycle_at is not None or app_lifecycle):
         connection.execute(
             """INSERT INTO turn_lifecycle_events(
                    event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
@@ -306,8 +319,8 @@ def _persist_normalized_event(
                VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
             (
                 normalized_event, session, event.turn_key or normalized_event, lifecycle,
-                event.observed_at,
-                None if event.observed_at_ns is None else event.observed_at_ns / 1_000_000_000,
+                lifecycle_at,
+                None if lifecycle_at_ns is None else lifecycle_at_ns / 1_000_000_000,
                 event.duration_ms, normalized_source, logical, event.source_ordinal,
             ),
         )

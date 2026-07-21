@@ -20,6 +20,7 @@ from .task_tree_types import (
     TokenVector,
     TokenVectorFact,
     ToolObservation,
+    validate_provenance,
     _Amount,
     _Bounds,
 )
@@ -141,6 +142,7 @@ def aggregate_task_tree(
     tools: Iterable[ToolObservation] = (), files: Iterable[FileObservation] = (),
     tests: Iterable[TestRunObservation] = (),
     cutoff_at: datetime | None = None,
+    cutoff_timing_provenance: Provenance = "exact",
     include_ambiguous_lineage: bool = True,
 ) -> TaskTreeMetrics:
     """Aggregate one opaque root through a trusted completion or explicit cutoff."""
@@ -195,10 +197,15 @@ def aggregate_task_tree(
         if completion is None:
             raise ValueError("root task_complete observation is required")
         cutoff = completion.observed_at
+        estimated_lifecycle_cutoff = completion.timing_provenance == "estimated"
     else:
         if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
             raise ValueError("cutoff_at must be timezone-aware")
+        validate_provenance(
+            cutoff_timing_provenance, "cutoff timing provenance",
+        )
         cutoff = cutoff_at
+        estimated_lifecycle_cutoff = cutoff_timing_provenance == "estimated"
     if root.started_at is not None and root.started_at > cutoff:
         raise ValueError("root starts after its task_complete observation")
     session_ids, cycle_edges = _descendants(
@@ -332,6 +339,8 @@ def aggregate_task_tree(
         for kind in sorted(unconfirmed_kinds)
     )
     recorded_caveats = (f"missing_final_token:{missing_finals}",) if missing_finals else ()
+    if estimated_lifecycle_cutoff:
+        recorded_caveats += ("estimated_lifecycle_cutoff_from_receipt",)
     if timestamp_missing:
         recorded_caveats += (f"timestamp_missing_token:{timestamp_missing}",)
     if ambiguous_timestamp_tokens:
@@ -346,7 +355,9 @@ def aggregate_task_tree(
     unique_caveats.extend(uncertainty)
     if cycle_edges:
         unique_caveats.append(f"cycle_edges:{cycle_edges}")
-    baseline_uncertain = bool(zero_baselines or unconfirmed_edges)
+    baseline_uncertain = bool(
+        zero_baselines or unconfirmed_edges or estimated_lifecycle_cutoff
+    )
     unique_uncertain = bool(
         baseline_uncertain or missing_finals or timestamp_missing
         or ambiguous_timestamp_tokens or selection_uncertain
@@ -427,7 +438,8 @@ def aggregate_task_tree(
         _token_fact(
             recorded,
             "estimated" if missing_finals or timestamp_missing
-            or ambiguous_timestamp_tokens or selection_uncertain else "exact",
+            or ambiguous_timestamp_tokens or selection_uncertain
+            or estimated_lifecycle_cutoff else "exact",
             recorded_caveats,
         ),
         _token_fact(replay, "estimated" if baseline_uncertain else "exact", baseline_caveats + uncertainty),
@@ -435,14 +447,24 @@ def aggregate_task_tree(
         ScalarFact(len(session_ids), "exact"), ScalarFact(max(0, len(session_ids) - 1), "derived"),
         ScalarFact(
             wall_clock_ms,
-            "derived" if wall_clock_ms is not None else "estimated",
-            () if wall_clock_ms is not None else ("missing_root_session_start",),
+            "estimated" if wall_clock_ms is None or estimated_lifecycle_cutoff else "derived",
+            (
+                ("estimated_lifecycle_cutoff_from_receipt",)
+                if wall_clock_ms is not None and estimated_lifecycle_cutoff
+                else (() if wall_clock_ms is not None else ("missing_root_session_start",))
+            ),
             0,
         ),
         ScalarFact(
             None if missing_starts else agent_time_lower,
-            "estimated" if missing_starts else "derived",
-            (f"missing_session_start:{missing_starts}",) if missing_starts else (),
+            "estimated" if missing_starts or estimated_lifecycle_cutoff else "derived",
+            (
+                (f"missing_session_start:{missing_starts}",)
+                if missing_starts else (
+                    ("estimated_lifecycle_cutoff_from_receipt",)
+                    if estimated_lifecycle_cutoff else ()
+                )
+            ),
             agent_time_lower,
         ),
         ScalarFact(coverage, "derived" if coverage is not None else "estimated", () if coverage is not None else ("unknown_working_tokens",)),

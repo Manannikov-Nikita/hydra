@@ -427,7 +427,8 @@ class TestEvidenceBuffer:
         return self.connection.execute(
             """SELECT 1 FROM codex_events
                  WHERE session_key=? AND tool_call_key=? AND tool_phase='completed'
-                   AND tool_status NOT IN ('completed','success') LIMIT 1""",
+                   AND tool_status IN ('declined','cancelled','interrupted')
+                   AND tool_exit_status IS NULL LIMIT 1""",
             (intent.session_key, intent.tool_call_key),
         ).fetchone() is not None
 

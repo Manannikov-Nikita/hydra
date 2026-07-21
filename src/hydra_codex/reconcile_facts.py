@@ -133,6 +133,7 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
             status = "complete"
             cutoff_source = completion.logical_source_key
             cutoff_ordinal = completion.source_ordinal
+            cutoff_timing_provenance = completion.timing_provenance
         else:
             candidates = [
                 value for member in members
@@ -147,6 +148,7 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
             status = "incomplete"
             cutoff_source = None
             cutoff_ordinal = None
+            cutoff_timing_provenance = "derived"
         included = tuple(sorted(
             member for member in members
             if sessions[member].started_at is None or sessions[member].started_at <= cutoff
@@ -154,6 +156,7 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
         if root in included:
             plans.append(TaskPlan(
                 root, status, cutoff, included, cutoff_source, cutoff_ordinal,
+                cutoff_timing_provenance,
             ))
     return tuple(sorted(plans, key=lambda item: item.root_key))
 
@@ -175,7 +178,7 @@ def build_token_deltas(
                     ,r.logical_source_key,t.event_key,t.source_family,
                     t.selection_provenance,t.selection_caveat
                FROM token_snapshots t LEFT JOIN rollout_sources r ON r.source_digest=t.source_digest
-              WHERE t.project_id=? AND t.contributes_total=1
+              WHERE t.project_id=? AND t.contributes_total=1 AND t.vector_valid=1
                 AND t.session_key IN ({placeholders})
               ORDER BY t.session_key,t.epoch,
                        CASE WHEN t.observed_at IS NULL THEN 1 ELSE 0 END,
@@ -189,7 +192,8 @@ def build_token_deltas(
         for row in connection.execute(
             f"""SELECT child_key,observed_at,input_tokens,cached_input_tokens,
                        output_tokens,reasoning_tokens FROM fork_baselines
-                  WHERE child_key IN ({placeholders}) AND provenance='exact'""",
+                  WHERE child_key IN ({placeholders}) AND provenance='exact'
+                    AND vector_valid=1""",
             plan.session_ids,
         )
     }

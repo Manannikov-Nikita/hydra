@@ -228,7 +228,7 @@ def _final_epoch_vectors(
                   COALESCE(s.logical_source_key,t.source_digest),t.line_number
              FROM token_snapshots t
              LEFT JOIN rollout_sources s ON s.source_digest=t.source_digest
-            WHERE t.project_id=? AND t.contributes_total=1
+            WHERE t.project_id=? AND t.contributes_total=1 AND t.vector_valid=1
             ORDER BY t.session_key,t.epoch,t.source_digest,t.line_number""", (project_id,),
     ).fetchall()
     grouped: dict[tuple[str, int], list[tuple[object, ...]]] = {}
@@ -308,15 +308,20 @@ def aggregate_project(connection: sqlite3.Connection, project_id: str) -> Projec
 def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> dict[str, MetricFact]:
     """Per-component final cumulative facts; absent parts never become zero."""
     epochs = _final_epoch_vectors(connection, project_id)
+    invalid_only = bool(not epochs and connection.execute(
+        "SELECT 1 FROM token_snapshots WHERE project_id=? AND vector_valid=0 LIMIT 1",
+        (project_id,),
+    ).fetchone())
     vectors = tuple(epoch.vector[:4] for epoch in epochs)
     timestamp_ambiguous = any(epoch.timestamp_ambiguous for epoch in epochs)
     def component(index: int) -> MetricFact:
         known = sum(epoch.component_lower_bounds[index] for epoch in epochs)
-        missing = any(row[index] is None for row in vectors)
+        missing = invalid_only or any(row[index] is None for row in vectors)
         caveats = tuple(
             caveat for caveat, present in (
                 ("missing_component", missing),
                 ("timestamp_ambiguous", timestamp_ambiguous),
+                ("invalid_legacy_token_vector", invalid_only),
             ) if present
         )
         unavailable = missing or timestamp_ambiguous
@@ -326,11 +331,11 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
         )
     inputs, cached, outputs, reasoning = component(0), component(1), component(2), component(3)
     working_ready = (
-        not timestamp_ambiguous
+        not invalid_only and not timestamp_ambiguous
         and all(row[0] is not None and row[1] is not None and row[2] is not None for row in vectors)
     )
     full_ready = (
-        not timestamp_ambiguous
+        not invalid_only and not timestamp_ambiguous
         and all(row[0] is not None and row[2] is not None for row in vectors)
     )
     working_lower = sum(epoch.working_lower_bound for epoch in epochs)
@@ -341,6 +346,7 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
                 row[0] is not None and row[1] is not None and row[2] is not None for row in vectors
             )),
             ("timestamp_ambiguous", timestamp_ambiguous),
+            ("invalid_legacy_token_vector", invalid_only),
         ) if present
     )
     full_caveats = tuple(
@@ -349,6 +355,7 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
                 row[0] is not None and row[2] is not None for row in vectors
             )),
             ("timestamp_ambiguous", timestamp_ambiguous),
+            ("invalid_legacy_token_vector", invalid_only),
         ) if present
     )
     working = MetricFact(
@@ -364,7 +371,8 @@ def aggregate_project_facts(connection: sqlite3.Connection, project_id: str) -> 
                   b.cached_input_tokens,b.output_tokens,b.reasoning_tokens
              FROM session_edges e
             JOIN rollout_sessions s ON s.session_key=e.child_key
-             LEFT JOIN fork_baselines b ON b.child_key=e.child_key
+             LEFT JOIN fork_baselines b
+               ON b.child_key=e.child_key AND b.vector_valid=1
             WHERE s.project_id=? AND e.parent_key IS NOT NULL
               AND e.confidence_kind='confirmed' AND e.confidence=1.0""",
         (project_id,),

@@ -78,6 +78,7 @@ def _task_fingerprint(
         "root": plan.root_key,
         "status": plan.status,
         "cutoff": _iso(plan.cutoff_at),
+        "cutoff_timing_provenance": plan.cutoff_timing_provenance,
         "sessions": list(plan.session_ids),
         "recorded": list(recorded.vector.values),
         "unique": list(unique.vector.values),
@@ -145,7 +146,9 @@ def _assemble_project(
     for plan in plans:
         metrics = aggregate_stored_task_tree(
             store.connection, project_id=project_id, root_id=plan.root_key,
-            cutoff_at=plan.cutoff_at, include_ambiguous_lineage=False,
+            cutoff_at=plan.cutoff_at,
+            cutoff_timing_provenance=plan.cutoff_timing_provenance,
+            include_ambiguous_lineage=False,
         )
         deltas, diagnostics = build_token_deltas(store.connection, project_id, plan)
         semantic = semantic_assembly(

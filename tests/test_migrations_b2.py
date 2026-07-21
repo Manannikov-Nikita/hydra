@@ -3,10 +3,14 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from hydra_codex.metrics import aggregate_project, aggregate_project_facts
 from hydra_codex.storage import MIGRATIONS, V2_TRIGGER_STATEMENTS, HydraStore, StorageUnavailable
+from hydra_codex.task_tree_storage import aggregate_stored_task_tree
+from hydra_codex.token_selection import refresh_token_source_selection
 
 
 def seed_rollout_rows(connection: sqlite3.Connection, version: int) -> None:
@@ -251,6 +255,68 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                         ):
                             HydraStore(database)
 
+    def test_legacy_impossible_token_vectors_are_quarantined_before_reporting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for carrier in ("token_snapshots", "fork_baselines"):
+                with self.subTest(carrier=carrier):
+                    database = root / f"invalid-{carrier}.sqlite3"
+                    build_schema(database, 25)
+                    connection = sqlite3.connect(database)
+                    connection.execute(
+                        f"UPDATE {carrier} SET input_tokens=10,cached_input_tokens=20"
+                    )
+                    connection.commit()
+                    connection.close()
+
+                    store = HydraStore(database)
+                    try:
+                        aggregate_stored_task_tree(
+                            store.connection,
+                            project_id="preserved-project",
+                            root_id="legacy-rollout-session",
+                            cutoff_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+                        )
+                        if carrier == "token_snapshots":
+                            refresh_token_source_selection(
+                                store.connection, "preserved-project",
+                            )
+                            row = store.connection.execute(
+                                """SELECT vector_valid,contributes_total,selection_caveat
+                                     FROM token_snapshots"""
+                            ).fetchone()
+                            self.assertEqual(tuple(row), (
+                                0, 0, "invalid_legacy_token_vector",
+                            ))
+                            facts = aggregate_project_facts(
+                                store.connection, "preserved-project",
+                            )
+                            metrics = aggregate_project(
+                                store.connection, "preserved-project",
+                            )
+                            self.assertIsNone(facts["recorded_working"].value)
+                            self.assertEqual(
+                                facts["recorded_working"].known_lower_bound, 0,
+                            )
+                            self.assertEqual(
+                                facts["recorded_working"].provenance, "estimated",
+                            )
+                            self.assertIn(
+                                "invalid_legacy_token_vector",
+                                facts["recorded_working"].caveats,
+                            )
+                            self.assertIsNone(metrics.recorded_working_tokens)
+                            self.assertEqual(metrics.provenance, "estimated")
+                        else:
+                            row = store.connection.execute(
+                                "SELECT vector_valid,validation_caveat FROM fork_baselines"
+                            ).fetchone()
+                            self.assertEqual(tuple(row), (
+                                0, "invalid_legacy_token_vector",
+                            ))
+                    finally:
+                        store.close()
+
     def test_tool_candidate_migration_normalizes_legacy_app_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "legacy-app-tool-status.sqlite3"
@@ -358,6 +424,68 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_v24_migration_does_not_call_failed_app_execution_a_non_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for exit_status in (1, None):
+                with self.subTest(exit_status=exit_status):
+                    database = root / f"legacy-failed-{exit_status}.sqlite3"
+                    build_schema(database, 23)
+                    connection = sqlite3.connect(database)
+                    try:
+                        if exit_status is None:
+                            connection.execute(
+                                """UPDATE rollout_test_runs
+                                      SET exit_status=NULL,outcome='unknown',
+                                          failure_cause='unknown',completeness='intent_only'
+                                    WHERE evidence_key='legacy-evidence'"""
+                            )
+                        else:
+                            connection.execute(
+                                """UPDATE rollout_test_runs
+                                      SET exit_status=1,outcome='failed',
+                                          failure_cause='product_failure',completeness='complete'
+                                    WHERE evidence_key='legacy-evidence'"""
+                            )
+                        connection.execute(
+                            """INSERT INTO codex_event_sources(
+                                   source_digest,project_id,schema_version,source_format,
+                                   line_count,byte_count)
+                               VALUES ('legacy-failed-source','preserved-project',
+                                       'codex.app-server/v2','app_server',1,1)"""
+                        )
+                        connection.execute(
+                            """INSERT INTO codex_events(
+                                   source_digest,source_ordinal,event_key,project_id,
+                                   source_format,schema_version,event_type,session_key,
+                                   status,provenance,tool_call_key,tool_name,tool_category,
+                                   tool_phase,tool_status,tool_exit_status)
+                               VALUES ('legacy-failed-source',1,'legacy-failed-event',
+                                       'preserved-project','app_server','codex.app-server/v2',
+                                       'item_completed','legacy-rollout-session','failed',
+                                       'exact','legacy-call','exec_command','tool',
+                                       'completed','failed',?)""",
+                            (exit_status,),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                    store = HydraStore(database)
+                    try:
+                        candidates = [
+                            row[0] for row in store.connection.execute(
+                                """SELECT candidate_kind
+                                     FROM test_evidence_candidates
+                                    WHERE session_key='legacy-rollout-session'
+                                      AND tool_call_key='legacy-call'"""
+                            )
+                        ]
+                        self.assertIn("evidence", candidates)
+                        self.assertNotIn("non_execution", candidates)
+                    finally:
+                        store.close()
 
     def test_interrupted_migration_rolls_back_and_clean_retry_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

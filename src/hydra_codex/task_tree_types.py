@@ -218,6 +218,7 @@ class LifecycleObservation:
     logical_source_key: str | None = None
     source_ordinal: int | None = None
     turn_key: str | None = None
+    timing_provenance: Provenance = "exact"
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
@@ -233,6 +234,7 @@ class LifecycleObservation:
             not isinstance(self.turn_key, str) or not self.turn_key
         ):
             raise ValueError("lifecycle turn key must be non-empty text or null")
+        validate_provenance(self.timing_provenance, "lifecycle timing provenance")
 
 
 @dataclass(frozen=True)

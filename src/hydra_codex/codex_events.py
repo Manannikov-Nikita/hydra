@@ -144,6 +144,8 @@ class CodexEventFact:
     provenance: str = "exact"
     parent_thread_key: str | None = None
     child_thread_key: str | None = None
+    lifecycle_at: str | None = None
+    lifecycle_at_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -193,7 +195,10 @@ def _safe_epoch_ns(value: int, divisor: int) -> tuple[str, int] | None:
 def _app_timestamp(method: str, params: Mapping[str, Any]) -> tuple[str | None, int | None, bool]:
     millisecond_field = "startedAtMs" if method == "item/started" else "completedAtMs" if method == "item/completed" else None
     if millisecond_field is not None:
-        value = _nonnegative(params.get(millisecond_field))
+        raw = params.get(millisecond_field)
+        if raw is None:
+            return None, None, False
+        value = _nonnegative(raw)
         converted = _safe_epoch_ns(value, 1_000_000) if value is not None else None
         return (*converted, False) if converted is not None else (None, None, True)
     turn = params.get("turn")
@@ -207,7 +212,10 @@ def _app_timestamp(method: str, params: Mapping[str, Any]) -> tuple[str | None, 
         return (*converted, False) if converted is not None else (None, None, True)
     thread = params.get("thread")
     if method == "thread/started" and isinstance(thread, Mapping):
-        value = _nonnegative(thread.get("createdAt"))
+        raw = thread.get("createdAt")
+        if raw is None:
+            return None, None, False
+        value = _nonnegative(raw)
         converted = _safe_epoch_ns(value, 1_000_000_000) if value is not None else None
         return (*converted, False) if converted is not None else (None, None, True)
     return None, None, False
@@ -341,12 +349,16 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
     turn_id = params.get("turnId") if isinstance(params.get("turnId"), str) else turn.get("id") if turn else None
     if not isinstance(thread, str) or not thread:
         return None, ("invalid_envelope",)
-    observed_at, observed_ns, bad_time = _app_timestamp(method, params)
+    payload_at, payload_ns, bad_time = _app_timestamp(method, params)
+    observed_at, observed_ns = payload_at, payload_ns
+    lifecycle_at, lifecycle_at_ns = (
+        (payload_at, payload_ns)
+        if method in {"thread/started", "turn/started", "turn/completed"}
+        else (None, None)
+    )
     if receipt_timestamp is not None:
         observed_at, observed_ns = receipt_timestamp
-    issues: list[str] = ["invalid_timestamp"] if receipt_invalid or (
-        receipt_timestamp is None and bad_time
-    ) else []
+    issues: list[str] = ["invalid_timestamp"] if receipt_invalid or bad_time else []
     item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
     contents = _app_contents(item, turn, key)
     if thread_object is not None and (preview := _content("user_prompt", thread_object.get("preview"), key)) is not None:
@@ -383,6 +395,7 @@ def _parse_app(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tuple
         _opaque(key, "thread", thread), _opaque(key, "turn", turn_id), duration,
         status, snapshots, tool, contents, "exact" if observed_at is not None else "estimated",
         _opaque(key, "thread", parent), _opaque(key, "thread", child),
+        lifecycle_at, lifecycle_at_ns,
     ), tuple(issues)
 
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 from .redaction import project_task_family, validate_task_family
@@ -18,6 +19,13 @@ from .storage import HydraStore
 
 PILOT_SCHEMA = "hydra.pilot/v1"
 AUDIT_SCHEMA = "hydra.audit/v1"
+_NANOSECONDS_PER_SECOND = 1_000_000_000
+_RFC3339_NANOSECOND = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[Tt]"
+    r"(?P<clock>\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<offset>[Zz]|[+-]\d{2}:\d{2})$"
+)
 
 
 def _iso(value: datetime) -> str:
@@ -31,6 +39,50 @@ def _timestamp(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("stored pilot timestamp is not timezone-aware")
     return parsed
+
+
+def _datetime_nanoseconds(value: datetime) -> int:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("pilot timestamp must be timezone-aware")
+    observed = value.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = observed - epoch
+    whole_seconds = delta.days * 86_400 + delta.seconds
+    return (
+        whole_seconds * _NANOSECONDS_PER_SECOND
+        + observed.microsecond * 1_000
+    )
+
+
+def _stored_timestamp_nanoseconds(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    match = _RFC3339_NANOSECOND.fullmatch(value)
+    if match is None:
+        return None
+    offset = match.group("offset")
+    if offset in {"Z", "z"}:
+        offset = "+00:00"
+    else:
+        offset_hour = int(offset[1:3])
+        offset_minute = int(offset[4:6])
+        if (
+            offset_hour > 23
+            or offset_minute > 59
+            or offset == "-00:00"
+        ):
+            return None
+    try:
+        observed = datetime.fromisoformat(
+            f'{match.group("date")}T{match.group("clock")}{offset}'
+        )
+    except ValueError:
+        return None
+    fraction = match.group("fraction") or ""
+    return (
+        _datetime_nanoseconds(observed)
+        + int(fraction.ljust(9, "0") or "0")
+    )
 
 
 def _canonical(value: object) -> str:
@@ -212,38 +264,49 @@ def _initial_present(
     store: HydraStore,
     project_id: str,
     sessions: tuple[str, ...],
-    cutoff_at: str,
+    cutoff_at: datetime,
 ) -> bool:
     placeholders = ",".join("?" for _ in sessions)
-    return store.connection.execute(
-        f"""SELECT 1 FROM annotations
+    cutoff_nanoseconds = _datetime_nanoseconds(cutoff_at)
+    rows = store.connection.execute(
+        f"""SELECT observed_at FROM annotations
               WHERE project_id=? AND session_id IN ({placeholders})
                 AND kind='phase' AND phase='understand' AND cause='prompt'
-                AND provenance='derived' AND observed_at<=?
-              LIMIT 1""",
-        (project_id, *sessions, cutoff_at),
-    ).fetchone() is not None
+                AND provenance='derived'""",
+        (project_id, *sessions),
+    )
+    return any(
+        observed is not None and observed <= cutoff_nanoseconds
+        for (value,) in rows
+        if (observed := _stored_timestamp_nanoseconds(value)) is not None
+    )
 
 
 def _transport_facts(
     store: HydraStore,
     project_id: str,
     sessions: tuple[str, ...],
-    cutoff_at: str,
+    cutoff_at: datetime,
 ) -> tuple[int, int, list[int]]:
     placeholders = ",".join("?" for _ in sessions)
+    cutoff_nanoseconds = _datetime_nanoseconds(cutoff_at)
     rows = store.connection.execute(
-        f"""SELECT disposition,latency_ms
+        f"""SELECT disposition,latency_ms,staged_at
                FROM annotation_transport_events
               WHERE project_id=? AND session_key IN ({placeholders})
-                AND staged_at<=?
               ORDER BY staged_order,transport_key""",
-        (project_id, *sessions, cutoff_at),
+        (project_id, *sessions),
     )
     accepted = 0
     failures = 0
     latencies: list[int] = []
-    for disposition, latency in rows:
+    for disposition, latency, staged_at in rows:
+        observed = _stored_timestamp_nanoseconds(staged_at)
+        if observed is None:
+            failures += 1
+            continue
+        if observed > cutoff_nanoseconds:
+            continue
         if disposition == "accepted":
             accepted += 1
             latencies.append(int(latency))
@@ -291,13 +354,21 @@ def _threshold_results(
 
 
 def pilot_status(
-    store: HydraStore, project_id: str, pilot_id: str,
+    store: HydraStore,
+    project_id: str,
+    pilot_id: str,
+    *,
+    _window_end: datetime | None = None,
 ) -> PilotStatus:
     """Build and persist the current deterministic cohort snapshot."""
     run = _pilot_run(store, project_id, pilot_id)
+    if _window_end is not None:
+        _iso(_window_end)
+        if run.closed_at is not None and _window_end != run.closed_at:
+            raise ValueError("closed pilot window cannot be overridden")
     tasks = list_reconciled_tasks(store, project_id)
     sessions_by_ref = _task_sessions(store, project_id)
-    window_end = run.closed_at
+    window_end = run.closed_at if run.closed_at is not None else _window_end
     eligible = tuple(
         task for task in tasks
         if task.status == "complete"
@@ -318,11 +389,11 @@ def pilot_status(
             cutoff = _iso(task.last_activity_at)
             instrumented = task.semantic.annotations.instrumented
             initial_missing = not _initial_present(
-                store, project_id, sessions, cutoff,
+                store, project_id, sessions, task.last_activity_at,
             )
             finish_missing = task.semantic.annotations.finish_count == 0
             accepted, failures, latencies = _transport_facts(
-                store, project_id, sessions, cutoff,
+                store, project_id, sessions, task.last_activity_at,
             )
             all_latencies.extend(latencies)
             family = (
@@ -481,6 +552,19 @@ def _reject_json_constant(_value: str) -> None:
     raise ValueError("audit JSON contains a non-finite value")
 
 
+class _DuplicateAuditKey(ValueError):
+    pass
+
+
+def _unique_audit_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateAuditKey(key)
+        result[key] = value
+    return result
+
+
 def close_pilot(
     store: HydraStore,
     *,
@@ -499,8 +583,17 @@ def close_pilot(
         raise ValueError("audit JSON is unavailable")
     raw = path.read_bytes()
     try:
-        audit = json.loads(raw, parse_constant=_reject_json_constant)
-    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        audit = json.loads(
+            raw,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_audit_object,
+        )
+    except (
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateAuditKey,
+    ) as error:
         raise ValueError("audit JSON is invalid") from error
     if not isinstance(audit, dict) or audit.get("schema_version") != AUDIT_SCHEMA:
         raise ValueError("audit JSON has an unsupported schema")
@@ -519,8 +612,10 @@ def close_pilot(
             "SELECT 1 FROM pilot_receipts WHERE pilot_id=?", (pilot_id,),
         ).fetchone() is not None:
             raise ValueError("pilot already has a receipt")
-        live = pilot_status(store, project_id, pilot_id).as_dict()
-        if embedded != live:
+        live = pilot_status(
+            store, project_id, pilot_id, _window_end=now,
+        ).as_dict()
+        if _canonical(embedded) != _canonical(live):
             raise ValueError("audit pilot snapshot is stale or inconsistent")
         if embedded.get("snapshot_digest") != live["snapshot_digest"]:
             raise ValueError("audit pilot digest is inconsistent")

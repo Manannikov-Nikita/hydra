@@ -489,6 +489,9 @@ def semantic_assembly(
         annotations.task_family, annotations, coverage, classified, unclassified, unclassified_full,
         unclassified_reasoning, dict(phase_working), dict(phase_full),
         dict(phase_reasoning), annotations.marker_count, staged["self_report_missing"],
-        staged["semantic_conflict"] + len(old_conflicts | set(annotations.detected_conflicts)), schema_count,
+        staged["semantic_conflict"]
+        + len(old_conflicts | set(annotations.detected_conflicts))
+        + int(annotations.family_conflict),
+        schema_count,
         tuple(sorted(diagnostics)), dict(diagnostics),
     )

@@ -160,6 +160,29 @@ def finish_turn(
     )
 
 
+def deliver_spooled_annotation(
+    store: HydraStore,
+    keys: Pseudonymizer,
+    capability: str,
+    *,
+    request_key: str,
+    observed_at: str,
+    payload: Mapping[str, Any],
+) -> AnnotationWrite:
+    """Persist one staged model payload with host-assigned sequence and time."""
+    model = ModelAnnotationInput.from_mapping(payload)
+    return _record_model_annotation(
+        store,
+        keys,
+        capability,
+        request_key=request_key,
+        sequence=None,
+        observed_at=observed_at,
+        model=model,
+        provenance=Provenance.MODEL_REPORTED,
+    )
+
+
 def _require_observation_after_issue(binding: Mapping[str, Any], observed_at: str) -> None:
     observed = timestamp(observed_at)
     if observed < timestamp(binding["binding_created_at"]):
@@ -186,7 +209,30 @@ def _record_annotation(
     *,
     provenance: Provenance,
 ) -> AnnotationWrite:
-    observed = timestamp(context.observed_at)
+    return _record_model_annotation(
+        store,
+        keys,
+        capability,
+        request_key=context.request_key,
+        sequence=context.sequence,
+        observed_at=context.observed_at,
+        model=model,
+        provenance=provenance,
+    )
+
+
+def _record_model_annotation(
+    store: HydraStore,
+    keys: Pseudonymizer,
+    capability: str,
+    *,
+    request_key: str,
+    sequence: int | None,
+    observed_at: str,
+    model: ModelAnnotationInput,
+    provenance: Provenance,
+) -> AnnotationWrite:
+    observed = timestamp(observed_at)
     capability_key = capability_digest(keys, capability)
     canonical_payload = json.dumps(
         _annotation_payload(model), sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -196,16 +242,28 @@ def _record_annotation(
 
     with store.rollout_transaction() as connection:
         binding = binding_for_capability(connection, capability_key)
-        _require_observation_after_issue(binding, context.observed_at)
+        _require_observation_after_issue(binding, observed_at)
         request_digest = "hreq_v1_" + keys.digest(
-            "event", f"{binding['turn_key']}/{context.request_key}"
+            "event", f"{binding['turn_key']}/{request_key}"
+        )
+        by_request = connection.execute(
+            "SELECT * FROM annotation_receipts WHERE request_digest=?", (request_digest,)
+        ).fetchone()
+        assigned_sequence = (
+            int(by_request["sequence"])
+            if sequence is None and by_request is not None
+            else int(binding["last_sequence"]) + 1
+            if sequence is None
+            else sequence
+        )
+        context = TrustedAnnotationContext(
+            request_key=request_key,
+            sequence=assigned_sequence,
+            observed_at=observed_at,
         )
         by_sequence = connection.execute(
             "SELECT * FROM annotation_receipts WHERE turn_key=? AND sequence=?",
             (binding["turn_key"], context.sequence),
-        ).fetchone()
-        by_request = connection.execute(
-            "SELECT * FROM annotation_receipts WHERE request_digest=?", (request_digest,)
         ).fetchone()
         previous = connection.execute(
             "SELECT observed_at FROM annotations WHERE turn_id=? AND sequence=?",

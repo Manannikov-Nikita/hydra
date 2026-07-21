@@ -16,6 +16,7 @@ from hydra_codex.annotation_core import (
     TrustedAnnotationContext,
     finish_turn,
 )
+from hydra_codex.cli import main as cli_main
 from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.storage import HydraStore
 from integrations.codex.hook import handle_event, run
@@ -67,6 +68,7 @@ class CodexHookTests(unittest.TestCase):
         self.key_path = self.root / "private" / "rollout-hmac.key"
         self.environ = {
             "HOME": str(self.root),
+            "TMPDIR": str(self.root / "tmp"),
             "HYDRA_DATABASE_PATH": str(self.database),
             "HYDRA_INSTALLATION_KEY_PATH": str(self.key_path),
         }
@@ -92,6 +94,22 @@ class CodexHookTests(unittest.TestCase):
     def instruction(self, response: dict[str, object]) -> str:
         self.capability(response)
         return str(response["hookSpecificOutput"]["additionalContext"])
+
+    def stage_finish(self, capability: str) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        status = cli_main(
+            [
+                "annotate", "--cwd", str(self.root),
+                "--kind", "finish", "--phase", "test_full",
+                "--cause", "final_verification", "--outcome", "success",
+                "--scope-change", "none", "--task-family", "codex-hooks",
+                "--confidence", "1", "--note", "verified",
+            ],
+            stdin=io.StringIO(), stdout=stdout, stderr=stderr,
+            environ={**self.environ, "HYDRA_TURN_CAPABILITY": capability},
+        )
+        self.assertEqual((status, stderr.getvalue()), (0, ""))
 
     def test_user_prompt_opens_private_turn_and_returns_only_short_model_instruction(self) -> None:
         raw_prompt = "Do not persist this secret prompt: sk-private-example"
@@ -181,7 +199,7 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(len({row["turn_key"] for row in rows}), 2)
 
     def test_prompt_then_stop_retry_records_missing_without_blocking_again(self) -> None:
-        self.handle(prompt_payload(cwd=str(self.root)))
+        original = self.capability(self.handle(prompt_payload(cwd=str(self.root))))
 
         first = self.handle(stop_payload(cwd=str(self.root)))
         second = self.handle(stop_payload(cwd=str(self.root), active=True))
@@ -189,7 +207,21 @@ class CodexHookTests(unittest.TestCase):
 
         self.assertEqual(first.get("decision"), "block")
         self.assertEqual(set(first), {"decision", "reason"})
-        self.assertIn("finish", str(first["reason"]))
+        reason = str(first["reason"])
+        retry = re.search(r"hcap_v1_[A-Za-z0-9_-]{43}", reason)
+        self.assertIsNotNone(retry)
+        self.assertNotEqual(retry.group(0), original)
+        self.assertIn(
+            'env PYTHONPATH="$(git rev-parse --show-toplevel)/src" '
+            f"HYDRA_TURN_CAPABILITY={retry.group(0)} python3.12 -m hydra_codex annotate",
+            reason,
+        )
+        for required in (
+            "--kind finish", "--phase test_full", "--cause final_verification",
+            "--outcome success", "--scope-change none", "--task-family unclassified",
+            "--confidence 1", '--note "done"',
+        ):
+            self.assertIn(required, reason)
         self.assertEqual(second, {})
         self.assertEqual(third, {})
         store = HydraStore(self.database)
@@ -205,6 +237,32 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual([row["fact_kind"] for row in facts], ["self_report_missing"])
         self.assertEqual(binding["state"], "finished")
         self.assertNotIn(b"private assistant response", self.database.read_bytes())
+
+    def test_stop_drains_staged_finish_before_retry_decision(self) -> None:
+        self.handle(prompt_payload(cwd=str(self.root)))
+        first = self.handle(stop_payload(cwd=str(self.root)))
+        retry = re.search(
+            r"hcap_v1_[A-Za-z0-9_-]{43}", str(first["reason"]),
+        )
+        self.assertIsNotNone(retry)
+        self.stage_finish(retry.group(0))
+
+        response = self.handle(stop_payload(cwd=str(self.root), active=True))
+
+        self.assertEqual(response, {})
+        self.assertEqual(tuple((self.root / "tmp" / "Hydra" / "spool").glob("*.json")), ())
+        store = HydraStore(self.database)
+        try:
+            kinds = [row[0] for row in store.connection.execute(
+                "SELECT kind FROM annotations ORDER BY sequence"
+            )]
+            missing = store.connection.execute(
+                "SELECT COUNT(*) FROM semantic_fact_staging WHERE fact_kind='self_report_missing'"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(kinds, ["phase", "finish"])
+        self.assertEqual(missing, 0)
 
     def test_stop_after_capability_expiry_renews_the_command_already_given_to_model(self) -> None:
         prompt = handle_event(
@@ -406,8 +464,10 @@ class CodexHookManifestTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         manifest = json.loads((root / ".codex" / "hooks.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(set(manifest["hooks"]), {"UserPromptSubmit", "Stop"})
-        for event in ("UserPromptSubmit", "Stop"):
+        self.assertEqual(
+            set(manifest["hooks"]), {"UserPromptSubmit", "PostToolUse", "Stop"},
+        )
+        for event in ("UserPromptSubmit", "PostToolUse", "Stop"):
             self.assertEqual(len(manifest["hooks"][event]), 1)
             group = manifest["hooks"][event][0]
             self.assertNotIn("matcher", group)

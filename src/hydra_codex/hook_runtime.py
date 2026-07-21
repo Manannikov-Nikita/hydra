@@ -19,6 +19,7 @@ from .annotation_core import (
     observe_stop,
     record_initial_understand,
 )
+from .annotation_spool import drain_annotations
 from .project import ProjectResolution, resolve_project
 from .rollout_identity import Pseudonymizer
 from .storage import HydraStore, StorageUnavailable, default_database_path
@@ -31,7 +32,6 @@ ProjectResolver = Callable[[Path | str], ProjectResolution]
 
 _INITIAL_REQUEST_DOMAIN = "codex-hook-initial-understand-v1"
 _CAPABILITY_LIFETIME = timedelta(hours=24)
-_STOP_REASON = "Hydra: add one finish annotation with outcome before ending this turn."
 _INSTALLED_ANNOTATION_COMMAND = (
     "HYDRA_TURN_CAPABILITY={capability} hydra-codex annotate"
 )
@@ -150,6 +150,15 @@ def _instruction(capability: str, annotation_command: str) -> dict[str, object]:
     }
 
 
+def _finish_command(capability: str, annotation_command: str) -> str:
+    return (
+        annotation_command.replace("{capability}", capability)
+        + " --kind finish --phase test_full --cause final_verification"
+        + " --outcome success --scope-change none --task-family unclassified"
+        + ' --confidence 1 --note "done"'
+    )
+
+
 def _handle_prompt(
     payload: Mapping[str, Any], project: ProjectResolution, store: HydraStore,
     keys: Pseudonymizer, now: datetime, observed_at: str, annotation_command: str,
@@ -181,6 +190,7 @@ def _handle_prompt(
 def _handle_stop(
     payload: Mapping[str, Any], project: ProjectResolution, store: HydraStore,
     keys: Pseudonymizer, now: datetime, observed_at: str,
+    annotation_command: str,
 ) -> dict[str, object]:
     active = payload.get("stop_hook_active")
     if not isinstance(active, bool):
@@ -201,7 +211,11 @@ def _handle_stop(
         retry_expires_at=issued.expires_at,
     )
     if state is StopState.RETRY_REQUIRED:
-        return {"decision": "block", "reason": _STOP_REASON}
+        command = _finish_command(issued.token, annotation_command)
+        return {
+            "decision": "block",
+            "reason": f"Hydra: run `{command}` before ending this turn.",
+        }
     return {}
 
 
@@ -224,7 +238,7 @@ def handle_event(
         if not isinstance(payload, Mapping):
             return {}
         event = payload.get("hook_event_name")
-        if event not in {"UserPromptSubmit", "Stop"}:
+        if event not in {"UserPromptSubmit", "PostToolUse", "Stop"}:
             return {}
         cwd = _required_text(payload, "cwd")
         _required_text(payload, "session_id")
@@ -247,11 +261,25 @@ def handle_event(
         keys = key_loader(_key_path(environment))
         store = _open_store(store_factory, _database_path(environment))
         try:
+            drain_annotations(
+                environment,
+                store,
+                keys,
+                project_id=project.project_id,
+                session_id=_required_text(payload, "session_id"),
+                turn_id=_required_text(payload, "turn_id"),
+                observed_at=observed_at,
+                allow_session_turns=event == "UserPromptSubmit",
+            )
+            if event == "PostToolUse":
+                return {}
             if event == "UserPromptSubmit":
                 return _handle_prompt(
                     payload, project, store, keys, now, observed_at, annotation_command,
                 )
-            return _handle_stop(payload, project, store, keys, now, observed_at)
+            return _handle_stop(
+                payload, project, store, keys, now, observed_at, annotation_command,
+            )
         finally:
             store.close()
     except Exception:

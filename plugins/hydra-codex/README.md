@@ -8,7 +8,10 @@ The bundled MCP server advertises `hydra.report` by default. It deliberately
 does not advertise `hydra.annotate` until Codex supplies an authenticated turn
 transport outside model-controlled arguments. During the pilot, the
 capability-bearing CLI command injected by the cooperative hook is the only
-supported annotation path.
+supported annotation path. That command atomically stages a private envelope
+under `$TMPDIR/Hydra/spool`; `PostToolUse` normally drains it, while
+`UserPromptSubmit` and `Stop` provide safety-net drains. The model-side command
+never writes the global Hydra database directly.
 
 The report tool returns the same `hydra.report/v3` contract as the CLI,
 including provenance-aware semantic markers, deterministic test evidence,
@@ -51,5 +54,5 @@ The checkout-local `.codex/hooks.json` remains the uninstalled fallback for the
 Hydra repository itself. Its wrapper loads `src/` directly and delegates to the
 same packaged runtime. When both sources are present, the plugin marks its hook
 source and suppresses itself for events owned by the project manifest. This
-keeps one model instruction and one Stop decision without disabling unrelated
-project hooks.
+keeps one model instruction, one annotation drain, and one Stop decision without
+disabling unrelated project hooks.

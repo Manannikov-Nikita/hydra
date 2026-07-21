@@ -89,8 +89,12 @@ total.
 `hydra-codex annotate` is normally invoked through the capability-bearing
 command injected by `UserPromptSubmit`; it rejects calls without the hook-issued
 turn capability. A model changes phase or reports a blocker with a short
-marker, then sends one `finish` marker before its final response. Hooks, not the
-model, bind project/session/turn identity and timestamps.
+marker, then sends one `finish` marker before its final response. The CLI writes
+only that semantic payload, capability, and an opaque request nonce to a private
+atomic envelope under `$TMPDIR/Hydra/spool`; it never opens the global Hydra
+database. `PostToolUse`, with `UserPromptSubmit` and `Stop` as safety nets,
+drains acknowledged envelopes. Hooks, not the model, bind project/session/turn
+identity, sequence, and timestamps.
 
 This is a cooperative instrumentation boundary, not local-process
 authentication: another process running as the same user can invoke the hook
@@ -157,9 +161,13 @@ subtracted from the observed total.
 
 ## Hook lifecycle
 
-`UserPromptSubmit` creates an opaque turn capability and records the initial
-`understand` phase. A later annotation closes the preceding semantic interval.
-At `Stop`, a missing finish marker requests exactly one retry. If the second
+`UserPromptSubmit` first drains pending annotations, then creates an opaque turn
+capability and records the initial `understand` phase. `PostToolUse` performs the
+normal drain; only a successfully persisted envelope is deleted. Malformed,
+expired, duplicate, and out-of-order envelopes are moved to a private quarantine
+with categorical diagnostics. A later annotation closes the preceding semantic
+interval. `Stop` drains before deciding. On the first missing finish it returns
+one complete executable finish command with a fresh capability. If the repeated
 Stop still has no finish marker, Hydra records `self_report_missing` and fails
 open so telemetry never blocks the user.
 

@@ -24,6 +24,7 @@ class PackagedHookEntrypointTests(unittest.TestCase):
         self.environment = dict(os.environ)
         self.environment.update({
             "HOME": str(self.root),
+            "TMPDIR": str(self.root / "tmp"),
             "HYDRA_DATABASE_PATH": str(self.root / "private" / "hydra.sqlite3"),
             "HYDRA_INSTALLATION_KEY_PATH": str(self.root / "private" / "rollout.key"),
             "PYTHONPATH": str(ROOT / "src"),
@@ -69,6 +70,17 @@ class PackagedHookEntrypointTests(unittest.TestCase):
             "last_assistant_message": "must not be returned",
         }
 
+    def post_tool(self, *, session: str, turn: str) -> dict[str, object]:
+        return {
+            "hook_event_name": "PostToolUse",
+            "session_id": session,
+            "turn_id": turn,
+            "cwd": str(self.root),
+            "tool_name": "exec_command",
+            "tool_input": "must not be returned",
+            "tool_response": "must not be returned",
+        }
+
     def assert_prompt_shape(self, response: dict[str, object]) -> str:
         self.assertEqual(set(response), {"hookSpecificOutput"})
         output = response["hookSpecificOutput"]
@@ -93,6 +105,9 @@ class PackagedHookEntrypointTests(unittest.TestCase):
         ))
         self.assertIn('PYTHONPATH="$(git rev-parse --show-toplevel)/src"', context)
         self.assertIn("python3.12 -m hydra_codex annotate", context)
+        self.assertEqual(self.invoke(
+            command, self.post_tool(session="local-session", turn="local-turn"),
+        ), {})
         self.assert_stop_shape(self.invoke(
             command, self.stop(session="local-session", turn="local-turn"),
         ))
@@ -146,6 +161,10 @@ class PackagedHookEntrypointTests(unittest.TestCase):
             self.assertEqual(json.loads(completed.stdout), {
                 "command": "annotate", "status": "ok",
             })
+            self.assertEqual(self.invoke(
+                command,
+                self.post_tool(session="lifecycle-session", turn="lifecycle-turn"),
+            ), {})
 
         self.assertEqual(self.invoke(
             command, self.stop(session="lifecycle-session", turn="lifecycle-turn"),
@@ -193,8 +212,10 @@ class PluginHookContractTests(unittest.TestCase):
         hooks_path = plugin_root / "hooks" / "hooks.json"
         self.assertTrue(hooks_path.is_file())
         hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
-        self.assertEqual(set(hooks["hooks"]), {"UserPromptSubmit", "Stop"})
-        for event in ("UserPromptSubmit", "Stop"):
+        self.assertEqual(
+            set(hooks["hooks"]), {"UserPromptSubmit", "PostToolUse", "Stop"},
+        )
+        for event in ("UserPromptSubmit", "PostToolUse", "Stop"):
             self.assertEqual(len(hooks["hooks"][event]), 1)
             group = hooks["hooks"][event][0]
             self.assertNotIn("matcher", group)
@@ -206,6 +227,13 @@ class PluginHookContractTests(unittest.TestCase):
                 "env HYDRA_CODEX_HOOK_SOURCE=plugin hydra-codex-hook",
             )
             self.assertLessEqual(command["timeout"], 10)
+
+        project_hooks = json.loads(
+            (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            set(project_hooks["hooks"]), {"UserPromptSubmit", "PostToolUse", "Stop"},
+        )
 
     def test_plugin_documents_post_pilot_installation_precondition(self) -> None:
         plugin_readme = (

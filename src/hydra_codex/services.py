@@ -5,12 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-import secrets
 
-from .annotation_core import annotate_with_capability, finish_turn
-from .annotation_persistence import binding_for_capability
-from .annotation_types import CapabilityRejected, TrustedAnnotationContext, capability_digest
-from .contracts import AnnotationKind, ModelAnnotationInput
+from .annotation_spool import stage_annotation
+from .contracts import ModelAnnotationInput
 from .project import ProjectResolution, resolve_project
 from .report_operations import compare_reports
 from .report_renderers import (
@@ -127,32 +124,8 @@ class LocalCommandServices:
         database_path: Path | None,
         cwd: Path,
     ) -> object:
-        project = self._project(cwd)
-        keys = self._keys()
-        store = HydraStore(self._database_path(database_path))
-        try:
-            with store.rollout_transaction() as connection:
-                observed_at = _utc_now(self._clock)
-                binding = binding_for_capability(
-                    connection, capability_digest(keys, capability),
-                )
-                if binding["project_id"] != project.project_id:
-                    raise CapabilityRejected(
-                        "annotation capability belongs to another project"
-                    )
-                context = TrustedAnnotationContext(
-                    request_key="cli-v1-" + secrets.token_urlsafe(24),
-                    sequence=int(binding["last_sequence"]) + 1,
-                    observed_at=observed_at,
-                )
-                payload = _payload(annotation)
-                if annotation.kind is AnnotationKind.FINISH:
-                    return finish_turn(store, keys, capability, context, payload)
-                return annotate_with_capability(
-                    store, keys, capability, context, payload,
-                )
-        finally:
-            store.close()
+        _ = database_path, cwd
+        return stage_annotation(self._environ, capability, _payload(annotation))
 
     def reconcile(self, database_path: Path | None, cwd: Path) -> object:
         from .reconcile_engine import reconcile_project

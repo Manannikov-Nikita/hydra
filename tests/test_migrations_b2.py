@@ -170,7 +170,15 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             store = HydraStore(database)
             self.addCleanup(store.close)
 
-            self.assertEqual(store.schema_version(), 29)
+            self.assertEqual(store.schema_version(), 30)
+            self.assertTrue({
+                "transport_key", "disposition", "diagnostic_category",
+                "staged_at_ns", "latency_ms",
+            }.issubset({
+                row[1] for row in store.connection.execute(
+                    "PRAGMA table_info(annotation_transport_events)"
+                )
+            }))
             self.assertEqual(
                 {
                     row[1] for row in store.connection.execute(

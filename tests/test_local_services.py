@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime, timezone
 import io
 import json
@@ -50,6 +49,7 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.key = self.root / "private" / "rollout-hmac.key"
         self.environ = {
             "HOME": str(self.root),
+            "TMPDIR": str(self.root / "tmp"),
             "HYDRA_DATABASE_PATH": str(self.database),
             "HYDRA_INSTALLATION_KEY_PATH": str(self.key),
         }
@@ -137,14 +137,70 @@ class LocalCommandServiceTests(unittest.TestCase):
         )
         return source
 
+    def test_annotation_cli_stages_only_private_semantics_without_writing_sqlite(self) -> None:
+        capability = self._open_turn()
+        before = self.database.read_bytes()
+
+        result = self._annotate(capability)
+
+        self.assertEqual(result, (0, '{"command":"annotate","status":"ok"}\n', ""))
+        self.assertEqual(self.database.read_bytes(), before)
+        spool = self.root / "tmp" / "Hydra" / "spool"
+        self.assertEqual(spool.stat().st_mode & 0o777, 0o700)
+        envelopes = tuple(spool.glob("*.json"))
+        self.assertEqual(len(envelopes), 1)
+        self.assertEqual(envelopes[0].stat().st_mode & 0o777, 0o600)
+        envelope = json.loads(envelopes[0].read_text(encoding="utf-8"))
+        self.assertEqual(set(envelope), {"capability", "payload", "request_nonce"})
+        self.assertEqual(envelope["capability"], capability)
+        self.assertRegex(envelope["request_nonce"], r"^hreq_v1_[A-Za-z0-9_-]{32}$")
+        self.assertEqual(set(envelope["payload"]), {
+            "kind", "phase", "cause", "scope_change", "task_family",
+            "confidence", "note",
+        })
+        serialized = json.dumps(envelope, sort_keys=True)
+        for forbidden in (
+            "private-session", "private-turn", "observed_at", "sequence",
+            "project_id", "session_id", "turn_id",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
     def test_default_cli_accepts_hook_capability_for_phase_and_finish(self) -> None:
         capability = self._open_turn()
 
         phase = self._annotate(capability)
+        phase_drain = handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "private-session",
+                "turn_id": "private-turn",
+                "cwd": str(self.project),
+                "tool_name": "exec_command",
+                "tool_input": "private command",
+                "tool_response": "private output",
+            },
+            environ=self.environ,
+            clock=lambda: datetime(2026, 7, 21, 0, 1, tzinfo=timezone.utc),
+        )
         finish = self._annotate(capability, finish=True)
+        finish_drain = handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "private-session",
+                "turn_id": "private-turn",
+                "cwd": str(self.project),
+                "tool_name": "exec_command",
+                "tool_input": "private command",
+                "tool_response": "private output",
+            },
+            environ=self.environ,
+            clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
+        )
 
         self.assertEqual(phase, (0, '{"command":"annotate","status":"ok"}\n', ""))
         self.assertEqual(finish, (0, '{"command":"annotate","status":"ok"}\n', ""))
+        self.assertEqual((phase_drain, finish_drain), ({}, {}))
+        self.assertEqual(tuple((self.root / "tmp" / "Hydra" / "spool").glob("*.json")), ())
         store = HydraStore(self.database)
         try:
             rows = store.connection.execute(
@@ -163,10 +219,13 @@ class LocalCommandServiceTests(unittest.TestCase):
         ])
         self.assertEqual(tuple(binding), ("finished", 2))
         database = self.database.read_bytes()
-        for secret in (capability, "private-session", "private-turn", "never persist this prompt"):
+        for secret in (
+            capability, "private-session", "private-turn", "never persist this prompt",
+            "private command", "private output",
+        ):
             self.assertNotIn(secret.encode(), database)
 
-    def test_default_cli_rejects_capability_bound_to_another_project(self) -> None:
+    def test_host_hook_not_cli_enforces_capability_project_binding(self) -> None:
         capability = self._open_turn()
         foreign = self.root / "foreign"
         (foreign / ".hydra").mkdir(parents=True)
@@ -186,8 +245,20 @@ class LocalCommandServiceTests(unittest.TestCase):
         )
 
         self.assertEqual((code, stdout, stderr), (
-            1, "", "hydra-codex: command failed\n",
+            0, '{"command":"annotate","status":"ok"}\n', "",
         ))
+        staged = tuple((self.root / "tmp" / "Hydra" / "spool").glob("*.json"))
+        self.assertEqual(len(staged), 1)
+        self.assertEqual(handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "private-session", "turn_id": "private-turn",
+                "cwd": str(foreign),
+            },
+            environ=self.environ,
+            clock=lambda: datetime(2026, 7, 21, 0, 1, tzinfo=timezone.utc),
+        ), {})
+        self.assertTrue(staged[0].exists())
         store = HydraStore(self.database)
         try:
             self.assertEqual(store.connection.execute(
@@ -195,6 +266,16 @@ class LocalCommandServiceTests(unittest.TestCase):
             ).fetchone()[0], 1)
         finally:
             store.close()
+        self.assertEqual(handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "private-session", "turn_id": "private-turn",
+                "cwd": str(self.project),
+            },
+            environ=self.environ,
+            clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
+        ), {})
+        self.assertFalse(staged[0].exists())
 
     def test_concurrent_phase_writes_allocate_distinct_sequences(self) -> None:
         capability = self._open_turn()
@@ -224,7 +305,17 @@ class LocalCommandServiceTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             writes = tuple(pool.map(write_phase, range(2)))
 
-        self.assertEqual({item.sequence for item in writes}, {1, 2})
+        self.assertEqual(len({item.name for item in writes}), 2)
+        self.assertTrue(all(item.is_file() for item in writes))
+        self.assertEqual(handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "private-session", "turn_id": "private-turn",
+                "cwd": str(self.project),
+            },
+            environ=self.environ,
+            clock=lambda: datetime(2026, 7, 21, 0, 1, tzinfo=timezone.utc),
+        ), {})
         store = HydraStore(self.database)
         try:
             rows = store.connection.execute(
@@ -276,46 +367,27 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertEqual(seen_databases, [self.database])
         self.assertEqual(seen_keys, [self.key])
 
-    def test_annotation_clock_is_read_inside_the_write_transaction(self) -> None:
+    def test_annotation_cli_does_not_assign_time_or_open_sqlite(self) -> None:
         capability = self._open_turn()
-        stores: list[TrackingStore] = []
-
-        class TrackingStore(HydraStore):
-            transaction_active = False
-
-            @contextmanager
-            def rollout_transaction(self):
-                with super().rollout_transaction() as connection:
-                    self.transaction_active = True
-                    try:
-                        yield connection
-                    finally:
-                        self.transaction_active = False
-
-        def factory(path):
-            store = TrackingStore(path)
-            stores.append(store)
-            return store
+        before = self.database.read_bytes()
 
         def clock() -> datetime:
-            self.assertTrue(stores)
-            self.assertTrue(stores[-1].transaction_active)
-            return datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc)
+            raise AssertionError("model-side annotation must not assign trusted time")
 
         service = LocalCommandServices(environ=self.environ, clock=clock)
-        with mock.patch("hydra_codex.services.HydraStore", side_effect=factory):
-            result = service.annotate(
-                ModelAnnotationInput.from_mapping({
-                    "kind": "phase", "phase": "review", "cause": "plan",
-                    "scope_change": "none", "task_family": "local-services",
-                    "confidence": 1.0, "note": "transaction ordering",
-                }),
-                capability,
-                self.database,
-                self.project,
-            )
+        result = service.annotate(
+            ModelAnnotationInput.from_mapping({
+                "kind": "phase", "phase": "review", "cause": "plan",
+                "scope_change": "none", "task_family": "local-services",
+                "confidence": 1.0, "note": "transaction ordering",
+            }),
+            capability,
+            self.database,
+            self.project,
+        )
 
-        self.assertEqual(result.sequence, 1)
+        self.assertTrue(result.is_file())
+        self.assertEqual(self.database.read_bytes(), before)
 
     def test_ingest_reconcile_report_and_compare_work_without_injected_services(self) -> None:
         self._rollout("task-a", second=10, input_tokens=100)

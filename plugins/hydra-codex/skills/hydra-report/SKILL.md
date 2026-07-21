@@ -41,6 +41,11 @@ configured hooks add identity and time in the cooperative local workflow. This
 is hook-attested telemetry, not cryptographic authentication against another
 process running as the same user.
 
+The CLI stages one private atomic envelope under `$TMPDIR/Hydra/spool`; it does
+not open Hydra's global SQLite database. `PostToolUse` drains normally, with
+`UserPromptSubmit` and `Stop` as safety nets. Stop drains before it decides
+whether to return the one permitted fresh capability-bearing finish retry.
+
 Use a lowercase categorical `task_family` such as `multiple-answer-quiz`, not a
 prompt excerpt, user identifier, path, email address, UUID, or secret.
 Use a public terminal category such as `quiz`, `workflow`, `architecture`,

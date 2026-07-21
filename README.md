@@ -20,6 +20,17 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
+For the complete verification suite, including real wheel and source-archive
+content checks, install the declared test tooling and run:
+
+```bash
+.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m unittest discover
+```
+
+The `test` extra is build-time tooling only; installed Hydra runtime remains
+dependency-free.
+
 The repository opts in with a stable, non-secret project identifier:
 
 ```toml
@@ -186,6 +197,13 @@ stage. Its MCP server advertises `hydra.report` by default. It deliberately does
 not advertise `hydra.annotate` until Codex provides an authenticated turn
 transport outside model-controlled MCP arguments. The cooperative capability CLI
 remains the annotation fallback.
+
+Wheel and source distributions ship that same canonical bundle. Use
+`hydra-codex-plugin path` to locate it, or
+`hydra-codex-plugin materialize /absolute/new/path` to copy it without
+overwriting an existing directory, then activate the returned directory through
+the plugin installation flow provided by the Codex host. The equivalent Python
+API is `hydra_codex.plugin_bundle`.
 
 `$hydra-report` describes how to reconcile, compare, and explain facts without
 upgrading estimates into exact measurements. A skill guides workflow and

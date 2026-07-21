@@ -24,6 +24,29 @@ this plugin is enabled. The hook manifest invokes the installed
 `hydra-codex-mcp`. If either executable is unavailable, install the Python
 package first; do not rewrite the plugin to select a turn by `cwd`.
 
+## Post-pilot activation
+
+The Python wheel and source distribution contain this complete plugin bundle.
+After installing `hydra-codex` in the environment that starts Codex, locate the
+installed, immutable bundle with:
+
+```bash
+hydra-codex-plugin path
+```
+
+Pass that returned directory to the plugin installation flow exposed by the
+Codex host. If the host or operator needs a separately managed copy, materialize
+the same complete bundle into a new directory and activate that directory:
+
+```bash
+hydra-codex-plugin materialize /absolute/path/to/hydra-codex-plugin
+```
+
+Materialization refuses to overwrite an existing path. Python integrations may
+use `hydra_codex.plugin_bundle.plugin_bundle_path` and
+`hydra_codex.plugin_bundle.materialize_plugin_bundle` for the same operations.
+Neither operation enables the post-pilot plugin automatically.
+
 The checkout-local `.codex/hooks.json` remains the uninstalled fallback for the
 Hydra repository itself. Its wrapper loads `src/` directly and delegates to the
 same packaged runtime. When both sources are present, the plugin marks its hook

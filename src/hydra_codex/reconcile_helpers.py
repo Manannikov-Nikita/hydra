@@ -6,6 +6,7 @@ from datetime import datetime
 import sqlite3
 from typing import Iterable
 
+from .lifecycle_timing import is_later_attempt_start
 from .reconcile_types import TaskPlan
 from .task_tree_storage import _optional_timestamp
 from .task_tree_types import LifecycleObservation
@@ -13,33 +14,11 @@ from .task_tree_types import LifecycleObservation
 
 def has_later_root_start(
     root: str, lifecycle: Iterable[LifecycleObservation],
-    completions: Iterable[LifecycleObservation],
+    completion: LifecycleObservation,
 ) -> bool:
-    completion = max(completions, key=lambda item: (
-        item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1,
-    ))
     return any(
-        item.session_id == root and item.kind == "task_started" and (
-            item.observed_at > completion.observed_at
-            or (
-                item.observed_at == completion.observed_at
-                and (
-                    (
-                        item.logical_source_key == completion.logical_source_key
-                        and item.source_ordinal is not None
-                        and completion.source_ordinal is not None
-                        and item.source_ordinal > completion.source_ordinal
-                    )
-                    or (
-                        item.logical_source_key != completion.logical_source_key
-                        and (
-                            item.turn_key is None or completion.turn_key is None
-                            or item.turn_key != completion.turn_key
-                        )
-                    )
-                )
-            )
-        )
+        item.session_id == root and item.kind == "task_started"
+        and is_later_attempt_start(item, completion)
         for item in lifecycle
     )
 

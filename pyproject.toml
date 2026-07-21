@@ -9,10 +9,38 @@ description = "Private, hybrid telemetry contracts for Codex work."
 requires-python = ">=3.12"
 dependencies = []
 
+[project.optional-dependencies]
+test = [
+    "build>=1.2",
+    "setuptools>=68",
+]
+
 [project.scripts]
 hydra-codex = "hydra_codex.__main__:main"
 hydra-codex-hook = "hydra_codex.hook_runtime:main"
 hydra-codex-mcp = "hydra_codex.mcp_server:main"
+hydra-codex-plugin = "hydra_codex.plugin_bundle:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/hydra-codex/plugins/hydra-codex" = [
+    "plugins/hydra-codex/.mcp.json",
+    "plugins/hydra-codex/README.md",
+]
+"share/hydra-codex/plugins/hydra-codex/.codex-plugin" = [
+    "plugins/hydra-codex/.codex-plugin/*",
+]
+"share/hydra-codex/plugins/hydra-codex/hooks" = [
+    "plugins/hydra-codex/hooks/*",
+]
+"share/hydra-codex/plugins/hydra-codex/skills/hydra-report" = [
+    "plugins/hydra-codex/skills/hydra-report/SKILL.md",
+]
+"share/hydra-codex/plugins/hydra-codex/skills/hydra-report/agents" = [
+    "plugins/hydra-codex/skills/hydra-report/agents/*",
+]
+"share/hydra-codex/plugins/hydra-codex/skills/hydra-report/references" = [
+    "plugins/hydra-codex/skills/hydra-report/references/*",
+]

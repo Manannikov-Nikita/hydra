@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import sqlite3
 from typing import Iterable
 
+from .lifecycle_timing import select_lifecycle_boundary
 from .reconcile_annotations import (
     AnnotationFacts,
     build_annotation_facts,
@@ -123,12 +124,12 @@ def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tupl
                 for start in starts.get(root, ())
             )
         ]
-        if eligible_completions and not has_later_root_start(
-            root, lifecycle, eligible_completions,
+        completion, _timing_conflicts = select_lifecycle_boundary(
+            eligible_completions, starts.get(root, ()),
+        )
+        if completion is not None and not has_later_root_start(
+            root, lifecycle, completion,
         ):
-            completion = max(eligible_completions, key=lambda item: (
-                item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1,
-            ))
             cutoff = completion.observed_at
             status = "complete"
             cutoff_source = completion.logical_source_key

@@ -190,10 +190,17 @@ def _upsert_session(
     explicit_starts = {
         "thread_started", "turn_started", "conversation_started", "user_prompt",
     }
-    starts = [
-        event.observed_at for event in events
-        if event.observed_at is not None and event.event_type in explicit_starts
-    ]
+    starts = []
+    for event in events:
+        if event.event_type not in explicit_starts:
+            continue
+        app_lifecycle_start = (
+            event.source_format == "app_server"
+            and event.event_type in {"thread_started", "turn_started"}
+        )
+        value = event.lifecycle_at if app_lifecycle_start else event.observed_at
+        if value is not None:
+            starts.append(value)
     started = None
     for value in starts:
         started = _iso_min(started, value)

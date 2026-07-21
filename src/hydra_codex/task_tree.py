@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Iterable
 
+from .lifecycle_timing import is_later_attempt_start, select_lifecycle_boundary
 from .task_tree_types import (
     ActivityObservation,
     FileObservation,
@@ -164,32 +165,16 @@ def aggregate_task_tree(
         item for item in lifecycle_items
         if item.session_id == root_id and item.kind == "task_complete"
     )
-    completion = max(
-        completions,
-        key=lambda item: (item.observed_at, item.source_ordinal if item.source_ordinal is not None else -1),
-    ) if completions else None
+    root_starts = tuple(
+        item for item in lifecycle_items
+        if item.session_id == root_id and item.kind == "task_started"
+    )
+    completion, lifecycle_timing_conflicts = select_lifecycle_boundary(
+        completions, root_starts,
+    )
     if completion is not None and any(
-        item.session_id == root_id and item.kind == "task_started" and (
-            item.observed_at > completion.observed_at
-            or (
-                item.observed_at == completion.observed_at
-                and (
-                    (
-                        item.logical_source_key == completion.logical_source_key
-                        and item.source_ordinal is not None
-                        and completion.source_ordinal is not None
-                        and item.source_ordinal > completion.source_ordinal
-                    )
-                    or (
-                        item.logical_source_key != completion.logical_source_key
-                        and (
-                            item.turn_key is None or completion.turn_key is None
-                            or item.turn_key != completion.turn_key
-                        )
-                    )
-                )
-            )
-        )
+        item.session_id == root_id and item.kind == "task_started"
+        and is_later_attempt_start(item, completion)
         for item in lifecycle_items
     ):
         completion = None
@@ -339,6 +324,11 @@ def aggregate_task_tree(
         for kind in sorted(unconfirmed_kinds)
     )
     recorded_caveats = (f"missing_final_token:{missing_finals}",) if missing_finals else ()
+    timing_conflict_caveat = (
+        (f"lifecycle_timing_conflict:{lifecycle_timing_conflicts}",)
+        if lifecycle_timing_conflicts else ()
+    )
+    recorded_caveats += timing_conflict_caveat
     if estimated_lifecycle_cutoff:
         recorded_caveats += ("estimated_lifecycle_cutoff_from_receipt",)
     if timestamp_missing:
@@ -385,6 +375,15 @@ def aggregate_task_tree(
         int((cutoff - root.started_at).total_seconds() * 1000)
         if root.started_at is not None else None
     )
+    wall_timing_caveats = timing_conflict_caveat
+    agent_timing_caveats = timing_conflict_caveat
+    if estimated_lifecycle_cutoff:
+        wall_timing_caveats += ("estimated_lifecycle_cutoff_from_receipt",)
+        agent_timing_caveats += ("estimated_lifecycle_cutoff_from_receipt",)
+    if wall_clock_ms is None:
+        wall_timing_caveats += ("missing_root_session_start",)
+    if missing_starts:
+        agent_timing_caveats += (f"missing_session_start:{missing_starts}",)
 
     if isinstance(classified_working_tokens, bool) or classified_working_tokens < 0:
         raise ValueError("classified_working_tokens must be non-negative")
@@ -448,23 +447,13 @@ def aggregate_task_tree(
         ScalarFact(
             wall_clock_ms,
             "estimated" if wall_clock_ms is None or estimated_lifecycle_cutoff else "derived",
-            (
-                ("estimated_lifecycle_cutoff_from_receipt",)
-                if wall_clock_ms is not None and estimated_lifecycle_cutoff
-                else (() if wall_clock_ms is not None else ("missing_root_session_start",))
-            ),
+            wall_timing_caveats,
             0,
         ),
         ScalarFact(
             None if missing_starts else agent_time_lower,
             "estimated" if missing_starts or estimated_lifecycle_cutoff else "derived",
-            (
-                (f"missing_session_start:{missing_starts}",)
-                if missing_starts else (
-                    ("estimated_lifecycle_cutoff_from_receipt",)
-                    if estimated_lifecycle_cutoff else ()
-                )
-            ),
+            agent_timing_caveats,
             agent_time_lower,
         ),
         ScalarFact(coverage, "derived" if coverage is not None else "estimated", () if coverage is not None else ("unknown_working_tokens",)),

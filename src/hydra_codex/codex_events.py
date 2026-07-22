@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .rollout_identity import Pseudonymizer
 from .rollout_privacy import canonical_timestamp
@@ -568,33 +568,44 @@ def _parse_otel(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tupl
     ), tuple(issues)
 
 
-def read_codex_event_jsonl(path: Path | str, *, schema: str, privacy_key: bytes) -> CodexEventBatch:
-    """Read a local JSONL source without writing, sorting, or aggregating its facts."""
+def read_codex_event_stream(
+    lines: Iterable[bytes], *, schema: str, privacy_key: bytes,
+) -> CodexEventBatch:
+    """Parse one byte-line stream without writing, sorting, or aggregating facts."""
     if schema not in _SCHEMAS:
         raise EventAdapterError(f"unsupported event schema: {schema!r}")
     if not isinstance(privacy_key, bytes) or len(privacy_key) != 32:
         raise EventAdapterError("privacy key must be exactly 32 bytes")
-    source = Path(path)
-    if not source.is_file():
-        raise EventAdapterError("event source must be a regular file")
     events: list[CodexEventFact] = []
     issues: list[AdapterIssue] = []
     parser = _parse_app if schema == APP_SERVER_V2 else _parse_otel
-    with source.open("rb") as handle:
-        for ordinal, raw_line in enumerate(handle, start=1):
-            event_key = _digest(privacy_key, "event", raw_line)
-            try:
-                text = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                issues.append(AdapterIssue(ordinal, event_key, "invalid_encoding"))
-                continue
-            try:
-                envelope = json.loads(text)
-            except json.JSONDecodeError:
-                issues.append(AdapterIssue(ordinal, event_key, "malformed_json"))
-                continue
-            event, codes = parser(envelope, ordinal, event_key, privacy_key)
-            if event is not None:
-                events.append(event)
-            issues.extend(AdapterIssue(ordinal, event_key, code) for code in codes)
+    for ordinal, raw_line in enumerate(lines, start=1):
+        if not isinstance(raw_line, bytes):
+            raise EventAdapterError("event stream must yield bytes")
+        event_key = _digest(privacy_key, "event", raw_line)
+        try:
+            text = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            issues.append(AdapterIssue(ordinal, event_key, "invalid_encoding"))
+            continue
+        try:
+            envelope = json.loads(text)
+        except json.JSONDecodeError:
+            issues.append(AdapterIssue(ordinal, event_key, "malformed_json"))
+            continue
+        event, codes = parser(envelope, ordinal, event_key, privacy_key)
+        if event is not None:
+            events.append(event)
+        issues.extend(AdapterIssue(ordinal, event_key, code) for code in codes)
     return CodexEventBatch(schema, tuple(events), tuple(issues))
+
+
+def read_codex_event_jsonl(path: Path | str, *, schema: str, privacy_key: bytes) -> CodexEventBatch:
+    """Read a local JSONL source without writing, sorting, or aggregating its facts."""
+    source = Path(path)
+    if not source.is_file():
+        raise EventAdapterError("event source must be a regular file")
+    with source.open("rb") as handle:
+        return read_codex_event_stream(
+            handle, schema=schema, privacy_key=privacy_key,
+        )

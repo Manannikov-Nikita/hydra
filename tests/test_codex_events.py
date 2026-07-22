@@ -12,6 +12,7 @@ from hydra_codex.codex_events import (
     ContentFingerprint,
     EventAdapterError,
     TokenSnapshotFact,
+    read_codex_event_stream,
     read_codex_event_jsonl,
 )
 from hydra_codex.rollout_identity import Pseudonymizer
@@ -22,6 +23,28 @@ KEY = b"event-adapter-fixture-key-000001"
 
 
 class CodexEventAdapterTests(unittest.TestCase):
+    def test_stream_adapter_parses_one_pass_bytes_without_a_path(self) -> None:
+        event = {
+            "method": "thread/started",
+            "params": {"thread": {"id": "stream-thread", "createdAt": 1720000000}},
+        }
+        iterations = 0
+
+        def lines():
+            nonlocal iterations
+            iterations += 1
+            self.assertEqual(iterations, 1)
+            yield (json.dumps(event) + "\n").encode("utf-8")
+
+        batch = read_codex_event_stream(
+            lines(), schema=APP_SERVER_V2, privacy_key=KEY,
+        )
+
+        self.assertEqual(iterations, 1)
+        self.assertEqual(len(batch.events), 1)
+        self.assertEqual(batch.events[0].source_ordinal, 1)
+        self.assertNotIn("stream-thread", repr(batch))
+
     def test_token_snapshot_rejects_an_impossible_cached_input_relation(self) -> None:
         with self.assertRaisesRegex(ValueError, "cached input"):
             TokenSnapshotFact("thread_total", True, 10, 20, 1, 0, 11)

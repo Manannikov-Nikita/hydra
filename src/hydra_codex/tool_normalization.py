@@ -214,7 +214,10 @@ def _hydra_command(command: str) -> bool:
         index += 1
     if index >= len(tokens):
         return False
-    commands = {"annotate", "compare", "ingest", "reconcile", "report"}
+    commands = {
+        "annotate", "audit", "compare", "doctor", "ingest", "pilot",
+        "reconcile", "report", "storage",
+    }
     executable = tokens[index].rsplit("/", 1)[-1]
     if executable == "hydra-codex":
         return index + 1 < len(tokens) and tokens[index + 1] in commands

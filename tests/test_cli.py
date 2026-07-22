@@ -32,6 +32,8 @@ class FakeServices:
         self.compare_content = "rendered comparison"
         self.pilot_content = "rendered pilot"
         self.audit_content = "rendered audit"
+        self.doctor_content = "rendered doctor"
+        self.storage_content = "rendered storage"
         self.failure: Exception | None = None
 
     def _fail(self) -> None:
@@ -78,6 +80,21 @@ class FakeServices:
         self.calls.append(("audit", pilot_id, output_format, database_path, cwd))
         return self.audit_content
 
+    def doctor(self, output_format, database_path, cwd):
+        self._fail()
+        self.calls.append(("doctor", output_format, database_path, cwd))
+        return self.doctor_content
+
+    def storage_status(self, output_format, database_path, cwd):
+        self._fail()
+        self.calls.append(("storage_status", output_format, database_path, cwd))
+        return self.storage_content
+
+    def storage_compact(self, output_format, database_path, cwd):
+        self._fail()
+        self.calls.append(("storage_compact", output_format, database_path, cwd))
+        return self.storage_content
+
 
 def invoke(
     argv, *, stdin="", environ=None, services=None, installation_key_path=None,
@@ -119,6 +136,8 @@ class CliParserTests(unittest.TestCase):
             ["audit", "--pilot", "hpilot_v1_public", "--format", "xml"],
             ["compare", "task_a"],
             ["annotate", "--capability", "secret"],
+            ["doctor", "--format", "html"],
+            ["storage", "compact", "--confirmation", "wrong"],
         )
         for argv in cases:
             with self.subTest(argv=argv):
@@ -131,7 +150,10 @@ class CliParserTests(unittest.TestCase):
     def test_help_is_success(self) -> None:
         code, stdout, stderr = invoke(["--help"])
         self.assertEqual((code, stderr), (0, ""))
-        for command in ("ingest", "annotate", "reconcile", "report", "compare", "audit"):
+        for command in (
+            "ingest", "annotate", "reconcile", "report", "compare", "audit",
+            "doctor", "storage",
+        ):
             self.assertIn(command, stdout)
 
     def test_module_entrypoint_uses_safe_parser_exit_without_leaking_argv(self) -> None:
@@ -290,6 +312,29 @@ class ServiceDelegationTests(unittest.TestCase):
                 self.services.calls[-1][:3],
                 ("audit", "hpilot_v1_public", "html"),
             )
+
+    def test_doctor_and_storage_commands_delegate_safe_arguments(self) -> None:
+        code, stdout, stderr = invoke(
+            ["doctor", "--format", "markdown"], services=self.services,
+        )
+        self.assertEqual((code, stdout, stderr), (0, "rendered doctor\n", ""))
+        self.assertEqual(self.services.calls[-1][:2], ("doctor", "markdown"))
+
+        code, stdout, stderr = invoke(
+            ["storage", "status", "--format", "json"], services=self.services,
+        )
+        self.assertEqual((code, stdout, stderr), (0, "rendered storage\n", ""))
+        self.assertEqual(self.services.calls[-1][:2], ("storage_status", "json"))
+
+        code, stdout, stderr = invoke(
+            [
+                "storage", "compact", "--confirmation", "compact hydra database",
+                "--format", "markdown",
+            ],
+            services=self.services,
+        )
+        self.assertEqual((code, stdout, stderr), (0, "rendered storage\n", ""))
+        self.assertEqual(self.services.calls[-1][:2], ("storage_compact", "markdown"))
 
     def test_service_errors_do_not_echo_exception_paths_or_secrets(self) -> None:
         private = "/private/database.sqlite3 capability-secret raw-note"

@@ -13,7 +13,7 @@ from hydra_codex.migrations_p16 import P16_MIGRATIONS
 from hydra_codex.migrations_q17 import Q17_MIGRATIONS
 from hydra_codex.pilot import close_pilot, pilot_status, start_pilot
 from hydra_codex.reconcile_engine import list_reconciled_tasks
-from hydra_codex.storage import HydraStore, StorageUnavailable
+from hydra_codex.storage import MIGRATIONS, HydraStore, StorageUnavailable
 from tests.test_migrations_b2 import build_schema
 from tests.test_report_semantic_trends import (
     BASE,
@@ -116,7 +116,7 @@ class PilotControllerMigrationTests(unittest.TestCase):
 
             store = HydraStore(database)
             try:
-                self.assertEqual(store.schema_version(), 35)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
                     1,

@@ -19,6 +19,9 @@ class ReadmeContractTests(unittest.TestCase):
             "hydra-codex report",
             "hydra-codex compare",
             "hydra-codex audit",
+            "hydra-codex doctor",
+            "hydra-codex storage status",
+            "hydra-codex storage compact",
         ):
             self.assertIn(command, normalized)
         self.assertIn("~/library/application support/hydra/hydra.sqlite3", normalized)
@@ -34,11 +37,25 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("test-evidence cross-tab", normalized)
         self.assertIn("awaiting_receipt", normalized)
         self.assertIn("hydra.audit/v1", normalized)
+        self.assertIn("hydra.comparison/v2", normalized)
+        self.assertIn("comparable", normalized)
+        self.assertIn("partial", normalized)
+        self.assertIn("not_comparable", normalized)
+        self.assertIn("unknown", normalized)
+        self.assertIn('confirmation "compact hydra database"', normalized)
+        self.assertIn("growth_baseline_unavailable", normalized)
+        self.assertIn("pilot close", normalized)
+        self.assertIn("`verified` or `rejected`", normalized)
         self.assertIn("does not drain pending annotations", normalized)
         self.assertIn("ambiguous shell expressions contribute no guessed file facts", normalized)
         self.assertIn("python -m pip install -e .", normalized)
         self.assertNotIn("pip install --no-build-isolation", normalized)
         self.assertNotIn("rendering, hooks, mcp, and plugin behavior remain intentionally out of scope", normalized)
+
+    def test_local_diagnostics_remain_outside_the_plugin_mcp_surface(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = " ".join(readme.lower().split())
+        self.assertIn("doctor and storage maintenance remain cli-only", normalized)
 
     def test_readme_links_the_authoritative_codex_surfaces(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

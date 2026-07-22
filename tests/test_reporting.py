@@ -18,6 +18,7 @@ from hydra_codex.report_renderers import (
     render_report_collection,
 )
 from hydra_codex.reporting import (
+    COMPARISON_SCHEMA,
     REPORT_SCHEMA,
     NumericFact,
     build_trend_window,
@@ -214,7 +215,7 @@ class CompareAndRendererTests(unittest.TestCase):
         comparison = compare_reports(zero, current)
         fact = comparison.metrics["deduplicated_working_tokens"]
 
-        self.assertEqual(comparison.schema_version, REPORT_SCHEMA)
+        self.assertEqual(comparison.schema_version, COMPARISON_SCHEMA)
         self.assertEqual(fact.delta.value, 100)
         self.assertIsNone(fact.percent_change.value)
         self.assertIn("zero_baseline_percentage_unavailable", fact.percent_change.caveats)

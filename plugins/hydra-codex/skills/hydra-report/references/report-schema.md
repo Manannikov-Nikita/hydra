@@ -46,3 +46,20 @@ future, and equal-time inputs do not.
 Shell-derived `file_reads` and `file_writes` remain observed lower bounds.
 Ambiguous compound commands, expansions, unsafe workdirs, and deferred calls
 produce no inferred file facts rather than false precision.
+
+## Pair comparison
+
+`hydra.comparison/v2` retains the full public metric set for both task reports,
+their raw deltas, and raw percent change. Interpretation is gated by `verdict`:
+
+- `comparable`: complete same-family tasks, no scope exclusion, usable facts,
+  and a current verified pilot receipt for both reports;
+- `partial`: the family is compatible, but the receipt or evidence is not
+  sufficient for a complete claim;
+- `not_comparable`: known family mismatch or explicit scope/comparison guard;
+- `unknown`: the task family or completion state is unavailable.
+
+`reasons` contains privacy-safe categorical codes. Raw percent change is never
+an automatic claim of improvement, regression, or causality. The comparison
+continues to state that instrumentation was not subtracted from observed token
+totals.

@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from hydra_codex.storage import HydraStore, StorageUnavailable
+from hydra_codex.storage import MIGRATIONS, HydraStore, StorageUnavailable
 from hydra_codex.reconcile_engine import list_reconciled_reports
 from hydra_codex.services import LocalCommandServices
 from tests.test_report_semantic_trends import BASE, PROJECT, StoredReportScenario, stamp
@@ -19,7 +19,7 @@ class PilotMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = HydraStore(Path(temporary) / "hydra.sqlite3")
             try:
-                self.assertEqual(store.schema_version(), 35)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 tables = {
                     str(row[0])
                     for row in store.connection.execute(

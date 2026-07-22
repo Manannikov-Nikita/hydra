@@ -133,6 +133,7 @@ class AuditRendererTests(unittest.TestCase):
         self.assertIn("@media (max-width: 640px)", rendered)
         self.assertIn("@media print", rendered)
         self.assertIn("overflow-wrap: anywhere", rendered)
+        self.assertIn(".task-columns > * { min-width: 0; }", rendered)
         self.assertIn("<main", rendered)
         self.assertIn("Evidence appendix", rendered)
         self.assertNotIn("<script", lowered)

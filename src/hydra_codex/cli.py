@@ -54,6 +54,18 @@ class CommandServices(Protocol):
         database_path: Path | None, cwd: Path,
     ) -> str: ...
 
+    def doctor(
+        self, output_format: str, database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
+    def storage_status(
+        self, output_format: str, database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
+    def storage_compact(
+        self, output_format: str, database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
 
 class _SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
@@ -69,6 +81,12 @@ def _positive_integer(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("positive integer required")
     return parsed
+
+
+def _compact_confirmation(value: str) -> str:
+    if value != "compact hydra database":
+        raise argparse.ArgumentTypeError("exact confirmation required")
+    return value
 
 
 def _common_options(parser: argparse.ArgumentParser) -> None:
@@ -112,6 +130,26 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--pilot", required=True)
     audit.add_argument("--format", choices=("json", "markdown", "html"), default="json")
     audit.add_argument("--output")
+
+    doctor = commands.add_parser("doctor")
+    _common_options(doctor)
+    doctor.add_argument("--format", choices=("json", "markdown"), default="json")
+
+    storage = commands.add_parser("storage")
+    storage_commands = storage.add_subparsers(dest="storage_command", required=True)
+    storage_status = storage_commands.add_parser("status")
+    _common_options(storage_status)
+    storage_status.add_argument(
+        "--format", choices=("json", "markdown"), default="json",
+    )
+    storage_compact = storage_commands.add_parser("compact")
+    _common_options(storage_compact)
+    storage_compact.add_argument(
+        "--format", choices=("json", "markdown"), default="json",
+    )
+    storage_compact.add_argument(
+        "--confirmation", type=_compact_confirmation, required=True,
+    )
 
     pilot = commands.add_parser("pilot")
     pilot_commands = pilot.add_subparsers(dest="pilot_command", required=True)
@@ -325,13 +363,19 @@ def _render(
         content = services.audit(
             arguments.pilot, arguments.format, database, cwd,
         )
-    else:
+    elif arguments.command == "compare":
         content = services.compare(
             arguments.left, arguments.right, arguments.format, database, cwd,
         )
+    elif arguments.command == "doctor":
+        content = services.doctor(arguments.format, database, cwd)
+    elif arguments.storage_command == "status":
+        content = services.storage_status(arguments.format, database, cwd)
+    else:
+        content = services.storage_compact(arguments.format, database, cwd)
     if not isinstance(content, str):
         raise RuntimeError("render service returned invalid content")
-    if arguments.output:
+    if getattr(arguments, "output", None):
         atomic_write(arguments.output, content)
     else:
         _write_rendered(stdout, content)

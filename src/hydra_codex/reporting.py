@@ -16,6 +16,7 @@ from .task_tree_types import ScalarFact, TokenVectorFact, validate_provenance
 
 
 REPORT_SCHEMA = "hydra.report/v3"
+COMPARISON_SCHEMA = "hydra.comparison/v2"
 _PUBLIC_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z")
 _UNITS = frozenset({"tokens", "milliseconds", "count", "ratio", "percent"})
@@ -416,14 +417,25 @@ class ComparisonReport:
     schema_version: str
     baseline_ref: str
     current_ref: str
+    verdict: str
+    reasons: tuple[str, ...]
     metrics: Mapping[str, MetricComparison]
     caveats: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != REPORT_SCHEMA:
-            raise ValueError("unsupported report schema")
+        if self.schema_version != COMPARISON_SCHEMA:
+            raise ValueError("unsupported comparison schema")
         if any(_PUBLIC_REF.fullmatch(value) is None for value in (self.baseline_ref, self.current_ref)):
             raise ValueError("comparison references must be opaque")
+        if self.verdict not in {"comparable", "partial", "not_comparable", "unknown"}:
+            raise ValueError("invalid comparison verdict")
+        _caveats(self.reasons)
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("comparison reasons must be unique")
+        if self.verdict == "comparable" and self.reasons:
+            raise ValueError("comparable verdict cannot have reasons")
+        if self.verdict != "comparable" and not self.reasons:
+            raise ValueError("non-comparable verdict requires reasons")
         _caveats(self.caveats)
         if any(_SAFE_CODE.fullmatch(name) is None for name in self.metrics):
             raise ValueError("comparison metric names must be privacy-safe codes")
@@ -436,6 +448,8 @@ class ComparisonReport:
             "schema_version": self.schema_version,
             "baseline_ref": self.baseline_ref,
             "current_ref": self.current_ref,
+            "verdict": self.verdict,
+            "reasons": list(self.reasons),
             "metrics": {name: fact.as_dict() for name, fact in self.metrics.items()},
             "caveats": list(self.caveats),
         }

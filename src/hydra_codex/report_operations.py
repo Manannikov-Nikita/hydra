@@ -114,17 +114,79 @@ def _comparison(baseline: NumericFact, current: NumericFact) -> MetricComparison
 
 def compare_reports(baseline: TaskReport, current: TaskReport) -> ComparisonReport:
     """Compare public facts without subtracting Hydra instrumentation from tokens."""
-    from .reporting import REPORT_SCHEMA, ComparisonReport
+    from .reporting import COMPARISON_SCHEMA, ComparisonReport
 
     left = baseline.public_facts()
     right = current.public_facts()
     if left.keys() != right.keys():
         raise ValueError("report metric sets differ")
+    verdict, reasons = _comparison_verdict(baseline, current)
     return ComparisonReport(
-        REPORT_SCHEMA, baseline.task_ref, current.task_ref,
+        COMPARISON_SCHEMA, baseline.task_ref, current.task_ref,
+        verdict, reasons,
         {name: _comparison(left[name], right[name]) for name in left},
         ("instrumentation_not_subtracted",),
     )
+
+
+def _usable_comparison_fact(value: NumericFact) -> bool:
+    return (
+        value.value is not None
+        and value.provenance in {"exact", "derived"}
+        and value.lower_bound in {None, value.value}
+    )
+
+
+def _comparison_verdict(
+    baseline: TaskReport, current: TaskReport,
+) -> tuple[str, tuple[str, ...]]:
+    """Gate interpretation while retaining every raw metric comparison."""
+    if (
+        baseline.task_family is not None
+        and current.task_family is not None
+        and baseline.task_family != current.task_family
+    ):
+        return "not_comparable", ("task_family_mismatch",)
+    if (
+        (
+            baseline.task_family is not None
+            and baseline.trend_input.task_family is None
+        )
+        or (
+            current.task_family is not None
+            and current.trend_input.task_family is None
+        )
+    ):
+        return "not_comparable", ("automatic_comparison_excluded",)
+
+    unknown: list[str] = []
+    if baseline.task_family is None or current.task_family is None:
+        unknown.append("task_family_unavailable")
+    if not baseline.completed or not current.completed:
+        unknown.append("task_incomplete")
+    if unknown:
+        return "unknown", tuple(unknown)
+
+    partial: list[str] = []
+    if any(
+        not item.pilot_health.receipt_verified
+        or item.pilot_health.status != "verified"
+        for item in (baseline, current)
+    ):
+        partial.append("pilot_receipt_unverified")
+    required = tuple(
+        getattr(item.trend_input, name)
+        for item in (baseline, current)
+        for name in (
+            "working_tokens", "test_retries", "read_amplification",
+            "review_fix_cycles", "compactions",
+        )
+    )
+    if any(not _usable_comparison_fact(value) for value in required):
+        partial.append("evidence_partial")
+    if partial:
+        return "partial", tuple(partial)
+    return "comparable", ()
 
 
 def _instant(item: TaskReport) -> float:

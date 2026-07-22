@@ -41,6 +41,12 @@ class HydraCommandClassificationTests(unittest.TestCase):
             "hydra-codex reconcile --cwd .",
             "hydra-codex report --last 5 --format json",
             "hydra-codex compare htask_aaaa htask_bbbb",
+            "hydra-codex audit --pilot hpilot_v1_opaque --format json",
+            "hydra-codex pilot start --target 5 --task-family telemetry-analysis",
+            "hydra-codex pilot status --format json",
+            "hydra-codex doctor --format json",
+            "hydra-codex storage status --format json",
+            'hydra-codex storage compact --confirmation "compact hydra database"',
         )
 
         result = normalize_custom_exec(

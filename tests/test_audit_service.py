@@ -117,11 +117,45 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertEqual(evidence["storage.rollout_events"]["value"], 4)
         self.assertIsNone(evidence["transport.pending_annotation_drain"]["value"])
         self.assertTrue(pending.exists(), "bare audit service must not drain unattested spool data")
+        store = HydraStore(self.database)
+        try:
+            snapshot = store.connection.execute(
+                """SELECT audit_sha256,database_bytes,wal_bytes,rollout_sources,
+                          rollout_events,codex_event_sources,codex_events,schema_version
+                     FROM storage_audit_snapshots
+                    WHERE project_id='hprj_audit_service'"""
+            ).fetchone()
+        finally:
+            store.close()
+        self.assertEqual(
+            str(snapshot[0]), hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(tuple(snapshot[1:]), tuple(
+            evidence[f"storage.{name}"]["value"] for name in (
+                "database_bytes", "wal_bytes", "rollout_sources",
+                "rollout_events", "codex_event_sources", "codex_events",
+                "schema_version",
+            )
+        ))
         for private in (
             "private-session", "private-turn", str(self.project), str(self.database),
             "unattested", "capability", "project_id",
         ):
             self.assertNotIn(private, rendered)
+
+    def test_failed_render_does_not_create_a_storage_baseline(self) -> None:
+        with self.assertRaises(ValueError):
+            LocalCommandServices(environ=self.environ).audit(
+                self.run.pilot_id, "unsupported", self.database, self.project,
+            )
+        store = HydraStore(self.database)
+        try:
+            count = store.connection.execute(
+                "SELECT COUNT(*) FROM storage_audit_snapshots"
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(count, 0)
 
     def test_canonical_audit_json_is_accepted_directly_by_rejected_close(self) -> None:
         rendered = LocalCommandServices(environ=self.environ).audit(
@@ -164,7 +198,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertGreaterEqual(health.wal_bytes, 0)
         self.assertEqual((health.rollout_sources, health.rollout_events), (1, 4))
         self.assertEqual((health.codex_event_sources, health.codex_events), (0, 0))
-        self.assertEqual(health.schema_version, 35)
+        self.assertEqual(health.schema_version, 36)
 
     def test_build_holds_one_nested_safe_transaction_across_status_and_reports(self) -> None:
         LocalCommandServices(environ=self.environ).audit(

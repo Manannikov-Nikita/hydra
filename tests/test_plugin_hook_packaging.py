@@ -251,6 +251,7 @@ class PluginHookContractTests(unittest.TestCase):
         self.assertIn("authenticated turn transport", normalized)
         self.assertNotIn("trusted turn transport", normalized)
         self.assertIn("does not advertise `hydra.annotate`", normalized)
+        self.assertIn("does not expose doctor or storage maintenance", normalized)
 
         schema = (
             ROOT / "plugins" / "hydra-codex" / "skills" / "hydra-report"
@@ -258,6 +259,9 @@ class PluginHookContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("`hydra.report/v3`", schema)
         self.assertIn("`semantic.annotations`", schema)
+        self.assertIn("`hydra.comparison/v2`", schema)
+        self.assertIn("`comparable`", schema)
+        self.assertIn("raw percent change", schema.lower())
 
 
 if __name__ == "__main__":

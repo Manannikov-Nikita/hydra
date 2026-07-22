@@ -21,6 +21,9 @@ raw prompts or turn an agent's prose summary into an exact measurement.
 3. For a requested pair, run
    `hydra-codex compare THREAD_A THREAD_B --format json`. Accept only opaque
    public references printed by Hydra, never internal session identifiers.
+   Read the `hydra.comparison/v2` verdict before interpreting the deltas.
+   `partial`, `not_comparable`, and `unknown` preserve raw evidence but do not
+   support a claim that one architecture or workflow caused an improvement.
 4. Read every fact's `provenance`, `lower_bound`, and `caveats` before
    explaining it. Preserve `unavailable` and `unclassified` rather than
    guessing.
@@ -74,3 +77,8 @@ semantic coverage is valid evidence that no phase labels existed.
   were product failures, flaky retries, infrastructure recovery, or final
   verification. Never infer that purpose from command text.
 - Read [report-schema.md](references/report-schema.md) for field meanings.
+- Treat `percent_change` as a raw arithmetic delta. Use comparative language
+  only when the verdict is `comparable`; even then, do not claim causality from
+  a single pair.
+- Local `doctor` and `storage` commands are operator-only diagnostics and
+  maintenance. Do not invoke them through model-controlled MCP tools.

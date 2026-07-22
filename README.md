@@ -134,6 +134,42 @@ references without exposing internal session IDs:
 hydra-codex compare task_a1b2 task_c3d4 --format markdown
 ```
 
+Comparison output uses `hydra.comparison/v2`. Its verdict is one of
+`comparable`, `partial`, `not_comparable`, or `unknown`. Hydra calls a pair
+comparable only when both tasks are complete, share one known task family,
+have usable deterministic evidence, pass scope guards, and are backed by a
+current verified pilot receipt. Every verdict retains the raw delta and raw
+percent change; a percentage is not described as an improvement or regression
+when the pair is not comparable.
+
+Check the local installation without exposing paths, project IDs, or SQLite
+error text:
+
+```bash
+hydra-codex doctor --format markdown
+hydra-codex storage status --format markdown
+```
+
+`doctor` emits `hydra.doctor/v1` categorical checks for project resolution,
+storage availability, schema, foreign keys, integrity, and restrictive file
+permissions. `storage status` emits `hydra.storage-status/v1` and compares
+current DB/WAL and event counts with the latest successful canonical audit.
+Before the first audit it reports `growth_baseline_unavailable` instead of
+inventing a trend.
+
+Maintenance is explicit and never performs retention deletion:
+
+```bash
+hydra-codex storage compact \
+  --confirmation "compact hydra database" \
+  --format markdown
+```
+
+Compaction only checkpoints WAL and runs SQLite `VACUUM`. It fingerprints every
+user table before and after, then reports that evidence rows, immutable pilot
+receipts, and audit snapshots were retained. Worktrees, rollout files, and
+semantic evidence are not deleted.
+
 ## What is exact and what is semantic
 
 For each cumulative usage epoch Hydra keeps the final observed counter rather
@@ -224,6 +260,9 @@ not advertise `hydra.annotate` until Codex provides an authenticated turn
 transport outside model-controlled MCP arguments. The cooperative capability CLI
 remains the annotation fallback.
 
+Doctor and storage maintenance remain CLI-only. The plugin MCP surface does
+not expose local diagnostics or mutating maintenance commands.
+
 Wheel and source distributions ship that same canonical bundle. Use
 `hydra-codex-plugin path` to locate it, or
 `hydra-codex-plugin materialize /absolute/new/path` to copy it without
@@ -245,6 +284,23 @@ review/fix cycles, or compaction. Only strictly earlier tasks form the baseline.
 The fifth task leaves pilot status at `awaiting_receipt`; Hydra never marks the
 pilot verified merely because five fixtures or tasks exist. Only after a real
 pilot receipt should the plugin become the default install.
+
+Use this operational sequence for the first real cohort:
+
+```bash
+hydra-codex pilot start --target 5 --task-family telemetry-analysis
+# Complete five subsequent real tasks with hooks enabled.
+hydra-codex pilot status --format markdown
+hydra-codex audit --pilot hpilot_v1_... --format json --output hydra-audit.json
+hydra-codex pilot close --pilot hpilot_v1_... \
+  --audit-json hydra-audit.json --decision verified
+```
+
+The operator owns the go/no-go decision after reading the canonical audit. A
+receipt must be explicitly `verified` or `rejected`; threshold failures cannot
+be closed as verified. Keep the JSON audit as the immutable decision input.
+For a rejected cohort, repeat `pilot close` with `--decision rejected`, correct
+the instrumentation, and start a new pilot rather than rewriting evidence.
 
 ## Authoritative Codex surfaces
 

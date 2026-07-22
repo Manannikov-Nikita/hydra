@@ -125,9 +125,11 @@ def _comparison_markdown(report: ComparisonReport) -> str:
         "",
         f"- Baseline: `{_md(report.baseline_ref)}`",
         f"- Current: `{_md(report.current_ref)}`",
+        f"- Verdict: `{_md(report.verdict)}`",
+        f"- Reasons: {_md(', '.join(report.reasons) if report.reasons else 'none')}",
         f"- Caveats: {_md(', '.join(report.caveats))}",
         "",
-        "| Metric | Baseline | Current | Delta | Change |",
+        "| Metric | Baseline | Current | Delta | Raw percent change |",
         "| --- | --- | --- | --- | --- |",
     ]
     lines.extend(
@@ -227,7 +229,10 @@ def _report_html(report: TaskReport) -> str:
 def _comparison_html(report: ComparisonReport) -> str:
     summary = (
         f"<p>Baseline <code>{escape(report.baseline_ref)}</code>; current "
-        f"<code>{escape(report.current_ref)}</code>; caveats {escape(', '.join(report.caveats))}.</p>"
+        f"<code>{escape(report.current_ref)}</code>; verdict "
+        f"<strong>{escape(report.verdict)}</strong>; reasons "
+        f"{escape(', '.join(report.reasons) if report.reasons else 'none')}; "
+        f"caveats {escape(', '.join(report.caveats))}.</p>"
     )
     rows = [
         (
@@ -238,7 +243,7 @@ def _comparison_html(report: ComparisonReport) -> str:
     ]
     return _document(
         "Hydra task comparison", "Hydra task comparison", summary,
-        ("Metric", "Baseline", "Current", "Delta", "Change"), rows,
+        ("Metric", "Baseline", "Current", "Delta", "Raw percent change"), rows,
     )
 
 

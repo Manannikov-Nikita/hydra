@@ -298,6 +298,7 @@ tbody th { color: var(--muted); font-weight: 600; }
 .task { padding-block: 26px; border-block-start: 1px solid var(--border); }
 .task:first-of-type { margin-block-start: 26px; }
 .task-columns { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 28px; margin-block: 20px; }
+.task-columns > * { min-width: 0; }
 .appendix-list { display: grid; gap: 16px; }
 .appendix-record { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; margin: 0; padding: 14px 0; border-block-start: 1px solid var(--border); }
 .appendix-record > div { min-width: 0; }

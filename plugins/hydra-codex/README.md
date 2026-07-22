@@ -19,6 +19,10 @@ pilot health, and conservative trend results. The source bundle is packaged
 but is not automatically enabled by installing the Python package; activation
 remains a post-pilot operator step.
 
+The plugin deliberately does not expose doctor or storage maintenance. Run
+`hydra-codex doctor`, `hydra-codex storage status`, and confirmed compaction
+locally from the CLI so a model-controlled MCP call cannot trigger maintenance.
+
 ## Installation prerequisite
 
 hydra-codex must be installed in the environment that starts Codex before

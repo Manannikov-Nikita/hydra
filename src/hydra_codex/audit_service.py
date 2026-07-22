@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
+import hashlib
 from pathlib import Path
 
 from .audit_builder import StorageHealthSnapshot, build_audit
@@ -18,46 +20,7 @@ from .reconcile_engine import list_reconciled_reports, reconcile_project
 from .rollout import ingest_rollouts
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .storage import HydraStore
-
-
-def current_storage_health(
-    store: HydraStore,
-    project_id: str,
-) -> StorageHealthSnapshot:
-    """Read exact current sizes and project-scoped counts without maintenance."""
-    if not isinstance(project_id, str) or not project_id:
-        raise ValueError("project_id must be non-empty")
-    database_path = store.database_path
-    wal_path = Path(str(database_path) + "-wal")
-
-    def count(query: str) -> int:
-        return int(store.connection.execute(query, (project_id,)).fetchone()[0])
-
-    return StorageHealthSnapshot(
-        database_bytes=database_path.stat().st_size,
-        wal_bytes=wal_path.stat().st_size if wal_path.is_file() else 0,
-        rollout_sources=count(
-            """SELECT COUNT(DISTINCT r.source_digest)
-                 FROM rollout_sources r
-                 JOIN rollout_logical_sources l
-                   ON l.logical_source_key=r.logical_source_key
-                WHERE l.project_id=?"""
-        ),
-        rollout_events=count(
-            """SELECT COUNT(DISTINCT e.event_key)
-                 FROM rollout_events e
-                 JOIN rollout_logical_sources l
-                   ON l.logical_source_key=e.logical_source_key
-                WHERE l.project_id=?"""
-        ),
-        codex_event_sources=count(
-            "SELECT COUNT(*) FROM codex_event_sources WHERE project_id=?"
-        ),
-        codex_events=count(
-            "SELECT COUNT(*) FROM codex_events WHERE project_id=?"
-        ),
-        schema_version=store.schema_version(),
-    )
+from .storage_health import current_storage_health, record_audit_snapshot
 
 
 def build_pilot_audit(
@@ -67,6 +30,17 @@ def build_pilot_audit(
     pilot_id: str,
 ) -> AuditReport:
     """Build from PilotStatus and TaskReport only, never raw semantic content."""
+    return _build_pilot_audit_with_health(
+        store, project_id=project_id, pilot_id=pilot_id,
+    )[0]
+
+
+def _build_pilot_audit_with_health(
+    store: HydraStore,
+    *,
+    project_id: str,
+    pilot_id: str,
+) -> tuple[AuditReport, StorageHealthSnapshot]:
     with store.rollout_transaction():
         status = pilot_status(store, project_id, pilot_id)
         task_refs = tuple(
@@ -83,11 +57,12 @@ def build_pilot_audit(
             raise ValueError(
                 "pilot task collection lacks a reconciled public report"
             ) from error
+        health = current_storage_health(store, project_id)
         return build_audit(
             status,
             reports,
-            current_storage_health(store, project_id),
-        )
+            health,
+        ), health
 
 
 def render_pilot_audit(audit: AuditReport, output_format: str) -> str:
@@ -129,6 +104,7 @@ def generate_audit(
     cwd: Path,
     pilot_id: str,
     output_format: str,
+    observed_at: datetime,
 ) -> str:
     """Ingest, reconcile, validate, build, and render one audit.
 
@@ -147,13 +123,20 @@ def generate_audit(
             hash_key=keys.key,
         )
         reconcile_project(store, project.project_id, keys.key)
-        return render_pilot_audit(
-            build_pilot_audit(
-                store,
-                project_id=project.project_id,
-                pilot_id=pilot_id,
-            ),
-            output_format,
+        audit, health = _build_pilot_audit_with_health(
+            store,
+            project_id=project.project_id,
+            pilot_id=pilot_id,
         )
+        rendered = render_pilot_audit(audit, output_format)
+        canonical_json = render_pilot_audit(audit, "json")
+        record_audit_snapshot(
+            store,
+            project_id=project.project_id,
+            audit_sha256=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+            observed_at=observed_at,
+            health=health,
+        )
+        return rendered
     finally:
         store.close()

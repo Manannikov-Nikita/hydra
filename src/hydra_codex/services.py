@@ -283,4 +283,55 @@ class LocalCommandServices:
             cwd=cwd,
             pilot_id=pilot_id,
             output_format=output_format,
+            observed_at=self._clock(),
         )
+
+    def doctor(
+        self,
+        output_format: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        from .diagnostics import render_doctor, run_doctor
+
+        return render_doctor(
+            run_doctor(
+                cwd=cwd,
+                database_path=self._database_path(database_path),
+            ),
+            output_format,
+        )
+
+    def storage_status(
+        self,
+        output_format: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        from .storage_health import render_storage_status, storage_status
+
+        project = self._project(cwd)
+        store = HydraStore(self._database_path(database_path))
+        try:
+            return render_storage_status(
+                storage_status(store, project.project_id), output_format,
+            )
+        finally:
+            store.close()
+
+    def storage_compact(
+        self,
+        output_format: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        from .storage_health import compact_storage, render_storage_compaction
+
+        self._project(cwd)
+        store = HydraStore(self._database_path(database_path))
+        try:
+            return render_storage_compaction(
+                compact_storage(store), output_format,
+            )
+        finally:
+            store.close()

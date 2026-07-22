@@ -24,7 +24,7 @@ from hydra_codex.dashboard_refresh import (
     trusted_rollout_roots,
     WorktreePartition,
 )
-from hydra_codex.project import ProjectResolution
+from hydra_codex.project import ProjectNotFound, ProjectResolution
 from hydra_codex.rollout_identity import RolloutRoot, TrustedRolloutCandidate
 from hydra_codex.rollout_sources import SourceChanged, SourceScan, SourceStat
 from hydra_codex.storage import HydraStore, StorageUnavailable
@@ -166,6 +166,38 @@ class RefreshControllerTests(unittest.TestCase):
         self.assertIs(self.cache.get(REF_B), self.before_b)
         self.assertIsNone(self.cache.get(REF_NEW))
         self.assertEqual(controller.current().state, "partial")
+
+    def test_existing_cached_snapshot_is_partial_when_no_project_was_refreshed(self) -> None:
+        refreshed_a = snapshot(REF_A)
+        runner = BlockingRunner(RefreshResult(
+            {REF_A: refreshed_a}, False, ("source_changed",), 1, 1, 0,
+        ))
+        controller = self.controller(runner)
+        controller.start()
+        self.assertTrue(runner.entered.wait(1))
+        runner.release.set()
+        controller.close()
+
+        published = self.cache.get(REF_A)
+        self.assertIsNot(published, self.before_a)
+        self.assertEqual(published.refresh.state, "partial")
+        self.assertIs(self.cache.get(REF_B), self.before_b)
+        self.assertEqual(controller.current().state, "partial")
+
+    def test_new_only_incomplete_result_remains_failed(self) -> None:
+        runner = BlockingRunner(RefreshResult(
+            {REF_NEW: snapshot(REF_NEW)}, False, ("source_changed",), 1, 1, 1,
+        ))
+        controller = self.controller(runner)
+        controller.start()
+        self.assertTrue(runner.entered.wait(1))
+        runner.release.set()
+        controller.close()
+
+        self.assertIs(self.cache.get(REF_A), self.before_a)
+        self.assertIs(self.cache.get(REF_B), self.before_b)
+        self.assertIsNone(self.cache.get(REF_NEW))
+        self.assertEqual(controller.current().state, "failed")
 
     def test_success_replaces_all_refs_and_failed_refresh_retains_all(self) -> None:
         replacement = snapshot(REF_NEW)
@@ -410,29 +442,62 @@ class GlobalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.partitions[0].worktrees, ())
         self.assertNotIn("project-cached", repr(plan))
 
-    def test_unavailable_and_ambiguous_sources_are_categorical_without_paths(self) -> None:
-        missing = self.root / "missing.jsonl"
+    def test_missing_relative_and_unregistered_cwd_are_silently_out_of_scope(self) -> None:
+        for index, cwd in enumerate((None, "relative", str(self.root / "unregistered"))):
+            with self.subTest(cwd=cwd):
+                source = self.root / f"out-of-scope-{index}.jsonl"
+                source.write_text("{}\n", encoding="utf-8")
+                scan = replace(
+                    self.source_scan(source, self.root, str(index + 1)), cwd=cwd,
+                )
+                candidate = TrustedRolloutCandidate(source, "active", source, True)
+
+                plan = plan_global_rollout_ingest(
+                    self.store, (RolloutRoot(source, "active"),), KEY,
+                    discover=lambda _roots, candidate=candidate: (candidate,),
+                    scanner=lambda *_args, scan=scan: scan,
+                    revalidate=lambda _item, scan=scan: scan.source_stat,
+                )
+
+                self.assertEqual(plan.project_count, 0)
+                self.assertEqual(plan.diagnostic_codes, ())
+
+    def test_unavailable_project_config_and_source_change_remain_categorical(self) -> None:
         source = self.root / "source.jsonl"
         source.write_text("{}\n", encoding="utf-8")
-        bad_scan = self.source_scan(source, Path("relative"), "c")
+        scan = self.source_scan(source, self.root, "c")
         candidate = TrustedRolloutCandidate(source, "active", source, True)
 
-        plan = plan_global_rollout_ingest(
-            self.store, (RolloutRoot(self.root, "active"),), KEY,
-            discover=lambda _roots: (candidate,),
-            scanner=lambda *_args: bad_scan,
-            revalidate=lambda _item: bad_scan.source_stat,
-        )
+        for error, expected in (
+            (ValueError("private malformed config"), "project_root_unavailable"),
+            (OSError("private unreadable config"), "project_root_unavailable"),
+        ):
+            with self.subTest(expected=expected, error=type(error).__name__):
+                plan = plan_global_rollout_ingest(
+                    self.store, (RolloutRoot(source, "active"),), KEY,
+                    discover=lambda _roots: (candidate,),
+                    scanner=lambda *_args: scan,
+                    revalidate=lambda _item: scan.source_stat,
+                    resolver=lambda _cwd, error=error: (_ for _ in ()).throw(error),
+                )
+                self.assertEqual(plan.project_count, 0)
+                self.assertEqual(plan.diagnostic_codes, (expected,))
 
-        self.assertEqual(plan.project_count, 0)
-        self.assertEqual(plan.diagnostic_codes, ("project_root_unavailable",))
-        self.assertNotIn(str(missing), repr(plan))
+        project_not_found = plan_global_rollout_ingest(
+            self.store, (RolloutRoot(source, "active"),), KEY,
+            discover=lambda _roots: (candidate,),
+            scanner=lambda *_args: scan,
+            revalidate=lambda _item: scan.source_stat,
+            resolver=lambda _cwd: (_ for _ in ()).throw(ProjectNotFound("private")),
+        )
+        self.assertEqual(project_not_found.diagnostic_codes, ())
 
         busy = sqlite3.OperationalError("private busy")
         busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
         other = sqlite3.OperationalError("private invalid")
         for error, expected in (
             (StorageUnavailable("private"), "storage_unavailable"),
+            (SourceChanged("private"), "source_changed"),
             (busy, "database_busy"), (other, "internal_failure"),
         ):
             mapped = plan_global_rollout_ingest(
@@ -628,6 +693,60 @@ class GlobalRunnerTests(unittest.TestCase):
             store.close()
         self.assertEqual(rows, [("project-b", "b-worktree")])
         self.assertEqual(result.diagnostic_codes, ("source_changed",))
+        self.assertFalse(result.replace_all)
+        temporary.cleanup()
+
+    def test_incomplete_refresh_republishes_all_committed_database_snapshots(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        database = root / "hydra.sqlite3"
+        worktree = worktree_partition("project-a", root / "worktree", "a.jsonl")
+        plan = GlobalRolloutPlan(
+            (ProjectPartition("project-a", (worktree,)),), 1, 1, 1, (),
+        )
+        store = HydraStore(database)
+        with store.rollout_transaction() as connection:
+            connection.execute(
+                """INSERT INTO dashboard_projects(
+                       project_id,display_name,first_seen_at,last_seen_at)
+                   VALUES (?,?,?,?)""",
+                (
+                    "project-a", "stable", "2026-07-22T10:00:00Z",
+                    "2026-07-22T10:00:00Z",
+                ),
+            )
+        store.close()
+        requested_project_ids: list[object] = []
+
+        def fail_after_mutation(store, *_args, **_kwargs):
+            store.connection.execute(
+                "UPDATE dashboard_projects SET display_name='uncommitted' "
+                "WHERE project_id='project-a'",
+            )
+            raise SourceChanged("private active rollout append")
+
+        def snapshots_from_store(store, *, refresh, project_ids):
+            requested_project_ids.append(project_ids)
+            row = store.connection.execute(
+                "SELECT display_name FROM dashboard_projects WHERE project_id='project-a'",
+            ).fetchone()
+            self.assertEqual(row[0], "stable")
+            return {REF_A: snapshot(REF_A)}
+
+        runner = GlobalRefreshRunner(
+            lambda: HydraStore(database), KEY,
+            SimpleNamespace(_refresh_snapshots_from_store=snapshots_from_store),
+            planner=lambda *_args, **_kwargs: plan,
+            ingester=fail_after_mutation,
+            reconciler=lambda *_args, **_kwargs: None,
+        )
+
+        result = runner.run(lambda *_args: None)
+
+        self.assertEqual(requested_project_ids, [None])
+        self.assertEqual(tuple(result.snapshots), (REF_A,))
+        self.assertEqual(result.diagnostic_codes, ("source_changed",))
+        self.assertEqual(result.projects_refreshed, 0)
         self.assertFalse(result.replace_all)
         temporary.cleanup()
 

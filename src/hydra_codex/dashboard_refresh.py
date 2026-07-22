@@ -185,14 +185,17 @@ class RefreshController:
                 progress.projects_refreshed,
             )
             failed = True
-        state: RefreshState = "failed" if failed else (
-            "succeeded" if result.replace_all else
-            "partial" if result.projects_refreshed else "failed"
-        )
         with self._cache._lock:
             current = self._current
             if current is None or current.refresh_ref != queued.refresh_ref:
                 return
+            publishable = bool(
+                set(result.snapshots).intersection(self._cache._snapshots)
+            )
+            state: RefreshState = "failed" if failed else (
+                "succeeded" if result.replace_all else
+                "partial" if publishable else "failed"
+            )
             terminal_progress = replace(
                 current.progress, projects_total=result.projects_total,
                 projects_completed=result.projects_completed,
@@ -453,7 +456,7 @@ class GlobalRefreshRunner:
                     snapshots = self._query._refresh_snapshots_from_store(
                         store,
                         refresh=self._idle_view(),
-                        project_ids=None if complete else successful,
+                        project_ids=None,
                     )
             except Exception as error:
                 diagnostics.add(self._code(error))

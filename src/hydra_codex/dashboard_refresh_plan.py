@@ -194,8 +194,11 @@ def plan_global_rollout_ingest(
             if scan.source_stat != before or scan.path != candidate.path:
                 raise SourceChanged("rollout source changed during ingest")
             if scan.cwd is None or not Path(scan.cwd).is_absolute():
-                raise ProjectNotFound("rollout source has no absolute project cwd")
-            resolution = resolver(scan.cwd)
+                continue
+            try:
+                resolution = resolver(scan.cwd)
+            except ProjectNotFound:
+                continue
             grouped.setdefault(
                 (resolution.project_id, resolution.project_root), [],
             ).append(AttributedRollout(candidate, scan, resolution))

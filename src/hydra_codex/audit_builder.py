@@ -6,12 +6,9 @@ from dataclasses import dataclass
 import re
 from typing import Iterable, Mapping
 
+from .audit_coherence import validate_task_coherence
 from .audit_comparability import comparability_readiness
-from .audit_model import (
-    AuditEvidenceRegistry,
-    AuditFact,
-    AuditReport,
-)
+from .audit_model import AuditEvidenceRegistry, AuditFact, AuditReport
 from .pilot import PILOT_SCHEMA, PilotStatus
 from .report_semantics import SEMANTIC_PHASES
 from .reporting import NumericFact, TaskReport
@@ -253,6 +250,8 @@ def _task_view(
             "scope_change": marker.scope_change,
             "outcome": marker.outcome,
             "confidence": confidence_ref,
+            "note": marker.note,
+            "provenance": marker.provenance,
         })
     scope_change = str(pilot_task.get("scope_change", "none"))
     trend_eligible = bool(pilot_task.get("trend_eligible", False))
@@ -310,6 +309,9 @@ def _task_view(
             "task_family": report.task_family,
             "scope_change": scope_change,
             "trend_eligible": trend_eligible,
+            "baseline_working_tokens": evidence_refs[
+                "trend.result.baseline_working_tokens"
+            ],
             "warning": report.trend_result.warning,
             "corroborating_signal": report.trend_result.corroborating_signal,
             "caveats": comparability_caveats,
@@ -365,6 +367,8 @@ def build_audit(
     registry = AuditEvidenceRegistry()
     pilot_refs, pilot_task_refs = _register_pilot_facts(registry, pilot_payload)
     ordered_reports = tuple(report_by_ref[task_ref] for task_ref in task_refs)
+    for index, report in enumerate(ordered_reports):
+        validate_task_coherence(pilot_tasks[index], report)
     task_views = [
         _task_view(
             registry,

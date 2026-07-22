@@ -67,24 +67,27 @@ def build_pilot_audit(
     pilot_id: str,
 ) -> AuditReport:
     """Build from PilotStatus and TaskReport only, never raw semantic content."""
-    status = pilot_status(store, project_id, pilot_id)
-    task_refs = tuple(
-        str(item["task_ref"])
-        for item in status.as_dict()["tasks"]
-    )
-    reports_by_ref = {
-        report.task_ref: report
-        for report in list_reconciled_reports(store, project_id)
-    }
-    try:
-        reports = tuple(reports_by_ref[task_ref] for task_ref in task_refs)
-    except KeyError as error:
-        raise ValueError("pilot task collection lacks a reconciled public report") from error
-    return build_audit(
-        status,
-        reports,
-        current_storage_health(store, project_id),
-    )
+    with store.rollout_transaction():
+        status = pilot_status(store, project_id, pilot_id)
+        task_refs = tuple(
+            str(item["task_ref"])
+            for item in status.as_dict()["tasks"]
+        )
+        reports_by_ref = {
+            report.task_ref: report
+            for report in list_reconciled_reports(store, project_id)
+        }
+        try:
+            reports = tuple(reports_by_ref[task_ref] for task_ref in task_refs)
+        except KeyError as error:
+            raise ValueError(
+                "pilot task collection lacks a reconciled public report"
+            ) from error
+        return build_audit(
+            status,
+            reports,
+            current_storage_health(store, project_id),
+        )
 
 
 def render_pilot_audit(audit: AuditReport, output_format: str) -> str:

@@ -216,6 +216,28 @@ class AuditBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "task collection"):
             build_audit(pilot_snapshot((bound,)), (bound, extra), storage())
 
+    def test_builder_rejects_incoherent_overlapping_pilot_task_facts(self) -> None:
+        report = replace(
+            public_report("coherence-root"),
+            semantic_conflicts=NumericFact(0, "count", "derived"),
+            schema_diagnostics=NumericFact(0, "count", "derived"),
+        )
+        cases = (
+            ("task_family", "different-family"),
+            ("completed_at", "2026-07-21T00:00:09Z"),
+            ("coverage", 1.0),
+            ("semantic_conflicts", 1),
+            ("schema_diagnostics", 1),
+            ("trend_eligible", False),
+        )
+
+        for field, replacement in cases:
+            with self.subTest(field=field):
+                snapshot = pilot_snapshot((report,)).as_dict()
+                snapshot["tasks"][0][field] = replacement
+                with self.assertRaisesRegex(ValueError, "pilot/report task mismatch"):
+                    build_audit(PilotStatus(snapshot), (report,), storage())
+
     def test_family_conflict_is_excluded_from_comparability_readiness(self) -> None:
         report = public_report("family-conflict")
         report = replace(
@@ -242,6 +264,10 @@ class AuditBuilderTests(unittest.TestCase):
 
     def test_expanded_scope_is_excluded_without_pairwise_comparison_claims(self) -> None:
         report = public_report("expanded-scope")
+        report = replace(
+            report,
+            trend_input=replace(report.trend_input, task_family=None),
+        )
         snapshot = pilot_snapshot((report,)).as_dict()
         snapshot["tasks"][0]["scope_change"] = "expanded"
         snapshot["tasks"][0]["trend_eligible"] = False
@@ -271,6 +297,64 @@ class AuditBuilderTests(unittest.TestCase):
                 "verified_receipt_required",
             ],
         )
+
+    def test_collection_cannot_be_ready_when_every_task_baseline_is_unknown(self) -> None:
+        reports = tuple(
+            public_report(f"unknown-baseline-{index}", second=index + 10)
+            for index in range(5)
+        )
+        snapshot = pilot_snapshot(reports).as_dict()
+        snapshot["transport_verified"] = True
+        snapshot["trend_ready"] = True
+        snapshot["receipt"] = {"decision": "verified", "current": True}
+
+        collection = build_audit(
+            PilotStatus(snapshot), reports, storage(),
+        ).as_dict()["collection"]
+
+        self.assertEqual(
+            {item["comparability"]["status"] for item in collection["tasks"]},
+            {"unknown"},
+        )
+        self.assertEqual(collection["comparability_readiness"], {
+            "status": "unknown",
+            "reasons": ["insufficient_comparable_baseline"],
+        })
+
+    def test_collection_aggregates_ready_unknown_and_excluded_tasks_as_partial(self) -> None:
+        ready = public_report("ready-baseline", second=10)
+        ready = replace(
+            ready,
+            trend_result=replace(
+                ready.trend_result,
+                baseline_working_tokens=NumericFact(90, "tokens", "derived"),
+            ),
+        )
+        unknown = public_report("unknown-baseline", second=11)
+        excluded = public_report("excluded-scope", second=12)
+        excluded = replace(
+            excluded,
+            trend_input=replace(excluded.trend_input, task_family=None),
+        )
+        reports = (ready, unknown, excluded)
+        snapshot = pilot_snapshot(reports).as_dict()
+        snapshot["tasks"][2]["scope_change"] = "expanded"
+        snapshot["tasks"][2]["trend_eligible"] = False
+        snapshot["transport_verified"] = True
+        snapshot["trend_ready"] = True
+        snapshot["receipt"] = {"decision": "verified", "current": True}
+
+        readiness = build_audit(
+            PilotStatus(snapshot), reports, storage(),
+        ).as_dict()["collection"]["comparability_readiness"]
+
+        self.assertEqual(readiness, {
+            "status": "partial",
+            "reasons": [
+                "insufficient_comparable_baseline",
+                "scope_change_excluded",
+            ],
+        })
 
 
 if __name__ == "__main__":

@@ -4,10 +4,13 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from hydra_codex.audit_service import current_storage_health
+import hydra_codex.audit_service as audit_service_module
+from hydra_codex.audit_service import build_pilot_audit, current_storage_health
 from hydra_codex.pilot import close_pilot, start_pilot
 from hydra_codex.report_renderers import render_report_collection
 from hydra_codex.services import LocalCommandServices
@@ -162,6 +165,44 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertEqual((health.rollout_sources, health.rollout_events), (1, 4))
         self.assertEqual((health.codex_event_sources, health.codex_events), (0, 0))
         self.assertEqual(health.schema_version, 35)
+
+    def test_build_holds_one_nested_safe_transaction_across_status_and_reports(self) -> None:
+        LocalCommandServices(environ=self.environ).audit(
+            self.run.pilot_id, "json", self.database, self.project,
+        )
+        store = HydraStore(self.database)
+        writer = sqlite3.connect(self.database, timeout=0)
+        original = audit_service_module.list_reconciled_reports
+        interleaving = {"blocked": False}
+
+        def attempt_interleaving(active_store, project_id):
+            try:
+                writer.execute(
+                    "UPDATE pilot_runs SET target=6 WHERE pilot_id=?",
+                    (self.run.pilot_id,),
+                )
+                writer.commit()
+            except sqlite3.OperationalError as error:
+                writer.rollback()
+                interleaving["blocked"] = "locked" in str(error).lower()
+            return original(active_store, project_id)
+
+        try:
+            with patch.object(
+                audit_service_module,
+                "list_reconciled_reports",
+                side_effect=attempt_interleaving,
+            ):
+                build_pilot_audit(
+                    store,
+                    project_id="hprj_audit_service",
+                    pilot_id=self.run.pilot_id,
+                )
+        finally:
+            writer.close()
+            store.close()
+
+        self.assertTrue(interleaving["blocked"])
 
 
 class LegacyReportByteCompatibilityTests(unittest.TestCase):

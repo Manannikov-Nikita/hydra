@@ -10,6 +10,7 @@ import re
 
 from .reporting import NumericFact
 from .task_tree_types import validate_provenance
+from .audit_references import validate_reference_closure
 
 
 AUDIT_SCHEMA = "hydra.audit/v1"
@@ -174,6 +175,7 @@ class AuditReport:
     def __post_init__(self) -> None:
         if self.schema_version != AUDIT_SCHEMA:
             raise ValueError("unsupported audit schema")
+        decoded_sections: dict[str, dict[str, object]] = {}
         for value, field in (
             (self.pilot_snapshot_json, "pilot snapshot"),
             (self.cohort_json, "cohort"),
@@ -186,6 +188,7 @@ class AuditReport:
                 raise ValueError(f"{field} is not canonical JSON") from error
             if _canonical_object(decoded, field) != value:
                 raise ValueError(f"{field} is not canonical JSON")
+            decoded_sections[field] = decoded
         if (
             not isinstance(self.evidence_appendix, tuple)
             or any(not isinstance(item, AuditEvidence) for item in self.evidence_appendix)
@@ -197,6 +200,12 @@ class AuditReport:
             raise ValueError("audit evidence facts must be unique and sorted")
         if len(set(evidence_ids)) != len(evidence_ids):
             raise ValueError("audit evidence IDs must be unique")
+        validate_reference_closure(
+            cohort=decoded_sections["cohort"],
+            collection=decoded_sections["collection"],
+            storage_health=decoded_sections["storage health"],
+            appendix_ids=evidence_ids,
+        )
 
     @classmethod
     def create(

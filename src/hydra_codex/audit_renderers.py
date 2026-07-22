@@ -7,6 +7,7 @@ import json
 import re
 from typing import Mapping
 
+from .audit_detail_renderers import html_task_detail, markdown_task_detail
 from .audit_model import AuditEvidence, AuditReport
 
 
@@ -130,20 +131,7 @@ def render_audit_markdown(audit: AuditReport) -> str:
             f"{_md_ref(item['semantic_coverage'], evidence)} |"
         )
     for item in collection["tasks"]:
-        lines.extend([
-            "",
-            f"### Task `{_md(item['task_ref'])}`",
-            "",
-            f"- Status: {_md(item['status'])}",
-            f"- Agent topology: {_md(item['agent_topology']['status'])}; "
-            f"sessions {_md_ref(item['agent_topology']['sessions'], evidence)}; "
-            f"subagents {_md_ref(item['agent_topology']['subagents'], evidence)}",
-            f"- Comparability: `{_md(item['comparability']['status'])}`; "
-            f"reasons {_md(', '.join(item['comparability']['caveats']) or 'none')}",
-            f"- Conflicts: {_md_ref(item['issues']['semantic_conflicts'], evidence)}; "
-            f"missing finish: {_md_ref(item['issues']['self_report_missing'], evidence)}; "
-            f"schema diagnostics: {_md_ref(item['issues']['schema_diagnostics'], evidence)}",
-        ])
+        lines.extend(markdown_task_detail(item, evidence))
     lines.extend([
         "",
         *_section_refs_markdown("Storage health", storage["evidence_refs"], evidence),
@@ -229,57 +217,27 @@ def _overview_html(items: list[dict[str, object]], evidence: Mapping[str, AuditE
     )
 
 
-def _task_html(item: dict[str, object], evidence: Mapping[str, AuditEvidence]) -> str:
-    topology = item["agent_topology"]
-    issues = item["issues"]
-    tools = item["tool_file_test"]
-    comparison = item["comparability"]
-    tool_rows = "".join(
-        f"<tr><th>{escape(name.replace('_', ' ').title())}</th>"
-        f"<td>{_html_ref(str(evidence_id), evidence)}</td></tr>"
-        for name, evidence_id in tools.items()
-        if name != "test_evidence"
-    )
-    issue_rows = "".join(
-        f"<tr><th>{escape(name.replace('_', ' ').title())}</th>"
-        f"<td>{_html_ref(str(evidence_id), evidence)}</td></tr>"
-        for name, evidence_id in issues.items()
-    )
-    reasons = ", ".join(comparison["caveats"]) or "none"
-    return (
-        f'<section class="task" aria-labelledby="task-{escape(str(item["task_ref"]))}">'
-        f'<h3 id="task-{escape(str(item["task_ref"]))}">Task '
-        f'<code>{escape(str(item["task_ref"]))}</code></h3>'
-        f'<p>{escape(str(item["status"]))} · {escape(str(item["task_family"] or "unavailable"))} · '
-        f'{escape(str(item["last_activity_at"]))}</p>'
-        '<div class="task-columns"><div><h4>Agent topology</h4>'
-        f'<p>{escape(str(topology["status"]))}. Sessions '
-        f'{_html_ref(str(topology["sessions"]), evidence)}; subagents '
-        f'{_html_ref(str(topology["subagents"]), evidence)}.</p>'
-        '<h4>Comparability</h4>'
-        f'<p><strong>{escape(str(comparison["status"]))}</strong> · {escape(reasons)}</p>'
-        f'<div class="table-wrap"><table><tbody>{issue_rows}</tbody></table></div></div>'
-        '<div><h4>Tool, file, and test evidence</h4>'
-        f'<div class="table-wrap"><table><tbody>{tool_rows}</tbody></table></div></div></div>'
-        '<h4>Phase allocation</h4>'
-        f'{_phase_html(item["phase_allocation"], evidence)}</section>'
-    )
-
-
 def _appendix_html(records: tuple[AuditEvidence, ...]) -> str:
-    rows = "".join(
-        f'<tr id="{item.evidence_id}" data-evidence-record="{item.evidence_id}">'
-        f'<td><code>{item.evidence_id}</code></td><td><code>{escape(item.fact)}</code></td>'
-        f'<td>{escape(_number(item.value))}</td><td>{escape(item.unit)}</td>'
-        f'<td>{escape(item.provenance)}</td><td>{escape(_number(item.lower_bound))}</td>'
-        f'<td>{escape(", ".join(item.caveats) or "none")}</td></tr>'
-        for item in records
-    )
-    return (
-        '<div class="table-wrap appendix"><table><thead><tr><th>Evidence</th><th>Fact</th>'
-        '<th>Value</th><th>Unit</th><th>Provenance</th><th>Lower bound</th>'
-        f"<th>Caveats</th></tr></thead><tbody>{rows}</tbody></table></div>"
-    )
+    rendered = []
+    for item in records:
+        values = (
+            ("Evidence", f"<code>{item.evidence_id}</code>"),
+            ("Fact", f"<code>{escape(item.fact)}</code>"),
+            ("Value", escape(_number(item.value))),
+            ("Unit", escape(item.unit)),
+            ("Provenance", escape(item.provenance)),
+            ("Lower bound", escape(_number(item.lower_bound))),
+            ("Caveats", escape(", ".join(item.caveats) or "none")),
+        )
+        fields = "".join(
+            f"<div><dt>{label}</dt><dd>{value}</dd></div>"
+            for label, value in values
+        )
+        rendered.append(
+            f'<dl class="appendix-record" id="{item.evidence_id}" '
+            f'data-evidence-record="{item.evidence_id}">{fields}</dl>'
+        )
+    return f'<div class="appendix-list">{"".join(rendered)}</div>'
 
 
 _STYLE = """
@@ -340,7 +298,11 @@ tbody th { color: var(--muted); font-weight: 600; }
 .task { padding-block: 26px; border-block-start: 1px solid var(--border); }
 .task:first-of-type { margin-block-start: 26px; }
 .task-columns { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 28px; margin-block: 20px; }
-.appendix td:nth-child(2), .appendix td:last-child { min-width: 220px; }
+.appendix-list { display: grid; gap: 16px; }
+.appendix-record { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; margin: 0; padding: 14px 0; border-block-start: 1px solid var(--border); }
+.appendix-record > div { min-width: 0; }
+.appendix-record dt { color: var(--muted); font-size: .78rem; font-weight: 700; }
+.appendix-record dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 .empty { color: var(--muted); font-style: italic; }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -362,15 +324,31 @@ tbody th { color: var(--muted); font-weight: 600; }
   .headline > div:last-child { border-block-end: 0; }
   .section-intro, .phase-label { align-items: flex-start; flex-direction: column; }
   .task-columns { grid-template-columns: 1fr; gap: 20px; }
+  .appendix-record { grid-template-columns: 1fr; }
   th, td { padding: 8px; }
 }
 @media print {
+  @page { size: A4; margin: 12mm; }
   :root { --bg: #fff; --text: #000; --muted: #333; --border: #999; --accent: #000; --track: #ddd; }
   body { background: #fff; color: #000; font-size: 10pt; }
   main { max-width: none; padding: 0; }
   a { color: #000; text-decoration: none; }
-  .task, .report-section, tr { break-inside: avoid; }
-  .appendix { overflow: visible; }
+  h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
+  .report-section { break-inside: auto; }
+  .task { break-before: page; break-inside: auto; }
+  .task:first-of-type { break-before: auto; }
+  .report-section[aria-labelledby="appendix"] { break-before: page; }
+  .table-wrap { overflow: visible; }
+  table { break-inside: auto; }
+  thead { display: table-header-group; }
+  thead { break-inside: avoid; page-break-inside: avoid; }
+  tbody { break-inside: auto; }
+  tfoot { display: table-footer-group; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+  tr { break-after: auto; page-break-after: auto; }
+  th, td { padding: 5px 6px; overflow-wrap: anywhere; }
+  .appendix-record { break-inside: avoid-page; page-break-inside: avoid; gap: 4px 12px; padding: 8px 0; }
+  .evidence-link { white-space: normal; }
 }
 """.strip()
 
@@ -385,7 +363,10 @@ def render_audit_html(audit: AuditReport) -> str:
     evidence = _index(audit)
     readiness = collection["comparability_readiness"]
     reasons = ", ".join(readiness["reasons"]) or "none"
-    task_sections = "".join(_task_html(item, evidence) for item in collection["tasks"])
+    task_sections = "".join(
+        html_task_detail(item, evidence, _phase_html)
+        for item in collection["tasks"]
+    )
     if not task_sections:
         task_sections = '<p class="empty">No completed cohort tasks.</p>'
     storage_rows = "".join(

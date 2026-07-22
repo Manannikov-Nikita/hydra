@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import unittest
 
-from hydra_codex.audit_model import AUDIT_SCHEMA, AuditEvidenceRegistry, AuditFact
+from hydra_codex.audit_model import (
+    AUDIT_SCHEMA,
+    AuditEvidenceRegistry,
+    AuditFact,
+    AuditReport,
+)
 from hydra_codex.reporting import NumericFact
 
 
@@ -77,6 +82,68 @@ class AuditEvidenceRegistryTests(unittest.TestCase):
             tuple(item.fact for item in forward.evidence),
             tuple(sorted(facts)),
         )
+
+
+class AuditReferenceClosureTests(unittest.TestCase):
+    @staticmethod
+    def _sample():
+        from tests.test_audit_renderers import sample_audit
+
+        return sample_audit()
+
+    def test_report_rejects_dangling_and_malformed_structured_references(self) -> None:
+        original = self._sample()
+        cases = (
+            "ev_0000000000000000",
+            0,
+        )
+
+        for replacement in cases:
+            with self.subTest(replacement=replacement):
+                payload = original.as_dict()
+                payload["cohort"]["headline"]["working_tokens"] = replacement
+                with self.assertRaisesRegex(ValueError, "evidence reference"):
+                    AuditReport.create(
+                        pilot_snapshot=payload["pilot_snapshot"],
+                        cohort=payload["cohort"],
+                        collection=payload["collection"],
+                        storage_health=payload["storage_health"],
+                        evidence_appendix=original.evidence_appendix,
+                    )
+
+    def test_report_rejects_an_orphan_appendix_record(self) -> None:
+        original = self._sample()
+        registry = AuditEvidenceRegistry()
+        registry.register("zz.orphan", AuditFact(1, "count", "exact"))
+        appendix = tuple(sorted(
+            original.evidence_appendix + registry.evidence,
+            key=lambda item: item.fact,
+        ))
+        payload = original.as_dict()
+
+        with self.assertRaisesRegex(ValueError, "orphan evidence"):
+            AuditReport.create(
+                pilot_snapshot=payload["pilot_snapshot"],
+                cohort=payload["cohort"],
+                collection=payload["collection"],
+                storage_health=payload["storage_health"],
+                evidence_appendix=appendix,
+            )
+
+    def test_report_does_not_treat_domain_text_as_an_evidence_reference(self) -> None:
+        original = self._sample()
+        payload = original.as_dict()
+        payload["cohort"]["task_family"] = "ev_research"
+
+        report = AuditReport.create(
+            pilot_snapshot=payload["pilot_snapshot"],
+            cohort=payload["cohort"],
+            collection=payload["collection"],
+            storage_health=payload["storage_health"],
+            evidence_appendix=original.evidence_appendix,
+        )
+
+        self.assertEqual(report.as_dict()["cohort"]["task_family"], "ev_research")
 
 
 if __name__ == "__main__":

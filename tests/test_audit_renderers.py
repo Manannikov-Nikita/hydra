@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import unittest
 
@@ -10,6 +11,13 @@ from hydra_codex.audit_renderers import (
     render_audit_json,
     render_audit_markdown,
 )
+from hydra_codex.report_semantics import (
+    SemanticMarkerSummary,
+    TestEvidenceRow,
+    TestEvidenceSummary,
+)
+from hydra_codex.reporting import NumericFact
+from hydra_codex.pilot import PilotStatus
 from tests.test_audit_builder import pilot_snapshot, public_report, storage
 
 
@@ -19,6 +27,53 @@ def sample_audit():
         public_report("render-b", input_tokens=220, second=20),
     )
     return build_audit(pilot_snapshot(reports), reports, storage())
+
+
+def structured_audit():
+    report = public_report("structured", input_tokens=120, second=10)
+    breakdown = report.semantic_breakdown
+    annotations = replace(
+        breakdown.annotations,
+        total_count=NumericFact(1, "count", "model_reported"),
+        test_evidence=TestEvidenceSummary(
+            NumericFact(1, "count", "derived", lower_bound=1),
+            (
+                TestEvidenceRow(
+                    "targeted",
+                    "product_failure",
+                    "product_fix_verification",
+                    "test_full",
+                    "final_verification",
+                    NumericFact(1, "count", "derived", lower_bound=1),
+                ),
+            ),
+        ),
+        timeline=(
+            SemanticMarkerSummary(
+                "blocker",
+                "fix",
+                "review_finding",
+                "none",
+                None,
+                0.75,
+                "[redacted]",
+            ),
+        ),
+        truncated_count=NumericFact(0, "count", "derived"),
+    )
+    report = replace(
+        report,
+        semantic_breakdown=replace(
+            breakdown,
+            marker_count=NumericFact(1, "count", "derived"),
+            annotations=annotations,
+        ),
+    )
+    snapshot = pilot_snapshot((report,)).as_dict()
+    snapshot["tasks"][0]["instrumented"] = True
+    snapshot["facts"]["instrumented_tasks"] = 1
+    snapshot["facts"]["enrollment"] = 1.0
+    return build_audit(PilotStatus(snapshot), (report,), storage())
 
 
 class AuditRendererTests(unittest.TestCase):
@@ -94,6 +149,88 @@ class AuditRendererTests(unittest.TestCase):
         for item in audit.evidence_appendix:
             marker = f'data-evidence-record="{item.evidence_id}"'
             self.assertEqual(rendered.count(marker), 1)
+
+    def test_human_formats_render_complete_structured_task_evidence(self) -> None:
+        original = structured_audit()
+        payload = original.as_dict()
+        hostile = "<marker>&"
+        payload["collection"]["tasks"][0]["semantic_markers"][0]["kind"] = hostile
+        audit = AuditReport.create(
+            pilot_snapshot=payload["pilot_snapshot"],
+            cohort=payload["cohort"],
+            collection=payload["collection"],
+            storage_health=payload["storage_health"],
+            evidence_appendix=original.evidence_appendix,
+        )
+
+        markdown = render_audit_markdown(audit)
+        html = render_audit_html(audit)
+
+        for label in (
+            "Per-task phase allocation",
+            "Tool, file, and test evidence",
+            "Deterministic test evidence",
+            "Issue and marker counts",
+            "Semantic marker timeline",
+            "Comparability",
+            "Baseline working tokens",
+        ):
+            with self.subTest(label=label):
+                self.assertIn(label, markdown)
+                self.assertIn(label, html)
+        for markdown_label, html_label in (
+            (r"product\_failure", "product_failure"),
+            (r"product\_fix\_verification", "product_fix_verification"),
+            (r"\[redacted\]", "[redacted]"),
+        ):
+            self.assertIn(markdown_label, markdown)
+            self.assertIn(html_label, html)
+        self.assertNotIn(hostile, html)
+        self.assertNotIn(hostile, markdown)
+        self.assertIn("&lt;marker&gt;&amp;", html)
+        self.assertIn("&lt;marker&gt;&amp;", markdown)
+
+    def test_print_css_keeps_appendix_records_intact(self) -> None:
+        rendered = render_audit_html(sample_audit())
+
+        for contract in (
+            "thead { display: table-header-group; }",
+            "thead { break-inside: avoid; page-break-inside: avoid; }",
+            "tbody { break-inside: auto; }",
+            "tr { break-inside: avoid; page-break-inside: avoid; }",
+            "tr { break-after: auto; page-break-after: auto; }",
+            ".report-section { break-inside: auto; }",
+            ".table-wrap { overflow: visible; }",
+            "break-inside: avoid-page; page-break-inside: avoid;",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, rendered)
+        self.assertNotIn(
+            ".task, .report-section, tr { break-inside: avoid; }",
+            rendered,
+        )
+
+    def test_html_labels_every_appendix_record_inline(self) -> None:
+        audit = sample_audit()
+
+        rendered = render_audit_html(audit)
+        count = len(audit.evidence_appendix)
+
+        self.assertEqual(rendered.count('<dl class="appendix-record"'), count)
+        for label in (
+            "Evidence",
+            "Fact",
+            "Value",
+            "Unit",
+            "Provenance",
+            "Lower bound",
+            "Caveats",
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(rendered.count(f"<dt>{label}</dt>"), count)
+        self.assertNotIn("appendix-chunk", rendered)
+        self.assertNotIn("appendix-grid", rendered)
+        self.assertNotIn('class="appendix-table"', rendered)
 
     def test_html_and_markdown_escape_hostile_dynamic_text(self) -> None:
         original = sample_audit()

@@ -149,6 +149,7 @@ def _assemble_project(
         metrics = aggregate_stored_task_tree(
             store.connection, project_id=project_id, root_id=plan.root_key,
             cutoff_at=plan.cutoff_at,
+            cutoff_instant=plan.cutoff_instant,
             cutoff_timing_provenance=plan.cutoff_timing_provenance,
             include_ambiguous_lineage=False,
         )

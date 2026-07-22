@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import unittest
 
+from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.task_tree import (
     ActivityObservation,
     FileObservation,
@@ -64,6 +65,39 @@ class TaskTreeMetricTests(unittest.TestCase):
         self.assertEqual(metrics.unique.provenance, "derived")
         self.assertEqual(metrics.root_wall_clock_ms.value, 10_000)
         self.assertEqual(metrics.agent_time_ms.value, 16_000)
+
+    def test_child_starting_one_hundred_nanoseconds_after_cutoff_is_excluded(self) -> None:
+        cutoff = require_exact_timestamp("2026-07-21T00:00:09Z")
+        after_cutoff = require_exact_timestamp(
+            "2026-07-21T00:00:09.0000001Z",
+        )
+
+        metrics = aggregate_task_tree(
+            root_id="root",
+            sessions=(
+                NormalizedSession("root", None, at(0)),
+                NormalizedSession(
+                    "after-cutoff", "root", after_cutoff.presentation,
+                    started_instant=after_cutoff,
+                ),
+            ),
+            tokens=(
+                TokenObservation(
+                    "root", at(5), 1, TokenVector(100, 0, 0, 0),
+                ),
+            ),
+            lifecycle=(
+                LifecycleObservation(
+                    "root", "task_complete", cutoff.presentation,
+                    observed_instant=cutoff,
+                ),
+            ),
+            activities=(),
+        )
+
+        self.assertEqual(metrics.session_ids, ("root",))
+        self.assertEqual(metrics.sessions.value, 1)
+        self.assertEqual(metrics.unique.working_tokens, 100)
 
     def test_unobserved_child_replay_is_zero_with_explicit_estimated_provenance(self) -> None:
         metrics = aggregate_task_tree(

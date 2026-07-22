@@ -183,10 +183,21 @@ class TokenObservation:
     value_provenance: Provenance = "exact"
     selection_caveat: str | None = None
     retain_value_without_timestamp: bool = False
+    observed_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.observed_at is not None:
             _require_aware(self.observed_at, "observed_at")
+            instant = self.observed_instant or instant_from_datetime(
+                self.observed_at,
+            )
+            if instant.presentation != self.observed_at:
+                raise ValueError("observed instant and datetime must match")
+            object.__setattr__(self, "observed_instant", instant)
+        elif self.observed_instant is not None:
+            raise ValueError("observed instant requires observed_at")
         validate_provenance(self.placement_provenance, "placement provenance")
         validate_provenance(self.value_provenance, "value provenance")
         if self.observed_at is None and self.placement_provenance != "estimated":
@@ -216,9 +227,18 @@ class ReplayBaselineObservation:
     session_id: str
     observed_at: datetime
     vector: TokenVector
+    observed_instant: ExactInstant | None = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
+        instant = self.observed_instant or instant_from_datetime(
+            self.observed_at,
+        )
+        if instant.presentation != self.observed_at:
+            raise ValueError("observed instant and datetime must match")
+        object.__setattr__(self, "observed_instant", instant)
 
 
 @dataclass(frozen=True)

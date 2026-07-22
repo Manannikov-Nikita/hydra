@@ -12,6 +12,7 @@ from unittest.mock import patch
 from hydra_codex.migrations_p16 import P16_MIGRATIONS
 from hydra_codex.migrations_q17 import Q17_MIGRATIONS
 from hydra_codex.pilot import close_pilot, pilot_status, start_pilot
+from hydra_codex.reconcile_engine import list_reconciled_tasks
 from hydra_codex.storage import HydraStore, StorageUnavailable
 from tests.test_migrations_b2 import build_schema
 from tests.test_report_semantic_trends import (
@@ -115,7 +116,7 @@ class PilotControllerMigrationTests(unittest.TestCase):
 
             store = HydraStore(database)
             try:
-                self.assertEqual(store.schema_version(), 34)
+                self.assertEqual(store.schema_version(), 35)
                 self.assertEqual(
                     store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
                     1,
@@ -325,6 +326,28 @@ class PilotControllerScenario(StoredReportScenario):
         self.assertIsNone(task["task_family"])
         self.assertEqual(task["scope_change"], "none")
 
+    def test_token_one_hundred_nanoseconds_after_completion_is_excluded(self) -> None:
+        self.add_task(
+            "exact-token-cutoff", 0, 100, family="telemetry-analysis",
+        )
+        self.db.execute(
+            """INSERT INTO token_snapshots(
+                   source_digest,line_number,session_key,project_id,epoch,input_tokens,
+                   cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,
+                   completeness,observed_at)
+               VALUES ('source-exact-token-cutoff',2,'exact-token-cutoff',?,0,
+                       1000,0,0,0,0,'complete',
+                       '2026-07-21T00:00:09.0000001Z')""",
+            (PROJECT,),
+        )
+
+        self.reconcile()
+        task = list_reconciled_tasks(self.store, PROJECT)[0]
+
+        self.assertEqual(task.metrics.unique.working_tokens, 100)
+        self.assertEqual(task.semantic.classified_working, 100)
+        self.assertEqual(task.semantic.coverage.value, 1.0)
+
     def test_stable_run_metadata_changes_snapshot_digest_before_receipt(self) -> None:
         run, before = self._verified_snapshot("metadata-binding")
         self.db.execute(
@@ -455,6 +478,79 @@ class PilotControllerScenario(StoredReportScenario):
             (run.pilot_id,),
         ).fetchone()
         self.assertEqual((state, closed_at), ("open", None))
+
+    def test_update_or_replace_cannot_target_a_receipted_run(self) -> None:
+        run, snapshot = self._verified_snapshot("run-update-replace")
+        audit_path = self.root / "run-update-replace-audit.json"
+        audit_path.write_text(
+            json.dumps(
+                {"schema_version": "hydra.audit/v1", "pilot_snapshot": snapshot},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        close_pilot(
+            self.store,
+            project_id=PROJECT,
+            pilot_id=run.pilot_id,
+            audit_json=audit_path,
+            decision="verified",
+            now=BASE + timedelta(seconds=100),
+        )
+
+        unguarded = sqlite3.connect(self.database)
+        try:
+            unguarded.execute("PRAGMA foreign_keys=OFF")
+            unguarded.execute(
+                """INSERT INTO pilot_runs(
+                       pilot_id,project_id,started_at,closed_at,target,
+                       task_family,thresholds_json,state)
+                   VALUES ('pilot_unreceipted','project-unreceipted',?,?,5,
+                           'telemetry-analysis','{}','closed')""",
+                (stamp(0), stamp(50)),
+            )
+            unguarded.commit()
+            protected_rowid = unguarded.execute(
+                "SELECT rowid FROM pilot_runs WHERE pilot_id=?", (run.pilot_id,),
+            ).fetchone()[0]
+            probes = (
+                (
+                    """UPDATE OR REPLACE pilot_runs SET pilot_id=?
+                         WHERE pilot_id='pilot_unreceipted'""",
+                    (run.pilot_id,),
+                ),
+                (
+                    """UPDATE OR REPLACE pilot_runs SET rowid=?
+                         WHERE pilot_id='pilot_unreceipted'""",
+                    (protected_rowid,),
+                ),
+            )
+            for sql, parameters in probes:
+                with self.subTest(sql=sql):
+                    unguarded.execute("SAVEPOINT replacement_probe")
+                    try:
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            unguarded.execute(sql, parameters)
+                    finally:
+                        unguarded.execute("ROLLBACK TO replacement_probe")
+                        unguarded.execute("RELEASE replacement_probe")
+
+            self.assertEqual(
+                unguarded.execute(
+                    "SELECT project_id,target FROM pilot_runs WHERE pilot_id=?",
+                    (run.pilot_id,),
+                ).fetchone(),
+                (PROJECT, 5),
+            )
+            self.assertEqual(
+                unguarded.execute(
+                    "SELECT COUNT(*) FROM pilot_runs WHERE pilot_id='pilot_unreceipted'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            unguarded.close()
 
     def test_status_holds_one_immediate_transaction_across_all_reads(self) -> None:
         run, _snapshot = self._verified_snapshot("atomic-status")

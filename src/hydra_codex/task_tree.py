@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Iterable
 
+from .exact_time import (
+    ExactInstant,
+    NANOSECONDS_PER_SECOND,
+    instant_from_datetime,
+)
 from .lifecycle_timing import is_later_attempt_start, select_lifecycle_boundary
 from .task_tree_types import (
     ActivityObservation,
@@ -104,8 +109,15 @@ def _session_amount(observations: list[TokenObservation]) -> _Amount:
     return _combine(_Amount(vector, _bounds(vector)) for vector in _epoch_vectors(observations))
 
 
+def _in_replay_baseline_window(
+    observed: ExactInstant, started: ExactInstant,
+) -> bool:
+    elapsed = observed.epoch_nanoseconds - started.epoch_nanoseconds
+    return 0 <= elapsed <= NANOSECONDS_PER_SECOND
+
+
 def _descendants(
-    root_id: str, sessions: dict[str, NormalizedSession], cutoff: datetime,
+    root_id: str, sessions: dict[str, NormalizedSession], cutoff: ExactInstant,
     include_ambiguous_lineage: bool,
 ) -> tuple[tuple[str, ...], int]:
     children: dict[str, list[str]] = defaultdict(list)
@@ -123,7 +135,8 @@ def _descendants(
             cycle_edges += 1
             continue
         session = sessions.get(current)
-        if session is None or (session.started_at is not None and session.started_at > cutoff):
+        started = None if session is None else session.started_instant
+        if session is None or (started is not None and started > cutoff):
             continue
         visited.add(current)
         queue.extend(sorted(children.get(current, ())))
@@ -143,6 +156,7 @@ def aggregate_task_tree(
     tools: Iterable[ToolObservation] = (), files: Iterable[FileObservation] = (),
     tests: Iterable[TestRunObservation] = (),
     cutoff_at: datetime | None = None,
+    cutoff_instant: ExactInstant | None = None,
     cutoff_timing_provenance: Provenance = "exact",
     include_ambiguous_lineage: bool = True,
 ) -> TaskTreeMetrics:
@@ -183,9 +197,14 @@ def aggregate_task_tree(
         completion is not None and completion.kind == "turn_aborted"
     )
     if cutoff_at is None:
+        if cutoff_instant is not None:
+            raise ValueError("cutoff_instant requires cutoff_at")
         if completion is None:
             raise ValueError("root task_complete observation is required")
         cutoff = completion.observed_at
+        exact_cutoff = completion.observed_instant or instant_from_datetime(
+            completion.observed_at,
+        )
         estimated_lifecycle_cutoff = completion.timing_provenance == "estimated"
     else:
         if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
@@ -194,11 +213,14 @@ def aggregate_task_tree(
             cutoff_timing_provenance, "cutoff timing provenance",
         )
         cutoff = cutoff_at
+        exact_cutoff = cutoff_instant or instant_from_datetime(cutoff_at)
+        if exact_cutoff.presentation != cutoff_at:
+            raise ValueError("cutoff instant and datetime must match")
         estimated_lifecycle_cutoff = cutoff_timing_provenance == "estimated"
-    if root.started_at is not None and root.started_at > cutoff:
+    if root.started_instant is not None and root.started_instant > exact_cutoff:
         raise ValueError("root starts after its task_complete observation")
     session_ids, cycle_edges = _descendants(
-        root_id, session_map, cutoff, include_ambiguous_lineage,
+        root_id, session_map, exact_cutoff, include_ambiguous_lineage,
     )
     included = set(session_ids)
 
@@ -209,7 +231,10 @@ def aggregate_task_tree(
     for item in token_items:
         if item.session_id not in included:
             continue
-        started_at = session_map[item.session_id].started_at
+        session = session_map[item.session_id]
+        started_at = session.started_at
+        started_instant = session.started_instant
+        observed_instant = item.observed_instant
         if item.observed_at is None:
             same_source_order = (
                 item.logical_source_key is not None
@@ -229,12 +254,21 @@ def aggregate_task_tree(
             else:
                 ambiguous_timestamp_tokens += 1
                 ambiguous_timestamp_sessions.add(item.session_id)
-        elif (
-            (started_at is None or started_at <= item.observed_at) and item.observed_at <= cutoff
+        elif observed_instant is not None and (
+            (
+                started_at is None
+                or started_instant is not None
+                and started_instant <= observed_instant
+            )
+            and observed_instant <= exact_cutoff
         ):
             token_by_session[item.session_id].append(item)
     for items in token_by_session.values():
-        items.sort(key=lambda item: (item.observed_at is None, item.observed_at or cutoff, item.sequence))
+        items.sort(key=lambda item: (
+            item.observed_instant is None,
+            item.observed_instant or exact_cutoff,
+            item.sequence,
+        ))
     timestamp_missing = sum(
         item.observed_at is None for items in token_by_session.values() for item in items
     )
@@ -268,7 +302,9 @@ def aggregate_task_tree(
 
     explicit = None if replay_baselines is None else {
         item.session_id: item for item in replay_baselines
-        if item.session_id in included and item.observed_at <= cutoff
+        if item.session_id in included
+        and item.observed_instant is not None
+        and item.observed_instant <= exact_cutoff
     }
     replay_by_session: dict[str, _Amount] = {}
     observed_baselines = zero_baselines = unconfirmed_edges = 0
@@ -285,19 +321,25 @@ def aggregate_task_tree(
             replay_by_session[session_id] = _Amount(TokenVector.zero(), _bounds(TokenVector.zero()))
             continue
         baseline = explicit.get(session_id) if explicit is not None else None
-        if explicit is None and session.started_at is not None:
-            threshold = session.started_at + timedelta(seconds=1)
+        session_start = session.started_instant
+        if explicit is None and session_start is not None:
             candidates = tuple(
                 item for item in token_by_session.get(session_id, ())
-                if item.observed_at is not None and session.started_at <= item.observed_at <= threshold
+                if item.observed_instant is not None
+                and _in_replay_baseline_window(
+                    item.observed_instant, session_start,
+                )
             )
             baseline_vector = candidates[-1].vector if candidates else None
         elif explicit is not None:
             baseline_vector = (
                 baseline.vector
                 if baseline is not None
-                and session.started_at is not None
-                and session.started_at <= baseline.observed_at <= session.started_at + timedelta(seconds=1)
+                and session_start is not None
+                and baseline.observed_instant is not None
+                and _in_replay_baseline_window(
+                    baseline.observed_instant, session_start,
+                )
                 else None
             )
         else:

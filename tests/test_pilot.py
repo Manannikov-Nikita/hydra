@@ -19,7 +19,7 @@ class PilotMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = HydraStore(Path(temporary) / "hydra.sqlite3")
             try:
-                self.assertEqual(store.schema_version(), 34)
+                self.assertEqual(store.schema_version(), 35)
                 tables = {
                     str(row[0])
                     for row in store.connection.execute(

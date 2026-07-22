@@ -79,7 +79,10 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
     )
     observations: list[TokenObservation] = []
     for sequence, row in enumerate(rows):
-        observed_at = _optional_timestamp(row[1])
+        observed_instant = _optional_instant(row[1])
+        observed_at = (
+            None if observed_instant is None else observed_instant.presentation
+        )
         observations.append(TokenObservation(
             str(row[0]), observed_at, sequence,
             TokenVector(row[3], row[4], row[5], row[6]), int(row[2]),
@@ -88,6 +91,7 @@ def _tokens(connection: sqlite3.Connection, project_id: str) -> tuple[TokenObser
             int(row[8]) if row[7] is not None else None,
             str(row[9]), str(row[10]) if row[10] is not None else None,
             row[11] == "app_server",
+            observed_instant,
         ))
     return tuple(observations)
 
@@ -102,10 +106,12 @@ def _baselines(connection: sqlite3.Connection, project_id: str) -> tuple[ReplayB
     )
     observations: list[ReplayBaselineObservation] = []
     for row in rows:
-        observed_at = _optional_timestamp(row[1])
-        if observed_at is not None:
+        observed_instant = _optional_instant(row[1])
+        if observed_instant is not None:
             observations.append(ReplayBaselineObservation(
-                str(row[0]), observed_at, TokenVector(row[2], row[3], row[4], row[5]),
+                str(row[0]), observed_instant.presentation,
+                TokenVector(row[2], row[3], row[4], row[5]),
+                observed_instant,
             ))
     return tuple(observations)
 
@@ -317,6 +323,7 @@ def aggregate_stored_task_tree(
     connection: sqlite3.Connection, *, project_id: str, root_id: str,
     classified_working_tokens: int = 0,
     cutoff_at: datetime | None = None,
+    cutoff_instant: ExactInstant | None = None,
     cutoff_timing_provenance: str = "exact",
     include_ambiguous_lineage: bool = True,
 ) -> TaskTreeMetrics:
@@ -336,6 +343,7 @@ def aggregate_stored_task_tree(
         files=_files(connection, project_id),
         tests=_tests(connection, project_id),
         cutoff_at=cutoff_at,
+        cutoff_instant=cutoff_instant,
         cutoff_timing_provenance=cutoff_timing_provenance,
         include_ambiguous_lineage=include_ambiguous_lineage,
     )

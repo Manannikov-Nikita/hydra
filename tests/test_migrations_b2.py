@@ -206,7 +206,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                 file_key="hspool_v1_" + "b" * 64,
             )
 
-            self.assertEqual(store.schema_version(), 34)
+            self.assertEqual(store.schema_version(), 35)
             self.assertEqual(store.connection.execute(
                 "SELECT COUNT(*) FROM annotation_transport_events "
                 "WHERE disposition='accepted'"
@@ -234,7 +234,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             store = HydraStore(database)
             self.addCleanup(store.close)
 
-            self.assertEqual(store.schema_version(), 34)
+            self.assertEqual(store.schema_version(), 35)
             row = store.connection.execute(
                 "SELECT diagnostic_category,staged_order FROM annotation_transport_events"
             ).fetchone()
@@ -250,7 +250,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             store = HydraStore(database)
             self.addCleanup(store.close)
 
-            self.assertEqual(store.schema_version(), 34)
+            self.assertEqual(store.schema_version(), 35)
             self.assertTrue({
                 "transport_key", "disposition", "diagnostic_category",
                 "staged_at_ns", "latency_ms",

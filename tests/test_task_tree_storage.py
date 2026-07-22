@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.storage import HydraStore
 from hydra_codex.rollout import Pseudonymizer, ingest_rollouts
 from hydra_codex.rollout_reconcile import reconcile_turn_attempts
@@ -129,6 +130,69 @@ class StoredTaskTreeTests(unittest.TestCase):
             self.assertEqual(metrics.file_reads.known_lower_bound, 1)
             self.assertEqual(metrics.full_test_runs.value, 1)
             self.assertEqual(metrics.test_retries.value, 1)
+
+    def test_post_cutoff_submicrosecond_replay_baseline_is_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            self.addCleanup(store.close)
+            connection = store.connection
+            connection.executemany(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,
+                       conversation_key,started_at)
+                   VALUES (?, 'project-exact-baseline', 'worktree', 1, '', ?)""",
+                (
+                    ("root", stamp(0)),
+                    ("child", "2026-07-21T00:00:08.500000Z"),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO session_edges(
+                       child_key,parent_key,baseline_working_tokens,
+                       confidence_kind,confidence)
+                   VALUES ('child','root',NULL,'confirmed',1.0)"""
+            )
+            connection.executemany(
+                """INSERT INTO token_snapshots(
+                       source_digest,line_number,session_key,project_id,epoch,
+                       input_tokens,cached_input_tokens,output_tokens,
+                       reasoning_tokens,cache_write_tokens,completeness,observed_at)
+                   VALUES (?, ?, ?, 'project-exact-baseline', 0,
+                           ?,0,0,0,0,'complete',?)""",
+                (
+                    ("source-root", 1, "root", 100, stamp(5)),
+                    (
+                        "source-child", 1, "child", 20,
+                        "2026-07-21T00:00:08.750000Z",
+                    ),
+                    (
+                        "source-child", 2, "child", 100,
+                        "2026-07-21T00:00:09.0000001Z",
+                    ),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO fork_baselines(
+                       child_key,source_digest,line_number,input_tokens,
+                       cached_input_tokens,output_tokens,reasoning_tokens,
+                       cache_write_tokens,provenance,observed_at)
+                   VALUES ('child','source-child',2,100,0,0,0,0,'exact',
+                           '2026-07-21T00:00:09.0000001Z')"""
+            )
+            connection.commit()
+            cutoff = require_exact_timestamp("2026-07-21T00:00:09Z")
+
+            metrics = aggregate_stored_task_tree(
+                connection,
+                project_id="project-exact-baseline",
+                root_id="root",
+                cutoff_at=cutoff.presentation,
+                cutoff_instant=cutoff,
+            )
+
+            self.assertEqual(metrics.recorded.working_tokens, 120)
+            self.assertEqual(metrics.replay_baseline.working_tokens, 0)
+            self.assertEqual(metrics.unique.working_tokens, 120)
 
     def test_ephemeral_child_without_started_at_is_retained_as_uncertain_lower_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

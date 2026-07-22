@@ -223,6 +223,44 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
         self.assertEqual(payload["project"]["display_name"], "A <script>")
 
+    def test_private_refresh_seam_reuses_caller_owned_store(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        store = HydraStore(self.database)
+        try:
+            with patch(
+                "hydra_codex.dashboard_queries.list_reconciled_reports",
+                side_effect=lambda _store, project_id: self.reports[project_id],
+            ):
+                snapshots = self.service._refresh_snapshots_from_store(
+                    store,
+                    refresh=self.refresh,
+                    project_ids={"project-a"},
+                )
+
+            self.assertEqual(tuple(snapshots), (project_ref,))
+            self.assertIsNotNone(store.connection)
+            self.assertEqual(snapshots[project_ref].selected_project_ref, project_ref)
+        finally:
+            store.close()
+
+    def test_private_refresh_seam_reads_each_project_once(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            with patch(
+                "hydra_codex.dashboard_queries.list_reconciled_reports",
+                side_effect=lambda _store, project_id: self.reports[project_id],
+            ) as reports:
+                snapshots = self.service._refresh_snapshots_from_store(
+                    store,
+                    refresh=self.refresh,
+                    project_ids=None,
+                )
+
+            self.assertEqual(len(snapshots), 2)
+            self.assertEqual(reports.call_count, 2)
+        finally:
+            store.close()
+
     def test_private_display_names_fall_back_to_opaque_project_label(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
         unsafe_names = (

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 import sqlite3
@@ -276,68 +276,134 @@ class DashboardQueryService:
         task_ref: str | None,
         refresh: DashboardRefreshView,
     ) -> DashboardSnapshot:
-        generated_at = self._generated_at()
         store = self._store_factory()
         try:
-            catalog = self._catalog(store)
-            if project_ref is None:
-                selected_ref = min((public_ref for _item, public_ref in catalog), default=None)
-            else:
-                self._resolve_project(catalog, project_ref)
-                selected_ref = project_ref
-            if task_ref is not None and selected_ref is None:
-                raise self._unknown()
-            by_project: dict[str, tuple[tuple[TaskReport, ...], str]] = {}
-            summaries: list[DashboardProjectSummary] = []
-            for item, public_ref in catalog:
-                reports, state = self._reports(store, item.project_id)
-                by_project[item.project_id] = (reports, state)
-                count = int(store.connection.execute(
-                    "SELECT COUNT(*) FROM reconciled_tasks WHERE project_id=?",
-                    (item.project_id,),
-                ).fetchone()[0])
-                summaries.append(DashboardProjectSummary(
-                    public_ref,
-                    self._display_name(item, public_ref),
-                    reports[0].last_activity_at if reports else item.last_seen_at,
-                    state,
-                    NumericFact(count, "count", "derived"),
-                ))
-            project_json: str | None = None
-            selected_task_json: str | None = None
-            selected_state = "current"
-            if selected_ref is not None:
-                item = self._resolve_project(catalog, selected_ref)
-                reports, selected_state = by_project[item.project_id]
-                project_json = canonical_json(self._project_payload(
-                    store, item, selected_ref, reports, selected_state,
-                ))
-                if task_ref is not None:
-                    selected = next(
-                        (report for report in reports if report.task_ref == task_ref),
-                        None,
-                    )
-                    if selected is None:
-                        raise self._unknown()
-                    selected_task_json = canonical_json(selected.as_dict())
-            freshness = {
-                "state": selected_state,
-                "doctor": {
-                    "scope": "global_launch_context",
-                    "report": self._doctor_report.as_dict(),
-                },
-            }
-            return DashboardSnapshot(
-                generated_at,
-                freshness,
-                tuple(summaries),
-                selected_ref,
-                project_json,
-                selected_task_json,
-                refresh,
+            return self._snapshot_from_store(
+                store, project_ref=project_ref, task_ref=task_ref, refresh=refresh,
             )
         finally:
             store.close()
+
+    def _snapshot_from_store(
+        self,
+        store: HydraStore,
+        *,
+        project_ref: str | None,
+        task_ref: str | None,
+        refresh: DashboardRefreshView,
+        generated_at: str | None = None,
+    ) -> DashboardSnapshot:
+        """Build one immutable DTO without taking ownership of *store*."""
+        catalog, by_project, summaries = self._prepare_snapshot_state(store)
+        return self._assemble_snapshot(
+            store,
+            catalog,
+            by_project,
+            summaries,
+            project_ref=project_ref,
+            task_ref=task_ref,
+            refresh=refresh,
+            generated_at=generated_at or self._generated_at(),
+        )
+
+    def _prepare_snapshot_state(
+        self, store: HydraStore,
+    ) -> tuple[
+        tuple[tuple[CatalogProject, str], ...],
+        dict[str, tuple[tuple[TaskReport, ...], str]],
+        tuple[DashboardProjectSummary, ...],
+    ]:
+        catalog = self._catalog(store)
+        by_project: dict[str, tuple[tuple[TaskReport, ...], str]] = {}
+        summaries: list[DashboardProjectSummary] = []
+        for item, public_ref in catalog:
+            reports, state = self._reports(store, item.project_id)
+            by_project[item.project_id] = (reports, state)
+            count = int(store.connection.execute(
+                "SELECT COUNT(*) FROM reconciled_tasks WHERE project_id=?",
+                (item.project_id,),
+            ).fetchone()[0])
+            summaries.append(DashboardProjectSummary(
+                public_ref,
+                self._display_name(item, public_ref),
+                reports[0].last_activity_at if reports else item.last_seen_at,
+                state,
+                NumericFact(count, "count", "derived"),
+            ))
+        return catalog, by_project, tuple(summaries)
+
+    def _assemble_snapshot(
+        self,
+        store: HydraStore,
+        catalog: tuple[tuple[CatalogProject, str], ...],
+        by_project: Mapping[str, tuple[tuple[TaskReport, ...], str]],
+        summaries: tuple[DashboardProjectSummary, ...],
+        *,
+        project_ref: str | None,
+        task_ref: str | None,
+        refresh: DashboardRefreshView,
+        generated_at: str,
+    ) -> DashboardSnapshot:
+        if project_ref is None:
+            selected_ref = min((public_ref for _item, public_ref in catalog), default=None)
+        else:
+            self._resolve_project(catalog, project_ref)
+            selected_ref = project_ref
+        if task_ref is not None and selected_ref is None:
+            raise self._unknown()
+        project_json: str | None = None
+        selected_task_json: str | None = None
+        selected_state = "current"
+        if selected_ref is not None:
+            item = self._resolve_project(catalog, selected_ref)
+            reports, selected_state = by_project[item.project_id]
+            project_json = canonical_json(self._project_payload(
+                store, item, selected_ref, reports, selected_state,
+            ))
+            if task_ref is not None:
+                selected = next(
+                    (report for report in reports if report.task_ref == task_ref),
+                    None,
+                )
+                if selected is None:
+                    raise self._unknown()
+                selected_task_json = canonical_json(selected.as_dict())
+        freshness = {
+            "state": selected_state,
+            "doctor": {
+                "scope": "global_launch_context",
+                "report": self._doctor_report.as_dict(),
+            },
+        }
+        return DashboardSnapshot(
+            generated_at, freshness, summaries,
+            selected_ref, project_json, selected_task_json, refresh,
+        )
+
+    def _refresh_snapshots_from_store(
+        self,
+        store: HydraStore,
+        *,
+        refresh: DashboardRefreshView,
+        project_ids: set[str] | None,
+    ) -> dict[str, DashboardSnapshot]:
+        """Build a same-instant public-ref map inside a caller transaction."""
+        catalog, by_project, summaries = self._prepare_snapshot_state(store)
+        generated_at = self._generated_at()
+        return {
+            public_ref: self._assemble_snapshot(
+                store,
+                catalog,
+                by_project,
+                summaries,
+                project_ref=public_ref,
+                task_ref=None,
+                refresh=refresh,
+                generated_at=generated_at,
+            )
+            for item, public_ref in catalog
+            if project_ids is None or item.project_id in project_ids
+        }
 
     def tasks(
         self,

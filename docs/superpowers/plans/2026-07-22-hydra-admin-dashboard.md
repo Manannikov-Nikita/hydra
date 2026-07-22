@@ -553,19 +553,17 @@ git commit -m "feat(dashboard): add trusted single-flight refresh"
 
 ---
 
-### Task 4: Secured loopback application, HTTP adapter, and CLI command
+### Task 4: Secured loopback application and HTTP adapter
 
 **Files:**
 - Create: `src/hydra_codex/dashboard_server.py`
-- Modify: `src/hydra_codex/cli.py`
 - Create: `tests/test_dashboard_server.py`
-- Modify: `tests/test_cli.py`
 
 **Interfaces:**
-- Consumes: query service, Refresh controller/cache, packaged assets, configured database/key paths.
-- Produces: pure `DashboardApplication.handle()`, `create_dashboard_server()`, `run_dashboard()`, CLI `hydra-codex dashboard`.
+- Consumes: query service, Refresh controller/cache, and an injected exact asset map.
+- Produces: pure `DashboardApplication.handle()` and `create_dashboard_server()` with an injected exact asset map.
 
-- [ ] **Step 1: Write pure HTTP/security and CLI RED tests**
+- [ ] **Step 1: Write pure HTTP/security RED tests**
 
 ```python
 def test_api_requires_exact_host_origin_and_bearer(self) -> None:
@@ -584,19 +582,13 @@ def test_refresh_requires_exact_empty_post(self) -> None:
     self.assertEqual(response.status, 400)
     self.assertEqual(self.controller.starts, 0)
 
-def test_dashboard_cli_has_no_host_option(self) -> None:
-    parser = build_parser()
-    arguments = parser.parse_args(["dashboard", "--port", "0", "--no-open"])
-    self.assertEqual((arguments.port, arguments.no_open), (0, True))
-    with self.assertRaises(SystemExit):
-        parser.parse_args(["dashboard", "--host", "0.0.0.0"])
 ```
 
 - [ ] **Step 2: Run server RED tests**
 
-Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_server tests.test_cli`
+Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_server`
 
-Expected: missing server and parser command failures.
+Expected: missing application/server failures.
 
 - [ ] **Step 3: Implement pure request/response application**
 
@@ -620,7 +612,7 @@ DashboardResponse` as the single validation/dispatch/error-sanitization entry
 point. Keep route functions private and return a `DashboardResponse` on every
 path; never delegate an error to `BaseHTTPRequestHandler`'s HTML responses.
 
-Static `/` and exact `/assets/...` routes are unauthenticated bootstrap resources. Every `/api/v1/*` route requires exactly one `Authorization: Bearer <token>` compared with `secrets.compare_digest`. Require exactly one exact Host. GET/HEAD may omit Origin but any supplied Origin must equal `http://<authority>`; POST requires exactly one exact Origin.
+Static `/` and exact injected `/assets/...` routes are unauthenticated bootstrap resources. Every `/api/v1/*` route requires exactly one `Authorization: Bearer <token>` compared with `secrets.compare_digest`. Require exactly one exact Host. GET/HEAD may omit Origin but any supplied Origin must equal `http://<authority>`; POST requires exactly one exact Origin.
 
 Implement:
 
@@ -649,32 +641,32 @@ Cross-Origin-Resource-Policy: same-origin
 
 Never emit `Access-Control-Allow-*`; suppress `BaseHTTPRequestHandler` request/version logs.
 
-- [ ] **Step 4: Add thin IPv4 loopback server and one-time token handoff**
+- [ ] **Step 4: Add the thin IPv4 loopback adapter**
 
-Implement exact public functions `create_dashboard_server(*, port,
-application_factory) -> ThreadingHTTPServer` and `run_dashboard(*, port,
-no_open, database_path, environ, installation_key_path, cwd, stdout,
-browser_open=webbrowser.open) -> None`.
+Implement exact public function `create_dashboard_server(*, port,
+application) -> ThreadingHTTPServer`. Tests construct `DashboardApplication`
+with an injected token, query service, Refresh controller, and exact in-memory
+asset map; production asset loading and launch lifecycle are Task 5.
 
-Construct only `ThreadingHTTPServer(("127.0.0.1", port), handler)` and verify its bound address. Generate `secrets.token_urlsafe(32)`. Default launch passes the credential-bearing fragment URL only to `browser_open` and prints a token-free authority. `--no-open` prints the credential-bearing launch URL exactly once as the explicit initial handoff; subsequent output contains no token. Close the Refresh controller and server on `KeyboardInterrupt`/normal shutdown.
-
-Add the direct CLI branch next to ingest (do not extend `LocalCommandServices`, which owns bounded request/response operations): `dashboard`, common `--db/--cwd`, `_nonnegative_port`, `--port 0`, `--no-open`.
+Construct only `ThreadingHTTPServer(("127.0.0.1", port), handler)` and verify
+its bound address. The adapter converts a bounded stdlib request into
+`DashboardRequest`, calls the pure application, writes the immutable response,
+and suppresses default request/version logs.
 
 - [ ] **Step 5: Test security matrix and loopback smoke**
 
 Cover wrong/duplicate auth, Host and Origin; null/IPv6/trailing-dot origins; non-empty body; transfer encoding; target/query bounds; no CORS; categorical 401/404/405/500; HEAD headers; exact assets/content types; token-free logs; database-unavailable response; server header without Python version; and one short-lived `http.client` smoke against port 0. Assert no bind other than `127.0.0.1` is expressible.
 
-- [ ] **Step 6: Run GREEN HTTP/CLI tests**
+- [ ] **Step 6: Run GREEN HTTP tests**
 
-Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_server tests.test_cli tests.test_local_services`
+Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_server`
 
 Expected: all tests pass; smoke server exits cleanly.
 
 - [ ] **Step 7: Commit the loopback slice**
 
 ```bash
-git add src/hydra_codex/dashboard_server.py src/hydra_codex/cli.py \
-  tests/test_dashboard_server.py tests/test_cli.py
+git add src/hydra_codex/dashboard_server.py tests/test_dashboard_server.py
 git commit -m "feat(dashboard): serve secured loopback API"
 ```
 
@@ -694,13 +686,15 @@ git commit -m "feat(dashboard): serve secured loopback API"
 - Create: `src/hydra_codex/dashboard_assets/views/shell.js`
 - Create: `src/hydra_codex/dashboard_assets/views/overview.js`
 - Modify: `src/hydra_codex/dashboard_server.py`
+- Modify: `src/hydra_codex/cli.py`
 - Modify: `pyproject.toml`
 - Create: `tests/test_dashboard_assets.py`
 - Create: `tests/test_dashboard_distribution.py`
+- Modify: `tests/test_cli.py`
 
 **Interfaces:**
 - Consumes: `hydra.dashboard/v1`, API error/refresh contracts, `DESIGN.md` tokens.
-- Produces: authenticated dashboard boot, theme/project navigation, Overview, packaged asset loader.
+- Produces: authenticated dashboard boot, theme/project navigation, Overview, packaged asset loader, one-time launch handoff, and `hydra-codex dashboard`.
 
 - [ ] **Step 1: Write asset, privacy, accessibility, and distribution RED tests**
 
@@ -723,13 +717,19 @@ def test_index_has_static_landmarks_and_no_inline_code(self) -> None:
     for marker in ("<header", "<nav", "<main", 'aria-live="polite"'):
         self.assertIn(marker, html)
     self.assertNotRegex(html, r"<script(?![^>]+src=)|<style")
+
+def test_dashboard_cli_has_no_host_option(self) -> None:
+    arguments = build_parser().parse_args(["dashboard", "--port", "0", "--no-open"])
+    self.assertEqual((arguments.port, arguments.no_open), (0, True))
+    with self.assertRaises(SystemExit):
+        build_parser().parse_args(["dashboard", "--host", "0.0.0.0"])
 ```
 
 - [ ] **Step 2: Run asset RED tests**
 
-Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_assets tests.test_dashboard_distribution`
+Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_assets tests.test_dashboard_distribution tests.test_cli`
 
-Expected: missing asset loader/files and distribution entries.
+Expected: missing asset loader/files, distribution entries, and CLI command.
 
 - [ ] **Step 3: Build token bootstrap and safe DOM foundation**
 
@@ -778,17 +778,34 @@ hydra_codex = [
 
 Load assets only with `importlib.resources.files("hydra_codex")` and an exact allowlist; never join a request path to the filesystem.
 
-- [ ] **Step 6: Run GREEN asset and package tests**
+- [ ] **Step 6: Integrate the one-time launch handoff and CLI command**
 
-Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_assets tests.test_dashboard_distribution tests.test_plugin_distribution`
+Implement `run_dashboard(*, port, no_open, database_path, environ,
+installation_key_path, cwd, stdout, browser_open=webbrowser.open) -> None`.
+Synchronize the catalog and build the initial last-valid public snapshot cache
+before accepting requests; database-unavailable and no-project states remain
+safe public DTOs. Generate `secrets.token_urlsafe(32)`. Default launch passes
+the credential-bearing fragment URL only to `browser_open` and prints a
+token-free authority. `--no-open` prints the credential-bearing URL exactly
+once as the initial handoff; later output contains no token. Close the Refresh
+controller/server on `KeyboardInterrupt` and normal shutdown.
+
+Add the direct CLI branch next to ingest (do not extend
+`LocalCommandServices`): `dashboard`, common `--db/--cwd`,
+`_nonnegative_port`, `--port 0`, and `--no-open`. There is no `--host`.
+
+- [ ] **Step 7: Run GREEN asset, package, and CLI tests**
+
+Run: `env PYTHONPATH=src python3.12 -m unittest tests.test_dashboard_assets tests.test_dashboard_distribution tests.test_cli tests.test_plugin_distribution`
 
 Expected: all tests pass; wheel/sdist contain each asset once and byte-identically; static report byte snapshots remain unchanged.
 
-- [ ] **Step 7: Commit the Overview slice**
+- [ ] **Step 8: Commit the Overview and launch slice**
 
 ```bash
 git add src/hydra_codex/dashboard_assets src/hydra_codex/dashboard_server.py \
-  pyproject.toml tests/test_dashboard_assets.py tests/test_dashboard_distribution.py
+  src/hydra_codex/cli.py pyproject.toml tests/test_dashboard_assets.py \
+  tests/test_dashboard_distribution.py tests/test_cli.py
 git commit -m "feat(dashboard): add Evidence Desk overview"
 ```
 

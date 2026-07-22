@@ -228,5 +228,55 @@ class TrustedRolloutDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(SourceChanged, "changed during ingest"):
             revalidate_trusted_rollout(candidate)
 
+    def test_directory_root_swap_after_lstat_before_resolve_is_rejected(self) -> None:
+        requested = self.root / "requested-active"
+        held = self.root / "held-active"
+        external = self.root / "external-directory"
+        write_rollout(requested / "expected.jsonl", identity="expected")
+        write_rollout(external / "escaped.jsonl", identity="escaped")
+        original_resolve = Path.resolve
+        swapped = False
+
+        def swap_then_resolve(path: Path, *args, **kwargs):
+            nonlocal swapped
+            if path == requested and not swapped:
+                swapped = True
+                requested.rename(held)
+                requested.symlink_to(external, target_is_directory=True)
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", new=swap_then_resolve):
+            candidates = discover_trusted_rollouts((
+                RolloutRoot(requested, "active"),
+            ))
+
+        self.assertTrue(swapped)
+        self.assertEqual(candidates, ())
+
+    def test_direct_file_root_swap_after_lstat_before_resolve_is_rejected(self) -> None:
+        requested = self.root / "requested.jsonl"
+        held = self.root / "held.jsonl"
+        external = self.root / "external.jsonl"
+        write_rollout(requested, identity="expected")
+        write_rollout(external, identity="escaped")
+        original_resolve = Path.resolve
+        swapped = False
+
+        def swap_then_resolve(path: Path, *args, **kwargs):
+            nonlocal swapped
+            if path == requested and not swapped:
+                swapped = True
+                requested.rename(held)
+                requested.symlink_to(external)
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", new=swap_then_resolve):
+            candidates = discover_trusted_rollouts((
+                RolloutRoot(requested, "archived"),
+            ))
+
+        self.assertTrue(swapped)
+        self.assertEqual(candidates, ())
+
 if __name__ == "__main__":
     unittest.main()

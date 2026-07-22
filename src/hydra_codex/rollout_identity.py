@@ -69,6 +69,10 @@ class TrustedRolloutCandidate:
     label: str
     root: Path = field(repr=False)
     root_is_file: bool = field(repr=False)
+    requested_root: Path | None = field(default=None, repr=False)
+    requested_root_identity: tuple[int, int, int] | None = field(
+        default=None, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.label not in {"active", "archived"}:
@@ -150,33 +154,57 @@ def _trusted_root_specs(roots: Iterable[RolloutRoot]) -> tuple[RolloutRoot, ...]
     return tuple(sorted(specs, key=lambda item: (item.label, str(Path(item.path)))))
 
 
+def _root_identity(details: os.stat_result) -> tuple[int, int, int]:
+    return (
+        int(details.st_dev), int(details.st_ino), stat.S_IFMT(details.st_mode),
+    )
+
+
+def _stable_canonical(
+    path: Path, expected: tuple[int, int, int],
+) -> Path | None:
+    try:
+        canonical = path.resolve(strict=True)
+        current = path.lstat()
+    except (OSError, RuntimeError):
+        return None
+    if stat.S_ISLNK(current.st_mode) or _root_identity(current) != expected:
+        return None
+    return canonical
+
+
 def discover_trusted_rollouts(
     roots: Iterable[RolloutRoot],
 ) -> tuple[TrustedRolloutCandidate, ...]:
     """Discover canonical JSONL files without following any trusted-root symlink."""
     found: dict[Path, TrustedRolloutCandidate] = {}
     for item in _trusted_root_specs(roots):
-        requested = Path(item.path)
+        requested = Path(item.path).absolute()
         try:
             details = requested.lstat()
         except OSError:
             continue
         if stat.S_ISLNK(details.st_mode):
             continue
+        requested_identity = _root_identity(details)
         if stat.S_ISREG(details.st_mode):
             if requested.suffix != ".jsonl":
                 continue
-            canonical = requested.resolve(strict=True)
+            canonical = _stable_canonical(requested, requested_identity)
+            if canonical is None:
+                continue
             found.setdefault(
                 canonical,
-                TrustedRolloutCandidate(canonical, item.label, canonical, True),
+                TrustedRolloutCandidate(
+                    canonical, item.label, canonical, True,
+                    requested, requested_identity,
+                ),
             )
             continue
         if not stat.S_ISDIR(details.st_mode):
             continue
-        try:
-            canonical_root = requested.resolve(strict=True)
-        except OSError:
+        canonical_root = _stable_canonical(requested, requested_identity)
+        if canonical_root is None:
             continue
         for directory, names, files in os.walk(
             canonical_root, topdown=True, followlinks=False,
@@ -202,8 +230,12 @@ def discover_trusted_rollouts(
                     candidate_details = candidate.lstat()
                     if not stat.S_ISREG(candidate_details.st_mode):
                         continue
-                    canonical = candidate.resolve(strict=True)
                 except OSError:
+                    continue
+                canonical = _stable_canonical(
+                    candidate, _root_identity(candidate_details),
+                )
+                if canonical is None:
                     continue
                 if not canonical.is_relative_to(canonical_root):
                     continue
@@ -211,6 +243,7 @@ def discover_trusted_rollouts(
                     canonical,
                     TrustedRolloutCandidate(
                         canonical, item.label, canonical_root, False,
+                        requested, requested_identity,
                     ),
                 )
     return tuple(found[path] for path in sorted(found))
@@ -221,6 +254,24 @@ def revalidate_trusted_rollout(candidate: TrustedRolloutCandidate) -> SourceStat
     if not isinstance(candidate, TrustedRolloutCandidate):
         raise SourceChanged(SOURCE_CHANGED_MESSAGE)
     try:
+        requested = candidate.requested_root or candidate.root
+        requested_details = requested.lstat()
+        requested_identity = _root_identity(requested_details)
+        if (
+            stat.S_ISLNK(requested_details.st_mode)
+            or candidate.requested_root_identity is not None
+            and requested_identity != candidate.requested_root_identity
+        ):
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+        expected_root = candidate.path if candidate.root_is_file else candidate.root
+        if requested.resolve(strict=True) != expected_root:
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+        after_resolve = requested.lstat()
+        if (
+            stat.S_ISLNK(after_resolve.st_mode)
+            or _root_identity(after_resolve) != requested_identity
+        ):
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE)
         root_details = candidate.root.lstat()
         if stat.S_ISLNK(root_details.st_mode):
             raise SourceChanged(SOURCE_CHANGED_MESSAGE)

@@ -109,6 +109,7 @@ select, input {
 .route-status:empty, .async-status:empty { display: none; }
 .async-status { margin-bottom: 20px; }
 .async-state { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.async-state.notice { padding-left: 12px; border-left: 3px solid var(--phase-orange); }
 .async-state .muted { margin-right: auto; }
 .page-header { display: flex; justify-content: space-between; align-items: start; gap: 24px; margin-bottom: 24px; }
 .page-header p { margin: 6px 0 0; color: var(--ink-muted); }
@@ -116,7 +117,7 @@ select, input {
 .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .metric-card { min-width: 0; padding: 20px; border-radius: 14px; background: var(--surface-subtle); }
 .metric-label { display: block; margin-bottom: 8px; color: var(--ink-muted); font-size: 13px; line-height: 1.25; font-weight: 500; }
-.metric-value { display: block; font-size: 28px; line-height: 1.15; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.metric-value { display: block; font-size: clamp(24px, 2.4vw, 32px); line-height: 1.1; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .metric-detail { display: block; margin-top: 6px; color: var(--ink-muted); font-size: 13px; }
 .phase-track { display: flex; width: 100%; height: 20px; overflow: hidden; border-radius: 10px; background: var(--track); }
 .phase-segment + .phase-segment { border-left: 1px solid var(--canvas); }
@@ -126,10 +127,13 @@ select, input {
 .phase-purple { background: var(--phase-purple); }
 .phase-red { background: var(--phase-red); }
 .phase-neutral { background: var(--phase-neutral); }
-.phase-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px 20px; margin: 16px 0 0; padding: 0; list-style: none; }
-.phase-label { display: flex; align-items: center; gap: 8px; }
+.phase-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px 24px; margin: 18px 0 0; padding: 0; list-style: none; }
+.phase-legend li { min-width: 0; }
+.phase-label { display: flex; min-width: 0; align-items: center; gap: 8px; font-weight: 500; }
+.phase-label > :last-child { overflow-wrap: anywhere; }
 .phase-swatch { width: 10px; height: 10px; border-radius: 999px; flex: 0 0 auto; }
-.phase-amount { display: block; margin-left: 18px; font-variant-numeric: tabular-nums; }
+.phase-amount { display: block; min-width: 0; margin: 3px 0 0 18px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.phase-provenance { display: block; margin-left: 18px; color: var(--ink-muted); font-size: 13px; overflow-wrap: anywhere; }
 .table-wrap { max-width: 100%; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 15px; }
 caption { padding: 0 0 10px; color: var(--ink-muted); text-align: left; }

@@ -1,4 +1,4 @@
-import {dataTable, el, factPercent, factText, metricCard, pageHeader, phaseFigure} from "../dom.js";
+import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseFigure} from "../dom.js";
 
 function basisText(project, overview) {
   if (overview.basis && overview.basis.task_ref) {
@@ -44,7 +44,7 @@ export function renderOverview(snapshot, actions) {
     task.task_ref,
     task.task_family || "Unclassified",
     task.status,
-    factText(task.headline && task.headline.working_tokens),
+    factSummaryText(task.headline && task.headline.working_tokens),
     task.last_activity_at,
   ]);
   const pilot = project.pilot;

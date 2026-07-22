@@ -35,8 +35,8 @@ function announce(message) {
   liveRegion.textContent = message;
 }
 
-function showAsyncState(kind, title, detail, retry = null) {
-  asyncStatus.replaceChildren(asyncState(kind, title, detail, retry));
+function showAsyncState(kind, title, detail, retry = null, actionLabel = "Retry") {
+  asyncStatus.replaceChildren(asyncState(kind, title, detail, retry, actionLabel));
 }
 
 function clearAsyncState() {
@@ -102,13 +102,15 @@ function refreshRequiredRoute(route) {
 
 function refreshProgressCount(fact) {
   if (!fact || fact.value === null) {
-    return fact && Number.isFinite(fact.lower_bound)
-      ? `at least ${formatNumber(fact.lower_bound)}`
+    return fact && Number.isFinite(fact.lower_bound) && fact.lower_bound > 0
+      ? `≥ ${formatNumber(fact.lower_bound)}`
       : "unavailable";
   }
   const value = fact.value === 0 ? "0" : formatNumber(fact.value);
   return Number.isFinite(fact.lower_bound)
-    ? `${value} (lower bound ${formatNumber(fact.lower_bound)})`
+    && fact.lower_bound > 0
+    && fact.lower_bound !== fact.value
+    ? `${value} (≥ ${formatNumber(fact.lower_bound)})`
     : value;
 }
 
@@ -121,15 +123,31 @@ function refreshProgressDetail(current) {
   ];
   const provenance = [...new Set(facts.map(fact =>
     fact && fact.provenance ? fact.provenance : "provenance unavailable"))];
-  const caveats = [...new Set(facts.flatMap(fact =>
-    fact && Array.isArray(fact.caveats) ? fact.caveats : []))];
-  const metadata = `provenance: ${provenance.join(", ")}`
-    + (caveats.length ? ` · caveats: ${caveats.join(", ")}` : "");
+  const metadata = `provenance: ${provenance.join(", ")}`;
   return `Sources scanned ${refreshProgressCount(progress.sources_scanned)}`
     + `/${refreshProgressCount(progress.sources_discovered)}; `
     + `Projects completed ${refreshProgressCount(progress.projects_completed)}`
     + `/${refreshProgressCount(progress.projects_total)}; `
     + `refreshed ${refreshProgressCount(progress.projects_refreshed)} · ${metadata}`;
+}
+
+function refreshDiagnosticDetail(current) {
+  const codes = new Set(current && Array.isArray(current.diagnostic_codes)
+    ? current.diagnostic_codes : []);
+  if (codes.has("source_changed")) {
+    return "A live task changed during refresh. Stable evidence remains visible. "
+      + "Wait for the active task to finish writing, then refresh again.";
+  }
+  if (codes.has("database_busy")) {
+    return "Hydra is finishing another write. Stable evidence remains visible. Refresh again shortly.";
+  }
+  if (codes.has("reconciliation_stale")) {
+    return "New observations arrived before reconciliation finished. Stable evidence remains visible. Refresh again.";
+  }
+  if (current && current.state === "partial") {
+    return "Some sources could not be refreshed. Stable evidence remains visible. Refresh again when the source is ready.";
+  }
+  return "The refresh could not finish. Stable evidence remains visible. Try again.";
 }
 
 function errorMessage(code) {
@@ -362,19 +380,31 @@ async function pollRefresh(refreshRef) {
     const reloaded = await reloadAfterRefresh();
     refreshButton.disabled = false;
     refreshButton.removeAttribute("aria-busy");
-    refreshButton.textContent = current.state === "partial" || current.state === "failed"
-      ? "Retry" : "Refresh";
+    refreshButton.textContent = current.state === "partial"
+      ? "Refresh again" : current.state === "failed" ? "Retry" : "Refresh";
     if (!reloaded) return;
     if (current.state === "partial" || current.state === "failed") {
-      const diagnostics = (current.diagnostic_codes || []).join(", ") || "no diagnostic code";
-      showAsyncState("error", `Refresh ${current.state}`, diagnostics, startRefresh);
-      announce(`Refresh ${current.state}: ${diagnostics}`);
+      const partial = current.state === "partial";
+      const title = partial ? "Refresh needs another pass" : "Refresh failed";
+      const detail = refreshDiagnosticDetail(current);
+      showAsyncState(
+        partial ? "notice" : "error", title, detail, startRefresh,
+        partial ? "Refresh again" : "Retry",
+      );
+      routeStatus.textContent = "";
+      announceRefreshOutcome(`${title}. ${detail}`);
     } else {
       clearAsyncState();
       announce("Refresh complete");
     }
     return;
   }
+}
+
+function announceRefreshOutcome(message) {
+  if (message === lastAnnouncement) return;
+  lastAnnouncement = message;
+  liveRegion.textContent = message;
 }
 
 async function startRefresh() {
@@ -393,7 +423,8 @@ async function startRefresh() {
     refreshButton.textContent = "Retry";
     const code = error instanceof ApiError ? error.code : "internal_failure";
     showAsyncState("error", "Refresh failed", errorMessage(code), startRefresh);
-    announce(`Refresh failed: ${code}`);
+    routeStatus.textContent = "";
+    announceRefreshOutcome("Refresh failed");
   }
 }
 

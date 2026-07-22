@@ -1,4 +1,4 @@
-import {dataTable, el, factPercent, factText, metricCard, pageHeader, phaseFigure} from "../dom.js";
+import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseDisplayName, phaseFigure} from "../dom.js";
 
 function filterButton(label, pressed, select) {
   const button = el("button", {class: "button ghost", type: "button", "aria-pressed": pressed, text: label});
@@ -54,10 +54,10 @@ function renderDetail(task) {
       ]),
     ]),
     el("section", {class: "section"}, [el("h3", {text: "Semantic timeline"}),
-      dataTable("Model-reported timeline", ["Kind", "Phase", "Cause", "Note", "Confidence / provenance"], timeline.map(item => [item.kind, item.phase || "—", item.cause, item.note || "—", `${String(item.confidence)} · ${item.provenance || "provenance unavailable"}`]))]),
+      dataTable("Model-reported timeline", ["Kind", "Phase", "Cause", "Note", "Confidence / provenance"], timeline.map(item => [item.kind, item.phase ? phaseDisplayName(item.phase) : "—", item.cause, item.note || "—", `${String(item.confidence)} · ${item.provenance || "provenance unavailable"}`]))]),
     el("section", {class: "section"}, [el("h3", {text: "Test and retry evidence"}),
       dataTable("Detected test evidence", ["Scope", "Failure cause", "Retry kind", "Phase", "Cause", "Count"], testRows.map(item => [
-        item.scope, item.failure_cause, item.retry_kind, item.phase, item.cause, factText(item.count),
+        item.scope, item.failure_cause, item.retry_kind, phaseDisplayName(item.phase), item.cause, factText(item.count),
       ]))]),
     el("section", {class: "section"}, [el("h3", {text: "Pilot and trend context"}),
       el("dl", {class: "divider-list"}, [
@@ -82,7 +82,7 @@ export function renderTasks(state, actions) {
   const listRows = visible.map(task => {
     const button = el("button", {class: "row-button mono", type: "button", "aria-pressed": task.task_ref === state.taskRef, text: task.task_ref});
     button.addEventListener("click", () => actions.selectTask(task.task_ref));
-    return [button, task.task_family || "Unclassified", task.status, factText(task.deduplicated_tokens && task.deduplicated_tokens.working)];
+    return [button, task.task_family || "Unclassified", task.status, factSummaryText(task.deduplicated_tokens && task.deduplicated_tokens.working)];
   });
   return el("div", {}, [
     pageHeader("Tasks", "Browse reconciled tasks, then inspect one evidence record in context."),

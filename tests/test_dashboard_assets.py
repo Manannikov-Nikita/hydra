@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import unittest
 
 
@@ -30,6 +33,21 @@ class DashboardAssetContractTests(unittest.TestCase):
 
     def all_sources(self) -> str:
         return "\n".join(self.asset(name) for name in sorted(EXPECTED_ASSETS))
+
+    def evaluate_dom(self, expression: str) -> object:
+        source = (
+            f"import * as dom from {json.dumps((ASSET_ROOT / 'dom.js').as_uri())};"
+            f"process.stdout.write(JSON.stringify({expression}));"
+        )
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", source],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
 
     def test_inventory_is_exact_utf8_and_self_contained(self) -> None:
         inventory = {
@@ -102,7 +120,6 @@ class DashboardAssetContractTests(unittest.TestCase):
             "document.createTextNode",
             "Number.isFinite",
             "fact.value === null",
-            "fact.value === 0",
             "fact.lower_bound",
             "fact.provenance",
             "style.flexBasis",
@@ -122,13 +139,74 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn('fact.provenance || "provenance unavailable"', dom)
         self.assertRegex(
             dom,
-            r"export function factText\(fact,[\s\S]+factDetail\(fact\)",
+            r"export function factText\(fact,[\s\S]+factAccessibleText\(fact,[\s\S]+factDetail\(fact\)",
         )
-        self.assertNotIn("fact.lower_bound > fact.value", dom)
         self.assertRegex(
             dom,
-            r"Number\.isFinite\(fact\.lower_bound\)[\s\S]+lower bound",
+            r"export function factSummaryText\(fact,[\s\S]+provenanceText\(fact\)",
         )
+        self.assertNotIn("fact.lower_bound > fact.value", dom)
+        self.assertIn("fact.lower_bound", dom)
+        self.assertNotIn("lower bound", dom.lower())
+        self.assertNotIn("upper bound", dom.lower())
+        self.assertIn("≥", dom)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_compact_numbers_promote_cleanly_at_suffix_boundaries(self) -> None:
+        values = self.evaluate_dom(
+            "[0, 999, 1000, 13500, 464000, 999499, 999500, "
+            "13766276, 464000000, 1200000000, -13500]"
+            ".map(dom.formatCompactNumber)"
+        )
+
+        self.assertEqual(values, [
+            "0", "999", "1k", "13.5k", "464k", "999k", "1M",
+            "13.8M", "464M", "1.2B", "-13.5k",
+        ])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_fact_values_use_symbolic_non_redundant_bounds(self) -> None:
+        values = self.evaluate_dom(
+            "["
+            "{value: 468356, lower_bound: 468356, unit: 'tokens'},"
+            "{value: 500000, lower_bound: 450000, unit: 'tokens'},"
+            "{value: null, lower_bound: 13500, unit: 'tokens'},"
+            "{value: 0, lower_bound: 0, unit: 'tokens'},"
+            "{value: null, lower_bound: 0, unit: 'tokens'},"
+            "{value: null, lower_bound: null, unit: 'tokens'}"
+            "].map(fact => dom.factValueText(fact))"
+        )
+
+        self.assertEqual(values, [
+            "≥ 468k tokens", "500k tokens · ≥ 450k tokens",
+            "≥ 13.5k tokens", "0 tokens", "Unavailable", "Unavailable",
+        ])
+
+        summary = self.evaluate_dom(
+            "dom.factSummaryText({value: 1000, lower_bound: 1000, unit: 'tokens', "
+            "provenance: 'derived', caveats: ['semantic_interval_allocation']})"
+        )
+        evidence = self.evaluate_dom(
+            "dom.factText({value: 1000, lower_bound: 1000, unit: 'tokens', "
+            "provenance: 'derived', caveats: ['semantic_interval_allocation']})"
+        )
+        self.assertEqual(summary, "≥ 1k tokens · Derived")
+        self.assertEqual(
+            evidence,
+            "≥ 1,000 tokens · derived · semantic_interval_allocation",
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_phase_names_are_short_human_labels(self) -> None:
+        labels = self.evaluate_dom(
+            "['understand', 'test_targeted', 'test_full', 'browser_qa', "
+            "'wait_external', 'unclassified'].map(dom.phaseDisplayName)"
+        )
+
+        self.assertEqual(labels, [
+            "Understand", "Targeted tests", "Full suite", "Browser QA",
+            "External wait", "Unclassified",
+        ])
 
     def test_design_tokens_themes_and_phase_map_are_exact(self) -> None:
         tokens = self.asset("tokens.css")
@@ -172,6 +250,10 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn("border-radius: 14px", css)
         self.assertIn(".phase-track", css)
         self.assertIn("height: 20px", css)
+        self.assertIn("minmax(220px, 1fr)", css)
+        self.assertIn(".phase-legend li", css)
+        self.assertIn("min-width: 0", css)
+        self.assertIn("overflow-wrap: anywhere", css)
         self.assertIn(".project-rail", css)
         self.assertIn("display: none !important", css)
         tokens = self.asset("tokens.css")
@@ -226,6 +308,8 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn("export function asyncState", dom)
         self.assertIn('role: "group"', dom)
         self.assertNotRegex(dom, r'role:\s*(?:"alert"|"status")')
+        self.assertIn('stateKind === "notice"', dom)
+        self.assertIn('"Refresh notice"', dom)
         self.assertIn("showAsyncState", app)
         self.assertIn("clearAsyncState", app)
         self.assertIn("lastAnnouncement", app)
@@ -339,6 +423,25 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn("comparison: null", state)
         self.assertIn("evidence: null", state)
         self.assertNotIn("routeView.replaceChildren", app.split("startRefresh", 1)[-1])
+
+    def test_partial_refresh_uses_human_recovery_copy(self) -> None:
+        app = self.asset("app.js")
+
+        for marker in (
+            "Stable evidence remains visible",
+            "Refresh again",
+            "A live task changed during refresh",
+            "Wait for the active task to finish writing",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, app)
+        terminal = app.split("async function pollRefresh", 1)[-1].split(
+            "async function startRefresh", 1,
+        )[0]
+        self.assertIn('partial ? "notice" : "error"', terminal)
+        self.assertIn("`${title}. ${detail}`", terminal)
+        self.assertNotIn('diagnostic_codes || []).join(", ")', terminal)
+        self.assertNotIn("Refresh partial: source_changed", app)
 
     def test_refresh_loading_state_reports_observed_progress_without_eta(self) -> None:
         app = self.asset("app.js")

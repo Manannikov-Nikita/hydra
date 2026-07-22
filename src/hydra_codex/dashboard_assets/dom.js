@@ -4,6 +4,22 @@ const PHASE_ORDER = Object.freeze([
   "test_full", "review", "fix", "docs", "browser_qa", "release",
   "wait_external", "unclassified",
 ]);
+const PHASE_LABELS = Object.freeze({
+  "understand": "Understand",
+  "research": "Research",
+  "design": "Design",
+  "implement": "Implement",
+  "test_targeted": "Targeted tests",
+  "test_full": "Full suite",
+  "review": "Review",
+  "fix": "Fix",
+  "docs": "Docs",
+  "browser_qa": "Browser QA",
+  "release": "Release",
+  "wait_external": "External wait",
+  "unclassified": "Unclassified",
+});
+const COMPACT_SUFFIXES = Object.freeze(["", "k", "M", "B", "T"]);
 export const PHASE_COLORS = Object.freeze({
   "understand": "blue", "research": "blue", "design": "blue",
   "implement": "orange", "docs": "orange",
@@ -22,7 +38,7 @@ export function el(tag, attributes = {}, children = []) {
     } else if (URL_ATTRIBUTES.has(name)) {
       if (name !== "href" || typeof value !== "string" || !value.startsWith("#")) throw new Error("unsafe URL attribute");
       node.setAttribute(name, value);
-    } else if (/^(aria-|data-)[a-z0-9_-]+$/.test(name) || /^(id|class|type|name|value|for|scope|colspan|tabindex|disabled|role|pattern|placeholder|min|max)$/.test(name)) {
+    } else if (/^(aria-|data-)[a-z0-9_-]+$/.test(name) || /^(id|class|type|name|value|for|scope|colspan|tabindex|disabled|role|title|pattern|placeholder|min|max)$/.test(name)) {
       if ((value !== false || name.startsWith("aria-")) && value !== null && value !== undefined) {
         const rendered = name.startsWith("aria-") ? String(value) : value === true ? "" : String(value);
         node.setAttribute(name, rendered);
@@ -42,6 +58,28 @@ export function formatNumber(value) {
   return new Intl.NumberFormat(undefined, {maximumFractionDigits: 2}).format(value);
 }
 
+export function formatCompactNumber(value) {
+  if (!Number.isFinite(value)) return "Unavailable";
+  const sign = value < 0 ? "-" : "";
+  const absolute = Math.abs(value);
+  let suffixIndex = absolute < 1000
+    ? 0
+    : Math.min(Math.floor(Math.log10(absolute) / 3), COMPACT_SUFFIXES.length - 1);
+  let scaled = absolute / 1000 ** suffixIndex;
+  let fractionDigits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+  let rounded = Number(scaled.toFixed(fractionDigits));
+  if (rounded >= 1000 && suffixIndex < COMPACT_SUFFIXES.length - 1) {
+    suffixIndex += 1;
+    scaled = absolute / 1000 ** suffixIndex;
+    fractionDigits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+    rounded = Number(scaled.toFixed(fractionDigits));
+  }
+  const rendered = new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: fractionDigits,
+  }).format(rounded);
+  return `${sign}${rendered}${COMPACT_SUFFIXES[suffixIndex]}`;
+}
+
 export function formatDuration(value) {
   if (!Number.isFinite(value)) return "Unavailable";
   if (value < 1000) return `${formatNumber(value)} ms`;
@@ -53,29 +91,62 @@ export function formatDuration(value) {
 function formatFactNumber(fact, value, options) {
   if (options.duration) return formatDuration(value);
   if (options.percent) return `${formatNumber(value * 100)}%`;
+  return `${formatCompactNumber(value)} ${fact.unit || ""}`.trim();
+}
+
+function formatExactFactNumber(fact, value, options) {
+  if (options.duration) return formatDuration(value);
+  if (options.percent) return `${formatNumber(value * 100)}%`;
   return `${formatNumber(value)} ${fact.unit || ""}`.trim();
 }
 
-function formatFactLowerBound(fact, options) {
+function formatFactMinimum(fact, options, formatter = formatFactNumber) {
   if (options.duration) return formatDuration(fact.lower_bound);
-  return formatFactNumber(fact, fact.lower_bound, options);
+  return formatter(fact, fact.lower_bound, options);
 }
 
-export function factValueText(fact, options = {}) {
+function hasPositiveMinimum(fact) {
+  return Number.isFinite(fact && fact.lower_bound)
+    && fact.lower_bound > 0;
+}
+
+function renderFactValue(fact, options, formatter) {
   if (!fact || fact.value === null) {
-    if (fact && Number.isFinite(fact.lower_bound)) {
-      return `At least ${formatFactLowerBound(fact, options)}`;
+    if (fact && Number.isFinite(fact.lower_bound) && fact.lower_bound > 0) {
+      return `≥ ${formatFactMinimum(fact, options, formatter)}`;
     }
     return "Unavailable";
   }
-  const value = fact.value === 0
-    ? formatFactNumber(fact, 0, options)
-    : formatFactNumber(fact, fact.value, options);
-  if (Number.isFinite(fact.lower_bound)) {
-    const lowerBound = formatFactLowerBound(fact, options);
-    return `${value} · lower bound ${lowerBound}`;
+  const value = formatter(fact, fact.value, options);
+  if (hasPositiveMinimum(fact) && fact.lower_bound === fact.value) {
+    return `≥ ${value}`;
+  }
+  if (hasPositiveMinimum(fact)) {
+    return `${value} · ≥ ${formatFactMinimum(fact, options, formatter)}`;
   }
   return value;
+}
+
+export function factValueText(fact, options = {}) {
+  return renderFactValue(fact, options, formatFactNumber);
+}
+
+export function factAccessibleText(fact, options = {}) {
+  return renderFactValue(fact, options, formatExactFactNumber);
+}
+
+export function phaseDisplayName(phase) {
+  return PHASE_LABELS[phase] || "Unclassified";
+}
+
+export function provenanceText(fact) {
+  const labels = {
+    exact: "Exact",
+    derived: "Derived",
+    model_reported: "Model reported",
+    estimated: "Estimated",
+  };
+  return labels[fact && fact.provenance] || "Provenance unavailable";
 }
 
 export function factDetail(fact) {
@@ -85,7 +156,11 @@ export function factDetail(fact) {
 }
 
 export function factText(fact, options = {}) {
-  return `${factValueText(fact, options)} · ${factDetail(fact)}`;
+  return `${factAccessibleText(fact, options)} · ${factDetail(fact)}`;
+}
+
+export function factSummaryText(fact, options = {}) {
+  return `${factValueText(fact, options)} · ${provenanceText(fact)}`;
 }
 
 export function factPercent(fact) {
@@ -94,10 +169,11 @@ export function factPercent(fact) {
 
 export function metricCard(label, fact, options = {}) {
   const value = factValueText(fact, options);
-  return el("div", {class: "metric-card"}, [
+  const accessible = factAccessibleText(fact, options);
+  return el("div", {class: "metric-card", title: `${label}: ${accessible}`}, [
     el("span", {class: "metric-label", text: label}),
-    el("strong", {class: "metric-value", text: value}),
-    el("span", {class: "metric-detail", text: factDetail(fact)}),
+    el("strong", {class: "metric-value", text: value, "aria-label": `${label}: ${accessible}`}),
+    el("span", {class: "metric-detail", text: provenanceText(fact)}),
   ]);
 }
 
@@ -109,7 +185,7 @@ function phaseFact(allocation, phase) {
 export function phaseFigure(allocation, label = "Working tokens by phase") {
   const entries = PHASE_ORDER.map(phase => ({phase, fact: phaseFact(allocation, phase)}));
   const total = entries.reduce((sum, entry) => sum + (Number.isFinite(entry.fact && entry.fact.value) && entry.fact.value >= 0 ? entry.fact.value : 0), 0);
-  const description = entries.map(entry => `${entry.phase}: ${factText(entry.fact)}`).join("; ");
+  const description = entries.map(entry => `${phaseDisplayName(entry.phase)}: ${factAccessibleText(entry.fact)}; ${provenanceText(entry.fact)}`).join("; ");
   const track = el("div", {class: "phase-track", role: "img", "aria-label": label, "aria-describedby": "phase-description"});
   for (const entry of entries) {
     const raw = Number.isFinite(entry.fact && entry.fact.value) && entry.fact.value >= 0 ? entry.fact.value : 0;
@@ -121,12 +197,20 @@ export function phaseFigure(allocation, label = "Working tokens by phase") {
   const legend = el("ul", {class: "phase-legend"}, entries.map(entry => {
     const raw = Number.isFinite(entry.fact && entry.fact.value) && entry.fact.value >= 0 ? entry.fact.value : 0;
     const percentage = total > 0 ? raw / total * 100 : 0;
+    const visibleValue = factValueText(entry.fact);
+    const accessibleValue = factAccessibleText(entry.fact);
     return el("li", {}, [
       el("span", {class: "phase-label"}, [
         el("span", {class: `phase-swatch phase-${PHASE_COLORS[entry.phase]}`, "aria-hidden": "true"}),
-        el("span", {text: entry.phase}),
+        el("span", {text: phaseDisplayName(entry.phase)}),
       ]),
-      el("span", {class: "phase-amount", text: `${factText(entry.fact)} · ${formatNumber(percentage)}%`}),
+      el("span", {
+        class: "phase-amount",
+        text: `${visibleValue} · ${formatNumber(percentage)}%`,
+        title: `${accessibleValue} · ${formatNumber(percentage)}%`,
+        "aria-label": `${phaseDisplayName(entry.phase)}: ${accessibleValue}; ${formatNumber(percentage)} percent; ${provenanceText(entry.fact)}`,
+      }),
+      el("span", {class: "phase-provenance", text: provenanceText(entry.fact)}),
     ]);
   }));
   return el("figure", {}, [track, legend, el("figcaption", {id: "phase-description", class: "sr-only", text: description})]);
@@ -150,19 +234,20 @@ export function emptyState(title, detail) {
   return el("div", {class: "empty-state"}, [el("h2", {text: title}), el("p", {text: detail})]);
 }
 
-export function asyncState(kind, title, detail, retry = null) {
-  const stateKind = kind === "error" ? "error" : "loading";
+export function asyncState(kind, title, detail, retry = null, actionLabel = "Retry") {
+  const stateKind = kind === "error" ? "error" : kind === "notice" ? "notice" : "loading";
   const region = el("div", {
     class: `async-state ${stateKind}`,
     role: "group",
-    "aria-label": stateKind === "error" ? "Request error" : "Request progress",
+    "aria-label": stateKind === "error" ? "Request error"
+      : stateKind === "notice" ? "Refresh notice" : "Request progress",
     "aria-busy": stateKind === "loading",
   }, [
     el("strong", {text: title}),
     el("span", {class: "muted", text: detail}),
   ]);
-  if (stateKind === "error" && typeof retry === "function") {
-    const action = el("button", {class: "button ghost", type: "button", text: "Retry"});
+  if (stateKind !== "loading" && typeof retry === "function") {
+    const action = el("button", {class: "button ghost", type: "button", text: actionLabel});
     action.addEventListener("click", retry);
     region.append(action);
   }

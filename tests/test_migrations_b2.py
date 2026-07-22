@@ -164,7 +164,96 @@ def replace_empty_table(path: Path, table: str, create_statement: str) -> None:
 
 
 class MigrationMatrixB2Tests(unittest.TestCase):
-    def test_schema_37_catalog_has_no_path_columns(self) -> None:
+    def test_schema_38_adds_partial_token_snapshot_task_lookup_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "token-index.sqlite3"
+            store = HydraStore(database)
+            try:
+                index = store.connection.execute(
+                    """SELECT sql FROM sqlite_master
+                         WHERE type='index'
+                           AND name='token_snapshots_project_session_valid'""",
+                ).fetchone()
+                listed = {
+                    str(row[1]): int(row[4])
+                    for row in store.connection.execute(
+                        "PRAGMA index_list(token_snapshots)",
+                    )
+                }
+
+                self.assertEqual(store.schema_version(), 38)
+                self.assertIsNotNone(index)
+                self.assertIn(
+                    "ON token_snapshots(project_id,session_key)",
+                    str(index[0]),
+                )
+                self.assertIn(
+                    "WHERE contributes_total=1 AND vector_valid=1",
+                    str(index[0]),
+                )
+                self.assertEqual(
+                    listed["token_snapshots_project_session_valid"], 1,
+                )
+            finally:
+                store.close()
+
+    def test_token_delta_query_plan_uses_project_session_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "token-plan.sqlite3"
+            store = HydraStore(database)
+            try:
+                plan = tuple(store.connection.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT t.session_key,t.source_digest,t.line_number,t.epoch,
+                              t.observed_at,t.input_tokens,t.cached_input_tokens,
+                              t.output_tokens,t.reasoning_tokens,r.logical_source_key,
+                              t.event_key,t.source_family,t.selection_provenance,
+                              t.selection_caveat
+                         FROM token_snapshots t
+                         LEFT JOIN rollout_sources r
+                                ON r.source_digest=t.source_digest
+                        WHERE t.project_id=? AND t.contributes_total=1
+                          AND t.vector_valid=1 AND t.session_key IN (?)
+                        ORDER BY t.session_key,t.epoch,
+                                 CASE WHEN t.observed_at IS NULL THEN 1 ELSE 0 END,
+                                 julianday(t.observed_at),t.source_digest,t.line_number""",
+                    ("project-a", "session-a"),
+                ))
+                details = "\n".join(str(row[3]) for row in plan)
+
+                self.assertIn(
+                    "token_snapshots_project_session_valid", details,
+                )
+                self.assertNotIn("SCAN t", details)
+            finally:
+                store.close()
+
+    def test_v37_token_rows_survive_query_index_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v37-token-index.sqlite3"
+            build_schema(database, 37)
+
+            store = HydraStore(database)
+            try:
+                preserved = store.connection.execute(
+                    """SELECT input_tokens,cached_input_tokens,output_tokens
+                         FROM token_snapshots
+                        WHERE project_id='preserved-project'
+                          AND session_key='legacy-rollout-session'""",
+                ).fetchone()
+                index = store.connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                         WHERE type='index'
+                           AND name='token_snapshots_project_session_valid'""",
+                ).fetchone()
+
+                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(tuple(preserved), (10, 2, 3))
+                self.assertIsNotNone(index)
+            finally:
+                store.close()
+
+    def test_latest_schema_catalog_has_no_path_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "catalog.sqlite3"
             store = HydraStore(database)
@@ -177,7 +266,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     columns,
                     {"project_id", "display_name", "first_seen_at", "last_seen_at"},
                 )
-                self.assertEqual(store.schema_version(), 37)
+                self.assertEqual(store.schema_version(), 38)
             finally:
                 store.close()
 

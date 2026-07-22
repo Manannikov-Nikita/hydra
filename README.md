@@ -20,6 +20,16 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
+Activate that environment before using the short `hydra-codex` examples below:
+
+```bash
+source .venv/bin/activate
+```
+
+Without activation, invoke the entry point explicitly as
+`.venv/bin/hydra-codex`. Installing into `.venv` does not add `hydra-codex` to
+the `PATH` of a fresh shell.
+
 For the complete verification suite, including real wheel and source-archive
 content checks, install the declared test tooling and run:
 
@@ -42,12 +52,37 @@ telemetry = "hybrid"
 Different worktrees containing that same project ID contribute observations to
 one project. Their relative worktree labels remain observations rather than new
 project identities. The project-local `.codex/hooks.json` enables the pilot for
-new Codex turns in this repository.
+new Codex turns in this repository. In Codex, trust the project, review `/hooks`,
+and confirm that `UserPromptSubmit`, `PostToolUse`, and `Stop` point to this
+repository's `integrations/codex/hook.py`. Start a new task after first enabling
+or changing those hooks; an already-open task does not prove that the new hook
+manifest was loaded.
 
 By default, private state is stored outside the repository at
 `~/Library/Application Support/Hydra/hydra.sqlite3`; the installation HMAC key
 lives beside it. Tests and isolated runs may set `HYDRA_DATABASE_PATH` and
 `HYDRA_INSTALLATION_KEY_PATH`.
+
+For the supported chat-to-dashboard startup, canary, Refresh, recovery, and
+shutdown procedure, see [Dashboard operations](docs/dashboard-operations.md).
+
+## Quick dashboard startup
+
+From the Hydra repository, after trusting its hooks and starting a new Codex
+task:
+
+```bash
+.venv/bin/hydra-codex doctor --format markdown
+.venv/bin/hydra-codex ingest
+.venv/bin/hydra-codex reconcile
+.venv/bin/hydra-codex dashboard
+```
+
+The dashboard binds only to `127.0.0.1` and normally opens the browser itself.
+It intentionally starts from a bounded stored snapshot; it does not scan local
+Codex history on launch. Press **Refresh** to import and reconcile the trusted
+active and archived rollout roots. Refresh is manual and single-flight: neither
+`Stop` nor leaving the dashboard open starts periodic background ingestion.
 
 ## CLI
 

@@ -367,6 +367,28 @@ class ReconcileEngineTests(unittest.TestCase):
         self.assertEqual(reports[0].pilot_health.task_count.value, 0)
         self.assertEqual(reports[0].pilot_health.missing_marker_rate.value, 0.0)
 
+    def test_reconciled_task_listing_reads_project_observations_once(self) -> None:
+        for index in range(3):
+            key = f"root-{index}"
+            self.session(key, index)
+            self.token(key, 1, 5 + index, 10 + index, 2, 3, 1)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"o" * 32)
+
+        statements: list[str] = []
+        self.connection.set_trace_callback(statements.append)
+        try:
+            tasks = list_reconciled_tasks(self.store, PROJECT)
+        finally:
+            self.connection.set_trace_callback(None)
+
+        project_session_reads = [
+            statement for statement in statements
+            if "SELECT s.session_key,e.parent_key,s.started_at" in statement
+        ]
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual(len(project_session_reads), 1)
+
     def test_query_fails_closed_when_sources_change_after_reconciliation(self) -> None:
         self.session("root", 0)
         self.token("root", 1, 5, 10, 2, 3, 1)

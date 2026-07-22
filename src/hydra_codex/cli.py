@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any, Mapping, Protocol, Sequence, TextIO
+from typing import Any, Callable, Mapping, Protocol, Sequence, TextIO
 
 from .contracts import ModelAnnotationInput
 from .project import ProjectNotFound, resolve_project
@@ -238,6 +238,7 @@ def _run_ingest(
     arguments: argparse.Namespace,
     environ: Mapping[str, str],
     installation_key_path: Path | None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, object]:
     from .services import (
         configured_database_path,
@@ -254,6 +255,7 @@ def _run_ingest(
         ).key
         report = ingest_rollouts(
             store, roots, project.project_root, project.project_id, hash_key=hash_key,
+            progress=progress,
         )
         event_report = None
         if arguments.event_source:
@@ -286,6 +288,29 @@ def _run_ingest(
             "event_issues": event_report.issues,
         })
     return result
+
+
+class _IngestProgressDisplay:
+    """Render privacy-safe progress on an interactive error stream."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self.stream = stream
+        self.active = False
+        self.complete = False
+
+    def __call__(self, stage: str, current: int, total: int) -> None:
+        self.active = True
+        self.complete = stage == "complete"
+        ending = "\n" if self.complete else ""
+        self.stream.write(
+            f"\rhydra-codex: ingest {stage} {current}/{total}{ending}",
+        )
+        self.stream.flush()
+
+    def close(self) -> None:
+        if self.active and not self.complete:
+            self.stream.write("\n")
+            self.stream.flush()
 
 
 def _stdin_text(stdin: TextIO) -> str:
@@ -462,9 +487,20 @@ def main(
         else:
             command_services = services
         if arguments.command == "ingest":
+            progress = (
+                _IngestProgressDisplay(error_stream)
+                if error_stream.isatty() else None
+            )
+            try:
+                result = _run_ingest(
+                    arguments, environment, installation_key_path, progress,
+                )
+            finally:
+                if progress is not None:
+                    progress.close()
             _write_json(
                 output_stream,
-                _run_ingest(arguments, environment, installation_key_path),
+                result,
             )
         elif arguments.command == "annotate":
             capability = environment.get("HYDRA_TURN_CAPABILITY")

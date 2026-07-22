@@ -28,7 +28,11 @@ from .reconcile_types import (
 )
 from .storage import HydraStore
 from .rollout_reconcile import reconcile_turn_attempts
-from .task_tree_storage import aggregate_stored_task_tree
+from .task_tree_storage import (
+    StoredProjectObservationIndex,
+    aggregate_stored_task_tree,
+    load_stored_project_observations,
+)
 from .task_tree_types import ScalarFact, TaskTreeMetrics
 from .test_evidence import materialize_test_evidence, reconcile_test_retries
 
@@ -142,18 +146,28 @@ def _assemble_project(
     tuple[tuple[TaskPlan, TaskTreeMetrics, tuple[DeltaFact, ...], SemanticAssembly], ...],
     str,
 ]:
-    plans = discover_task_plans(store.connection, project_id)
+    observations = load_stored_project_observations(
+        store.connection, project_id,
+    )
+    observation_index = StoredProjectObservationIndex(observations)
+    plans = discover_task_plans(
+        store.connection, project_id, observations,
+    )
     assembled: list[tuple[TaskPlan, TaskTreeMetrics, tuple[DeltaFact, ...], SemanticAssembly]] = []
     fingerprints: list[dict[str, object]] = []
     for plan in plans:
+        task_observations = observation_index.select(plan.session_ids)
         metrics = aggregate_stored_task_tree(
             store.connection, project_id=project_id, root_id=plan.root_key,
             cutoff_at=plan.cutoff_at,
             cutoff_instant=plan.cutoff_instant,
             cutoff_timing_provenance=plan.cutoff_timing_provenance,
             include_ambiguous_lineage=False,
+            project_observations=task_observations,
         )
-        deltas, diagnostics = build_token_deltas(store.connection, project_id, plan)
+        deltas, diagnostics = build_token_deltas(
+            store.connection, project_id, plan, task_observations,
+        )
         semantic = semantic_assembly(
             store.connection, project_id, plan, metrics, deltas, diagnostics,
         )

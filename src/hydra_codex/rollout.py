@@ -52,7 +52,11 @@ from .rollout_sources import (
     source_stat,
 )
 from .storage import HydraStore, StorageUnavailable
-from .test_evidence import TestEvidenceBuffer, parse_structured_result
+from .test_evidence import (
+    TestEvidenceBuffer,
+    parse_structured_result,
+    reconcile_test_evidence,
+)
 from .tool_normalization import custom_exec_outcome
 from .tool_spans import persist_tool_end, persist_tool_start
 
@@ -664,10 +668,6 @@ def _parse_source(
         test_evidence.flush()
         if parsed_lines != len(line_fingerprints):
             raise SourceChanged(SOURCE_CHANGED_MESSAGE)
-        reconcile_turn_attempts(
-            connection,
-            lambda digest, ordinal, kind: _insert_diagnostic(connection, digest, ordinal, kind, {}),
-        )
     return diagnostics
 
 
@@ -770,7 +770,8 @@ def ingest_rollouts(
     hash_token = ACTIVE_HASHER.set(hasher)
     try:
         root_specs = tuple(roots)
-        if prepared_scans is None:
+        direct_discovery = prepared_scans is None
+        if direct_discovery:
             files = discover_rollouts(root_specs)
             sources = tuple(
                 _IngestSource(
@@ -792,6 +793,8 @@ def ingest_rollouts(
         diagnostics = 0
         unique: set[str] = set()
         total_sources = len(sources)
+        if direct_discovery:
+            _emit_ingest_progress(progress, "discover", 0, total_sources)
         _emit_ingest_progress(progress, "inspect", 0, total_sources)
         for index, ingest_source in enumerate(sources, start=1):
             _emit_ingest_progress(progress, "inspect", index, total_sources)
@@ -823,6 +826,7 @@ def ingest_rollouts(
                         continue
                     before_stat = after_candidate_stat
             if scan is None:
+                _emit_ingest_progress(progress, "scan", index, total_sources)
                 scan = scan_source(path, hasher.key, opaque)
                 before_stat = scan.source_stat
             digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
@@ -940,16 +944,6 @@ def ingest_rollouts(
                         "UPDATE rollout_sources SET materialized=1 "
                         "WHERE source_digest=?", (digest,),
                     )
-                from .token_selection import refresh_token_source_selection
-
-                refresh_token_source_selection(connection, project_id)
-                reconcile_token_epochs(
-                    connection, project_id,
-                    lambda source_digest, ordinal, kind: _insert_diagnostic(
-                        connection, source_digest, ordinal, kind, {},
-                    ),
-                )
-                reconcile_fork_baselines(connection, project_id)
                 materialized = connection.execute(
                     "SELECT materialized FROM rollout_sources WHERE source_digest=?",
                     (digest,),
@@ -965,6 +959,7 @@ def ingest_rollouts(
         with store.rollout_transaction() as connection:
             from .token_selection import refresh_token_source_selection
 
+            reconcile_test_evidence(connection)
             refresh_token_source_selection(connection, project_id)
             reconcile_token_epochs(
                 connection, project_id,
@@ -973,7 +968,17 @@ def ingest_rollouts(
                 ),
             )
             reconcile_fork_baselines(connection, project_id)
+            reconcile_turn_attempts(
+                connection,
+                lambda source_digest, ordinal, kind: _insert_diagnostic(
+                    connection, source_digest, ordinal, kind, {},
+                ),
+            )
         _emit_ingest_progress(progress, "reconcile", 1, 1)
+        if direct_discovery:
+            _emit_ingest_progress(
+                progress, "complete", total_sources, total_sources,
+            )
         return IngestReport(len(sources), len(unique), diagnostics)
     finally:
         ACTIVE_HASHER.reset(hash_token)

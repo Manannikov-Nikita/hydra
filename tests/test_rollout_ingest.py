@@ -77,6 +77,78 @@ class RolloutIngestTests(unittest.TestCase):
         self.store.close()
         self.temporary_directory.cleanup()
 
+    def test_global_reconciliation_runs_once_per_ingest_batch(self) -> None:
+        for index in range(2):
+            write_jsonl(self.root / "rollouts" / f"tests-{index}.jsonl", [
+                v1("session_meta", {
+                    "id": f"anon-tests-{index}", "cwd": str(self.project),
+                }),
+                v1("response_item", {
+                    "type": "function_call", "call_id": f"call-{index}",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"pytest tests/test_{index}.py"}),
+                }, 1),
+                v1("response_item", {
+                    "type": "function_call_output", "call_id": f"call-{index}",
+                    "output": json.dumps({"exit_code": 0}),
+                }, 2),
+            ])
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+
+        ingest_rollouts(
+            self.store, (self.root / "rollouts",), self.project,
+            "project-synthetic", hash_key=b"b" * 32,
+        )
+
+        materializations = [
+            statement for statement in statements
+            if "DELETE FROM rollout_test_runs" in statement
+        ]
+        token_selections = [
+            statement for statement in statements
+            if "SELECT session_key,source_family,observed_at,event_key,input_tokens" in statement
+        ]
+        token_epochs = [
+            statement for statement in statements
+            if "envelope_kind='counter_reset'" in statement
+        ]
+        fork_baselines = [
+            statement for statement in statements
+            if "DELETE FROM fork_baselines" in statement
+        ]
+        turn_attempts = [
+            statement for statement in statements
+            if "FROM turn_lifecycle_events" in statement
+            and "SELECT event_key,session_key,turn_key,event_kind" in statement
+        ]
+        self.assertEqual(len(materializations), 1)
+        self.assertEqual(len(token_selections), 1)
+        self.assertEqual(len(token_epochs), 1)
+        self.assertEqual(len(fork_baselines), 1)
+        self.assertEqual(len(turn_attempts), 1)
+        self.assertEqual(self.store.count("rollout_test_runs"), 2)
+
+    def test_ingest_progress_reports_safe_batch_stages_without_paths(self) -> None:
+        source = self.root / "rollouts" / "private-name.jsonl"
+        write_jsonl(source, [
+            v1("session_meta", {"id": "anon-progress", "cwd": str(self.project)}),
+        ])
+        progress: list[tuple[str, int, int]] = []
+
+        ingest_rollouts(
+            self.store, (self.root / "rollouts",), self.project,
+            "project-synthetic", hash_key=b"p" * 32,
+            progress=lambda stage, current, total: progress.append(
+                (stage, current, total),
+            ),
+        )
+
+        self.assertEqual(progress[0], ("discover", 0, 1))
+        self.assertIn(("scan", 1, 1), progress)
+        self.assertEqual(progress[-1], ("complete", 1, 1))
+        self.assertNotIn("private-name", repr(progress))
+
     def test_active_archive_duplicate_resume_abort_open_turn_and_unknown_schema(self) -> None:
         records = [
             v1("session_meta", {"id": "anon-session-a", "cwd": str(self.project / "one")}),

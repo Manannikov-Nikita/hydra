@@ -57,6 +57,11 @@ Import the default active and archived local rollout roots:
 hydra-codex ingest
 ```
 
+On an interactive terminal, ingest reports privacy-safe `discover`, `inspect`,
+`scan`, and `reconcile` counters on stderr; JSON stdout remains unchanged. A
+first run after a source-state migration may scan every local rollout, while
+subsequent unchanged locations use metadata-only checks.
+
 An explicit rollout JSONL file or directory can be added without changing the
 defaults:
 

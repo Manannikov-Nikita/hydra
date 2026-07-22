@@ -17,11 +17,9 @@ from .reconcile_annotations import (
     phase_at,
 )
 from .task_tree_storage import (
-    _activities,
-    _lifecycle,
     _optional_timestamp,
-    _sessions,
-    _trusted_semantic_activities,
+    StoredProjectObservations,
+    load_stored_project_observations,
 )
 from .reconcile_types import TaskPlan
 from .reconcile_helpers import has_later_root_start, task_family as _task_family
@@ -102,22 +100,25 @@ def _session_instant(session: NormalizedSession) -> ExactInstant | None:
     return session.started_instant or instant_from_datetime(session.started_at)
 
 
-def discover_task_plans(connection: sqlite3.Connection, project_id: str) -> tuple[TaskPlan, ...]:
-    sessions = {item.session_id: item for item in _sessions(connection, project_id)}
+def discover_task_plans(
+    connection: sqlite3.Connection, project_id: str,
+    project_observations: StoredProjectObservations | None = None,
+) -> tuple[TaskPlan, ...]:
+    observations = project_observations or load_stored_project_observations(
+        connection, project_id,
+    )
+    sessions = {item.session_id: item for item in observations.sessions}
     if not sessions:
         return ()
     parents = {key: _effective_parent(item, set(sessions)) for key, item in sessions.items()}
     grouped: dict[str, list[str]] = defaultdict(list)
     for key in sessions:
         grouped[_canonical_root(key, parents)].append(key)
-    lifecycle = _lifecycle(connection, project_id)
-    activity = _activities(connection, project_id)
+    lifecycle = observations.lifecycle
+    activity = observations.activities
     activity_by_session: dict[str, list[datetime]] = defaultdict(list)
     for item in activity:
         activity_by_session[item.session_id].append(item.observed_at)
-    for item in _trusted_semantic_activities(connection, project_id):
-        if item.session_id in sessions:
-            activity_by_session[item.session_id].append(item.observed_at)
     terminals: dict[str, list[LifecycleObservation]] = defaultdict(list)
     starts: dict[str, list[LifecycleObservation]] = defaultdict(list)
     for item in lifecycle:
@@ -190,6 +191,7 @@ def _subtract(current: TokenVector, previous: TokenVector) -> TokenVector | None
 
 def build_token_deltas(
     connection: sqlite3.Connection, project_id: str, plan: TaskPlan,
+    project_observations: StoredProjectObservations | None = None,
 ) -> tuple[tuple[DeltaFact, ...], Counter[str]]:
     placeholders = ",".join("?" for _ in plan.session_ids)
     rows = list(connection.execute(
@@ -206,7 +208,10 @@ def build_token_deltas(
                        t.source_digest,t.line_number""",
         (project_id, *plan.session_ids),
     ))
-    sessions = {item.session_id: item for item in _sessions(connection, project_id)}
+    observations = project_observations or load_stored_project_observations(
+        connection, project_id,
+    )
+    sessions = {item.session_id: item for item in observations.sessions}
     baselines = {
         str(row[0]): (TokenVector(row[2], row[3], row[4], row[5]), _optional_timestamp(row[1]))
         for row in connection.execute(

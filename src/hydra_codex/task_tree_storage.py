@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 import sqlite3
 
@@ -319,17 +320,87 @@ def _tests(connection: sqlite3.Connection, project_id: str) -> tuple[TestRunObse
     )
 
 
-def aggregate_stored_task_tree(
-    connection: sqlite3.Connection, *, project_id: str, root_id: str,
-    classified_working_tokens: int = 0,
-    cutoff_at: datetime | None = None,
-    cutoff_instant: ExactInstant | None = None,
-    cutoff_timing_provenance: str = "exact",
-    include_ambiguous_lineage: bool = True,
-) -> TaskTreeMetrics:
-    """Build a task tree exclusively from normalized persisted observations."""
-    return aggregate_task_tree(
-        root_id=root_id,
+@dataclass(frozen=True)
+class StoredProjectObservations:
+    sessions: tuple[NormalizedSession, ...]
+    tokens: tuple[TokenObservation, ...]
+    lifecycle: tuple[LifecycleObservation, ...]
+    activities: tuple[ActivityObservation, ...]
+    replay_baselines: tuple[ReplayBaselineObservation, ...]
+    tools: tuple[ToolObservation, ...]
+    files: tuple[FileObservation, ...]
+    tests: tuple[TestRunObservation, ...]
+
+
+@dataclass(frozen=True)
+class _StoredSessionObservations:
+    session: NormalizedSession
+    tokens: tuple[TokenObservation, ...]
+    lifecycle: tuple[LifecycleObservation, ...]
+    activities: tuple[ActivityObservation, ...]
+    replay_baselines: tuple[ReplayBaselineObservation, ...]
+    tools: tuple[ToolObservation, ...]
+    files: tuple[FileObservation, ...]
+    tests: tuple[TestRunObservation, ...]
+
+
+class StoredProjectObservationIndex:
+    """Partition one project snapshot without repeatedly scanning every row."""
+
+    def __init__(self, observations: StoredProjectObservations) -> None:
+        sessions = {item.session_id: item for item in observations.sessions}
+
+        def grouped(items):
+            values: dict[str, list[object]] = {key: [] for key in sessions}
+            for item in items:
+                values.setdefault(item.session_id, []).append(item)
+            return values
+
+        tokens = grouped(observations.tokens)
+        lifecycle = grouped(observations.lifecycle)
+        activities = grouped(observations.activities)
+        baselines = grouped(observations.replay_baselines)
+        tools = grouped(observations.tools)
+        files = grouped(observations.files)
+        tests = grouped(observations.tests)
+        self._sessions = {
+            key: _StoredSessionObservations(
+                session,
+                tuple(tokens[key]),
+                tuple(lifecycle[key]),
+                tuple(activities[key]),
+                tuple(baselines[key]),
+                tuple(tools[key]),
+                tuple(files[key]),
+                tuple(tests[key]),
+            )
+            for key, session in sessions.items()
+        }
+
+    def select(self, session_ids: tuple[str, ...]) -> StoredProjectObservations:
+        try:
+            selected = tuple(self._sessions[session_id] for session_id in session_ids)
+        except KeyError as error:
+            raise RuntimeError("task plan references an unavailable session") from error
+        return StoredProjectObservations(
+            sessions=tuple(item.session for item in selected),
+            tokens=tuple(value for item in selected for value in item.tokens),
+            lifecycle=tuple(value for item in selected for value in item.lifecycle),
+            activities=tuple(value for item in selected for value in item.activities),
+            replay_baselines=tuple(
+                value for item in selected for value in item.replay_baselines
+            ),
+            tools=tuple(value for item in selected for value in item.tools),
+            files=tuple(value for item in selected for value in item.files),
+            tests=tuple(value for item in selected for value in item.tests),
+        )
+
+
+def load_stored_project_observations(
+    connection: sqlite3.Connection, project_id: str,
+) -> StoredProjectObservations:
+    """Read project-wide normalized observations once for batch task assembly."""
+    return StoredProjectObservations(
         sessions=_sessions(connection, project_id),
         tokens=_tokens(connection, project_id),
         lifecycle=_lifecycle(connection, project_id),
@@ -337,11 +408,37 @@ def aggregate_stored_task_tree(
             *_activities(connection, project_id),
             *_trusted_semantic_activities(connection, project_id),
         ),
-        classified_working_tokens=classified_working_tokens,
         replay_baselines=_baselines(connection, project_id),
         tools=_tools(connection, project_id),
         files=_files(connection, project_id),
         tests=_tests(connection, project_id),
+    )
+
+
+def aggregate_stored_task_tree(
+    connection: sqlite3.Connection, *, project_id: str, root_id: str,
+    classified_working_tokens: int = 0,
+    cutoff_at: datetime | None = None,
+    cutoff_instant: ExactInstant | None = None,
+    cutoff_timing_provenance: str = "exact",
+    include_ambiguous_lineage: bool = True,
+    project_observations: StoredProjectObservations | None = None,
+) -> TaskTreeMetrics:
+    """Build a task tree exclusively from normalized persisted observations."""
+    observations = project_observations or load_stored_project_observations(
+        connection, project_id,
+    )
+    return aggregate_task_tree(
+        root_id=root_id,
+        sessions=observations.sessions,
+        tokens=observations.tokens,
+        lifecycle=observations.lifecycle,
+        activities=observations.activities,
+        classified_working_tokens=classified_working_tokens,
+        replay_baselines=observations.replay_baselines,
+        tools=observations.tools,
+        files=observations.files,
+        tests=observations.tests,
         cutoff_at=cutoff_at,
         cutoff_instant=cutoff_instant,
         cutoff_timing_provenance=cutoff_timing_provenance,

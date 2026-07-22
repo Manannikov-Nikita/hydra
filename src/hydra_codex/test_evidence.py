@@ -397,8 +397,14 @@ def reconcile_test_retries(connection: sqlite3.Connection) -> None:
             previous, previous_key = row, current_key
 
 
+def reconcile_test_evidence(connection: sqlite3.Connection) -> None:
+    """Rebuild canonical test runs and retry attribution once per ingest batch."""
+    materialize_test_evidence(connection)
+    reconcile_test_retries(connection)
+
+
 class TestEvidenceBuffer:
-    """Join test intent/result records within one source, then reconcile globally."""
+    """Join and persist test intent/result records from one source."""
 
     def __init__(
         self,
@@ -594,5 +600,3 @@ class TestEvidenceBuffer:
             if self._has_app_terminal_rejection(intent):
                 self._persist_non_execution(intent.session_key, intent.tool_call_key)
             self._persist_current(buffer_key)
-        materialize_test_evidence(self.connection)
-        reconcile_test_retries(self.connection)

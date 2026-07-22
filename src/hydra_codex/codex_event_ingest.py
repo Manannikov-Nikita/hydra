@@ -33,7 +33,7 @@ from .rollout_reconcile import (
 )
 from .shell_facts import shell_file_facts
 from .storage import HydraStore
-from .test_evidence import TestEvidenceBuffer
+from .test_evidence import TestEvidenceBuffer, reconcile_test_evidence
 from .token_selection import refresh_token_source_selection
 from .tool_spans import persist_tool_end, persist_tool_start
 
@@ -693,6 +693,7 @@ def ingest_codex_events(
             )
             if prepared_report != expected_prepared_report:
                 raise EventAdapterError("prepared event source report mismatch")
+            reconcile_test_evidence(connection)
             refresh_token_source_selection(connection, project_id)
             reconcile_token_epochs(
                 connection, project_id,

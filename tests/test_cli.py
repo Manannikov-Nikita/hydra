@@ -126,6 +126,11 @@ class NoReadStdin:
         raise AssertionError("flag annotation must not read stdin")
 
 
+class TtyBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class CliParserTests(unittest.TestCase):
     def test_argparse_errors_return_two(self) -> None:
         cases = (
@@ -488,6 +493,42 @@ class IngestCliTests(unittest.TestCase):
                 "command": "ingest", "diagnostics": 0, "files_seen": 0,
                 "status": "ok", "unique_sources": 0,
             })
+
+    def test_tty_ingest_shows_privacy_safe_progress_without_changing_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = self.create_project(base)
+            home = base / "home"
+            active = home / ".codex" / "sessions"
+            active.mkdir(parents=True)
+            private_name = "private-rollout-name.jsonl"
+            event = {
+                "timestamp": "2026-07-21T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "thread", "cwd": str(project)},
+            }
+            (active / private_name).write_text(
+                json.dumps(event) + "\n", encoding="utf-8",
+            )
+            output = io.StringIO()
+            progress = TtyBuffer()
+
+            code = main(
+                [
+                    "ingest", "--cwd", str(project),
+                    "--db", str(base / "hydra.sqlite3"),
+                ],
+                stdin=io.StringIO(), stdout=output, stderr=progress,
+                environ={"HOME": str(home)},
+                installation_key_path=base / "keys" / "rollout-hmac.key",
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["files_seen"], 1)
+            rendered = progress.getvalue()
+            self.assertIn("hydra-codex: ingest discover 0/1", rendered)
+            self.assertIn("hydra-codex: ingest scan 1/1", rendered)
+            self.assertIn("hydra-codex: ingest complete 1/1", rendered)
+            self.assertNotIn(private_name, rendered)
 
     def test_zero_source_ingest_keeps_db_source_and_project_directories_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

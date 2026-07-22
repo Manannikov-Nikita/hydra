@@ -238,6 +238,26 @@ class OneShotAuditServiceTests(unittest.TestCase):
 
         self.assertTrue(interleaving["blocked"])
 
+    def test_dashboard_audit_build_does_not_refresh_pilot_enrollment(self) -> None:
+        LocalCommandServices(environ=self.environ).audit(
+            self.run.pilot_id, "json", self.database, self.project,
+        )
+        store = HydraStore(self.database)
+        try:
+            before = store.connection.total_changes
+            audit = build_pilot_audit(
+                store,
+                project_id="hprj_audit_service",
+                pilot_id=self.run.pilot_id,
+                refresh_enrollment=False,
+            )
+            after = store.connection.total_changes
+        finally:
+            store.close()
+
+        self.assertEqual(after, before)
+        self.assertEqual(audit.schema_version, "hydra.audit/v1")
+
 
 class LegacyReportByteCompatibilityTests(unittest.TestCase):
     def test_report_v3_and_report_list_v1_rendered_bytes_are_unchanged(self) -> None:

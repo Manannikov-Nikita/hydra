@@ -10,33 +10,13 @@ from .audit_coherence import validate_task_coherence
 from .audit_comparability import comparability_readiness
 from .audit_model import AuditEvidenceRegistry, AuditFact, AuditReport
 from .pilot import PILOT_SCHEMA, PilotStatus
+from .public_payload import reject_private_fields
 from .report_semantics import SEMANTIC_PHASES
 from .reporting import NumericFact, TaskReport
 
 
 _PILOT_ID = re.compile(r"hpilot_v1_[0-9a-f]{32}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_PRIVATE_FIELDS = frozenset({
-    "absolute_path",
-    "arguments",
-    "capability",
-    "command",
-    "content",
-    "database_path",
-    "message",
-    "path",
-    "project_id",
-    "prompt",
-    "raw",
-    "root",
-    "root_id",
-    "root_key",
-    "session_id",
-    "session_ids",
-    "session_key",
-    "turn_id",
-    "turn_key",
-})
 _PILOT_FACT_UNITS = {
     "aggregate_coverage": "ratio",
     "delivery_failures": "count",
@@ -90,17 +70,6 @@ class StorageHealthSnapshot:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError("storage health facts must be non-negative integers")
-
-
-def _reject_private_fields(value: object) -> None:
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            if key in _PRIVATE_FIELDS:
-                raise ValueError("public audit input contains a private field")
-            _reject_private_fields(nested)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            _reject_private_fields(nested)
 
 
 def _numeric(
@@ -338,7 +307,7 @@ def build_audit(
     if not isinstance(storage_health, StorageHealthSnapshot):
         raise ValueError("storage health must be a read-only snapshot")
     pilot_payload = pilot_status.as_dict()
-    _reject_private_fields(pilot_payload)
+    reject_private_fields(pilot_payload)
     if pilot_payload.get("schema_version") != PILOT_SCHEMA:
         raise ValueError("unsupported pilot snapshot schema")
     pilot = pilot_payload.get("pilot")

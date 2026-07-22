@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 import hashlib
 import json
@@ -27,6 +29,9 @@ from .storage import HydraStore
 
 PILOT_SCHEMA = "hydra.pilot/v1"
 AUDIT_SCHEMA = "hydra.audit/v1"
+_READ_ONLY_STATUS = ContextVar("hydra_read_only_pilot_status", default=False)
+
+
 def _iso(value: datetime) -> str:
     try:
         return public_timestamp(value)
@@ -340,9 +345,43 @@ def pilot_status(
     _window_end: datetime | None = None,
 ) -> PilotStatus:
     """Build and persist one atomic deterministic cohort snapshot."""
+    return _build_pilot_status(
+        store, project_id, pilot_id, enroll=not _READ_ONLY_STATUS.get(),
+        _window_end=_window_end,
+    )
+
+
+def read_pilot_status(
+    store: HydraStore,
+    project_id: str,
+    pilot_id: str,
+) -> PilotStatus:
+    """Build status from already-enrolled stored tasks without writes."""
+    return _build_pilot_status(store, project_id, pilot_id, enroll=False)
+
+
+@contextmanager
+def read_only_pilot_statuses():
+    """Keep transitive report construction from refreshing pilot enrollment."""
+    token = _READ_ONLY_STATUS.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY_STATUS.reset(token)
+
+
+def _build_pilot_status(
+    store: HydraStore,
+    project_id: str,
+    pilot_id: str,
+    *,
+    enroll: bool,
+    _window_end: datetime | None = None,
+) -> PilotStatus:
     with store.rollout_transaction():
         return _pilot_status_snapshot(
-            store, project_id, pilot_id, _window_end=_window_end,
+            store, project_id, pilot_id, enroll=enroll,
+            _window_end=_window_end,
         )
 
 
@@ -351,6 +390,7 @@ def _pilot_status_snapshot(
     project_id: str,
     pilot_id: str,
     *,
+    enroll: bool,
     _window_end: datetime | None = None,
 ) -> PilotStatus:
     run = _pilot_run(store, project_id, pilot_id)
@@ -367,7 +407,7 @@ def _pilot_status_snapshot(
     )
     if run.started_instant is None:
         raise RuntimeError("pilot start instant is unavailable")
-    eligible = tuple(
+    eligible_candidates = tuple(
         task for task in tasks
         if task.status == "complete"
         and task.last_activity_instant is not None
@@ -377,6 +417,20 @@ def _pilot_status_snapshot(
             or task.last_activity_instant <= window_end
         )
     )
+    if enroll:
+        eligible = eligible_candidates
+    else:
+        enrolled_refs = {
+            str(row[0])
+            for row in store.connection.execute(
+                "SELECT task_ref FROM pilot_tasks WHERE pilot_id=?",
+                (run.pilot_id,),
+            )
+        }
+        eligible = tuple(
+            task for task in eligible_candidates
+            if task.public_ref in enrolled_refs
+        )
     public_tasks: list[dict[str, object]] = []
     task_cutoffs: list[list[str]] = []
     all_latencies: list[int] = []
@@ -438,8 +492,9 @@ def _pilot_status_snapshot(
                     "storage_schema_version": store.schema_version(),
                 }).encode("utf-8")
             ).hexdigest()
-            connection.execute(
-                """INSERT INTO pilot_tasks(
+            if enroll:
+                connection.execute(
+                    """INSERT INTO pilot_tasks(
                        pilot_id,task_ref,completed_at,task_family,scope_change,
                        instrumented,initial_missing,finish_missing,delivery_failures,
                        semantic_conflicts,schema_diagnostics,coverage_value,
@@ -461,16 +516,16 @@ def _pilot_status_snapshot(
                        staging_latency_p95_ms=excluded.staging_latency_p95_ms,
                        trend_eligible=excluded.trend_eligible,
                        task_input_digest=excluded.task_input_digest""",
-                (
-                    run.pilot_id, task.public_ref, task_instant.canonical,
-                    family, scope,
-                    int(instrumented), int(initial_missing), int(finish_missing),
-                    failures, task.semantic.semantic_conflicts,
-                    task.semantic.schema_diagnostics, coverage, accepted,
-                    _p95(latencies), int(family is not None and scope == "none"),
-                    task_digest,
-                ),
-            )
+                    (
+                        run.pilot_id, task.public_ref, task_instant.canonical,
+                        family, scope,
+                        int(instrumented), int(initial_missing), int(finish_missing),
+                        failures, task.semantic.semantic_conflicts,
+                        task.semantic.schema_diagnostics, coverage, accepted,
+                        _p95(latencies), int(family is not None and scope == "none"),
+                        task_digest,
+                    ),
+                )
             public_tasks.append(task_fact)
             task_cutoffs.append([task.public_ref, task_instant.canonical])
 

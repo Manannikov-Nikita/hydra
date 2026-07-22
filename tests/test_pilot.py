@@ -308,6 +308,38 @@ class PilotCohortTests(StoredReportScenario):
             5,
         )
 
+    def test_read_status_uses_only_enrolled_tasks_without_writes(self) -> None:
+        from hydra_codex.pilot import pilot_status, read_pilot_status, start_pilot
+
+        run = start_pilot(
+            self.store,
+            project_id=PROJECT,
+            target=5,
+            task_family="telemetry-analysis",
+            now=BASE - timedelta(seconds=1),
+        )
+        self.add_task("new-root", 20, 100, family="telemetry-analysis")
+        from hydra_codex.reconcile_engine import reconcile_project
+
+        self.db.commit()
+        reconcile_project(self.store, PROJECT, b"s" * 32)
+
+        before = self.db.total_changes
+        empty = read_pilot_status(self.store, PROJECT, run.pilot_id).as_dict()
+
+        self.assertEqual(self.db.total_changes, before)
+        self.assertEqual(empty["tasks"], [])
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM pilot_tasks WHERE pilot_id=?", (run.pilot_id,),
+        ).fetchone()[0], 0)
+
+        enrolled = pilot_status(self.store, PROJECT, run.pilot_id).as_dict()
+        before = self.db.total_changes
+        observed = read_pilot_status(self.store, PROJECT, run.pilot_id).as_dict()
+
+        self.assertEqual(self.db.total_changes, before)
+        self.assertEqual(observed, enrolled)
+
     def test_fractional_and_offset_events_after_completion_are_excluded(self) -> None:
         from hydra_codex.pilot import pilot_status, start_pilot
 

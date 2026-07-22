@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timezone
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
+from hydra_codex.audit_model import AuditEvidence
+from hydra_codex.dashboard_model import DashboardRefreshView
 from hydra_codex.dashboard_queries import (
     CatalogProject,
+    DashboardQueryService,
     observe_resolved_project,
     sync_project_catalog,
 )
+from hydra_codex.diagnostics import DoctorCheck, DoctorReport
 from hydra_codex.project import ProjectResolution
 from hydra_codex.public_refs import (
     project_catalog_references,
     project_public_references,
 )
 from hydra_codex.storage import HydraStore
+from tests.test_audit_builder import public_report
 
 
 class DashboardQueryTests(unittest.TestCase):
@@ -128,6 +137,176 @@ class DashboardQueryTests(unittest.TestCase):
             tuple(row), ("project-a", "Hydra Core", "2026-07-20T12:00:00Z", "2026-07-20T12:00:00Z"),
         )
         self.assertNotIn("/private/project", "\n".join(self.store.connection.iterdump()))
+
+
+class DashboardPublicQueryServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database = Path(self.temporary.name) / "hydra.sqlite3"
+        store = HydraStore(self.database)
+        store.connection.executemany(
+            """INSERT INTO dashboard_projects(
+                   project_id,display_name,first_seen_at,last_seen_at)
+               VALUES (?,?,?,?)""",
+            (
+                ("project-a", "A <script>", "2026-07-20T00:00:00Z", "2026-07-22T10:00:00Z"),
+                ("project-b", None, "2026-07-20T00:00:00Z", "2026-07-22T11:00:00Z"),
+            ),
+        )
+        store.connection.commit()
+        store.close()
+        first = replace(public_report("first", input_tokens=10, second=10),
+                        last_activity_at="2026-07-22T10:00:00Z")
+        latest = replace(public_report("latest", input_tokens=30, second=20),
+                         last_activity_at="2026-07-22T11:00:00Z")
+        other = replace(public_report("other", input_tokens=50, second=30),
+                        task_ref=latest.task_ref,
+                        trend_input=replace(public_report("other", input_tokens=50, second=30).trend_input,
+                                            task_ref=latest.task_ref),
+                        last_activity_at="2026-07-22T12:00:00Z")
+        self.reports = {"project-a": (latest, first), "project-b": (other,)}
+        checks = tuple(DoctorCheck(code, "ok") for code in (
+            "project_resolution", "storage_available", "schema_current",
+            "foreign_keys_ok", "integrity_ok", "storage_permissions_restricted",
+        ))
+        self.refresh = DashboardRefreshView(None, "idle", None, None, None, {}, ())
+        self.service = DashboardQueryService(
+            lambda: HydraStore(self.database),
+            b"k" * 32,
+            lambda: datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc),
+            DoctorReport(checks),
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def catalog_refs(self):
+        return project_catalog_references(("project-a", "project-b"), b"k" * 32)
+
+    def database_dump(self) -> str:
+        store = HydraStore(self.database)
+        try:
+            return "\n".join(store.connection.iterdump())
+        finally:
+            store.close()
+
+    def test_snapshot_uses_latest_task_and_never_writes(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        latest, first = self.reports["project-a"]
+        before = self.database_dump()
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ):
+            snapshot = self.service.snapshot(
+                project_ref=project_ref,
+                task_ref=first.task_ref,
+                refresh=self.refresh,
+            )
+
+        payload = snapshot.as_dict()
+        self.assertEqual(self.database_dump(), before)
+        self.assertEqual(payload["project"]["overview"]["basis"], {
+            "kind": "latest_task", "task_ref": latest.task_ref,
+        })
+        self.assertEqual(
+            payload["project"]["overview"]["headline"]["working_tokens"],
+            latest.deduplicated_tokens.working.as_dict(),
+        )
+        self.assertNotEqual(
+            payload["project"]["overview"]["headline"]["working_tokens"]["value"],
+            latest.deduplicated_tokens.working.value
+            + first.deduplicated_tokens.working.value,
+        )
+        self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
+        self.assertEqual(payload["project"]["display_name"], "A <script>")
+
+    def test_task_pages_are_project_scoped_ordered_and_bounded(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ):
+            first_page = self.service.tasks(project_ref, cursor=None, limit=1).as_dict()
+            second_page = self.service.tasks(
+                project_ref, cursor=first_page["page"]["next_cursor"], limit=1,
+            ).as_dict()
+            with self.assertRaises(ValueError):
+                self.service.tasks(project_ref, cursor=None, limit=101)
+
+        self.assertEqual(
+            [item["task_ref"] for item in first_page["items"]],
+            [self.reports["project-a"][0].task_ref],
+        )
+        self.assertEqual(
+            [item["task_ref"] for item in second_page["items"]],
+            [self.reports["project-a"][1].task_ref],
+        )
+        self.assertFalse(second_page["page"]["has_more"])
+
+    def test_compare_requires_both_refs_in_selected_project(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        latest, first = self.reports["project-a"]
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ):
+            comparison = self.service.compare(project_ref, first.task_ref, latest.task_ref)
+            with self.assertRaisesRegex(KeyError, r"^'unknown public reference'$"):
+                self.service.compare(project_ref, "task_000000000000", latest.task_ref)
+
+        self.assertEqual(comparison.schema_version, "hydra.comparison/v2")
+
+    def test_evidence_reads_only_latest_selected_project_pilot(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            store.connection.executemany(
+                """INSERT INTO pilot_runs(
+                       pilot_id,project_id,started_at,closed_at,target,task_family,
+                       thresholds_json,state)
+                   VALUES (?,?,?,?,1,'all','{}',?)""",
+                (
+                    ("hpilot_v1_11111111111111111111111111111111", "project-a", "2026-07-21T00:00:00Z", "2026-07-21T01:00:00Z", "closed"),
+                    ("hpilot_v1_22222222222222222222222222222222", "project-a", "2026-07-22T00:00:00Z", None, "open"),
+                    ("hpilot_v1_33333333333333333333333333333333", "project-b", "2026-07-23T00:00:00Z", None, "open"),
+                ),
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        evidence = AuditEvidence(
+            "ev_0123456789abcdef", "tasks.safe.working", 30, "tokens", "derived",
+        )
+        called: list[tuple[str, str, bool]] = []
+
+        def build(_store, *, project_id, pilot_id, refresh_enrollment=True):
+            called.append((project_id, pilot_id, refresh_enrollment))
+            return SimpleNamespace(evidence_appendix=(evidence,))
+
+        before = self.database_dump()
+        with patch("hydra_codex.dashboard_queries.build_pilot_audit", side_effect=build):
+            selected = self.service.evidence(
+                self.catalog_refs()["project-a"], evidence.evidence_id,
+            )
+
+        self.assertIs(selected, evidence)
+        self.assertEqual(called, [(
+            "project-a", "hpilot_v1_22222222222222222222222222222222", False,
+        )])
+        self.assertEqual(self.database_dump(), before)
+
+    def test_unknown_selectors_use_one_categorical_error(self) -> None:
+        for call in (
+            lambda: self.service.snapshot(
+                project_ref="project_000000000000", task_ref=None, refresh=self.refresh,
+            ),
+            lambda: self.service.tasks("project_000000000000", cursor=None),
+        ):
+            with self.subTest(call=call), self.assertRaisesRegex(
+                KeyError, r"^'unknown public reference'$",
+            ):
+                call()
 
 
 if __name__ == "__main__":

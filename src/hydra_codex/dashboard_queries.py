@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 import sqlite3
+from typing import cast
 
+from .audit_model import AuditEvidence
+from .audit_service import build_pilot_audit
+from .dashboard_model import (
+    DashboardProjectSummary,
+    DashboardRefreshView,
+    DashboardSnapshot,
+    DashboardTaskPage,
+    canonical_json,
+)
+from .diagnostics import DoctorReport
+from .exact_time import public_timestamp
+from .pilot import read_only_pilot_statuses, read_pilot_status
 from .project import ProjectResolution
+from .public_payload import reject_private_fields
+from .public_refs import project_catalog_references
+from .reconcile_engine import ReconciliationStale, list_reconciled_reports
+from .report_operations import compare_reports
+from .reporting import ComparisonReport, NumericFact, TaskReport
 from .storage import HydraStore
+from .storage_health import storage_status
 
 
 @dataclass(frozen=True)
@@ -81,3 +102,325 @@ def observe_resolved_project(
                 resolution.project_id, resolution.display_name, observed_at, observed_at,
             ),
         )
+
+
+StoreFactory = Callable[[], HydraStore]
+Clock = Callable[[], datetime]
+
+
+class DashboardQueryService:
+    """Read-only project-scoped queries over already-refreshed Hydra data."""
+
+    def __init__(
+        self,
+        store_factory: StoreFactory,
+        installation_key: bytes,
+        clock: Clock,
+        doctor_report: DoctorReport,
+    ) -> None:
+        if not callable(store_factory) or not callable(clock):
+            raise TypeError("dashboard store factory and clock must be callable")
+        if not isinstance(installation_key, bytes) or len(installation_key) < 16:
+            raise ValueError("installation key must contain at least 16 bytes")
+        if not isinstance(doctor_report, DoctorReport):
+            raise TypeError("doctor_report must be a DoctorReport")
+        self._store_factory = store_factory
+        self._installation_key = installation_key
+        self._clock = clock
+        self._doctor_report = doctor_report
+
+    def _generated_at(self) -> str:
+        return public_timestamp(self._clock())
+
+    def _catalog(
+        self, store: HydraStore,
+    ) -> tuple[tuple[CatalogProject, str], ...]:
+        catalog = _catalog_rows(store.connection)
+        projection = project_catalog_references(
+            (item.project_id for item in catalog), self._installation_key,
+        )
+        return tuple((item, projection[item.project_id]) for item in catalog)
+
+    @staticmethod
+    def _unknown() -> KeyError:
+        return KeyError("unknown public reference")
+
+    def _resolve_project(
+        self,
+        catalog: tuple[tuple[CatalogProject, str], ...],
+        project_ref: str,
+    ) -> CatalogProject:
+        match = next(
+            (item for item, public_ref in catalog if public_ref == project_ref),
+            None,
+        )
+        if match is None:
+            raise self._unknown()
+        return match
+
+    @staticmethod
+    def _ordered_reports(reports: tuple[TaskReport, ...]) -> tuple[TaskReport, ...]:
+        def ordering(report: TaskReport) -> tuple[float, str]:
+            observed = datetime.fromisoformat(
+                report.last_activity_at.replace("Z", "+00:00"),
+            )
+            return (-observed.timestamp(), report.task_ref)
+
+        return tuple(sorted(reports, key=ordering))
+
+    def _reports(
+        self, store: HydraStore, project_id: str,
+    ) -> tuple[tuple[TaskReport, ...], str]:
+        try:
+            with read_only_pilot_statuses():
+                reports = cast(
+                    tuple[TaskReport, ...],
+                    list_reconciled_reports(store, project_id),
+                )
+        except ReconciliationStale:
+            return (), "stale"
+        return self._ordered_reports(reports), "current"
+
+    @staticmethod
+    def _display_name(item: CatalogProject, project_ref: str) -> str:
+        return item.display_name or f"Project {project_ref.removeprefix('project_')[:8]}"
+
+    @staticmethod
+    def _unavailable(unit: str) -> NumericFact:
+        return NumericFact(None, unit, "estimated", ("no_reconciled_tasks",))
+
+    @staticmethod
+    def _recent_task(report: TaskReport) -> dict[str, object]:
+        return {
+            "task_ref": report.task_ref,
+            "status": report.status,
+            "last_activity_at": report.last_activity_at,
+            "task_family": report.task_family,
+            "headline": {
+                "working_tokens": report.deduplicated_tokens.working.as_dict(),
+                "full_context_tokens": report.deduplicated_tokens.full_context.as_dict(),
+                "wall_clock_ms": report.wall_clock.as_dict(),
+            },
+        }
+
+    def _project_payload(
+        self,
+        store: HydraStore,
+        item: CatalogProject,
+        project_ref: str,
+        reports: tuple[TaskReport, ...],
+        freshness_state: str,
+    ) -> dict[str, object]:
+        latest = reports[0] if reports else None
+        if latest is None:
+            headline = {
+                "working_tokens": self._unavailable("tokens").as_dict(),
+                "full_context_tokens": self._unavailable("tokens").as_dict(),
+                "wall_clock_ms": self._unavailable("milliseconds").as_dict(),
+            }
+            phase_allocation: object = None
+        else:
+            headline = {
+                "working_tokens": latest.deduplicated_tokens.working.as_dict(),
+                "full_context_tokens": latest.deduplicated_tokens.full_context.as_dict(),
+                "wall_clock_ms": latest.wall_clock.as_dict(),
+            }
+            phase_allocation = latest.semantic_breakdown.as_dict()
+        pilot_row = store.connection.execute(
+            """SELECT pilot_id FROM pilot_runs WHERE project_id=?
+                 ORDER BY started_at DESC,pilot_id DESC LIMIT 1""",
+            (item.project_id,),
+        ).fetchone()
+        pilot = (
+            None
+            if pilot_row is None
+            else read_pilot_status(store, item.project_id, str(pilot_row[0])).as_dict()
+        )
+        payload: dict[str, object] = {
+            "project_ref": project_ref,
+            "display_name": self._display_name(item, project_ref),
+            "last_activity_at": (
+                latest.last_activity_at if latest is not None else item.last_seen_at
+            ),
+            "freshness_state": freshness_state,
+            "overview": {
+                "basis": {
+                    "kind": "latest_task",
+                    "task_ref": None if latest is None else latest.task_ref,
+                },
+                "headline": headline,
+                "phase_allocation": phase_allocation,
+            },
+            "recent_tasks": [self._recent_task(report) for report in reports[:10]],
+            "pilot": pilot,
+            "storage": storage_status(store, item.project_id).as_dict(),
+            "system_health": {
+                "scope": "global_launch_context",
+                "doctor": self._doctor_report.as_dict(),
+            },
+        }
+        reject_private_fields(payload)
+        return payload
+
+    def snapshot(
+        self,
+        *,
+        project_ref: str | None,
+        task_ref: str | None,
+        refresh: DashboardRefreshView,
+    ) -> DashboardSnapshot:
+        generated_at = self._generated_at()
+        store = self._store_factory()
+        try:
+            catalog = self._catalog(store)
+            if project_ref is None:
+                selected_ref = min((public_ref for _item, public_ref in catalog), default=None)
+            else:
+                self._resolve_project(catalog, project_ref)
+                selected_ref = project_ref
+            if task_ref is not None and selected_ref is None:
+                raise self._unknown()
+            by_project: dict[str, tuple[tuple[TaskReport, ...], str]] = {}
+            summaries: list[DashboardProjectSummary] = []
+            for item, public_ref in catalog:
+                reports, state = self._reports(store, item.project_id)
+                by_project[item.project_id] = (reports, state)
+                count = int(store.connection.execute(
+                    "SELECT COUNT(*) FROM reconciled_tasks WHERE project_id=?",
+                    (item.project_id,),
+                ).fetchone()[0])
+                summaries.append(DashboardProjectSummary(
+                    public_ref,
+                    self._display_name(item, public_ref),
+                    reports[0].last_activity_at if reports else item.last_seen_at,
+                    state,
+                    NumericFact(count, "count", "derived"),
+                ))
+            project_json: str | None = None
+            selected_task_json: str | None = None
+            selected_state = "current"
+            if selected_ref is not None:
+                item = self._resolve_project(catalog, selected_ref)
+                reports, selected_state = by_project[item.project_id]
+                project_json = canonical_json(self._project_payload(
+                    store, item, selected_ref, reports, selected_state,
+                ))
+                if task_ref is not None:
+                    selected = next(
+                        (report for report in reports if report.task_ref == task_ref),
+                        None,
+                    )
+                    if selected is None:
+                        raise self._unknown()
+                    selected_task_json = canonical_json(selected.as_dict())
+            freshness = {
+                "state": selected_state,
+                "doctor": {
+                    "scope": "global_launch_context",
+                    "report": self._doctor_report.as_dict(),
+                },
+            }
+            return DashboardSnapshot(
+                generated_at,
+                freshness,
+                tuple(summaries),
+                selected_ref,
+                project_json,
+                selected_task_json,
+                refresh,
+            )
+        finally:
+            store.close()
+
+    def tasks(
+        self,
+        project_ref: str,
+        *,
+        cursor: str | None,
+        limit: int = 50,
+    ) -> DashboardTaskPage:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        generated_at = self._generated_at()
+        store = self._store_factory()
+        try:
+            catalog = self._catalog(store)
+            item = self._resolve_project(catalog, project_ref)
+            reports, _state = self._reports(store, item.project_id)
+            start = 0
+            if cursor is not None:
+                try:
+                    start = next(
+                        index for index, report in enumerate(reports)
+                        if report.task_ref == cursor
+                    ) + 1
+                except StopIteration:
+                    raise self._unknown() from None
+            selected = reports[start:start + limit]
+            has_more = start + len(selected) < len(reports)
+            next_cursor = selected[-1].task_ref if selected and has_more else None
+            return DashboardTaskPage(
+                generated_at,
+                project_ref,
+                tuple(canonical_json(report.as_dict()) for report in selected),
+                limit,
+                next_cursor,
+            )
+        finally:
+            store.close()
+
+    def compare(
+        self,
+        project_ref: str,
+        left: str,
+        right: str,
+    ) -> ComparisonReport:
+        store = self._store_factory()
+        try:
+            item = self._resolve_project(self._catalog(store), project_ref)
+            reports, _state = self._reports(store, item.project_id)
+            by_ref = {report.task_ref: report for report in reports}
+            try:
+                baseline, current = by_ref[left], by_ref[right]
+            except KeyError:
+                raise self._unknown() from None
+            comparison = compare_reports(baseline, current)
+            reject_private_fields(comparison.as_dict())
+            return comparison
+        finally:
+            store.close()
+
+    def evidence(
+        self,
+        project_ref: str,
+        evidence_id: str,
+    ) -> AuditEvidence:
+        store = self._store_factory()
+        try:
+            item = self._resolve_project(self._catalog(store), project_ref)
+            row = store.connection.execute(
+                """SELECT pilot_id FROM pilot_runs WHERE project_id=?
+                     ORDER BY started_at DESC,pilot_id DESC LIMIT 1""",
+                (item.project_id,),
+            ).fetchone()
+            if row is None:
+                raise self._unknown()
+            audit = build_pilot_audit(
+                store,
+                project_id=item.project_id,
+                pilot_id=str(row[0]),
+                refresh_enrollment=False,
+            )
+            match = next(
+                (
+                    evidence for evidence in audit.evidence_appendix
+                    if evidence.evidence_id == evidence_id
+                ),
+                None,
+            )
+            if match is None:
+                raise self._unknown()
+            reject_private_fields(match.as_dict())
+            return match
+        finally:
+            store.close()

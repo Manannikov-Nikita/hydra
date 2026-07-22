@@ -14,7 +14,7 @@ from .audit_renderers import (
     render_audit_json,
     render_audit_markdown,
 )
-from .pilot import pilot_status
+from .pilot import pilot_status, read_only_pilot_statuses, read_pilot_status
 from .project import resolve_project
 from .reconcile_engine import list_reconciled_reports, reconcile_project
 from .rollout import ingest_rollouts
@@ -28,10 +28,12 @@ def build_pilot_audit(
     *,
     project_id: str,
     pilot_id: str,
+    refresh_enrollment: bool = True,
 ) -> AuditReport:
     """Build from PilotStatus and TaskReport only, never raw semantic content."""
     return _build_pilot_audit_with_health(
         store, project_id=project_id, pilot_id=pilot_id,
+        refresh_enrollment=refresh_enrollment,
     )[0]
 
 
@@ -40,29 +42,33 @@ def _build_pilot_audit_with_health(
     *,
     project_id: str,
     pilot_id: str,
+    refresh_enrollment: bool = True,
 ) -> tuple[AuditReport, StorageHealthSnapshot]:
-    with store.rollout_transaction():
-        status = pilot_status(store, project_id, pilot_id)
-        task_refs = tuple(
-            str(item["task_ref"])
-            for item in status.as_dict()["tasks"]
-        )
-        reports_by_ref = {
-            report.task_ref: report
-            for report in list_reconciled_reports(store, project_id)
-        }
-        try:
-            reports = tuple(reports_by_ref[task_ref] for task_ref in task_refs)
-        except KeyError as error:
-            raise ValueError(
-                "pilot task collection lacks a reconciled public report"
-            ) from error
-        health = current_storage_health(store, project_id)
-        return build_audit(
-            status,
-            reports,
-            health,
-        ), health
+    def build() -> tuple[AuditReport, StorageHealthSnapshot]:
+        with store.rollout_transaction():
+            status_builder = pilot_status if refresh_enrollment else read_pilot_status
+            status = status_builder(store, project_id, pilot_id)
+            task_refs = tuple(
+                str(item["task_ref"])
+                for item in status.as_dict()["tasks"]
+            )
+            reports_by_ref = {
+                report.task_ref: report
+                for report in list_reconciled_reports(store, project_id)
+            }
+            try:
+                reports = tuple(reports_by_ref[task_ref] for task_ref in task_refs)
+            except KeyError as error:
+                raise ValueError(
+                    "pilot task collection lacks a reconciled public report"
+                ) from error
+            health = current_storage_health(store, project_id)
+            return build_audit(status, reports, health), health
+
+    if refresh_enrollment:
+        return build()
+    with read_only_pilot_statuses():
+        return build()
 
 
 def render_pilot_audit(audit: AuditReport, output_format: str) -> str:

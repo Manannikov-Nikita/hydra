@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -576,7 +577,7 @@ def persist_prepared_codex_event_sources(
     hash_key: bytes,
 ) -> CodexEventIngestReport:
     """Persist pre-parsed stat-bound sources inside the caller's transaction."""
-    items = tuple(sources)
+    items = copy.deepcopy(tuple(sources))
     validate_prepared_codex_event_sources_key(items, hash_key)
     if not connection.in_transaction:
         raise ValueError("prepared event persistence requires an owning transaction")
@@ -616,15 +617,17 @@ def persist_prepared_codex_event_sources(
                        VALUES (?,?) ON CONFLICT DO NOTHING""",
                     (item.source_digest, location),
                 )
-        for item in items:
-            if source_stat(item.path) != item.source_stat:
-                raise SourceChanged(SOURCE_CHANGED_MESSAGE)
-        return CodexEventIngestReport(
+        report = CodexEventIngestReport(
             files_seen=len(items),
             unique_sources=len(unique),
             events=sum(len(batch.events) for _item, batch in unique.values()),
             issues=sum(len(batch.issues) for _item, batch in unique.values()),
         )
+        for item in items:
+            if source_stat(item.path) != item.source_stat:
+                raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+        validate_prepared_codex_event_sources_key(items, hash_key)
+        return report
     finally:
         ACTIVE_HASHER.reset(hash_token)
 
@@ -635,13 +638,28 @@ def ingest_codex_events(
     prepared_sources: Iterable[PreparedCodexEventSource] = (),
 ) -> CodexEventIngestReport:
     """Import privacy-safe event facts with content idempotency and canonical identities."""
-    prepared_items = tuple(prepared_sources)
+    prepared_items = copy.deepcopy(tuple(prepared_sources))
     validate_prepared_codex_event_sources_key(prepared_items, hash_key)
     if not isinstance(project_id, str) or not project_id:
         raise ValueError("project_id must be non-empty")
     hasher = Pseudonymizer(hash_key)
     hash_token = ACTIVE_HASHER.set(hasher)
     try:
+        prepared_summary: dict[str, tuple[int, int]] = {}
+        for item in prepared_items:
+            digest = hasher.digest(
+                "source",
+                f"codex-event/{project_id}/{item.schema}/{item.raw_digest}",
+            )
+            prepared_summary.setdefault(
+                digest, (len(item.batch.events), len(item.batch.issues)),
+            )
+        expected_prepared_report = CodexEventIngestReport(
+            len(prepared_items),
+            len(prepared_summary),
+            sum(events for events, _issues in prepared_summary.values()),
+            sum(issues for _events, issues in prepared_summary.values()),
+        )
         items = tuple(sources)
         prepared = tuple(_prepare(item, hasher, project_id) for item in items)
         unique: dict[str, tuple[_PreparedSource, CodexEventBatch]] = {}
@@ -666,13 +684,15 @@ def ingest_codex_events(
                            VALUES (?,?) ON CONFLICT DO NOTHING""",
                         (item.source_digest, location),
                     )
-            persist_prepared_codex_event_sources(
+            prepared_report = persist_prepared_codex_event_sources(
                 connection,
                 prepared_items,
                 project_root,
                 project_id,
                 hash_key=hash_key,
             )
+            if prepared_report != expected_prepared_report:
+                raise EventAdapterError("prepared event source report mismatch")
             refresh_token_source_selection(connection, project_id)
             reconcile_token_epochs(
                 connection, project_id,
@@ -687,17 +707,18 @@ def ingest_codex_events(
                     connection, source, line, kind,
                 ),
             )
-        all_batches = dict(unique)
-        for item in prepared_items:
-            digest = hasher.digest(
-                "source",
-                f"codex-event/{project_id}/{item.schema}/{item.raw_digest}",
-            )
-            all_batches.setdefault(digest, (None, item.batch))
+        prepared_only = {
+            digest: counts
+            for digest, counts in prepared_summary.items()
+            if digest not in unique
+        }
         return CodexEventIngestReport(
-            len(items) + len(prepared_items), len(all_batches),
-            sum(len(batch.events) for _item, batch in all_batches.values()),
-            sum(len(batch.issues) for _item, batch in all_batches.values()),
+            len(items) + prepared_report.files_seen,
+            len(unique) + len(prepared_only),
+            sum(len(batch.events) for _item, batch in unique.values())
+            + sum(events for events, _issues in prepared_only.values()),
+            sum(len(batch.issues) for _item, batch in unique.values())
+            + sum(issues for _events, issues in prepared_only.values()),
         )
     finally:
         ACTIVE_HASHER.reset(hash_token)

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from contextlib import ExitStack
+from dataclasses import replace
 from datetime import datetime, timezone
-import re
 import secrets
 import sqlite3
 import threading
 from types import MappingProxyType
-from typing import Literal, Protocol
+from typing import Protocol
 
 from .dashboard_model import DashboardRefreshView, DashboardSnapshot
 from .dashboard_queries import (
@@ -24,159 +24,26 @@ from .dashboard_refresh_plan import (
     GlobalRolloutPlan,
     ProjectPartition,
     WorktreePartition,
+    guard_cached_rollout,
     plan_global_rollout_ingest,
     refresh_cached_location,
     trusted_rollout_roots,
 )
+from .dashboard_refresh_state import (
+    PROJECT_REF_PATTERN,
+    REFRESH_STAGES,
+    RefreshProgress,
+    RefreshResult,
+    RefreshSnapshot,
+    RefreshStage,
+    RefreshState,
+)
 from .exact_time import public_timestamp
 from .reconcile_engine import ReconciliationStale, reconcile_project
-from .reporting import NumericFact
 from .rollout import ingest_rollouts
 from .rollout_identity import RolloutRoot
 from .rollout_sources import SourceChanged
 from .storage import HydraStore, StorageUnavailable
-
-
-RefreshState = Literal["queued", "running", "succeeded", "partial", "failed"]
-RefreshStage = Literal["discover", "inspect", "scan", "reconcile"]
-_STAGES = ("discover", "inspect", "scan", "reconcile")
-_TERMINAL = frozenset({"succeeded", "partial", "failed"})
-_DIAGNOSTICS = frozenset({
-    "storage_unavailable", "source_changed", "project_root_unavailable",
-    "reconciliation_stale", "database_busy", "event_attribution_unavailable",
-    "event_attribution_ambiguous", "internal_failure",
-})
-_PROJECT_REF = re.compile(r"project_[0-9a-f]{12,64}\Z")
-
-
-def _timestamp(value: str, field_name: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, ValueError) as error:
-        raise ValueError(f"{field_name} must be an ISO timestamp") from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{field_name} must be timezone-aware")
-    return parsed
-
-
-@dataclass(frozen=True)
-class RefreshProgress:
-    sources_discovered: int = 0
-    sources_inspected: int = 0
-    sources_scanned: int = 0
-    projects_total: int = 0
-    projects_completed: int = 0
-    projects_refreshed: int = 0
-
-    def __post_init__(self) -> None:
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in self.values()
-        ):
-            raise ValueError("refresh progress must contain non-negative integers")
-        if self.sources_inspected > self.sources_discovered:
-            raise ValueError("inspected sources cannot exceed discovered sources")
-        if self.sources_scanned > self.sources_inspected:
-            raise ValueError("scanned sources cannot exceed inspected sources")
-        if self.projects_completed > self.projects_total:
-            raise ValueError("completed projects cannot exceed total projects")
-        if self.projects_refreshed > self.projects_completed:
-            raise ValueError("refreshed projects cannot exceed completed projects")
-
-    def values(self) -> tuple[int, ...]:
-        return (
-            self.sources_discovered, self.sources_inspected, self.sources_scanned,
-            self.projects_total, self.projects_completed, self.projects_refreshed,
-        )
-
-    def facts(self) -> dict[str, NumericFact]:
-        names = (
-            "sources_discovered", "sources_inspected", "sources_scanned",
-            "projects_total", "projects_completed", "projects_refreshed",
-        )
-        return {
-            name: NumericFact(value, "count", "derived")
-            for name, value in zip(names, self.values(), strict=True)
-        }
-
-
-@dataclass(frozen=True)
-class RefreshSnapshot:
-    refresh_ref: str
-    state: RefreshState
-    stage: RefreshStage | None
-    started_at: str
-    finished_at: str | None
-    progress: RefreshProgress
-    diagnostic_codes: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if re.fullmatch(r"refresh_[0-9a-f]{12,64}", self.refresh_ref) is None:
-            raise ValueError("refresh_ref must be an opaque public reference")
-        if self.state not in {"queued", "running", *_TERMINAL}:
-            raise ValueError("invalid refresh state")
-        if (self.state == "running") != (self.stage is not None):
-            raise ValueError("only running refreshes carry a stage")
-        if self.stage is not None and self.stage not in _STAGES:
-            raise ValueError("invalid refresh stage")
-        if (self.state in _TERMINAL) != (self.finished_at is not None):
-            raise ValueError("only terminal refreshes carry finished_at")
-        started = _timestamp(self.started_at, "refresh started_at")
-        if self.finished_at is not None and _timestamp(
-            self.finished_at, "refresh finished_at",
-        ) < started:
-            raise ValueError("refresh finished_at cannot precede started_at")
-        if not isinstance(self.progress, RefreshProgress):
-            raise TypeError("progress must be RefreshProgress")
-        codes = tuple(sorted(set(self.diagnostic_codes)))
-        if any(code not in _DIAGNOSTICS for code in codes):
-            raise ValueError("refresh diagnostics must be categorical")
-        object.__setattr__(self, "diagnostic_codes", codes)
-
-    def to_view(self) -> DashboardRefreshView:
-        return DashboardRefreshView(
-            self.refresh_ref, self.state, self.stage, self.started_at,
-            self.finished_at, self.progress.facts(), self.diagnostic_codes,
-        )
-
-    def as_dict(self) -> dict[str, object]:
-        return self.to_view().as_dict()
-
-
-@dataclass(frozen=True)
-class RefreshResult:
-    snapshots: Mapping[str, DashboardSnapshot] = field(repr=False)
-    replace_all: bool
-    diagnostic_codes: tuple[str, ...]
-    projects_total: int
-    projects_completed: int
-    projects_refreshed: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.replace_all, bool):
-            raise TypeError("replace_all must be boolean")
-        if any(code not in _DIAGNOSTICS for code in self.diagnostic_codes):
-            raise ValueError("refresh diagnostics must be categorical")
-        RefreshProgress(
-            projects_total=self.projects_total,
-            projects_completed=self.projects_completed,
-            projects_refreshed=self.projects_refreshed,
-        )
-        if self.replace_all and (
-            self.diagnostic_codes
-            or self.projects_completed != self.projects_total
-            or self.projects_refreshed != self.projects_total
-        ):
-            raise ValueError("full replacement requires a complete successful refresh")
-        if any(_PROJECT_REF.fullmatch(key) is None for key in self.snapshots):
-            raise ValueError("snapshot cache keys must be public project references")
-        if any(
-            not isinstance(value, DashboardSnapshot)
-            for value in self.snapshots.values()
-        ):
-            raise TypeError("refresh snapshots must be DashboardSnapshot values")
-        object.__setattr__(self, "snapshots", MappingProxyType(dict(self.snapshots)))
-        object.__setattr__(self, "diagnostic_codes", tuple(sorted(set(self.diagnostic_codes))))
 
 
 class DashboardSnapshotCache:
@@ -188,7 +55,7 @@ class DashboardSnapshotCache:
 
     @staticmethod
     def _freeze(snapshots: Mapping[str, DashboardSnapshot]) -> Mapping[str, DashboardSnapshot]:
-        if any(_PROJECT_REF.fullmatch(key) is None for key in snapshots):
+        if any(PROJECT_REF_PATTERN.fullmatch(key) is None for key in snapshots):
             raise ValueError("snapshot cache keys must be public project references")
         if any(not isinstance(value, DashboardSnapshot) for value in snapshots.values()):
             raise TypeError("snapshot cache values must be DashboardSnapshot")
@@ -254,8 +121,17 @@ class RefreshController:
             )
             self._current = queued
             self._worker = worker
-        worker.start()
-        return queued, False
+            try:
+                worker.start()
+            except Exception:
+                failed = replace(
+                    queued, state="failed", finished_at=queued.started_at,
+                    diagnostic_codes=("internal_failure",),
+                )
+                self._current = failed
+                self._worker = None
+                return failed, False
+            return queued, False
 
     def _report(self, stage: RefreshStage, value: RefreshProgress) -> None:
         with self._cache._lock:
@@ -263,7 +139,7 @@ class RefreshController:
             if current is None or current.state not in {"queued", "running"}:
                 raise RuntimeError("refresh progress has no active job")
             previous_stage = current.stage or "discover"
-            if _STAGES.index(stage) < _STAGES.index(previous_stage):
+            if REFRESH_STAGES.index(stage) < REFRESH_STAGES.index(previous_stage):
                 raise ValueError("refresh stages must be monotonic")
             if any(new < old for new, old in zip(
                 value.values(), current.progress.values(), strict=True,
@@ -272,12 +148,35 @@ class RefreshController:
             self._current = replace(current, state="running", stage=stage, progress=value)
 
     def _run(self, queued: RefreshSnapshot) -> None:
+        failed = False
         try:
             self._report("discover", RefreshProgress())
             result = self._runner.run(self._report)
+            with self._cache._lock:
+                current = self._current
+                if current is None or any(
+                    new < old for new, old in zip(
+                        (
+                            result.projects_total, result.projects_completed,
+                            result.projects_refreshed,
+                        ),
+                        current.progress.values()[3:], strict=True,
+                    )
+                ):
+                    raise ValueError("refresh result counters regressed")
         except Exception:
-            result = RefreshResult({}, False, ("internal_failure",), 0, 0, 0)
-        state: RefreshState = (
+            with self._cache._lock:
+                progress = (
+                    RefreshProgress() if self._current is None
+                    else self._current.progress
+                )
+            result = RefreshResult(
+                {}, False, ("internal_failure",),
+                progress.projects_total, progress.projects_completed,
+                progress.projects_refreshed,
+            )
+            failed = True
+        state: RefreshState = "failed" if failed else (
             "succeeded" if result.replace_all else
             "partial" if result.projects_refreshed else "failed"
         )
@@ -286,14 +185,9 @@ class RefreshController:
             if current is None or current.refresh_ref != queued.refresh_ref:
                 return
             terminal_progress = replace(
-                current.progress,
-                projects_total=max(current.progress.projects_total, result.projects_total),
-                projects_completed=max(
-                    current.progress.projects_completed, result.projects_completed,
-                ),
-                projects_refreshed=max(
-                    current.progress.projects_refreshed, result.projects_refreshed,
-                ),
+                current.progress, projects_total=result.projects_total,
+                projects_completed=result.projects_completed,
+                projects_refreshed=result.projects_refreshed,
             )
             terminal = replace(
                 current, state=state, stage=None, finished_at=public_timestamp(self._clock()),
@@ -329,7 +223,10 @@ class RefreshController:
         with self._cache._lock:
             worker = self._worker
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout)
+            try:
+                worker.join(timeout)
+            except RuntimeError:
+                return
 
     def __repr__(self) -> str:
         current = self.current()
@@ -365,7 +262,7 @@ class GlobalRefreshRunner:
         self._clock = clock
 
     @staticmethod
-    def _code(error: BaseException) -> str:
+    def _code(error: Exception) -> str:
         if isinstance(error, StorageUnavailable):
             return "storage_unavailable"
         if isinstance(error, SourceChanged):
@@ -419,9 +316,11 @@ class GlobalRefreshRunner:
                 plan.partitions, key=lambda item: item.project_id,
             ))
             for partition in ordered_partitions:
+                report("reconcile", observed)
                 try:
-                    with store.rollout_transaction():
+                    with store.rollout_transaction(), ExitStack() as guards:
                         for cached in partition.cached:
+                            guards.enter_context(guard_cached_rollout(cached))
                             self._cached_refresher(store, cached)
                         for worktree in sorted(
                             partition.worktrees, key=lambda item: str(item.project_root),

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+import sqlite3
 
 from .project import ProjectNotFound, ProjectResolution, resolve_project
 from .rollout import UnchangedLocationAttribution, unchanged_location_attribution
@@ -15,8 +17,10 @@ from .rollout_identity import (
     discover_trusted_rollouts,
     revalidate_trusted_rollout,
 )
-from .rollout_sources import SourceChanged, SourceScan, SourceStat, scan_source
-from .storage import HydraStore
+from .rollout_sources import (
+    SourceChanged, SourceScan, SourceStat, open_source, scan_source,
+)
+from .storage import HydraStore, StorageUnavailable
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,21 @@ class CachedRollout:
     revision: str = field(repr=False)
     location: str = field(repr=False)
     label: str
+    candidate: TrustedRolloutCandidate = field(repr=False)
+    source_stat: SourceStat = field(repr=False)
+
+
+@contextmanager
+def guard_cached_rollout(item: CachedRollout) -> Iterator[None]:
+    """Hold one exact trusted source descriptor across its cached DB update."""
+    if revalidate_trusted_rollout(item.candidate) != item.source_stat:
+        raise SourceChanged("rollout source changed during refresh")
+    with open_source(item.candidate.path, item.source_stat):
+        if revalidate_trusted_rollout(item.candidate) != item.source_stat:
+            raise SourceChanged("rollout source changed during refresh")
+        yield
+        if revalidate_trusted_rollout(item.candidate) != item.source_stat:
+            raise SourceChanged("rollout source changed during refresh")
 
 
 def refresh_cached_location(store: HydraStore, item: CachedRollout) -> None:
@@ -110,8 +129,17 @@ def trusted_rollout_roots(environ: Mapping[str, str]) -> tuple[RolloutRoot, ...]
 
 
 def _diagnostic(error: Exception) -> str:
+    if isinstance(error, StorageUnavailable):
+        return "storage_unavailable"
     if isinstance(error, SourceChanged):
         return "source_changed"
+    if isinstance(error, sqlite3.OperationalError):
+        code = getattr(error, "sqlite_errorcode", None)
+        if isinstance(code, int) and code & 0xFF in {
+            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
+        }:
+            return "database_busy"
+        return "internal_failure"
     if isinstance(error, (ProjectNotFound, ValueError, OSError)):
         return "project_root_unavailable"
     return "internal_failure"
@@ -121,9 +149,12 @@ def _cached(
     binding: UnchangedLocationAttribution,
     location: str,
     label: str,
+    candidate: TrustedRolloutCandidate,
+    source_stat: SourceStat,
 ) -> CachedRollout:
     return CachedRollout(
         binding.project_id, binding.logical, binding.revision, location, label,
+        candidate, source_stat,
     )
 
 
@@ -163,7 +194,7 @@ def plan_global_rollout_ingest(
                 if revalidate(candidate) != before:
                     raise SourceChanged("rollout source changed during ingest")
                 cached.setdefault(unchanged.project_id, []).append(
-                    _cached(unchanged, location, candidate.label),
+                    _cached(unchanged, location, candidate.label, candidate, before),
                 )
                 continue
             scan = scanner(candidate.path, installation_key, keys.digest)

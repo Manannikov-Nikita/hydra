@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 from hydra_codex.dashboard_refresh import (
     AttributedRollout,
-    CachedRollout,
     DashboardSnapshotCache,
     GlobalRolloutPlan,
     GlobalRefreshRunner,
@@ -267,6 +266,18 @@ class RefreshControllerTests(unittest.TestCase):
         self.assertEqual(controller.current().state, "failed")
         self.assertEqual(controller.current().diagnostic_codes, ("internal_failure",))
 
+        class InconsistentRunner:
+            def run(self, report):
+                report("reconcile", progress(projects_total=1, projects_completed=1))
+                return RefreshResult({}, False, (), 0, 0, 0)
+
+        inconsistent = self.controller(InconsistentRunner())
+        inconsistent.start()
+        inconsistent.close()
+        self.assertEqual(inconsistent.current().state, "failed")
+        self.assertEqual(inconsistent.current().diagnostic_codes, ("internal_failure",))
+        self.assertEqual(inconsistent.current().progress.projects_completed, 1)
+
     def test_close_is_bounded_and_only_waits_for_owned_worker(self) -> None:
         import time
 
@@ -284,6 +295,12 @@ class RefreshControllerTests(unittest.TestCase):
         runner.release.set()
         controller.close()
 
+        failed = self.controller(BlockingRunner(RefreshResult({}, True, (), 0, 0, 0)))
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("failed")):
+            state, reused = failed.start()
+        self.assertFalse(reused)
+        self.assertEqual((state.state, state.diagnostic_codes), ("failed", ("internal_failure",)))
+        failed.close()
 
 class GlobalPlannerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -411,6 +428,19 @@ class GlobalPlannerTests(unittest.TestCase):
         self.assertEqual(plan.diagnostic_codes, ("project_root_unavailable",))
         self.assertNotIn(str(missing), repr(plan))
 
+        busy = sqlite3.OperationalError("private busy")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        other = sqlite3.OperationalError("private invalid")
+        for error, expected in (
+            (StorageUnavailable("private"), "storage_unavailable"),
+            (busy, "database_busy"), (other, "internal_failure"),
+        ):
+            mapped = plan_global_rollout_ingest(
+                self.store, (RolloutRoot(source, "active"),), KEY,
+                discover=lambda _roots: (candidate,),
+                revalidate=lambda _item, error=error: (_ for _ in ()).throw(error),
+            )
+            self.assertEqual(mapped.diagnostic_codes, (expected,))
 
 class GlobalRunnerTests(unittest.TestCase):
     def test_defaults_to_no_event_sources_and_worker_owns_store(self) -> None:
@@ -484,36 +514,59 @@ class GlobalRunnerTests(unittest.TestCase):
                 self.assertEqual(result.diagnostic_codes, (expected,))
                 self.assertFalse(result.replace_all)
 
-    def test_cached_project_reconciles_without_prepared_ingest(self) -> None:
+    def test_cached_project_revalidates_without_prepared_ingest(self) -> None:
         temporary = tempfile.TemporaryDirectory()
-        database = Path(temporary.name) / "hydra.sqlite3"
-        cached = CachedRollout(
-            "project-cached", "logical", "revision", "location", "archived",
+        root = Path(temporary.name)
+        database = root / "hydra.sqlite3"
+        source = root / "cached.jsonl"
+        source.write_text("{}\n", encoding="utf-8")
+        source = source.resolve()
+        details = source.stat()
+        source_stat = SourceStat(
+            details.st_dev, details.st_ino, details.st_size,
+            details.st_mtime_ns, details.st_ctime_ns,
         )
-        plan = GlobalRolloutPlan(
-            (ProjectPartition("project-cached", (), (cached,)),),
-            1, 1, 0, (),
-        )
+        candidate = TrustedRolloutCandidate(source, "active", source, True)
+        store = HydraStore(database)
+        binding = SimpleNamespace(
+            project_id="project-cached", logical="logical", revision="revision")
+        with patch("hydra_codex.dashboard_refresh_plan.unchanged_location_attribution",
+                   return_value=binding):
+            plan = plan_global_rollout_ingest(
+                store, (RolloutRoot(source, "active"),), KEY,
+                discover=lambda _roots: (candidate,), revalidate=lambda _item: source_stat,
+            )
+        store.close()
         ingests: list[object] = []
         reconciles: list[str] = []
-        refreshed: list[str] = []
-        query = SimpleNamespace(
-            _refresh_snapshots_from_store=lambda *_args, **_kwargs: {},
-        )
+        query = SimpleNamespace(_refresh_snapshots_from_store=lambda *_args, **_kwargs: {})
         runner = GlobalRefreshRunner(
             lambda: HydraStore(database), KEY, query,
             planner=lambda *_args, **_kwargs: plan,
             ingester=lambda *_args, **_kwargs: ingests.append(object()),
             reconciler=lambda _store, project_id, _key: reconciles.append(project_id),
-            cached_refresher=lambda _store, item: refreshed.append(item.label),
+            cached_refresher=lambda *_args: None,
         )
-
         result = runner.run(lambda *_args: None)
-
         self.assertEqual(ingests, [])
+        self.assertEqual(result.diagnostic_codes, ())
         self.assertEqual(reconciles, ["project-cached"])
-        self.assertEqual(refreshed, ["archived"])
         self.assertTrue(result.replace_all)
+        reconciles.clear()
+
+        def mutate_during_reconcile(_store, project_id, _key):
+            reconciles.append(project_id)
+            source.write_text('{"changed":true}\n', encoding="utf-8")
+
+        changed_runner = GlobalRefreshRunner(
+            lambda: HydraStore(database), KEY, query,
+            planner=lambda *_args, **_kwargs: plan, reconciler=mutate_during_reconcile,
+            cached_refresher=lambda *_args: None,
+        )
+        changed = changed_runner.run(lambda *_args: None)
+        self.assertEqual(reconciles, ["project-cached"])
+        self.assertEqual(changed.diagnostic_codes, ("source_changed",))
+        self.assertNotIn(str(source), repr(plan.partitions[0]))
         temporary.cleanup()
 
     def test_multi_worktree_failure_rolls_back_project_and_projects_are_independent(self) -> None:
@@ -529,8 +582,10 @@ class GlobalRunnerTests(unittest.TestCase):
         ), 3, 3, 3, ())
         calls: list[tuple[str, str]] = []
         reconciles: list[str] = []
+        stages: list[str] = []
 
         def ingest(store, _roots, project_root, project_id, **_kwargs):
+            self.assertEqual(stages[-1], "reconcile")
             calls.append((project_id, Path(project_root).name))
             with store.rollout_transaction() as connection:
                 connection.execute(
@@ -556,7 +611,7 @@ class GlobalRunnerTests(unittest.TestCase):
             reconciler=lambda _store, project_id, _key: reconciles.append(project_id),
         )
 
-        result = runner.run(lambda *_args: None)
+        result = runner.run(lambda stage, _progress: stages.append(stage))
 
         self.assertEqual(calls, [
             ("project-a", "a-worktree"),

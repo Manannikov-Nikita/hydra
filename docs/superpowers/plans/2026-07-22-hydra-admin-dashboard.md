@@ -20,7 +20,7 @@
 - Keep canonical `hydra.report/v3`, `hydra.comparison/v2`, `hydra.audit/v1`, JSON, Markdown, static HTML, MCP, hook, and plugin contracts backward compatible.
 - Use the Evidence Desk visual contract in `DESIGN.md`: at most three headline cards, one phase bar, divider-based tables, restrained blue interaction accent, stable phase colors, no gradients/glass/decorative grids/ambient shadows.
 - Support system theme plus persisted manual light/dark preference, keyboard operation, visible focus, reduced motion, valid headings, captions/scoped headers, and WCAG AA contrast.
-- Work from an isolated worktree created from commit `bbcb92a`; do not carry the main checkout's unrelated uncommitted plugin/ingest changes into the branch.
+- Work from an isolated worktree created from commit `87b5cba` (application/design base `bbcb92a`); do not carry the main checkout's unrelated uncommitted plugin/ingest changes into the branch.
 
 ---
 

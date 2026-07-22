@@ -164,6 +164,44 @@ def replace_empty_table(path: Path, table: str, create_statement: str) -> None:
 
 
 class MigrationMatrixB2Tests(unittest.TestCase):
+    def test_schema_37_catalog_has_no_path_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "catalog.sqlite3"
+            store = HydraStore(database)
+            try:
+                columns = {
+                    row[1]
+                    for row in store.connection.execute("PRAGMA table_info(dashboard_projects)")
+                }
+                self.assertEqual(
+                    columns,
+                    {"project_id", "display_name", "first_seen_at", "last_seen_at"},
+                )
+                self.assertEqual(store.schema_version(), 37)
+            finally:
+                store.close()
+
+    def test_schema_37_catalog_constraint_drift_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "catalog-drift.sqlite3"
+            store = HydraStore(database)
+            store.close()
+            replace_empty_table(
+                database,
+                "dashboard_projects",
+                """CREATE TABLE dashboard_projects (
+                    project_id TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                ) WITHOUT ROWID""",
+            )
+
+            with self.assertRaisesRegex(
+                StorageUnavailable, "dashboard project catalog trust constraints",
+            ):
+                HydraStore(database)
+
     def test_v30_accepted_unacknowledged_retry_uses_existing_request_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "v30-accepted.sqlite3"

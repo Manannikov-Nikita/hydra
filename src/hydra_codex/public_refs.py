@@ -42,6 +42,28 @@ def project_public_references(
     opaque_ids: Iterable[str], installation_key: bytes, *, minimum_length: int = 12,
 ) -> PublicReferenceProjection:
     """Project private opaque IDs to stable refs, expanding only colliding prefixes."""
+    return _project_references(
+        opaque_ids, installation_key,
+        domain=b"hydra/public-task-ref/v1/", prefix="task_",
+        minimum_length=minimum_length,
+    )
+
+
+def project_catalog_references(
+    project_ids: Iterable[str], installation_key: bytes,
+) -> PublicReferenceProjection:
+    """Project private project IDs through a domain distinct from task refs."""
+    return _project_references(
+        project_ids, installation_key,
+        domain=b"hydra/public-project-ref/v1/", prefix="project_",
+        minimum_length=12,
+    )
+
+
+def _project_references(
+    opaque_ids: Iterable[str], installation_key: bytes, *, domain: bytes,
+    prefix: str, minimum_length: int,
+) -> PublicReferenceProjection:
     if not isinstance(installation_key, bytes) or len(installation_key) < 16:
         raise ValueError("installation key must contain at least 16 bytes")
     if isinstance(minimum_length, bool) or not isinstance(minimum_length, int) or not 1 <= minimum_length <= 64:
@@ -52,7 +74,7 @@ def project_public_references(
     identifiers = tuple(sorted(set(supplied)))
     digests = {
         item: hmac.new(
-            installation_key, b"hydra/public-task-ref/v1/" + item.encode("utf-8"), hashlib.sha256,
+            installation_key, domain + item.encode("utf-8"), hashlib.sha256,
         ).hexdigest()
         for item in identifiers
     }
@@ -70,5 +92,5 @@ def project_public_references(
             for item in group:
                 lengths[item] += 1
     return PublicReferenceProjection({
-        item: f"task_{digests[item][:lengths[item]]}" for item in identifiers
+        item: f"{prefix}{digests[item][:lengths[item]]}" for item in identifiers
     })

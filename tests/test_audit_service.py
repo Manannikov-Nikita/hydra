@@ -198,7 +198,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertGreaterEqual(health.wal_bytes, 0)
         self.assertEqual((health.rollout_sources, health.rollout_events), (1, 4))
         self.assertEqual((health.codex_event_sources, health.codex_events), (0, 0))
-        self.assertEqual(health.schema_version, 36)
+        self.assertEqual(health.schema_version, 37)
 
     def test_build_holds_one_nested_safe_transaction_across_status_and_reports(self) -> None:
         LocalCommandServices(environ=self.environ).audit(

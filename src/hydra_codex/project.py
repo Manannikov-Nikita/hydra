@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import tomllib
+import unicodedata
 
 
 class ProjectNotFound(FileNotFoundError):
@@ -16,6 +17,27 @@ class ProjectResolution:
     project_id: str
     project_root: Path
     worktree_path: Path
+    display_name: str | None = None
+
+
+def _trusted_display_name(value: object, config_path: Path) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{config_path} display_name must be text")
+    normalized = unicodedata.normalize("NFC", value)
+    for character in normalized:
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cf", "Zl", "Zp"}:
+            raise ValueError(f"{config_path} display_name contains unsafe characters")
+        if unicodedata.bidirectional(character) in {
+            "LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI",
+        }:
+            raise ValueError(f"{config_path} display_name contains unsafe characters")
+    collapsed = " ".join(normalized.split())
+    if not 1 <= len(collapsed) <= 80:
+        raise ValueError(f"{config_path} display_name must contain 1 to 80 characters")
+    return collapsed
 
 
 def resolve_project(cwd: Path | str) -> ProjectResolution:
@@ -31,5 +53,8 @@ def resolve_project(cwd: Path | str) -> ProjectResolution:
             project_id = data.get("project_id")
             if not isinstance(project_id, str) or not project_id.strip():
                 raise ValueError(f"{config_path} must contain a non-empty project_id")
-            return ProjectResolution(project_id, directory, current.relative_to(directory))
+            return ProjectResolution(
+                project_id, directory, current.relative_to(directory),
+                _trusted_display_name(data.get("display_name"), config_path),
+            )
     raise ProjectNotFound(f"no .hydra/project.toml found from {cwd}")

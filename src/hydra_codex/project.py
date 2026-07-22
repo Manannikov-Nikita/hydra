@@ -20,24 +20,32 @@ class ProjectResolution:
     display_name: str | None = None
 
 
-def _trusted_display_name(value: object, config_path: Path) -> str | None:
+def normalize_project_display_name(value: object) -> str | None:
+    """Return the canonical safe presentation name used by project config."""
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError(f"{config_path} display_name must be text")
+        raise ValueError("display_name must be text")
     normalized = unicodedata.normalize("NFC", value)
     for character in normalized:
         category = unicodedata.category(character)
         if category in {"Cc", "Cf", "Zl", "Zp"}:
-            raise ValueError(f"{config_path} display_name contains unsafe characters")
+            raise ValueError("display_name contains unsafe characters")
         if unicodedata.bidirectional(character) in {
             "LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI",
         }:
-            raise ValueError(f"{config_path} display_name contains unsafe characters")
+            raise ValueError("display_name contains unsafe characters")
     collapsed = " ".join(normalized.split())
     if not 1 <= len(collapsed) <= 80:
-        raise ValueError(f"{config_path} display_name must contain 1 to 80 characters")
+        raise ValueError("display_name must contain 1 to 80 characters")
     return collapsed
+
+
+def _trusted_display_name(value: object, config_path: Path) -> str | None:
+    try:
+        return normalize_project_display_name(value)
+    except ValueError as error:
+        raise ValueError(f"{config_path} {error}") from error
 
 
 def resolve_project(cwd: Path | str) -> ProjectResolution:

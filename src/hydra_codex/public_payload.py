@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 import re
 
+from .redaction import redact_note
+from .project import normalize_project_display_name
+
 
 PRIVATE_FIELDS = frozenset({
     "absolute_path", "arguments", "capability", "command", "content",
@@ -14,20 +17,66 @@ PRIVATE_FIELDS = frozenset({
     "worktree_path",
 })
 
-_WINDOWS_ABSOLUTE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
-_FILE_URI = re.compile(r"file:(?://)?", re.IGNORECASE)
+_PRIVATE_PATH_FRAGMENT = re.compile(r"(?<![A-Za-z0-9/])/(?![/\s])")
+_WINDOWS_PATH_FRAGMENT = re.compile(r"(?<!\w)[A-Za-z]:[\\/]")
+_UNC_PATH_FRAGMENT = re.compile(r"(?:^|\s)\\\\[^\s\\]+[\\/]")
+_DOUBLE_SLASH_FRAGMENT = re.compile(r"(?<![:/])//[^/\s]+/")
+_FILE_URI_FRAGMENT = re.compile(r"\bfile://", re.IGNORECASE)
+_TILDE_PATH_FRAGMENT = re.compile(r"(?:^|\s)~/")
+_UUID_FRAGMENT = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![0-9a-f])",
+    re.IGNORECASE,
+)
+_LONG_IDENTIFIER_FRAGMENT = re.compile(
+    r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{20,}(?![A-Za-z0-9+/=_-])",
+)
+_INTERNAL_ID_FRAGMENT = re.compile(
+    r"\b(?:session|turn|project|rollout|refresh|hpilot(?:_v1)?|hstorage(?:_v1)?)"
+    r"[_-][A-Za-z0-9_-]{6,}\b",
+    re.IGNORECASE,
+)
+_EXCEPTION_FRAGMENT = re.compile(
+    r"\b(?:Traceback|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*(?::|\()",
+)
+_SHELL_FRAGMENT = re.compile(
+    r"(?:^|\s)(?:sudo|rm|curl|wget|python(?:3(?:\.\d+)?)?|bash|zsh|sh|git|npm|npx|env|"
+    r"hydra-codex|uv|docker|gh|pytest|ruff|make|cat|sed|rg|cp|mv)\s+"
+    r"|;|&&|\|\||\$\(|`",
+    re.IGNORECASE,
+)
 
 
-def is_path_like_public_text(value: object) -> bool:
-    """Return whether visible text resembles a local absolute filesystem path."""
-    if not isinstance(value, str):
+def is_safe_dashboard_display_name(value: object, private_project_id: str) -> bool:
+    """Validate the one trusted browser text field against private fragments."""
+    try:
+        normalized = normalize_project_display_name(value)
+    except ValueError:
         return False
-    stripped = value.strip()
-    return bool(
-        stripped.startswith(("/", "~/", "//"))
-        or _WINDOWS_ABSOLUTE.match(stripped)
-        or _FILE_URI.match(stripped)
-    )
+    if (
+        not isinstance(value, str)
+        or normalized != value
+        or not isinstance(private_project_id, str)
+        or not private_project_id
+        or redact_note(value) != value
+        or re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(private_project_id)}(?![A-Za-z0-9_-])",
+            value,
+        ) is not None
+    ):
+        return False
+    return not any(pattern.search(value) for pattern in (
+        _PRIVATE_PATH_FRAGMENT,
+        _WINDOWS_PATH_FRAGMENT,
+        _UNC_PATH_FRAGMENT,
+        _DOUBLE_SLASH_FRAGMENT,
+        _FILE_URI_FRAGMENT,
+        _TILDE_PATH_FRAGMENT,
+        _UUID_FRAGMENT,
+        _LONG_IDENTIFIER_FRAGMENT,
+        _INTERNAL_ID_FRAGMENT,
+        _EXCEPTION_FRAGMENT,
+        _SHELL_FRAGMENT,
+    ))
 
 
 def reject_private_fields(value: object, *, _enum_keys: bool = False) -> None:
@@ -44,5 +93,3 @@ def reject_private_fields(value: object, *, _enum_keys: bool = False) -> None:
     elif isinstance(value, (list, tuple)):
         for nested in value:
             reject_private_fields(nested, _enum_keys=_enum_keys)
-    elif is_path_like_public_text(value):
-        raise ValueError("public payload contains path-like visible text")

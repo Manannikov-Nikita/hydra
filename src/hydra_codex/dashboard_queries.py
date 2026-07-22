@@ -22,7 +22,7 @@ from .diagnostics import DoctorReport
 from .exact_time import public_timestamp
 from .pilot import read_only_pilot_statuses, read_pilot_status
 from .project import ProjectResolution
-from .public_payload import is_path_like_public_text, reject_private_fields
+from .public_payload import is_safe_dashboard_display_name, reject_private_fields
 from .public_refs import project_catalog_references
 from .reconcile_engine import ReconciliationStale, list_reconciled_reports
 from .report_operations import compare_reports
@@ -184,7 +184,9 @@ class DashboardQueryService:
 
     @staticmethod
     def _display_name(item: CatalogProject, project_ref: str) -> str:
-        if item.display_name and not is_path_like_public_text(item.display_name):
+        if item.display_name and is_safe_dashboard_display_name(
+            item.display_name, item.project_id,
+        ):
             return item.display_name
         return f"Project {project_ref.removeprefix('project_')[:8]}"
 

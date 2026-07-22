@@ -223,32 +223,72 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
         self.assertEqual(payload["project"]["display_name"], "A <script>")
 
-    def test_path_like_display_name_falls_back_to_opaque_project_label(self) -> None:
+    def test_private_display_names_fall_back_to_opaque_project_label(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        unsafe_names = (
+            "Hydra /Users/alice/private-project",
+            "Hydra /workspace/private-project",
+            "Hydra /srv/private-project",
+            r"Hydra C:\Users\alice\private-project",
+            r"Hydra \\server\private-project",
+            "Hydra //server/private-project",
+            "Hydra file:///Users/alice/private-project",
+            "Hydra ~/private-project",
+            "Hydra project-a",
+            "Hydra 123e4567-e89b-12d3-a456-426614174000",
+            "Hydra 0123456789abcdef0123456789abcdef",
+            "Hydra session_0123456789abcdef",
+            "ValueError: private project failed",
+            "Hydra git status && env",
+            "Hydra docker compose up",
+            "Hydra report; env",
+            "Hydra owner@example.com",
+            "Hydra\u200bCore",
+            "Hydra\u202eCore",
+            "Hydra Cafe\u0301",
+        )
+        for display_name in unsafe_names:
+            store = HydraStore(self.database)
+            try:
+                store.connection.execute(
+                    "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
+                    (display_name,),
+                )
+                store.connection.commit()
+            finally:
+                store.close()
+            with patch(
+                "hydra_codex.dashboard_queries.list_reconciled_reports",
+                side_effect=lambda _store, project_id: self.reports[project_id],
+            ):
+                payload = self.service.snapshot(
+                    project_ref=project_ref,
+                    task_ref=None,
+                    refresh=self.refresh,
+                ).as_dict()
+            with self.subTest(display_name=display_name):
+                self.assertEqual(
+                    payload["project"]["display_name"],
+                    f"Project {project_ref.removeprefix('project_')[:8]}",
+                )
+
         store = HydraStore(self.database)
         try:
             store.connection.execute(
                 "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
-                ("/Users/alice/private-project",),
+                ("Hydra project-alpha",),
             )
             store.connection.commit()
         finally:
             store.close()
-        project_ref = self.catalog_refs()["project-a"]
-
         with patch(
             "hydra_codex.dashboard_queries.list_reconciled_reports",
             side_effect=lambda _store, project_id: self.reports[project_id],
         ):
             payload = self.service.snapshot(
-                project_ref=project_ref,
-                task_ref=None,
-                refresh=self.refresh,
+                project_ref=project_ref, task_ref=None, refresh=self.refresh,
             ).as_dict()
-
-        self.assertEqual(
-            payload["project"]["display_name"],
-            f"Project {project_ref.removeprefix('project_')[:8]}",
-        )
+        self.assertEqual(payload["project"]["display_name"], "Hydra project-alpha")
 
     def test_pilot_and_storage_numbers_are_dashboard_numeric_facts(self) -> None:
         store = HydraStore(self.database)

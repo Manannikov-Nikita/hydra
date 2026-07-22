@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 import json
 from types import MappingProxyType
 import unittest
+from copy import deepcopy
 
 from hydra_codex.dashboard_model import (
     DashboardProjectSummary,
@@ -13,6 +14,7 @@ from hydra_codex.dashboard_model import (
 )
 from hydra_codex.public_payload import reject_private_fields
 from hydra_codex.reporting import NumericFact
+from tests.test_audit_builder import public_report
 
 
 def canonical(value: object) -> str:
@@ -170,16 +172,51 @@ class DashboardModelTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 reject_private_fields({"safe": [{key: "secret"}]})
 
-    def test_public_payload_rejects_path_like_visible_values(self) -> None:
-        for value in (
-            "/Users/alice/private-project",
-            r"C:\\Users\\alice\\private-project",
-            r"\\\\server\\private-project",
-            "~/private-project",
-            "file:///Users/alice/private-project",
-        ):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                reject_private_fields({"display_name": value})
+    def test_structural_privacy_guard_allows_safe_semantic_note_vocabulary(self) -> None:
+        for note in ("/api/status returned 500", "file: upload complete"):
+            with self.subTest(note=note):
+                reject_private_fields({"semantic": {"timeline": [{"note": note}]}})
+
+    def test_selected_task_and_task_page_allow_safe_semantic_notes(self) -> None:
+        for note in ("/api/status returned 500", "file: upload complete"):
+            report = public_report("safe-note", input_tokens=10, second=10).as_dict()
+            report["semantic"]["annotations"]["timeline"] = [{
+                "kind": "phase",
+                "phase": "review",
+                "cause": "other",
+                "scope_change": "none",
+                "outcome": None,
+                "confidence": 0.9,
+                "note": note,
+                "provenance": "model_reported",
+            }]
+            encoded = canonical(report)
+            with self.subTest(note=note):
+                page = DashboardTaskPage(
+                    "2026-07-22T12:00:00Z",
+                    "project_0123456789ab",
+                    (encoded,),
+                    50,
+                    None,
+                )
+                self.assertEqual(
+                    page.as_dict()["items"][0]["semantic"]["annotations"]["timeline"][0]["note"],
+                    note,
+                )
+                baseline = self.snapshot()
+                selected = DashboardSnapshot(
+                    baseline.generated_at,
+                    baseline.freshness,
+                    baseline.projects,
+                    baseline.selected_project_ref,
+                    baseline.project_json,
+                    encoded,
+                    baseline.refresh,
+                )
+                self.assertEqual(
+                    selected.as_dict()["selected_task"]["semantic"]["annotations"]["timeline"][0]["note"],
+                    note,
+                )
 
     def test_task_page_rejects_shallow_report_shaped_payload(self) -> None:
         with self.assertRaises(ValueError):
@@ -251,6 +288,159 @@ class DashboardModelTests(unittest.TestCase):
                 50,
                 None,
             )
+
+    def test_task_report_rejects_invalid_canonical_numeric_semantics(self) -> None:
+        baseline = public_report("numeric-semantics", input_tokens=10, second=10).as_dict()
+        mutations = (
+            ("negative token", lambda payload: payload["recorded_tokens"]["input"].update(value=-1)),
+            ("fractional token", lambda payload: payload["recorded_tokens"]["input"].update(value=1.5)),
+            ("negative count", lambda payload: payload["counts"]["sessions"].update(value=-1)),
+            ("fractional count", lambda payload: payload["counts"]["sessions"].update(value=1.5)),
+            ("negative time", lambda payload: payload["timing"]["wall_clock"].update(value=-1)),
+            ("fractional time", lambda payload: payload["timing"]["wall_clock"].update(value=1.5)),
+            ("ratio above one", lambda payload: payload["semantic"]["coverage"].update(value=1.1)),
+            (
+                "negative lower bound",
+                lambda payload: payload["counts"]["sessions"].update(lower_bound=-1),
+            ),
+            (
+                "fractional lower bound",
+                lambda payload: payload["counts"]["sessions"].update(lower_bound=0.5),
+            ),
+            (
+                "negative semantic phase",
+                lambda payload: payload["semantic"]["breakdown"]["phases"]["review"]["working"].update(value=-1),
+            ),
+        )
+        for label, mutate in mutations:
+            payload = deepcopy(baseline)
+            mutate(payload)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                DashboardTaskPage(
+                    "2026-07-22T12:00:00Z",
+                    "project_0123456789ab",
+                    (canonical(payload),),
+                    50,
+                    None,
+                )
+
+    def test_task_report_rejects_health_trend_and_evidence_incoherence(self) -> None:
+        baseline = public_report("coherence", input_tokens=10, second=10).as_dict()
+
+        verified_without_receipt = deepcopy(baseline)
+        verified_without_receipt["pilot_health"].update(
+            status="verified", receipt_verified=False,
+        )
+        bad_signal = deepcopy(baseline)
+        bad_signal["trend"]["result"]["corroborating_signal"] = "private_signal"
+        bad_evidence = deepcopy(baseline)
+        bad_evidence["semantic"]["annotations"]["test_evidence"] = {
+            "total_count": NumericFact(2, "count", "derived").as_dict(),
+            "rows": [{
+                "scope": "full", "failure_cause": "none", "retry_kind": "none",
+                "phase": "test_full", "cause": "other",
+                "count": NumericFact(1, "count", "derived").as_dict(),
+            }],
+            "caveats": [],
+        }
+        unsorted_evidence = deepcopy(baseline)
+        unsorted_evidence["semantic"]["annotations"]["test_evidence"] = {
+            "total_count": NumericFact(2, "count", "derived").as_dict(),
+            "rows": [
+                {
+                    "scope": scope, "failure_cause": "none", "retry_kind": "none",
+                    "phase": "test_full", "cause": "other",
+                    "count": NumericFact(1, "count", "derived").as_dict(),
+                }
+                for scope in ("targeted", "full")
+            ],
+            "caveats": [],
+        }
+        long_timeline = deepcopy(baseline)
+        long_timeline["semantic"]["annotations"]["timeline"] = [
+            {
+                "kind": "phase", "phase": "review", "cause": "other",
+                "scope_change": "none", "outcome": None, "confidence": 0.9,
+                "note": "safe review", "provenance": "model_reported",
+            }
+            for _ in range(21)
+        ]
+        long_note = deepcopy(baseline)
+        long_note["semantic"]["annotations"]["timeline"] = [{
+            "kind": "phase", "phase": "review", "cause": "other",
+            "scope_change": "none", "outcome": None, "confidence": 0.9,
+            "note": "a" * 241, "provenance": "model_reported",
+        }]
+        for label, payload in (
+            ("verified without receipt", verified_without_receipt),
+            ("unknown trend signal", bad_signal),
+            ("inconsistent test evidence total", bad_evidence),
+            ("unsorted test evidence", unsorted_evidence),
+            ("unbounded timeline", long_timeline),
+            ("unbounded marker note", long_note),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                DashboardTaskPage(
+                    "2026-07-22T12:00:00Z",
+                    "project_0123456789ab",
+                    (canonical(payload),),
+                    50,
+                    None,
+                )
+
+    def test_task_report_allows_signed_canonical_trend_growth(self) -> None:
+        payload = public_report("signed-trend", input_tokens=10, second=10).as_dict()
+        payload["trend"]["result"]["token_growth"].update(value=-10)
+        payload["trend"]["result"]["signal_growth"].update(value=-2)
+
+        page = DashboardTaskPage(
+            "2026-07-22T12:00:00Z",
+            "project_0123456789ab",
+            (canonical(payload),),
+            50,
+            None,
+        )
+
+        self.assertEqual(page.as_dict()["items"][0]["trend"]["result"]["token_growth"]["value"], -10)
+
+    def test_dashboard_storage_enforces_exact_current_and_signed_growth_facts(self) -> None:
+        snapshot = self.snapshot()
+        signed = json.loads(snapshot.project_json or "{}")
+        signed["storage"]["baseline_state"] = "available"
+        signed["storage"]["baseline"] = deepcopy(signed["storage"]["current"])
+        signed["storage"]["growth"] = {
+            name: {
+                "value": -1,
+                "unit": "bytes" if name.endswith("_bytes") else "count",
+                "provenance": "derived",
+                "caveats": [],
+                "lower_bound": None,
+            }
+            for name in (
+                "database_bytes", "wal_bytes", "rollout_sources", "rollout_events",
+                "codex_event_sources", "codex_events",
+            )
+        }
+        DashboardSnapshot(
+            snapshot.generated_at, snapshot.freshness, snapshot.projects,
+            snapshot.selected_project_ref, canonical(signed), None,
+            snapshot.refresh,
+        )
+
+        mutations = (
+            ("derived current", {"provenance": "derived"}),
+            ("negative current", {"value": -1}),
+            ("fractional current", {"value": 1.5}),
+        )
+        for label, mutation in mutations:
+            project = deepcopy(signed)
+            project["storage"]["current"]["database_bytes"].update(mutation)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                DashboardSnapshot(
+                    snapshot.generated_at, snapshot.freshness, snapshot.projects,
+                    snapshot.selected_project_ref, canonical(project), None,
+                    snapshot.refresh,
+                )
 
 
 if __name__ == "__main__":

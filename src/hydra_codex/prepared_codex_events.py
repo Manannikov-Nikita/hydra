@@ -10,7 +10,13 @@ import sqlite3
 import stat
 from typing import Mapping, TYPE_CHECKING
 
-from .codex_events import CodexEventBatch, EventAdapterError, read_codex_event_stream
+from .codex_events import (
+    APP_SERVER_V2,
+    OTEL_LOG_V1,
+    CodexEventBatch,
+    EventAdapterError,
+    read_codex_event_stream,
+)
 from .rollout_identity import Pseudonymizer
 from .rollout_sources import (
     SOURCE_CHANGED_MESSAGE,
@@ -29,6 +35,7 @@ _ATTRIBUTION_CODES = frozenset({
     "event_attribution_ambiguous",
 })
 _KEY_BINDING_DOMAIN = b"hydra/prepared-codex-event-key/v1"
+_EVENT_SCHEMAS = frozenset({APP_SERVER_V2, OTEL_LOG_V1})
 
 
 def _validate_hash_key(hash_key: bytes) -> None:
@@ -39,6 +46,14 @@ def _validate_hash_key(hash_key: bytes) -> None:
 def _key_binding(hash_key: bytes) -> str:
     _validate_hash_key(hash_key)
     return hmac.new(hash_key, _KEY_BINDING_DOMAIN, hashlib.sha256).hexdigest()
+
+
+def _lower_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 @dataclass(frozen=True)
@@ -57,21 +72,34 @@ class PreparedCodexEventSource:
     thread_keys: tuple[str, ...] = field(repr=False)
 
     def __post_init__(self) -> None:
+        if self.schema not in _EVENT_SCHEMAS:
+            raise ValueError("unsupported event source schema")
         for value in (self.line_count, self.byte_count):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError("event source counts must be non-negative integers")
         if not isinstance(self.path, Path) or not self.path.is_absolute():
             raise ValueError("prepared event path must be absolute")
-        if not isinstance(self.raw_digest, str) or len(self.raw_digest) != 64:
-            raise ValueError("raw event digest must be sha256 hex")
-        if not isinstance(self.location_key, str) or not self.location_key:
-            raise ValueError("event location key must be non-empty")
-        if not isinstance(self.key_binding, str) or len(self.key_binding) != 64:
-            raise ValueError("event key binding must be sha256 hex")
+        for name, value in (
+            ("raw event digest", self.raw_digest),
+            ("event location key", self.location_key),
+            ("event key binding", self.key_binding),
+        ):
+            if not _lower_sha256(value):
+                raise ValueError(f"{name} must be lowercase sha256 hex")
         if self.batch.schema != self.schema:
             raise ValueError("prepared event schema must match its batch")
-        if tuple(sorted(set(self.thread_keys))) != self.thread_keys:
-            raise ValueError("prepared thread keys must be unique and sorted")
+        expected_threads = tuple(sorted({
+            thread_key
+            for event in self.batch.events
+            for thread_key in (
+                event.thread_key,
+                event.parent_thread_key,
+                event.child_thread_key,
+            )
+            if thread_key is not None
+        }))
+        if self.thread_keys != expected_threads:
+            raise ValueError("prepared thread keys must exactly match the event batch")
 
 
 @dataclass(frozen=True)
@@ -153,9 +181,14 @@ def prepare_codex_event_source(
         key_binding=binding,
         batch=batch,
         thread_keys=tuple(sorted({
-            event.thread_key
+            thread_key
             for event in batch.events
-            if event.thread_key is not None
+            for thread_key in (
+                event.thread_key,
+                event.parent_thread_key,
+                event.child_thread_key,
+            )
+            if thread_key is not None
         })),
     )
 
@@ -165,11 +198,16 @@ def validate_prepared_codex_event_sources_key(
 ) -> None:
     """Bind prepared opaque identities to the exact key that produced them."""
     expected = _key_binding(hash_key)
+    hasher = Pseudonymizer(hash_key)
     for source in sources:
         if not isinstance(source, PreparedCodexEventSource):
             raise TypeError("prepared sources must be PreparedCodexEventSource values")
+        PreparedCodexEventSource.__post_init__(source)
         if not hmac.compare_digest(source.key_binding, expected):
             raise EventAdapterError("prepared event source key mismatch")
+        expected_location = hasher.digest("path", str(source.path))
+        if not hmac.compare_digest(source.location_key, expected_location):
+            raise EventAdapterError("prepared event source location mismatch")
 
 
 def _current_project_root(

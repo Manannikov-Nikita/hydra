@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from hydra_codex.codex_events import (
     APP_SERVER_V2,
@@ -242,6 +243,21 @@ class CodexEventAdapterTests(unittest.TestCase):
             read_codex_event_jsonl(source, schema=APP_SERVER_V2, privacy_key=b"short")
         with self.assertRaisesRegex(EventAdapterError, "regular file"):
             read_codex_event_jsonl(source.parent, schema=APP_SERVER_V2, privacy_key=KEY)
+
+    def test_file_adapter_validates_schema_and_key_before_filesystem_access(self) -> None:
+        missing = Path("private-missing-events.jsonl")
+
+        with mock.patch.object(
+            Path, "is_file", side_effect=AssertionError("filesystem reached"),
+        ):
+            with self.assertRaisesRegex(EventAdapterError, "unsupported event schema"):
+                read_codex_event_jsonl(
+                    missing, schema="codex.app-server/v999", privacy_key=KEY,
+                )
+            with self.assertRaisesRegex(EventAdapterError, "exactly 32 bytes"):
+                read_codex_event_jsonl(
+                    missing, schema=APP_SERVER_V2, privacy_key=b"short",
+                )
 
     def test_malformed_unknown_and_invalid_values_emit_safe_issues(self) -> None:
         lines = [

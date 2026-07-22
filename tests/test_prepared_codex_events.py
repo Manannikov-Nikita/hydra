@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import hmac
 import os
@@ -13,7 +14,11 @@ from hydra_codex.codex_event_ingest import (
     ingest_codex_events,
     persist_prepared_codex_event_sources,
 )
-from hydra_codex.codex_events import APP_SERVER_V2, EventAdapterError
+from hydra_codex.codex_events import (
+    APP_SERVER_V2,
+    CodexEventBatch,
+    EventAdapterError,
+)
 from hydra_codex.prepared_codex_events import (
     EventAttributionDiagnostic,
     PreparedEventAttribution,
@@ -95,6 +100,26 @@ class PreparedCodexEventSourceTests(unittest.TestCase):
             self.assertRaisesRegex(EventAdapterError, "exactly 32 bytes"),
         ):
             prepare_codex_event_source(source, hash_key=b"short")
+
+    def test_prepared_contract_rejects_unknown_schema_and_noncanonical_digests(self) -> None:
+        prepared = prepare_codex_event_source(
+            self.source("private-thread"), hash_key=KEY,
+        )
+        unsupported = CodexEventBatch(
+            "codex.app-server/v999", prepared.batch.events, prepared.batch.issues,
+        )
+
+        with self.assertRaisesRegex(ValueError, "unsupported event source schema"):
+            replace(
+                prepared,
+                schema=unsupported.schema,
+                batch=unsupported,
+            )
+        for field in ("raw_digest", "location_key", "key_binding"):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "lowercase sha256 hex",
+            ):
+                replace(prepared, **{field: "A" * 64})
 
 
 class PreparedCodexEventAttributionTests(unittest.TestCase):
@@ -243,6 +268,46 @@ class PreparedCodexEventAttributionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(SourceChanged, "changed during ingest"):
             revalidate_prepared_event_attribution(result)
+
+    def test_unbound_spawn_child_makes_trusted_parent_attribution_unavailable(self) -> None:
+        path = self.root / "spawn.jsonl"
+        path.write_text(json.dumps({
+            "method": "item/completed",
+            "params": {
+                "threadId": "parent",
+                "turnId": "parent-turn",
+                "item": {
+                    "id": "spawn-call",
+                    "type": "collabToolCall",
+                    "status": "completed",
+                    "senderThreadId": "parent",
+                    "newThreadId": "unbound-child",
+                },
+            },
+        }) + "\n", encoding="utf-8")
+        prepared = prepare_codex_event_source(
+            CodexEventSource(path, APP_SERVER_V2), hash_key=KEY,
+        )
+        parent = self.bind("parent", PROJECT, "feature/one")
+        current_root = self.root / "current-root"
+        current_root.mkdir()
+        current_root = current_root.resolve()
+        changes_before = self.store.connection.total_changes
+
+        result = attribute_prepared_codex_event_source(
+            self.store.connection,
+            prepared,
+            {(PROJECT, "feature/one"): (current_root,)},
+        )
+
+        child = Pseudonymizer(KEY).digest("identity", "unbound-child")
+        self.assertEqual(prepared.thread_keys, tuple(sorted((parent, child))))
+        self.assertEqual(
+            result,
+            EventAttributionDiagnostic("event_attribution_unavailable"),
+        )
+        self.assertEqual(self.store.connection.total_changes, changes_before)
+        self.assertEqual(self.store.count("codex_event_sources"), 0)
 
     def test_relative_missing_or_symlink_rollout_roots_are_unavailable(self) -> None:
         prepared = self.prepared("first")
@@ -406,6 +471,61 @@ class PreparedCodexEventPersistenceTests(unittest.TestCase):
                             )
                 self.assertNotIn(short_key.hex(), str(raised.exception))
                 self.assertEqual(self.store.count("codex_event_sources"), 0)
+
+    def test_unknown_prepared_schema_is_rejected_before_stat_or_write(self) -> None:
+        prepared = self.prepared("first", "events.jsonl")
+        object.__setattr__(prepared, "schema", "codex.app-server/v999")
+        object.__setattr__(
+            prepared,
+            "batch",
+            CodexEventBatch("codex.app-server/v999", prepared.batch.events, ()),
+        )
+
+        with (
+            mock.patch(
+                "hydra_codex.codex_event_ingest.source_stat",
+                side_effect=AssertionError("source stat reached"),
+            ),
+            self.assertRaisesRegex(ValueError, "unsupported event source schema"),
+        ):
+            with self.store.rollout_transaction() as connection:
+                persist_prepared_codex_event_sources(
+                    connection,
+                    (prepared,),
+                    self.root,
+                    PROJECT,
+                    hash_key=KEY,
+                )
+
+        self.assertEqual(self.store.count("codex_event_sources"), 0)
+
+    def test_replaced_raw_path_fails_location_binding_before_stat_or_write(self) -> None:
+        prepared = self.prepared("first", "events.jsonl")
+        replaced = replace(
+            prepared,
+            path=(self.root / "different-private-path.jsonl").resolve(),
+        )
+
+        with (
+            mock.patch(
+                "hydra_codex.codex_event_ingest.source_stat",
+                side_effect=AssertionError("source stat reached"),
+            ),
+            self.assertRaisesRegex(
+                EventAdapterError, "prepared event source location mismatch",
+            ) as raised,
+        ):
+            with self.store.rollout_transaction() as connection:
+                persist_prepared_codex_event_sources(
+                    connection,
+                    (replaced,),
+                    self.root,
+                    PROJECT,
+                    hash_key=KEY,
+                )
+
+        self.assertNotIn(str(replaced.path), str(raised.exception))
+        self.assertEqual(self.store.count("codex_event_sources"), 0)
 
     def test_legacy_ingest_accepts_optional_prepared_sources_without_reopening(self) -> None:
         prepared = self.prepared("first", "events.jsonl")

@@ -568,14 +568,18 @@ def _parse_otel(envelope: Any, ordinal: int, event_key: str, key: bytes) -> tupl
     ), tuple(issues)
 
 
-def read_codex_event_stream(
-    lines: Iterable[bytes], *, schema: str, privacy_key: bytes,
-) -> CodexEventBatch:
-    """Parse one byte-line stream without writing, sorting, or aggregating facts."""
+def _validate_event_adapter_inputs(schema: str, privacy_key: bytes) -> None:
     if schema not in _SCHEMAS:
         raise EventAdapterError(f"unsupported event schema: {schema!r}")
     if not isinstance(privacy_key, bytes) or len(privacy_key) != 32:
         raise EventAdapterError("privacy key must be exactly 32 bytes")
+
+
+def read_codex_event_stream(
+    lines: Iterable[bytes], *, schema: str, privacy_key: bytes,
+) -> CodexEventBatch:
+    """Parse one byte-line stream without writing, sorting, or aggregating facts."""
+    _validate_event_adapter_inputs(schema, privacy_key)
     events: list[CodexEventFact] = []
     issues: list[AdapterIssue] = []
     parser = _parse_app if schema == APP_SERVER_V2 else _parse_otel
@@ -602,6 +606,7 @@ def read_codex_event_stream(
 
 def read_codex_event_jsonl(path: Path | str, *, schema: str, privacy_key: bytes) -> CodexEventBatch:
     """Read a local JSONL source without writing, sorting, or aggregating its facts."""
+    _validate_event_adapter_inputs(schema, privacy_key)
     source = Path(path)
     if not source.is_file():
         raise EventAdapterError("event source must be a regular file")

@@ -62,7 +62,7 @@ class PluginDistributionContentTests(unittest.TestCase):
                 ROOT,
                 source,
                 ignore=shutil.ignore_patterns(
-                    ".git", ".venv", "__pycache__", ".pytest_cache",
+                    ".git", ".venv", ".codegraph", "__pycache__", ".pytest_cache",
                     "build", "dist", "*.egg-info",
                 ),
             )

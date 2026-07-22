@@ -13,7 +13,9 @@
     "developerName": "Hydra",
     "category": "Productivity",
     "capabilities": ["Local telemetry", "Task reports"],
-    "defaultPrompt": "Use $hydra-report to reconcile local Codex telemetry and summarize the latest task report."
+    "defaultPrompt": [
+      "Use $hydra-report to reconcile local Codex telemetry and summarize the latest task report."
+    ]
   },
   "mcpServers": "./.mcp.json"
 }

@@ -209,6 +209,13 @@ class PluginHookContractTests(unittest.TestCase):
             (plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"),
         )
         self.assertNotIn("hooks", manifest)
+        self.assertEqual(
+            manifest["interface"]["defaultPrompt"],
+            [
+                "Use $hydra-report to reconcile local Codex telemetry and "
+                "summarize the latest task report.",
+            ],
+        )
         hooks_path = plugin_root / "hooks" / "hooks.json"
         self.assertTrue(hooks_path.is_file())
         hooks = json.loads(hooks_path.read_text(encoding="utf-8"))

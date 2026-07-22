@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
@@ -17,9 +16,7 @@ from .rollout_identity import (
     discover_trusted_rollouts,
     revalidate_trusted_rollout,
 )
-from .rollout_sources import (
-    SourceChanged, SourceScan, SourceStat, open_source, scan_source,
-)
+from .rollout_sources import SourceChanged, SourceScan, SourceStat, scan_source
 from .storage import HydraStore, StorageUnavailable
 
 
@@ -41,17 +38,10 @@ class CachedRollout:
     source_stat: SourceStat = field(repr=False)
 
 
-@contextmanager
-def guard_cached_rollout(item: CachedRollout) -> Iterator[None]:
-    """Hold one exact trusted source descriptor across its cached DB update."""
+def revalidate_cached_rollout(item: CachedRollout) -> None:
+    """Require one cached source to retain its exact trusted identity and stat."""
     if revalidate_trusted_rollout(item.candidate) != item.source_stat:
         raise SourceChanged("rollout source changed during refresh")
-    with open_source(item.candidate.path, item.source_stat):
-        if revalidate_trusted_rollout(item.candidate) != item.source_stat:
-            raise SourceChanged("rollout source changed during refresh")
-        yield
-        if revalidate_trusted_rollout(item.candidate) != item.source_stat:
-            raise SourceChanged("rollout source changed during refresh")
 
 
 def refresh_cached_location(store: HydraStore, item: CachedRollout) -> None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timezone
 import secrets
@@ -24,8 +23,8 @@ from .dashboard_refresh_plan import (
     GlobalRolloutPlan,
     ProjectPartition,
     WorktreePartition,
-    guard_cached_rollout,
     plan_global_rollout_ingest,
+    revalidate_cached_rollout,
     refresh_cached_location,
     trusted_rollout_roots,
 )
@@ -318,9 +317,9 @@ class GlobalRefreshRunner:
             for partition in ordered_partitions:
                 report("reconcile", observed)
                 try:
-                    with store.rollout_transaction(), ExitStack() as guards:
+                    with store.rollout_transaction():
                         for cached in partition.cached:
-                            guards.enter_context(guard_cached_rollout(cached))
+                            revalidate_cached_rollout(cached)
                             self._cached_refresher(store, cached)
                         for worktree in sorted(
                             partition.worktrees, key=lambda item: str(item.project_root),
@@ -338,6 +337,8 @@ class GlobalRefreshRunner:
                                 prepared_scans=scans,
                             )
                         self._reconcile(store, partition.project_id, self._key)
+                        for cached in partition.cached:
+                            revalidate_cached_rollout(cached)
                     successful.add(partition.project_id)
                 except Exception as error:
                     diagnostics.add(self._code(error))

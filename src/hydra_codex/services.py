@@ -266,3 +266,21 @@ class LocalCommandServices:
             )
         finally:
             store.close()
+
+    def audit(
+        self,
+        pilot_id: str,
+        output_format: str,
+        database_path: Path | None,
+        cwd: Path,
+    ) -> str:
+        from .audit_service import generate_audit
+
+        return generate_audit(
+            environ=self._environ,
+            database_path=self._database_path(database_path),
+            installation_key_path=self._key_path(),
+            cwd=cwd,
+            pilot_id=pilot_id,
+            output_format=output_format,
+        )

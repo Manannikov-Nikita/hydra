@@ -34,6 +34,14 @@ class StdioMcpServerTests(unittest.TestCase):
         self.assertEqual(initialized["result"]["protocolVersion"], "2025-06-18")
         tools = server.handle(request(2, "tools/list"))["result"]["tools"]
         self.assertEqual([tool["name"] for tool in tools], ["hydra.report"])
+        report_schema = tools[0]["inputSchema"]
+        self.assertEqual(
+            set(report_schema["properties"]), {"last", "pilot", "format"},
+        )
+        self.assertEqual(
+            report_schema["oneOf"],
+            [{"required": ["last"]}, {"required": ["pilot"]}],
+        )
 
         trusted = StdioMcpServer(FakeRunner([]), annotation_enabled=True)
         tools = trusted.handle(request(12, "tools/list"))["result"]["tools"]
@@ -127,6 +135,41 @@ class StdioMcpServerTests(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(runner.calls, [(("hydra-test", "ingest"), None)])
         self.assertNotIn("private", response["result"]["content"][0]["text"])
+
+    def test_report_audit_mode_delegates_to_one_shot_audit_command(self) -> None:
+        pilot_id = "hpilot_v1_0123456789abcdef0123456789abcdef"
+        runner = FakeRunner([
+            ProcessResult(0, '{"schema_version":"hydra.audit/v1"}\n', ""),
+        ])
+        server = StdioMcpServer(runner, executable="hydra-test")
+
+        response = server.handle(request(16, "tools/call", {
+            "name": "hydra.report",
+            "arguments": {"pilot": pilot_id, "format": "json"},
+        }))
+
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(runner.calls, [(
+            ("hydra-test", "audit", "--pilot", pilot_id, "--format", "json"),
+            None,
+        )])
+
+    def test_report_modes_are_mutually_exclusive_and_pilot_is_opaque(self) -> None:
+        runner = FakeRunner([])
+        server = StdioMcpServer(runner)
+        cases = (
+            {},
+            {"last": 1, "pilot": "hpilot_v1_0123456789abcdef0123456789abcdef"},
+            {"pilot": "raw-project-or-path"},
+        )
+
+        for index, arguments in enumerate(cases, start=20):
+            with self.subTest(arguments=arguments):
+                response = server.handle(request(index, "tools/call", {
+                    "name": "hydra.report", "arguments": arguments,
+                }))
+                self.assertTrue(response["result"]["isError"])
+        self.assertEqual(runner.calls, [])
 
     def test_subprocess_errors_are_generic_and_do_not_echo_stderr(self) -> None:
         runner = FakeRunner([ProcessResult(1, "", "raw secret from database")])

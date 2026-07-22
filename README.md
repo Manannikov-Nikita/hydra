@@ -111,6 +111,22 @@ hydra-codex report --last 10 --format markdown --output hydra-report.md
 hydra-codex report --last 10 --format html --output hydra-report.html
 ```
 
+Generate one canonical pilot audit as JSON, Markdown, or static HTML:
+
+```bash
+hydra-codex audit \
+  --pilot hpilot_v1_0123456789abcdef0123456789abcdef \
+  --format json \
+  --output hydra-audit.json
+```
+
+`hydra.audit/v1` contains the exact public `hydra.pilot/v1` snapshot, the
+cohort overview and per-task views, current read-only storage health, and one
+exact-once evidence appendix. Its canonical JSON bytes can be passed directly
+to `hydra-codex pilot close`. Because a bare CLI or MCP call has no
+host-attested turn context, it does not drain pending annotations or invent
+session or turn identity; the audit records that pending drain as unavailable.
+
 Reports print opaque public references such as `task_…`. Compare two of those
 references without exposing internal session IDs:
 
@@ -201,7 +217,9 @@ drift is diagnosed without retaining an unknown payload.
 ## MCP, skill, and plugin status
 
 The source plugin is packaged under `plugins/hydra-codex/` for the post-pilot
-stage. Its MCP server advertises `hydra.report` by default. It deliberately does
+stage. Its MCP server advertises `hydra.report` by default. The tool accepts
+exactly one of `last` for the existing report list or `pilot` for a canonical
+pilot audit, plus the requested format. It deliberately does
 not advertise `hydra.annotate` until Codex provides an authenticated turn
 transport outside model-controlled MCP arguments. The cooperative capability CLI
 remains the annotation fallback.

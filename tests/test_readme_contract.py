@@ -18,6 +18,7 @@ class ReadmeContractTests(unittest.TestCase):
             "hydra-codex reconcile",
             "hydra-codex report",
             "hydra-codex compare",
+            "hydra-codex audit",
         ):
             self.assertIn(command, normalized)
         self.assertIn("~/library/application support/hydra/hydra.sqlite3", normalized)
@@ -32,6 +33,8 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("not a general-purpose content classifier", normalized)
         self.assertIn("test-evidence cross-tab", normalized)
         self.assertIn("awaiting_receipt", normalized)
+        self.assertIn("hydra.audit/v1", normalized)
+        self.assertIn("does not drain pending annotations", normalized)
         self.assertIn("ambiguous shell expressions contribute no guessed file facts", normalized)
         self.assertIn("python -m pip install -e .", normalized)
         self.assertNotIn("pip install --no-build-isolation", normalized)

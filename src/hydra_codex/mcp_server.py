@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 import subprocess
 import sys
 from typing import Any, Mapping, Protocol, TextIO
@@ -17,6 +18,7 @@ from .contracts import ModelAnnotationInput
 
 
 MCP_PROTOCOL = "2025-06-18"
+_PILOT_ID = re.compile(r"hpilot_v1_[0-9a-f]{32}\Z")
 
 
 @dataclass(frozen=True)
@@ -87,16 +89,24 @@ def _tool_definitions(*, annotation_enabled: bool) -> list[dict[str, object]]:
             },
         })
     tools.append({
-            "name": "hydra.report",
-            "description": "Reconcile local telemetry and render recent privacy-safe task reports.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "last": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "format": {"type": "string", "enum": ["json", "markdown", "html"]},
+        "name": "hydra.report",
+        "description": (
+            "Reconcile local telemetry and render either recent privacy-safe task reports "
+            "or one canonical pilot audit."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "last": {"type": "integer", "minimum": 1, "maximum": 100},
+                "pilot": {
+                    "type": "string",
+                    "pattern": "^hpilot_v1_[0-9a-f]{32}$",
                 },
-                "required": ["last"], "additionalProperties": False,
+                "format": {"type": "string", "enum": ["json", "markdown", "html"]},
             },
+            "oneOf": [{"required": ["last"]}, {"required": ["pilot"]}],
+            "additionalProperties": False,
+        },
         })
     return tools
 
@@ -154,14 +164,33 @@ class StdioMcpServer:
         return _result_text(result.stdout or '{"status":"ok"}\n')
 
     def _report(self, arguments: object) -> dict[str, object]:
-        if not isinstance(arguments, Mapping) or set(arguments) - {"last", "format"}:
+        if not isinstance(arguments, Mapping) or set(arguments) - {"last", "pilot", "format"}:
             raise ValueError("invalid arguments")
-        count = arguments.get("last")
+        has_last = "last" in arguments
+        has_pilot = "pilot" in arguments
+        if has_last == has_pilot:
+            raise ValueError("exactly one report mode is required")
         output_format = arguments.get("format", "json")
-        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
-            raise ValueError("invalid last")
         if output_format not in {"json", "markdown", "html"}:
             raise ValueError("invalid format")
+        if has_pilot:
+            pilot_id = arguments.get("pilot")
+            if not isinstance(pilot_id, str) or _PILOT_ID.fullmatch(pilot_id) is None:
+                raise ValueError("invalid pilot")
+            rendered = self._runner.run((
+                self._executable,
+                "audit",
+                "--pilot",
+                pilot_id,
+                "--format",
+                str(output_format),
+            ))
+            if rendered.returncode != 0:
+                return _result_text("Hydra command failed.", error=True)
+            return _result_text(rendered.stdout)
+        count = arguments.get("last")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
+            raise ValueError("invalid last")
         ingested = self._runner.run((self._executable, "ingest"))
         if ingested.returncode != 0:
             return _result_text("Hydra command failed.", error=True)

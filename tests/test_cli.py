@@ -31,6 +31,7 @@ class FakeServices:
         self.report_content = "rendered report"
         self.compare_content = "rendered comparison"
         self.pilot_content = "rendered pilot"
+        self.audit_content = "rendered audit"
         self.failure: Exception | None = None
 
     def _fail(self) -> None:
@@ -72,6 +73,11 @@ class FakeServices:
         ))
         return self.pilot_content
 
+    def audit(self, pilot_id, output_format, database_path, cwd):
+        self._fail()
+        self.calls.append(("audit", pilot_id, output_format, database_path, cwd))
+        return self.audit_content
+
 
 def invoke(
     argv, *, stdin="", environ=None, services=None, installation_key_path=None,
@@ -109,6 +115,8 @@ class CliParserTests(unittest.TestCase):
             [],
             ["report", "--last", "0"],
             ["report", "--last", "1", "--format", "xml"],
+            ["audit", "--format", "json"],
+            ["audit", "--pilot", "hpilot_v1_public", "--format", "xml"],
             ["compare", "task_a"],
             ["annotate", "--capability", "secret"],
         )
@@ -123,7 +131,7 @@ class CliParserTests(unittest.TestCase):
     def test_help_is_success(self) -> None:
         code, stdout, stderr = invoke(["--help"])
         self.assertEqual((code, stderr), (0, ""))
-        for command in ("ingest", "annotate", "reconcile", "report", "compare"):
+        for command in ("ingest", "annotate", "reconcile", "report", "compare", "audit"):
             self.assertIn(command, stdout)
 
     def test_module_entrypoint_uses_safe_parser_exit_without_leaking_argv(self) -> None:
@@ -262,6 +270,26 @@ class ServiceDelegationTests(unittest.TestCase):
             self.services.calls[-1][0:4],
             ("pilot_close", "hpilot_v1_public", Path("audit.json"), "verified"),
         )
+
+    def test_audit_delegates_pilot_format_and_uses_atomic_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "audit.html"
+
+            code, stdout, stderr = invoke(
+                [
+                    "audit", "--pilot", "hpilot_v1_public", "--format", "html",
+                    "--output", str(target), "--db", "audit.sqlite3", "--cwd", ".",
+                ],
+                services=self.services,
+            )
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            self.assertEqual(target.read_text(encoding="utf-8"), "rendered audit")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(
+                self.services.calls[-1][:3],
+                ("audit", "hpilot_v1_public", "html"),
+            )
 
     def test_service_errors_do_not_echo_exception_paths_or_secrets(self) -> None:
         private = "/private/database.sqlite3 capability-secret raw-note"

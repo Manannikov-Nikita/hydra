@@ -49,6 +49,11 @@ class CommandServices(Protocol):
         database_path: Path | None, cwd: Path,
     ) -> str: ...
 
+    def audit(
+        self, pilot_id: str, output_format: str,
+        database_path: Path | None, cwd: Path,
+    ) -> str: ...
+
 
 class _SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
@@ -101,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("right")
     compare.add_argument("--format", choices=("json", "markdown", "html"), default="json")
     compare.add_argument("--output")
+
+    audit = commands.add_parser("audit")
+    _common_options(audit)
+    audit.add_argument("--pilot", required=True)
+    audit.add_argument("--format", choices=("json", "markdown", "html"), default="json")
+    audit.add_argument("--output")
 
     pilot = commands.add_parser("pilot")
     pilot_commands = pilot.add_subparsers(dest="pilot_command", required=True)
@@ -310,6 +321,10 @@ def _render(
     database, cwd = _paths(arguments)
     if arguments.command == "report":
         content = services.report(arguments.last, arguments.format, database, cwd)
+    elif arguments.command == "audit":
+        content = services.audit(
+            arguments.pilot, arguments.format, database, cwd,
+        )
     else:
         content = services.compare(
             arguments.left, arguments.right, arguments.format, database, cwd,

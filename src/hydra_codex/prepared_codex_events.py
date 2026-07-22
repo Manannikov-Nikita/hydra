@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import hashlib
 import hmac
+import json
 from pathlib import Path
 import sqlite3
 import stat
@@ -35,6 +36,7 @@ _ATTRIBUTION_CODES = frozenset({
     "event_attribution_ambiguous",
 })
 _KEY_BINDING_DOMAIN = b"hydra/prepared-codex-event-key/v1"
+_PAYLOAD_SEAL_DOMAIN = b"hydra/prepared-codex-event-payload/v1\x00"
 _EVENT_SCHEMAS = frozenset({APP_SERVER_V2, OTEL_LOG_V1})
 
 
@@ -56,6 +58,69 @@ def _lower_sha256(value: object) -> bool:
     )
 
 
+def _batch_payload(batch: CodexEventBatch) -> dict[str, object]:
+    events: list[dict[str, object]] = []
+    for event in batch.events:
+        value = asdict(event)
+        if event.tool is not None:
+            tool = value.get("tool")
+            if not isinstance(tool, dict):
+                raise EventAdapterError("prepared event source payload is invalid")
+            tool["ephemeral"] = {
+                "command": event.tool.ephemeral_command,
+                "output": event.tool.ephemeral_output,
+                "workdir": event.tool.ephemeral_workdir,
+                "file_writes": list(event.tool.ephemeral_file_writes),
+            }
+        events.append(value)
+    return {
+        "schema": batch.schema,
+        "events": events,
+        "issues": [asdict(issue) for issue in batch.issues],
+    }
+
+
+def _payload_seal(
+    hash_key: bytes,
+    *,
+    schema: str,
+    line_count: int,
+    byte_count: int,
+    path: Path,
+    source_details: SourceStat,
+    raw_digest: str,
+    location_key: str,
+    key_binding: str,
+    batch: CodexEventBatch,
+    thread_keys: tuple[str, ...],
+) -> str:
+    payload = {
+        "schema": schema,
+        "line_count": line_count,
+        "byte_count": byte_count,
+        "canonical_path": str(path),
+        "source_stat": asdict(source_details),
+        "raw_digest": raw_digest,
+        "location_key": location_key,
+        "key_binding": key_binding,
+        "batch": _batch_payload(batch),
+        "thread_keys": list(thread_keys),
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise EventAdapterError("prepared event source payload is invalid") from error
+    return hmac.new(
+        hash_key, _PAYLOAD_SEAL_DOMAIN + encoded, hashlib.sha256,
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class PreparedCodexEventSource:
     """One exact event stream, normalized without retaining raw content."""
@@ -68,6 +133,7 @@ class PreparedCodexEventSource:
     raw_digest: str = field(repr=False)
     location_key: str = field(repr=False)
     key_binding: str = field(repr=False)
+    payload_seal: str = field(repr=False)
     batch: CodexEventBatch = field(repr=False)
     thread_keys: tuple[str, ...] = field(repr=False)
 
@@ -83,6 +149,7 @@ class PreparedCodexEventSource:
             ("raw event digest", self.raw_digest),
             ("event location key", self.location_key),
             ("event key binding", self.key_binding),
+            ("event payload seal", self.payload_seal),
         ):
             if not _lower_sha256(value):
                 raise ValueError(f"{name} must be lowercase sha256 hex")
@@ -170,26 +237,34 @@ def prepare_codex_event_source(
         batch = read_codex_event_stream(
             measured_lines(handle), schema=source.schema, privacy_key=hash_key,
         )
-    return PreparedCodexEventSource(
+    digest = raw_digest.hexdigest()
+    location = hasher.digest("path", str(canonical))
+    thread_keys = tuple(sorted({
+        thread_key
+        for event in batch.events
+        for thread_key in (
+            event.thread_key,
+            event.parent_thread_key,
+            event.child_thread_key,
+        )
+        if thread_key is not None
+    }))
+    seal = _payload_seal(
+        hash_key,
         schema=source.schema,
         line_count=line_count,
         byte_count=byte_count,
         path=canonical,
-        source_stat=expected_stat,
-        raw_digest=raw_digest.hexdigest(),
-        location_key=hasher.digest("path", str(canonical)),
+        source_details=expected_stat,
+        raw_digest=digest,
+        location_key=location,
         key_binding=binding,
         batch=batch,
-        thread_keys=tuple(sorted({
-            thread_key
-            for event in batch.events
-            for thread_key in (
-                event.thread_key,
-                event.parent_thread_key,
-                event.child_thread_key,
-            )
-            if thread_key is not None
-        })),
+        thread_keys=thread_keys,
+    )
+    return PreparedCodexEventSource(
+        source.schema, line_count, byte_count, canonical, expected_stat,
+        digest, location, binding, seal, batch, thread_keys,
     )
 
 
@@ -208,6 +283,21 @@ def validate_prepared_codex_event_sources_key(
         expected_location = hasher.digest("path", str(source.path))
         if not hmac.compare_digest(source.location_key, expected_location):
             raise EventAdapterError("prepared event source location mismatch")
+        expected_seal = _payload_seal(
+            hash_key,
+            schema=source.schema,
+            line_count=source.line_count,
+            byte_count=source.byte_count,
+            path=source.path,
+            source_details=source.source_stat,
+            raw_digest=source.raw_digest,
+            location_key=source.location_key,
+            key_binding=source.key_binding,
+            batch=source.batch,
+            thread_keys=source.thread_keys,
+        )
+        if not hmac.compare_digest(source.payload_seal, expected_seal):
+            raise EventAdapterError("prepared event source payload mismatch")
 
 
 def _current_project_root(

@@ -71,6 +71,7 @@ class PreparedCodexEventSourceTests(unittest.TestCase):
         for private in (
             str(source.path), source.path.name, expected_thread,
             prepared.raw_digest, prepared.location_key, prepared.key_binding,
+            prepared.payload_seal,
             KEY.hex(),
         ):
             self.assertNotIn(private, rendered)
@@ -115,7 +116,7 @@ class PreparedCodexEventSourceTests(unittest.TestCase):
                 schema=unsupported.schema,
                 batch=unsupported,
             )
-        for field in ("raw_digest", "location_key", "key_binding"):
+        for field in ("raw_digest", "location_key", "key_binding", "payload_seal"):
             with self.subTest(field=field), self.assertRaisesRegex(
                 ValueError, "lowercase sha256 hex",
             ):

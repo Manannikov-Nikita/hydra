@@ -257,6 +257,14 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             "ssh host",
             "ls -la",
             "Clone project-b",
+            r"Hydra >output",
+            r"Hydra ~alice/private",
+            "FOO=bar ls",
+            "Echo hello",
+            "KeyboardInterrupt happened",
+            "Clone hprj_ab12",
+            "Clone root_abcdef",
+            "Hydra & status",
         )
         for display_name in unsafe_names:
             store = HydraStore(self.database)

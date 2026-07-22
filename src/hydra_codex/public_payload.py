@@ -35,12 +35,12 @@ _HEX_IDENTIFIER_FRAGMENT = re.compile(
     r"(?<![0-9a-f])[0-9a-f]{32,64}(?![0-9a-f])", re.IGNORECASE,
 )
 _INTERNAL_ID_FRAGMENT = re.compile(
-    r"\b(?:session|turn|project|task|rollout|refresh|hpilot(?:_v1)?|hstorage(?:_v1)?)"
+    r"\b(?:session|turn|project|task|rollout|refresh|root|hprj|hpilot(?:_v1)?|hstorage(?:_v1)?)"
     r"[_-][A-Za-z0-9_-]+\b",
     re.IGNORECASE,
 )
 _EXCEPTION_FRAGMENT = re.compile(
-    r"\b(?:Traceback|Errno|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b",
+    r"\b(?:Traceback|Errno|KeyboardInterrupt|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt))\b",
     re.IGNORECASE,
 )
 _SHELL_FRAGMENT = re.compile(
@@ -49,15 +49,34 @@ _SHELL_FRAGMENT = re.compile(
     re.IGNORECASE,
 )
 _SHELL_OPERATOR_FRAGMENT = re.compile(
-    r";|\||&&|\|\||\$\(|`|(?:^|\s)(?:>>?|<)(?=\s|$)",
+    r";|\||&|\$\(|`|(?:^|\s)(?:>>?)(?=\S|\s|$)|(?:^|\s)<(?=\s|$)",
 )
+_MARKUP_TOKEN = re.compile(r"<[A-Za-z][A-Za-z0-9-]*>\Z")
+_TITLE_TOKEN_PUNCTUATION = frozenset("._+-'()")
 
 
-def _starts_with_uppercase_letter(value: str) -> bool:
-    for character in value:
-        if character.isalpha() and character.lower() != character.upper():
-            return character == character.upper()
-    return False
+def _is_public_title_token(token: str) -> bool:
+    if _MARKUP_TOKEN.fullmatch(token) is not None:
+        return True
+    if not token or any(
+        not character.isalnum() and character not in _TITLE_TOKEN_PUNCTUATION
+        for character in token
+    ):
+        return False
+    first_cased = next(
+        (
+            character for character in token
+            if character.isalpha() and character.lower() != character.upper()
+        ),
+        None,
+    )
+    if first_cased is None:
+        return any(character.isdigit() for character in token)
+    return first_cased.isupper()
+
+
+def _has_public_title_grammar(value: str) -> bool:
+    return all(_is_public_title_token(token) for token in value.split())
 
 
 def _contains_opaque_long_token(value: str) -> bool:
@@ -88,7 +107,7 @@ def is_safe_dashboard_display_name(value: object, private_project_id: str) -> bo
         or normalized != value
         or not isinstance(private_project_id, str)
         or not private_project_id
-        or not _starts_with_uppercase_letter(value)
+        or not _has_public_title_grammar(value)
         or redact_note(_redaction_probe(value)) != _redaction_probe(value)
         or _contains_opaque_long_token(value)
         or re.search(

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hydra_codex.project import resolve_project
+from hydra_codex.project import normalize_project_display_name, resolve_project
 
 
 PROJECT_CONFIG = 'project_id = "hprj_4db8fca38ef042f3"\ntelemetry = "hybrid"\n'
@@ -36,9 +36,12 @@ class ProjectResolutionTests(unittest.TestCase):
         self.assertEqual(resolve_project(normalized).display_name, "Café")
 
     def test_project_config_rejects_control_bidi_and_overlong_names(self) -> None:
-        for value in ("Hydra\nCore", "Hydra\u202eCore", "x" * 81):
+        for value in ("Hydra\nCore", "Hydra\u202eCore", "Hydra\ud800", "x" * 81):
             with self.subTest(value=repr(value)), self.assertRaises(ValueError):
-                resolve_project(self.project("project-a", display_name=value))
+                if "\ud800" in value:
+                    normalize_project_display_name(value)
+                else:
+                    resolve_project(self.project("project-a", display_name=value))
 
     def test_resolves_project_from_a_nested_worktree_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

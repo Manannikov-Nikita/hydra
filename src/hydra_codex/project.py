@@ -29,7 +29,7 @@ def normalize_project_display_name(value: object) -> str | None:
     normalized = unicodedata.normalize("NFC", value)
     for character in normalized:
         category = unicodedata.category(character)
-        if category in {"Cc", "Cf", "Zl", "Zp"}:
+        if category.startswith("C") or category in {"Zl", "Zp"}:
             raise ValueError("display_name contains unsafe characters")
         if unicodedata.bidirectional(character) in {
             "LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI",

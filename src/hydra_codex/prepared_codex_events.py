@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 from pathlib import Path
 import sqlite3
 import stat
 from typing import Mapping, TYPE_CHECKING
 
-from .codex_events import CodexEventBatch, read_codex_event_stream
+from .codex_events import CodexEventBatch, EventAdapterError, read_codex_event_stream
 from .rollout_identity import Pseudonymizer
 from .rollout_sources import (
     SOURCE_CHANGED_MESSAGE,
@@ -27,6 +28,17 @@ _ATTRIBUTION_CODES = frozenset({
     "event_attribution_unavailable",
     "event_attribution_ambiguous",
 })
+_KEY_BINDING_DOMAIN = b"hydra/prepared-codex-event-key/v1"
+
+
+def _validate_hash_key(hash_key: bytes) -> None:
+    if not isinstance(hash_key, bytes) or len(hash_key) != 32:
+        raise EventAdapterError("privacy key must be exactly 32 bytes")
+
+
+def _key_binding(hash_key: bytes) -> str:
+    _validate_hash_key(hash_key)
+    return hmac.new(hash_key, _KEY_BINDING_DOMAIN, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -40,6 +52,7 @@ class PreparedCodexEventSource:
     source_stat: SourceStat = field(repr=False)
     raw_digest: str = field(repr=False)
     location_key: str = field(repr=False)
+    key_binding: str = field(repr=False)
     batch: CodexEventBatch = field(repr=False)
     thread_keys: tuple[str, ...] = field(repr=False)
 
@@ -53,6 +66,8 @@ class PreparedCodexEventSource:
             raise ValueError("raw event digest must be sha256 hex")
         if not isinstance(self.location_key, str) or not self.location_key:
             raise ValueError("event location key must be non-empty")
+        if not isinstance(self.key_binding, str) or len(self.key_binding) != 64:
+            raise ValueError("event key binding must be sha256 hex")
         if self.batch.schema != self.schema:
             raise ValueError("prepared event schema must match its batch")
         if tuple(sorted(set(self.thread_keys))) != self.thread_keys:
@@ -101,6 +116,7 @@ def prepare_codex_event_source(
     source: CodexEventSource, *, hash_key: bytes,
 ) -> PreparedCodexEventSource:
     """Hash and parse one stat-bound physical stream exactly once."""
+    binding = _key_binding(hash_key)
     hasher = Pseudonymizer(hash_key)
     requested = Path(source.path).expanduser().absolute()
     expected_stat = source_stat(requested)
@@ -134,6 +150,7 @@ def prepare_codex_event_source(
         source_stat=expected_stat,
         raw_digest=raw_digest.hexdigest(),
         location_key=hasher.digest("path", str(canonical)),
+        key_binding=binding,
         batch=batch,
         thread_keys=tuple(sorted({
             event.thread_key
@@ -141,6 +158,18 @@ def prepare_codex_event_source(
             if event.thread_key is not None
         })),
     )
+
+
+def validate_prepared_codex_event_sources_key(
+    sources: tuple[PreparedCodexEventSource, ...], hash_key: bytes,
+) -> None:
+    """Bind prepared opaque identities to the exact key that produced them."""
+    expected = _key_binding(hash_key)
+    for source in sources:
+        if not isinstance(source, PreparedCodexEventSource):
+            raise TypeError("prepared sources must be PreparedCodexEventSource values")
+        if not hmac.compare_digest(source.key_binding, expected):
+            raise EventAdapterError("prepared event source key mismatch")
 
 
 def _current_project_root(

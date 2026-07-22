@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import os
 from pathlib import Path
 import tempfile
@@ -12,7 +13,7 @@ from hydra_codex.codex_event_ingest import (
     ingest_codex_events,
     persist_prepared_codex_event_sources,
 )
-from hydra_codex.codex_events import APP_SERVER_V2
+from hydra_codex.codex_events import APP_SERVER_V2, EventAdapterError
 from hydra_codex.prepared_codex_events import (
     EventAttributionDiagnostic,
     PreparedEventAttribution,
@@ -64,7 +65,8 @@ class PreparedCodexEventSourceTests(unittest.TestCase):
         rendered = repr(prepared)
         for private in (
             str(source.path), source.path.name, expected_thread,
-            prepared.raw_digest, prepared.location_key,
+            prepared.raw_digest, prepared.location_key, prepared.key_binding,
+            KEY.hex(),
         ):
             self.assertNotIn(private, rendered)
 
@@ -77,6 +79,22 @@ class PreparedCodexEventSourceTests(unittest.TestCase):
             prepare_codex_event_source(
                 CodexEventSource(link, APP_SERVER_V2), hash_key=KEY,
             )
+
+    def test_prepare_rejects_invalid_key_before_source_stat_or_read(self) -> None:
+        source = self.source("private-thread")
+
+        with (
+            mock.patch(
+                "hydra_codex.prepared_codex_events.source_stat",
+                side_effect=AssertionError("source stat reached"),
+            ),
+            mock.patch(
+                "hydra_codex.rollout_sources.os.open",
+                side_effect=AssertionError("source read reached"),
+            ),
+            self.assertRaisesRegex(EventAdapterError, "exactly 32 bytes"),
+        ):
+            prepare_codex_event_source(source, hash_key=b"short")
 
 
 class PreparedCodexEventAttributionTests(unittest.TestCase):
@@ -308,6 +326,87 @@ class PreparedCodexEventPersistenceTests(unittest.TestCase):
 
         self.assertEqual(self.store.count("codex_event_sources"), 0)
 
+    def test_mismatched_valid_key_is_rejected_before_stat_or_write_in_both_seams(self) -> None:
+        prepared = self.prepared("first", "events.jsonl")
+        other_key = b"z" * 32
+
+        for seam in ("optional", "direct"):
+            with self.subTest(seam=seam):
+                with (
+                    mock.patch(
+                        "hydra_codex.prepared_codex_events.hmac.compare_digest",
+                        wraps=hmac.compare_digest,
+                    ) as compare,
+                    mock.patch(
+                        "hydra_codex.codex_event_ingest.source_stat",
+                        side_effect=AssertionError("source stat reached"),
+                    ),
+                    self.assertRaisesRegex(
+                        EventAdapterError, "prepared event source key mismatch",
+                    ) as raised,
+                ):
+                    if seam == "optional":
+                        ingest_codex_events(
+                            self.store,
+                            (),
+                            self.root,
+                            PROJECT,
+                            hash_key=other_key,
+                            prepared_sources=(prepared,),
+                        )
+                    else:
+                        with self.store.rollout_transaction() as connection:
+                            persist_prepared_codex_event_sources(
+                                connection,
+                                (prepared,),
+                                self.root,
+                                PROJECT,
+                                hash_key=other_key,
+                            )
+                compare.assert_called()
+                message = str(raised.exception)
+                self.assertNotIn(other_key.hex(), message)
+                self.assertNotIn(prepared.key_binding, message)
+                self.assertEqual(self.store.count("codex_event_sources"), 0)
+
+    def test_invalid_key_length_is_rejected_before_compare_stat_or_write(self) -> None:
+        prepared = self.prepared("first", "events.jsonl")
+        short_key = b"short"
+
+        for seam in ("optional", "direct"):
+            with self.subTest(seam=seam):
+                with (
+                    mock.patch(
+                        "hydra_codex.prepared_codex_events.hmac.compare_digest",
+                        side_effect=AssertionError("compare reached"),
+                    ),
+                    mock.patch(
+                        "hydra_codex.codex_event_ingest.source_stat",
+                        side_effect=AssertionError("source stat reached"),
+                    ),
+                    self.assertRaisesRegex(EventAdapterError, "exactly 32 bytes") as raised,
+                ):
+                    if seam == "optional":
+                        ingest_codex_events(
+                            self.store,
+                            (),
+                            self.root,
+                            PROJECT,
+                            hash_key=short_key,
+                            prepared_sources=(prepared,),
+                        )
+                    else:
+                        with self.store.rollout_transaction() as connection:
+                            persist_prepared_codex_event_sources(
+                                connection,
+                                (prepared,),
+                                self.root,
+                                PROJECT,
+                                hash_key=short_key,
+                            )
+                self.assertNotIn(short_key.hex(), str(raised.exception))
+                self.assertEqual(self.store.count("codex_event_sources"), 0)
+
     def test_legacy_ingest_accepts_optional_prepared_sources_without_reopening(self) -> None:
         prepared = self.prepared("first", "events.jsonl")
 
@@ -391,7 +490,7 @@ class PreparedCodexEventPersistenceTests(unittest.TestCase):
         self.assertEqual(self.store.count("codex_event_sources"), 0)
         self.assertEqual(self.store.count("codex_events"), 0)
 
-    def test_direct_prepared_persistence_matches_legacy_post_persist_reconciliation(self) -> None:
+    def test_optional_prepared_ingest_matches_legacy_post_persist_reconciliation(self) -> None:
         source = self.root / "parity.jsonl"
         source.write_text(
             (Path(__file__).parent / "fixtures" / "codex_events" / "app_server_v2.jsonl")

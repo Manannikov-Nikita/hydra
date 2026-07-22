@@ -17,7 +17,10 @@ from .codex_events import (
     read_codex_event_jsonl,
 )
 from .lineage import assert_session_project, persist_confirmed_parent
-from .prepared_codex_events import PreparedCodexEventSource
+from .prepared_codex_events import (
+    PreparedCodexEventSource,
+    validate_prepared_codex_event_sources_key,
+)
 from .rollout_identity import ACTIVE_HASHER, Pseudonymizer
 from .rollout_persistence import persist_file
 from .rollout_privacy import canonical_timestamp
@@ -573,6 +576,8 @@ def persist_prepared_codex_event_sources(
     hash_key: bytes,
 ) -> CodexEventIngestReport:
     """Persist pre-parsed stat-bound sources inside the caller's transaction."""
+    items = tuple(sources)
+    validate_prepared_codex_event_sources_key(items, hash_key)
     if not connection.in_transaction:
         raise ValueError("prepared event persistence requires an owning transaction")
     if not isinstance(project_id, str) or not project_id:
@@ -580,10 +585,7 @@ def persist_prepared_codex_event_sources(
     hasher = Pseudonymizer(hash_key)
     hash_token = ACTIVE_HASHER.set(hasher)
     try:
-        items = tuple(sources)
         for item in items:
-            if not isinstance(item, PreparedCodexEventSource):
-                raise TypeError("prepared sources must be PreparedCodexEventSource values")
             if source_stat(item.path) != item.source_stat:
                 raise SourceChanged(SOURCE_CHANGED_MESSAGE)
         unique: dict[str, tuple[_PreparedSource, CodexEventBatch]] = {}
@@ -633,13 +635,14 @@ def ingest_codex_events(
     prepared_sources: Iterable[PreparedCodexEventSource] = (),
 ) -> CodexEventIngestReport:
     """Import privacy-safe event facts with content idempotency and canonical identities."""
+    prepared_items = tuple(prepared_sources)
+    validate_prepared_codex_event_sources_key(prepared_items, hash_key)
     if not isinstance(project_id, str) or not project_id:
         raise ValueError("project_id must be non-empty")
     hasher = Pseudonymizer(hash_key)
     hash_token = ACTIVE_HASHER.set(hasher)
     try:
         items = tuple(sources)
-        prepared_items = tuple(prepared_sources)
         prepared = tuple(_prepare(item, hasher, project_id) for item in items)
         unique: dict[str, tuple[_PreparedSource, CodexEventBatch]] = {}
         locations: dict[str, set[str]] = {}

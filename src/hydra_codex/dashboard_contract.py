@@ -359,8 +359,12 @@ def _validate_storage_group(value: object, *, allow_none: bool, growth: bool = F
             "bytes" if field.endswith("_bytes") else "count",
             integer=True,
             nonnegative=not growth,
-            provenance="derived" if growth else "exact",
         )
+        assert isinstance(fact, Mapping)
+        if fact["value"] is not None and fact["provenance"] != (
+            "derived" if growth else "exact"
+        ):
+            raise ValueError("available storage fact has invalid provenance")
 
 
 def _validate_storage(value: object) -> None:

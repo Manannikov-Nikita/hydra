@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import re
@@ -180,10 +180,31 @@ class DashboardProjectSummary:
 
 
 @dataclass(frozen=True)
+class DashboardProjectCatalog:
+    """One strictly validated project collection shared by bulk snapshots."""
+
+    projects: tuple[DashboardProjectSummary, ...]
+    project_refs: frozenset[str] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.projects, tuple) or any(
+            not isinstance(item, DashboardProjectSummary) for item in self.projects
+        ):
+            raise ValueError("projects must contain dashboard project summaries")
+        project_refs = frozenset(item.project_ref for item in self.projects)
+        if len(project_refs) != len(self.projects):
+            raise ValueError("project references must be unique")
+        object.__setattr__(self, "projects", tuple(sorted(
+            self.projects, key=lambda item: item.project_ref,
+        )))
+        object.__setattr__(self, "project_refs", project_refs)
+
+
+@dataclass(frozen=True)
 class DashboardSnapshot:
     generated_at: str
     freshness: Mapping[str, object]
-    projects: tuple[DashboardProjectSummary, ...]
+    projects: tuple[DashboardProjectSummary, ...] | DashboardProjectCatalog
     selected_project_ref: str | None
     project_json: str | None
     selected_task_json: str | None
@@ -198,18 +219,15 @@ class DashboardSnapshot:
         validate_freshness(thawed_freshness)
         reject_private_fields(thawed_freshness)
         object.__setattr__(self, "freshness", frozen_freshness)
-        if not isinstance(self.projects, tuple) or any(
-            not isinstance(item, DashboardProjectSummary) for item in self.projects
-        ):
-            raise ValueError("projects must contain dashboard project summaries")
-        if len({item.project_ref for item in self.projects}) != len(self.projects):
-            raise ValueError("project references must be unique")
-        object.__setattr__(self, "projects", tuple(sorted(
-            self.projects, key=lambda item: item.project_ref,
-        )))
+        project_catalog = (
+            self.projects
+            if isinstance(self.projects, DashboardProjectCatalog)
+            else DashboardProjectCatalog(self.projects)
+        )
+        object.__setattr__(self, "projects", project_catalog.projects)
         if self.selected_project_ref is not None:
             _project_ref(self.selected_project_ref)
-            if self.selected_project_ref not in {item.project_ref for item in self.projects}:
+            if self.selected_project_ref not in project_catalog.project_refs:
                 raise ValueError("selected project is not in the catalog")
         if (self.selected_project_ref is None) != (self.project_json is None):
             raise ValueError("selected project and project payload must appear together")

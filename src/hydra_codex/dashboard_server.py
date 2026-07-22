@@ -87,11 +87,11 @@ def _as_dict(value: object) -> dict[str, object]:
         raise ValueError("dashboard public contract must serialize to an object")
     reject_private_fields(payload)
     return payload
-
 class DashboardApplication:
     def __init__(
         self, *, token: str, query_service: object, refresh_controller: object,
         snapshot_cache: object, assets: Mapping[str, DashboardAsset],
+        fallback_snapshot: object | None = None, fallback_error: str | None = None,
         _authority: str | None = None,
     ) -> None:
         if (
@@ -117,12 +117,10 @@ class DashboardApplication:
             copied[path] = asset
         if _authority is not None:
             self._validate_authority(_authority)
-        self._token = token
-        self._query = query_service
-        self._controller = refresh_controller
-        self._cache = snapshot_cache
-        self._assets = MappingProxyType(dict(sorted(copied.items())))
-        self._authority = _authority
+        if fallback_error not in {None, "storage_unavailable"}: raise ValueError("dashboard fallback error is invalid")
+        self._token, self._query, self._controller = token, query_service, refresh_controller
+        self._cache, self._fallback_snapshot, self._fallback_error = snapshot_cache, fallback_snapshot, fallback_error
+        self._assets, self._authority = MappingProxyType(dict(sorted(copied.items()))), _authority
     @staticmethod
     def _validate_authority(authority: str) -> None:
         match = _AUTHORITY.fullmatch(authority) if isinstance(authority, str) else None
@@ -133,7 +131,8 @@ class DashboardApplication:
         return DashboardApplication(
             token=self._token, query_service=self._query,
             refresh_controller=self._controller, snapshot_cache=self._cache,
-            assets=self._assets, _authority=authority,
+            assets=self._assets, fallback_snapshot=self._fallback_snapshot,
+            fallback_error=self._fallback_error, _authority=authority,
         )
     def __repr__(self) -> str:
         return f"DashboardApplication(bound={self._authority is not None}, asset_count={len(self._assets)})"
@@ -330,7 +329,12 @@ class DashboardApplication:
                     refs = self._cache.refs()
                     selected = refs[0] if refs else None
                 if selected is None:
-                    raise _HttpError("refresh_unavailable")
+                    if self._fallback_error is not None and not self._controller.succeeded_once(): raise _HttpError(self._fallback_error)
+                    if self._fallback_snapshot is None:
+                        raise _HttpError("refresh_unavailable")
+                    payload = _as_dict(self._fallback_snapshot)
+                    payload["refresh"] = _as_dict(self._current_refresh())
+                    return self._json(200, payload, method)
                 cached = self._controller.snapshot(selected)
                 if cached is None:
                     raise KeyError("unknown public reference")

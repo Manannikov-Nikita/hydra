@@ -6,11 +6,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 import sqlite3
-from typing import cast
+from typing import Protocol, cast
 
 from .audit_model import AuditEvidence
 from .audit_service import build_pilot_audit
 from .dashboard_model import (
+    DashboardProjectCatalog,
     DashboardProjectSummary,
     DashboardRefreshView,
     DashboardSnapshot,
@@ -109,6 +110,15 @@ StoreFactory = Callable[[], HydraStore]
 Clock = Callable[[], datetime]
 
 
+class _ConnectionSource(Protocol):
+    connection: sqlite3.Connection
+
+
+@dataclass(frozen=True)
+class _BootstrapStore:
+    connection: sqlite3.Connection
+
+
 class DashboardQueryService:
     """Read-only project-scoped queries over already-refreshed Hydra data."""
 
@@ -134,7 +144,7 @@ class DashboardQueryService:
         return public_timestamp(self._clock())
 
     def _catalog(
-        self, store: HydraStore,
+        self, store: _ConnectionSource,
     ) -> tuple[tuple[CatalogProject, str], ...]:
         catalog = _catalog_rows(store.connection)
         projection = project_catalog_references(
@@ -191,8 +201,44 @@ class DashboardQueryService:
         return f"Project {project_ref.removeprefix('project_')[:8]}"
 
     @staticmethod
-    def _unavailable(unit: str) -> NumericFact:
-        return NumericFact(None, unit, "estimated", ("no_reconciled_tasks",))
+    def _unavailable(
+        unit: str, caveat: str = "no_reconciled_tasks",
+    ) -> NumericFact:
+        return NumericFact(None, unit, "estimated", (caveat,))
+
+    @staticmethod
+    def _bootstrap_storage() -> dict[str, object]:
+        """Return an explicit unknown storage view without scanning event tables."""
+        caveat = "dashboard_refresh_required"
+
+        def fact(unit: str) -> dict[str, object]:
+            if unit == "bytes":
+                return {
+                    "value": None,
+                    "unit": "bytes",
+                    "provenance": "estimated",
+                    "caveats": [caveat],
+                    "lower_bound": None,
+                }
+            return NumericFact(None, unit, "estimated", (caveat,)).as_dict()
+
+        return {
+            "baseline_state": "unavailable",
+            "current": {
+                "database_bytes": fact("bytes"),
+                "wal_bytes": fact("bytes"),
+                "rollout_sources": fact("count"),
+                "rollout_events": fact("count"),
+                "codex_event_sources": fact("count"),
+                "codex_events": fact("count"),
+                "schema_version": fact("count"),
+            },
+            "baseline": None,
+            "growth": None,
+            "diagnostics": [
+                {"code": caveat, "severity": "info"},
+            ],
+        }
 
     @staticmethod
     def _recent_task(report: TaskReport) -> dict[str, object]:
@@ -210,18 +256,31 @@ class DashboardQueryService:
 
     def _project_payload(
         self,
-        store: HydraStore,
+        store: HydraStore | _BootstrapStore,
         item: CatalogProject,
         project_ref: str,
         reports: tuple[TaskReport, ...],
         freshness_state: str,
+        *,
+        bootstrap: bool = False,
     ) -> dict[str, object]:
         latest = reports[0] if reports else None
         if latest is None:
+            unavailable_caveat = (
+                "dashboard_refresh_required"
+                if bootstrap and freshness_state == "stale"
+                else "no_reconciled_tasks"
+            )
             headline = {
-                "working_tokens": self._unavailable("tokens").as_dict(),
-                "full_context_tokens": self._unavailable("tokens").as_dict(),
-                "wall_clock_ms": self._unavailable("milliseconds").as_dict(),
+                "working_tokens": self._unavailable(
+                    "tokens", unavailable_caveat,
+                ).as_dict(),
+                "full_context_tokens": self._unavailable(
+                    "tokens", unavailable_caveat,
+                ).as_dict(),
+                "wall_clock_ms": self._unavailable(
+                    "milliseconds", unavailable_caveat,
+                ).as_dict(),
             }
             phase_allocation: object = None
         else:
@@ -231,18 +290,23 @@ class DashboardQueryService:
                 "wall_clock_ms": latest.wall_clock.as_dict(),
             }
             phase_allocation = latest.semantic_breakdown.as_dict()
-        pilot_row = store.connection.execute(
-            """SELECT pilot_id FROM pilot_runs WHERE project_id=?
-                 ORDER BY started_at DESC,pilot_id DESC LIMIT 1""",
-            (item.project_id,),
-        ).fetchone()
-        pilot = (
-            None
-            if pilot_row is None
-            else project_pilot_status(
-                read_pilot_status(store, item.project_id, str(pilot_row[0])).as_dict(),
+        if bootstrap:
+            pilot = None
+        else:
+            pilot_row = store.connection.execute(
+                """SELECT pilot_id FROM pilot_runs WHERE project_id=?
+                     ORDER BY started_at DESC,pilot_id DESC LIMIT 1""",
+                (item.project_id,),
+            ).fetchone()
+            pilot = (
+                None
+                if pilot_row is None
+                else project_pilot_status(
+                    read_pilot_status(
+                        store, item.project_id, str(pilot_row[0]),
+                    ).as_dict(),
+                )
             )
-        )
         payload: dict[str, object] = {
             "project_ref": project_ref,
             "display_name": self._display_name(item, project_ref),
@@ -260,7 +324,13 @@ class DashboardQueryService:
             },
             "recent_tasks": [self._recent_task(report) for report in reports[:10]],
             "pilot": pilot,
-            "storage": project_storage_status(storage_status(store, item.project_id)),
+            "storage": (
+                self._bootstrap_storage()
+                if bootstrap
+                else project_storage_status(storage_status(
+                    cast(HydraStore, store), item.project_id,
+                ))
+            ),
             "system_health": {
                 "scope": "global_launch_context",
                 "doctor": self._doctor_report.as_dict(),
@@ -284,9 +354,82 @@ class DashboardQueryService:
         finally:
             store.close()
 
+    def bootstrap_snapshots(
+        self, *, refresh: DashboardRefreshView,
+    ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
+        """Build a bounded launch cache from persisted catalog metadata only.
+
+        Strict report reconstruction intentionally remains behind explicit Refresh:
+        on a large history it validates every task tree and is not a safe startup
+        dependency.  Launch data therefore marks projects with reconciled rows as
+        stale and keeps their metrics unavailable until Refresh publishes a fully
+        validated replacement.
+        """
+        store = self._store_factory()
+        try:
+            return self._bootstrap_snapshots_from_source(store, refresh=refresh)
+        finally:
+            store.close()
+
+    def bootstrap_snapshots_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        refresh: DashboardRefreshView,
+    ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
+        """Build launch DTOs from a caller-owned, bounded read-only connection."""
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("dashboard bootstrap requires a SQLite connection")
+        return self._bootstrap_snapshots_from_source(
+            _BootstrapStore(connection), refresh=refresh,
+        )
+
+    def _bootstrap_snapshots_from_source(
+        self,
+        store: HydraStore | _BootstrapStore,
+        *,
+        refresh: DashboardRefreshView,
+    ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
+        catalog = self._catalog(store)
+        by_project: dict[str, tuple[tuple[TaskReport, ...], str]] = {}
+        summaries: list[DashboardProjectSummary] = []
+        for item, public_ref in catalog:
+            state = "stale"
+            by_project[item.project_id] = ((), state)
+            summaries.append(DashboardProjectSummary(
+                public_ref,
+                self._display_name(item, public_ref),
+                item.last_seen_at,
+                state,
+                NumericFact(
+                    None, "count", "estimated", ("dashboard_refresh_required",),
+                ),
+            ))
+        project_catalog = DashboardProjectCatalog(tuple(summaries))
+        generated_at = self._generated_at()
+        if not catalog:
+            empty = self._assemble_snapshot(
+                store, catalog, by_project, project_catalog,
+                project_ref=None, task_ref=None, refresh=refresh,
+                generated_at=generated_at,
+                bootstrap=True,
+            )
+            return {}, empty
+        snapshots = {
+            public_ref: self._assemble_snapshot(
+                store, catalog, by_project, project_catalog,
+                project_ref=public_ref, task_ref=None, refresh=refresh,
+                generated_at=generated_at,
+                bootstrap=True,
+                resolved_project=item,
+            )
+            for item, public_ref in catalog
+        }
+        return snapshots, None
+
     def _snapshot_from_store(
         self,
-        store: HydraStore,
+        store: HydraStore | _BootstrapStore,
         *,
         project_ref: str | None,
         task_ref: str | None,
@@ -311,7 +454,7 @@ class DashboardQueryService:
     ) -> tuple[
         tuple[tuple[CatalogProject, str], ...],
         dict[str, tuple[tuple[TaskReport, ...], str]],
-        tuple[DashboardProjectSummary, ...],
+        DashboardProjectCatalog,
     ]:
         catalog = self._catalog(store)
         by_project: dict[str, tuple[tuple[TaskReport, ...], str]] = {}
@@ -330,35 +473,47 @@ class DashboardQueryService:
                 state,
                 NumericFact(count, "count", "derived"),
             ))
-        return catalog, by_project, tuple(summaries)
+        return catalog, by_project, DashboardProjectCatalog(tuple(summaries))
 
     def _assemble_snapshot(
         self,
         store: HydraStore,
         catalog: tuple[tuple[CatalogProject, str], ...],
         by_project: Mapping[str, tuple[tuple[TaskReport, ...], str]],
-        summaries: tuple[DashboardProjectSummary, ...],
+        summaries: tuple[DashboardProjectSummary, ...] | DashboardProjectCatalog,
         *,
         project_ref: str | None,
         task_ref: str | None,
         refresh: DashboardRefreshView,
         generated_at: str,
+        bootstrap: bool = False,
+        resolved_project: CatalogProject | None = None,
     ) -> DashboardSnapshot:
         if project_ref is None:
             selected_ref = min((public_ref for _item, public_ref in catalog), default=None)
+            selected_item = None
         else:
-            self._resolve_project(catalog, project_ref)
             selected_ref = project_ref
+            selected_item = (
+                resolved_project
+                if resolved_project is not None
+                else self._resolve_project(catalog, project_ref)
+            )
         if task_ref is not None and selected_ref is None:
             raise self._unknown()
         project_json: str | None = None
         selected_task_json: str | None = None
-        selected_state = "current"
+        selected_state = "unavailable" if selected_ref is None else "current"
         if selected_ref is not None:
-            item = self._resolve_project(catalog, selected_ref)
+            item = (
+                selected_item
+                if selected_item is not None
+                else self._resolve_project(catalog, selected_ref)
+            )
             reports, selected_state = by_project[item.project_id]
             project_json = canonical_json(self._project_payload(
                 store, item, selected_ref, reports, selected_state,
+                bootstrap=bootstrap,
             ))
             if task_ref is not None:
                 selected = next(
@@ -400,6 +555,7 @@ class DashboardQueryService:
                 task_ref=None,
                 refresh=refresh,
                 generated_at=generated_at,
+                resolved_project=item,
             )
             for item, public_ref in catalog
             if project_ids is None or item.project_id in project_ids

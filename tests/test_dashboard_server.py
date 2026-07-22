@@ -144,6 +144,7 @@ class FakeRefreshController:
         }
         self.refresh = FakeRefreshSnapshot()
         self.close_calls = 0
+        self._succeeded_once = False
 
     def start(self):
         self.starts += 1
@@ -157,6 +158,11 @@ class FakeRefreshController:
 
     def current(self):
         return self.refresh
+
+    def succeeded_once(self):
+        if self.refresh.state == "succeeded":
+            self._succeeded_once = True
+        return self._succeeded_once
 
     def snapshot(self, project_ref):
         return self.snapshots.get(project_ref)
@@ -399,6 +405,58 @@ class DashboardApplicationTests(unittest.TestCase):
         self.assertEqual(response.status, 503)
         self.assertEqual(self.payload(response)["error"]["code"], "refresh_unavailable")
         self.assertEqual(self.query.calls, [])
+
+    def test_empty_cache_can_serve_prebuilt_onboarding_snapshot(self) -> None:
+        fallback = PublicPayload({
+            "schema_version": "hydra.dashboard/v1",
+            "projects": [],
+            "selected_project_ref": None,
+            "project": None,
+            "selected_task": None,
+        })
+        empty = DashboardApplication(
+            token=TOKEN, query_service=self.query,
+            refresh_controller=self.controller, snapshot_cache=FakeCache(()),
+            assets=self.assets, fallback_snapshot=fallback,
+        ).bound_to(AUTHORITY)
+        self.controller.snapshots.clear()
+
+        response = empty.handle(request("/api/v1/snapshot"))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.payload(response)["projects"], [])
+        self.assertEqual(self.query.calls, [])
+
+    def test_launch_storage_error_clears_only_after_successful_refresh(self) -> None:
+        fallback = PublicPayload({
+            "schema_version": "hydra.dashboard/v1",
+            "projects": [],
+            "selected_project_ref": None,
+            "project": None,
+            "selected_task": None,
+        })
+        empty = DashboardApplication(
+            token=TOKEN, query_service=self.query,
+            refresh_controller=self.controller, snapshot_cache=FakeCache(()),
+            assets=self.assets, fallback_snapshot=fallback,
+            fallback_error="storage_unavailable",
+        ).bound_to(AUTHORITY)
+        self.controller.snapshots.clear()
+
+        blocked = empty.handle(request("/api/v1/snapshot"))
+        self.controller.refresh.state = "succeeded"
+        recovered = empty.handle(request("/api/v1/snapshot"))
+        self.controller.refresh.state = "running"
+        while_refreshing = empty.handle(request("/api/v1/snapshot"))
+        self.controller.refresh.state = "failed"
+        after_failure = empty.handle(request("/api/v1/snapshot"))
+
+        self.assertEqual(blocked.status, 503)
+        self.assertEqual(self.payload(blocked)["error"]["code"], "storage_unavailable")
+        self.assertEqual(recovered.status, 200)
+        self.assertEqual(self.payload(recovered)["projects"], [])
+        self.assertEqual(while_refreshing.status, 200)
+        self.assertEqual(after_failure.status, 200)
 
     def test_refresh_start_and_status_have_safe_schema_and_location(self) -> None:
         post = request(

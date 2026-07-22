@@ -83,6 +83,16 @@ def _positive_integer(value: str) -> int:
     return parsed
 
 
+def _nonnegative_port(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port required") from error
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("port required")
+    return parsed
+
+
 def _compact_confirmation(value: str) -> str:
     if value != "compact hydra database":
         raise argparse.ArgumentTypeError("exact confirmation required")
@@ -111,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = commands.add_parser("reconcile")
     _common_options(reconcile)
+
+    dashboard = commands.add_parser("dashboard")
+    _common_options(dashboard)
+    dashboard.add_argument("--port", type=_nonnegative_port, default=0)
+    dashboard.add_argument("--no-open", action="store_true")
 
     report = commands.add_parser("report")
     _common_options(report)
@@ -417,21 +432,35 @@ def main(
     output_stream = sys.stdout if stdout is None else stdout
     error_stream = sys.stderr if stderr is None else stderr
     environment = os.environ if environ is None else environ
-    if services is None:
-        from .services import LocalCommandServices
-
-        command_services: CommandServices = LocalCommandServices(
-            environ=environment,
-            installation_key_path=installation_key_path,
-        )
-    else:
-        command_services = services
     with redirect_stdout(output_stream), redirect_stderr(error_stream):
         try:
             arguments = build_parser().parse_args(argv)
         except SystemExit as exit_request:
             return int(exit_request.code or 0)
     try:
+        if arguments.command == "dashboard":
+            from .dashboard_launch import run_dashboard
+
+            database, cwd = _paths(arguments)
+            run_dashboard(
+                port=arguments.port,
+                no_open=arguments.no_open,
+                database_path=database,
+                environ=environment,
+                installation_key_path=installation_key_path,
+                cwd=cwd,
+                stdout=output_stream,
+            )
+            return 0
+        if services is None:
+            from .services import LocalCommandServices
+
+            command_services: CommandServices = LocalCommandServices(
+                environ=environment,
+                installation_key_path=installation_key_path,
+            )
+        else:
+            command_services = services
         if arguments.command == "ingest":
             _write_json(
                 output_stream,

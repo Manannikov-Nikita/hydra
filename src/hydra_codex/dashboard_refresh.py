@@ -114,6 +114,7 @@ class RefreshController:
         self._ref_factory = ref_factory
         self._current: RefreshSnapshot | None = None
         self._worker: threading.Thread | None = None
+        self._succeeded_once = False
 
     def start(self) -> tuple[RefreshSnapshot, bool]:
         with self._cache._lock:
@@ -207,6 +208,8 @@ class RefreshController:
             }
             self._cache._publish_locked(published, result.replace_all)
             self._current = terminal
+            if state == "succeeded":
+                self._succeeded_once = True
 
     def get(self, refresh_ref: str) -> RefreshSnapshot:
         with self._cache._lock:
@@ -217,6 +220,10 @@ class RefreshController:
     def current(self) -> RefreshSnapshot | None:
         with self._cache._lock:
             return self._current
+
+    def succeeded_once(self) -> bool:
+        with self._cache._lock:
+            return self._succeeded_once
 
     def snapshot(self, project_ref: str) -> DashboardSnapshot | None:
         with self._cache._lock:

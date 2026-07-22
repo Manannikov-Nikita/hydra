@@ -149,6 +149,33 @@ class DashboardModelTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             snapshot.generated_at = "changed"  # type: ignore[misc]
 
+    def test_snapshot_keeps_strict_validation_for_external_project_tuples(self) -> None:
+        snapshot = self.snapshot()
+        duplicate = (snapshot.projects[0], snapshot.projects[0])
+
+        with self.assertRaisesRegex(ValueError, "project references must be unique"):
+            DashboardSnapshot(
+                snapshot.generated_at,
+                snapshot.freshness,
+                duplicate,
+                snapshot.selected_project_ref,
+                snapshot.project_json,
+                snapshot.selected_task_json,
+                snapshot.refresh,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "projects must contain dashboard project summaries",
+        ):
+            DashboardSnapshot(
+                snapshot.generated_at,
+                snapshot.freshness,
+                [snapshot.projects[0]],  # type: ignore[arg-type]
+                snapshot.selected_project_ref,
+                snapshot.project_json,
+                snapshot.selected_task_json,
+                snapshot.refresh,
+            )
+
     def test_unavailable_fact_does_not_become_zero(self) -> None:
         payload = self.snapshot(report=False).as_dict()
         fact = payload["project"]["overview"]["headline"]["working_tokens"]

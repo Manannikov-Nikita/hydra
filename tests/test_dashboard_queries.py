@@ -223,6 +223,124 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
         self.assertEqual(payload["project"]["display_name"], "A <script>")
 
+    def test_bootstrap_snapshots_use_catalog_without_rebuilding_reports(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO reconciled_tasks(
+                       project_id,root_key,public_ref,status,cutoff_at,last_activity_at,
+                       task_family,reconciliation_version,input_digest)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    "project-a", "root-a", "task_0123456789ab", "complete",
+                    "2026-07-22T10:00:00Z", "2026-07-22T10:00:00Z",
+                    "telemetry-analysis", 1, "digest-a",
+                ),
+            )
+            store.connection.execute(
+                """INSERT INTO pilot_runs(
+                       pilot_id,project_id,started_at,closed_at,target,task_family,
+                       thresholds_json,state)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    "pilot-a", "project-a", "2026-07-22T09:00:00Z", None,
+                    5, "telemetry-analysis", "{}", "open",
+                ),
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=AssertionError("bootstrap must not rebuild task reports"),
+        ), patch(
+            "hydra_codex.dashboard_queries.read_pilot_status",
+            side_effect=AssertionError("bootstrap must not rebuild pilot status"),
+        ), patch(
+            "hydra_codex.dashboard_queries.storage_status",
+            side_effect=AssertionError("bootstrap must not scan raw storage facts"),
+        ), patch.object(
+            self.service,
+            "_bootstrap_pilot",
+            side_effect=AssertionError("bootstrap must not scan pilot history"),
+            create=True,
+        ):
+            snapshots, empty = self.service.bootstrap_snapshots(refresh=self.refresh)
+
+        project_a = self.catalog_refs()["project-a"]
+        project_b = self.catalog_refs()["project-b"]
+        self.assertEqual(set(snapshots), {project_a, project_b})
+        self.assertIsNone(empty)
+        first = snapshots[project_a].as_dict()
+        second = snapshots[project_b].as_dict()
+        self.assertIsNone(first["projects"][0]["task_count"]["value"])
+        self.assertEqual(
+            first["projects"][0]["task_count"]["caveats"],
+            ["dashboard_refresh_required"],
+        )
+        self.assertEqual(first["project"]["freshness_state"], "stale")
+        self.assertIsNone(
+            first["project"]["overview"]["headline"]["working_tokens"]["value"],
+        )
+        self.assertEqual(
+            first["project"]["overview"]["headline"]["working_tokens"]["caveats"],
+            ["dashboard_refresh_required"],
+        )
+        self.assertIsNone(first["project"]["pilot"])
+        storage = first["project"]["storage"]
+        self.assertEqual(storage["baseline_state"], "unavailable")
+        self.assertTrue(all(
+            fact["value"] is None
+            and fact["provenance"] == "estimated"
+            and fact["caveats"] == ["dashboard_refresh_required"]
+            for fact in storage["current"].values()
+        ))
+        self.assertEqual(second["project"]["freshness_state"], "stale")
+
+    def test_bootstrap_snapshots_share_one_validated_project_catalog(self) -> None:
+        snapshots, empty = self.service.bootstrap_snapshots(refresh=self.refresh)
+
+        self.assertIsNone(empty)
+        self.assertEqual(len(snapshots), 2)
+        shared_projects = next(iter(snapshots.values())).projects
+        self.assertTrue(all(
+            snapshot.projects is shared_projects
+            for snapshot in snapshots.values()
+        ))
+
+    def test_bootstrap_bulk_assembly_does_not_repeat_linear_project_resolves(self) -> None:
+        original_resolve = self.service._resolve_project
+
+        with patch.object(
+            self.service,
+            "_resolve_project",
+            wraps=original_resolve,
+        ) as resolve_project:
+            snapshots, empty = self.service.bootstrap_snapshots(refresh=self.refresh)
+
+        self.assertIsNone(empty)
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(resolve_project.call_count, 0)
+
+    def test_bootstrap_snapshots_preserve_empty_onboarding_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "empty.sqlite3"
+            HydraStore(database).close()
+            service = DashboardQueryService(
+                lambda: HydraStore(database), b"k" * 32,
+                lambda: datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc),
+                self.service._doctor_report,
+            )
+
+            snapshots, empty = service.bootstrap_snapshots(refresh=self.refresh)
+
+        self.assertEqual(snapshots, {})
+        self.assertIsNotNone(empty)
+        self.assertEqual(empty.as_dict()["projects"], [])
+        self.assertIsNone(empty.as_dict()["selected_project_ref"])
+        self.assertEqual(empty.as_dict()["freshness"]["state"], "unavailable")
+
     def test_private_refresh_seam_reuses_caller_owned_store(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
         store = HydraStore(self.database)

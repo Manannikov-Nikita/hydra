@@ -11,6 +11,8 @@ import threading
 from types import MappingProxyType
 from typing import Protocol
 
+from .codex_event_ingest import ingest_codex_events
+from .dashboard_event_refresh import prepare_dashboard_events
 from .dashboard_model import DashboardRefreshView, DashboardSnapshot
 from .dashboard_queries import (
     DashboardQueryService,
@@ -38,6 +40,13 @@ from .dashboard_refresh_state import (
     RefreshState,
 )
 from .exact_time import public_timestamp
+from .prepared_codex_events import (
+    PreparedCodexEventSource,
+    PreparedEventAttribution,
+    attribute_prepared_codex_event_source,
+    prepare_codex_event_source,
+    revalidate_prepared_event_attribution,
+)
 from .reconcile_engine import ReconciliationStale, reconcile_project
 from .rollout import ingest_rollouts
 from .rollout_identity import RolloutRoot
@@ -245,6 +254,16 @@ class GlobalRefreshRunner:
         event_sources: Iterable[object] = (),
         planner: Callable[..., GlobalRolloutPlan] = plan_global_rollout_ingest,
         ingester: Callable[..., object] = ingest_rollouts,
+        event_ingester: Callable[..., object] = ingest_codex_events,
+        event_preparer: Callable[
+            ..., PreparedCodexEventSource
+        ] = prepare_codex_event_source,
+        event_attributor: Callable[
+            ..., object
+        ] = attribute_prepared_codex_event_source,
+        event_revalidator: Callable[
+            [PreparedEventAttribution], None
+        ] = revalidate_prepared_event_attribution,
         reconciler: Callable[..., object] = reconcile_project,
         cached_refresher: Callable[[HydraStore, CachedRollout], None] = refresh_cached_location,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -256,6 +275,10 @@ class GlobalRefreshRunner:
         self._event_sources = tuple(event_sources)
         self._planner = planner
         self._ingest = ingester
+        self._event_ingest = event_ingester
+        self._prepare_event = event_preparer
+        self._attribute_event = event_attributor
+        self._revalidate_event = event_revalidator
         self._reconcile = reconciler
         self._cached_refresher = cached_refresher
         self._clock = clock
@@ -289,16 +312,24 @@ class GlobalRefreshRunner:
             return RefreshResult({}, False, (self._code(error),), 0, 0, 0)
         try:
             observed = RefreshProgress()
+            event_count = len(self._event_sources)
+            last_stage: RefreshStage = "discover"
 
             def planned(stage: str, current: int, total: int) -> None:
-                nonlocal observed
+                nonlocal last_stage, observed
                 if stage == "discover":
-                    observed = replace(observed, sources_discovered=total)
+                    observed = replace(
+                        observed, sources_discovered=total + event_count,
+                    )
                 elif stage == "inspect":
                     observed = replace(observed, sources_inspected=current)
                 elif stage == "scan":
                     observed = replace(observed, sources_scanned=current)
-                report(stage, observed)  # type: ignore[arg-type]
+                candidate: RefreshStage = stage  # type: ignore[assignment]
+                if REFRESH_STAGES.index(candidate) < REFRESH_STAGES.index(last_stage):
+                    candidate = last_stage
+                report(candidate, observed)
+                last_stage = candidate
 
             try:
                 plan = self._planner(store, self._roots, self._key, planned)
@@ -307,8 +338,48 @@ class GlobalRefreshRunner:
                     {}, False, (self._code(error),), 0, 0, 0,
                 )
             diagnostics = set(plan.diagnostic_codes)
-            if self._event_sources:
-                diagnostics.add("event_attribution_unavailable")
+            observed = replace(
+                observed,
+                sources_discovered=max(
+                    observed.sources_discovered,
+                    getattr(plan, "discovered_count", 0) + event_count,
+                ),
+                sources_inspected=max(
+                    observed.sources_inspected,
+                    getattr(plan, "inspected_count", 0),
+                ),
+                sources_scanned=max(
+                    observed.sources_scanned,
+                    getattr(plan, "scanned_count", 0),
+                ),
+            )
+
+            def event_progress(scanned: bool) -> None:
+                nonlocal last_stage, observed
+                observed = replace(
+                    observed,
+                    sources_inspected=(
+                        observed.sources_inspected + int(not scanned)
+                    ),
+                    sources_scanned=observed.sources_scanned + int(scanned),
+                )
+                candidate: RefreshStage = "scan" if scanned else "inspect"
+                if REFRESH_STAGES.index(candidate) < REFRESH_STAGES.index(last_stage):
+                    candidate = last_stage
+                report(candidate, observed)
+                last_stage = candidate
+
+            prepared_events = prepare_dashboard_events(
+                store.connection,
+                self._event_sources,
+                plan.partitions,
+                self._key,
+                progress=event_progress,
+                error_code=self._code,
+                preparer=self._prepare_event,
+                attributor=self._attribute_event,
+            )
+            diagnostics.update(prepared_events.diagnostic_codes)
             observed = replace(observed, projects_total=len(plan.partitions))
             successful: set[str] = set()
             ordered_partitions = tuple(sorted(
@@ -336,6 +407,16 @@ class GlobalRefreshRunner:
                                 partition.project_id, hash_key=self._key,
                                 prepared_scans=scans,
                             )
+                        for group in prepared_events.for_project(partition.project_id):
+                            for _prepared, attribution in group.attributions:
+                                self._revalidate_event(attribution)
+                            self._event_ingest(
+                                store, (), group.project_root,
+                                partition.project_id, hash_key=self._key,
+                                prepared_sources=group.prepared_sources,
+                            )
+                            for _prepared, attribution in group.attributions:
+                                self._revalidate_event(attribution)
                         self._reconcile(store, partition.project_id, self._key)
                         for cached in partition.cached:
                             revalidate_cached_rollout(cached)

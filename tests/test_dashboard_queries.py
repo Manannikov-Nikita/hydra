@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from collections.abc import Mapping
 
 from hydra_codex.audit_model import AuditEvidence
 from hydra_codex.dashboard_model import DashboardRefreshView
@@ -221,6 +222,104 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         )
         self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
         self.assertEqual(payload["project"]["display_name"], "A <script>")
+
+    def test_path_like_display_name_falls_back_to_opaque_project_label(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
+                ("/Users/alice/private-project",),
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        project_ref = self.catalog_refs()["project-a"]
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ):
+            payload = self.service.snapshot(
+                project_ref=project_ref,
+                task_ref=None,
+                refresh=self.refresh,
+            ).as_dict()
+
+        self.assertEqual(
+            payload["project"]["display_name"],
+            f"Project {project_ref.removeprefix('project_')[:8]}",
+        )
+
+    def test_pilot_and_storage_numbers_are_dashboard_numeric_facts(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO pilot_runs(
+                       pilot_id,project_id,started_at,closed_at,target,task_family,
+                       thresholds_json,state)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    "hpilot_v1_11111111111111111111111111111111",
+                    "project-a", "2026-07-22T00:00:00Z", None, 5,
+                    "telemetry-analysis", "{}", "open",
+                ),
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        project_ref = self.catalog_refs()["project-a"]
+
+        pilot_status = SimpleNamespace(as_dict=lambda: {
+            "schema_version": "hydra.pilot/v1",
+            "pilot": {
+                "pilot_id": "hpilot_v1_11111111111111111111111111111111",
+                "started_at": "2026-07-22T00:00:00Z",
+                "closed_at": None,
+                "target": 5,
+                "task_family": "telemetry-analysis",
+                "state": "open",
+            },
+            "facts": {
+                "eligible_tasks": 3,
+                "instrumented_tasks": 2,
+                "enrollment": 2 / 3,
+                "aggregate_coverage": 0.75,
+            },
+            "threshold_results": {"missing_marker_rate": True},
+            "transport_verified": True,
+            "trend_ready": False,
+        })
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ), patch(
+            "hydra_codex.dashboard_queries.read_pilot_status",
+            return_value=pilot_status,
+        ):
+            project = self.service.snapshot(
+                project_ref=project_ref,
+                task_ref=None,
+                refresh=self.refresh,
+            ).as_dict()["project"]
+
+        def assert_numbers_wrapped(value: object, parent: str | None = None) -> None:
+            if isinstance(value, bool) or value is None or isinstance(value, str):
+                return
+            if isinstance(value, (int, float)):
+                self.assertIn(parent, {"value", "lower_bound"})
+                return
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    assert_numbers_wrapped(nested, str(key))
+                return
+            if isinstance(value, (list, tuple)):
+                for nested in value:
+                    assert_numbers_wrapped(nested, parent)
+
+        assert_numbers_wrapped(project["pilot"])
+        assert_numbers_wrapped(project["storage"])
+        self.assertEqual(project["pilot"]["target"]["unit"], "count")
+        self.assertEqual(project["storage"]["current"]["database_bytes"]["unit"], "bytes")
 
     def test_task_pages_are_project_scoped_ordered_and_bounded(self) -> None:
         project_ref = self.catalog_refs()["project-a"]

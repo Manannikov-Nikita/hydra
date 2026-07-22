@@ -47,6 +47,8 @@ class DashboardModelTests(unittest.TestCase):
         project = {
             "project_ref": "project_0123456789ab",
             "display_name": "Hydra <Core>",
+            "last_activity_at": "2026-07-22T10:00:00Z",
+            "freshness_state": "current",
             "overview": {
                 "basis": {
                     "kind": "latest_task",
@@ -57,7 +59,49 @@ class DashboardModelTests(unittest.TestCase):
                         NumericFact(1, "tokens", "derived").as_dict()
                         if report else unavailable.as_dict()
                     ),
+                    "full_context_tokens": (
+                        NumericFact(2, "tokens", "derived").as_dict()
+                        if report else unavailable.as_dict()
+                    ),
+                    "wall_clock_ms": (
+                        NumericFact(1, "milliseconds", "derived").as_dict()
+                        if report else NumericFact(
+                            None, "milliseconds", "estimated", ("no_reconciled_tasks",),
+                        ).as_dict()
+                    ),
                 },
+                "phase_allocation": None,
+            },
+            "recent_tasks": [],
+            "pilot": None,
+            "storage": {
+                "baseline_state": "unavailable",
+                "current": {
+                    "database_bytes": {
+                        "value": 0, "unit": "bytes", "provenance": "exact",
+                        "caveats": [], "lower_bound": None,
+                    },
+                    "wal_bytes": {
+                        "value": 0, "unit": "bytes", "provenance": "exact",
+                        "caveats": [], "lower_bound": None,
+                    },
+                    **{
+                        name: NumericFact(0, "count", "exact").as_dict()
+                        for name in (
+                            "rollout_sources", "rollout_events",
+                            "codex_event_sources", "codex_events", "schema_version",
+                        )
+                    },
+                },
+                "baseline": None,
+                "growth": None,
+                "diagnostics": [
+                    {"code": "growth_baseline_unavailable", "severity": "info"},
+                ],
+            },
+            "system_health": {
+                "scope": "global_launch_context",
+                "doctor": self.doctor(),
             },
         }
         summary = DashboardProjectSummary(
@@ -69,13 +113,31 @@ class DashboardModelTests(unittest.TestCase):
         )
         return DashboardSnapshot(
             "2026-07-22T12:00:00Z",
-            MappingProxyType({"state": "current"}),
+            MappingProxyType({
+                "state": "current",
+                "doctor": {
+                    "scope": "global_launch_context",
+                    "report": self.doctor(),
+                },
+            }),
             (summary,),
             summary.project_ref,
             canonical(project),
             None,
             self.refresh(),
         )
+
+    @staticmethod
+    def doctor() -> dict[str, object]:
+        codes = (
+            "project_resolution", "storage_available", "schema_current",
+            "foreign_keys_ok", "integrity_ok", "storage_permissions_restricted",
+        )
+        return {
+            "schema_version": "hydra.doctor/v1",
+            "status": "healthy",
+            "checks": [{"code": code, "status": "ok"} for code in codes],
+        }
 
     def test_snapshot_is_immutable_and_canonical(self) -> None:
         snapshot = self.snapshot()
@@ -107,6 +169,78 @@ class DashboardModelTests(unittest.TestCase):
         ):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 reject_private_fields({"safe": [{key: "secret"}]})
+
+    def test_public_payload_rejects_path_like_visible_values(self) -> None:
+        for value in (
+            "/Users/alice/private-project",
+            r"C:\\Users\\alice\\private-project",
+            r"\\\\server\\private-project",
+            "~/private-project",
+            "file:///Users/alice/private-project",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                reject_private_fields({"display_name": value})
+
+    def test_task_page_rejects_shallow_report_shaped_payload(self) -> None:
+        with self.assertRaises(ValueError):
+            DashboardTaskPage(
+                "2026-07-22T12:00:00Z",
+                "project_0123456789ab",
+                (canonical({
+                    "schema_version": "hydra.report/v3",
+                    "task_ref": "task_0123456789ab",
+                }),),
+                50,
+                None,
+            )
+
+    def test_snapshot_rejects_shallow_project_payload(self) -> None:
+        snapshot = self.snapshot()
+        shallow = canonical({
+            "project_ref": "project_0123456789ab",
+            "display_name": "Hydra Core",
+        })
+
+        with self.assertRaises(ValueError):
+            DashboardSnapshot(
+                snapshot.generated_at,
+                snapshot.freshness,
+                snapshot.projects,
+                snapshot.selected_project_ref,
+                shallow,
+                None,
+                snapshot.refresh,
+            )
+
+    def test_snapshot_rejects_malformed_freshness_shape(self) -> None:
+        snapshot = self.snapshot()
+
+        with self.assertRaises(ValueError):
+            DashboardSnapshot(
+                snapshot.generated_at,
+                {"state": "current", "unexpected": True},
+                snapshot.projects,
+                snapshot.selected_project_ref,
+                snapshot.project_json,
+                None,
+                snapshot.refresh,
+            )
+
+    def test_snapshot_rejects_malformed_numeric_fact_shape(self) -> None:
+        snapshot = self.snapshot()
+        project = json.loads(snapshot.project_json or "{}")
+        project["overview"]["headline"]["working_tokens"]["unexpected"] = 1
+
+        with self.assertRaises(ValueError):
+            DashboardSnapshot(
+                snapshot.generated_at,
+                snapshot.freshness,
+                snapshot.projects,
+                snapshot.selected_project_ref,
+                canonical(project),
+                None,
+                snapshot.refresh,
+            )
 
     def test_task_page_requires_canonical_report_schema(self) -> None:
         with self.assertRaises(ValueError):

@@ -17,11 +17,12 @@ from .dashboard_model import (
     DashboardTaskPage,
     canonical_json,
 )
+from .dashboard_projections import project_pilot_status, project_storage_status
 from .diagnostics import DoctorReport
 from .exact_time import public_timestamp
 from .pilot import read_only_pilot_statuses, read_pilot_status
 from .project import ProjectResolution
-from .public_payload import reject_private_fields
+from .public_payload import is_path_like_public_text, reject_private_fields
 from .public_refs import project_catalog_references
 from .reconcile_engine import ReconciliationStale, list_reconciled_reports
 from .report_operations import compare_reports
@@ -183,7 +184,9 @@ class DashboardQueryService:
 
     @staticmethod
     def _display_name(item: CatalogProject, project_ref: str) -> str:
-        return item.display_name or f"Project {project_ref.removeprefix('project_')[:8]}"
+        if item.display_name and not is_path_like_public_text(item.display_name):
+            return item.display_name
+        return f"Project {project_ref.removeprefix('project_')[:8]}"
 
     @staticmethod
     def _unavailable(unit: str) -> NumericFact:
@@ -234,7 +237,9 @@ class DashboardQueryService:
         pilot = (
             None
             if pilot_row is None
-            else read_pilot_status(store, item.project_id, str(pilot_row[0])).as_dict()
+            else project_pilot_status(
+                read_pilot_status(store, item.project_id, str(pilot_row[0])).as_dict(),
+            )
         )
         payload: dict[str, object] = {
             "project_ref": project_ref,
@@ -253,7 +258,7 @@ class DashboardQueryService:
             },
             "recent_tasks": [self._recent_task(report) for report in reports[:10]],
             "pilot": pilot,
-            "storage": storage_status(store, item.project_id).as_dict(),
+            "storage": project_storage_status(storage_status(store, item.project_id)),
             "system_health": {
                 "scope": "global_launch_context",
                 "doctor": self._doctor_report.as_dict(),

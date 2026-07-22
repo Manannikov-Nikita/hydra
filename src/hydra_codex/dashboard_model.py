@@ -9,6 +9,11 @@ import json
 import re
 from types import MappingProxyType
 
+from .dashboard_contract import (
+    validate_freshness,
+    validate_project_payload,
+    validate_task_report,
+)
 from .public_payload import reject_private_fields
 from .reporting import NumericFact
 
@@ -189,7 +194,9 @@ class DashboardSnapshot:
         if not isinstance(self.freshness, Mapping):
             raise ValueError("freshness must be a public mapping")
         frozen_freshness = _freeze(self.freshness)
-        reject_private_fields(_thaw(frozen_freshness))
+        thawed_freshness = _thaw(frozen_freshness)
+        validate_freshness(thawed_freshness)
+        reject_private_fields(thawed_freshness)
         object.__setattr__(self, "freshness", frozen_freshness)
         if not isinstance(self.projects, tuple) or any(
             not isinstance(item, DashboardProjectSummary) for item in self.projects
@@ -208,14 +215,14 @@ class DashboardSnapshot:
             raise ValueError("selected project and project payload must appear together")
         if self.project_json is not None:
             project = _canonical_object(self.project_json, "dashboard project")
+            validate_project_payload(project)
             if project.get("project_ref") != self.selected_project_ref:
                 raise ValueError("project payload does not match selected project")
         if self.selected_task_json is not None:
             if self.selected_project_ref is None:
                 raise ValueError("selected task requires a selected project")
             task = _canonical_object(self.selected_task_json, "dashboard selected task")
-            if task.get("schema_version") != "hydra.report/v3":
-                raise ValueError("selected task must use hydra.report/v3")
+            validate_task_report(task)
             _task_ref(task.get("task_ref"))
         if not isinstance(self.refresh, DashboardRefreshView):
             raise ValueError("refresh must be a DashboardRefreshView")
@@ -256,8 +263,7 @@ class DashboardTaskPage:
         ordered_refs: list[str] = []
         for item in self.items_json:
             payload = _canonical_object(item, "dashboard task")
-            if payload.get("schema_version") != "hydra.report/v3":
-                raise ValueError("dashboard tasks must use hydra.report/v3")
+            validate_task_report(payload)
             task_ref = _task_ref(payload.get("task_ref"))
             assert task_ref is not None
             if task_ref in seen:

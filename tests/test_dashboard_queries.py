@@ -242,10 +242,21 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             "Hydra git status && env",
             "Hydra docker compose up",
             "Hydra report; env",
+            "Hydra | status",
+            "Hydra > output",
+            "Hydra < input",
+            "Hydra `status`",
+            "Hydra $(status)",
+            "Hydra abcdefghijklmnop1234",
             "Hydra owner@example.com",
             "Hydra\u200bCore",
             "Hydra\u202eCore",
             "Hydra Cafe\u0301",
+            r"path=\\server\share",
+            "OSError [Errno 2] failed",
+            "ssh host",
+            "ls -la",
+            "Clone project-b",
         )
         for display_name in unsafe_names:
             store = HydraStore(self.database)
@@ -272,23 +283,25 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
                     f"Project {project_ref.removeprefix('project_')[:8]}",
                 )
 
-        store = HydraStore(self.database)
-        try:
-            store.connection.execute(
-                "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
-                ("Hydra project-alpha",),
-            )
-            store.connection.commit()
-        finally:
-            store.close()
-        with patch(
-            "hydra_codex.dashboard_queries.list_reconciled_reports",
-            side_effect=lambda _store, project_id: self.reports[project_id],
-        ):
-            payload = self.service.snapshot(
-                project_ref=project_ref, task_ref=None, refresh=self.refresh,
-            ).as_dict()
-        self.assertEqual(payload["project"]["display_name"], "Hydra project-alpha")
+        for display_name in ("ObservabilityDashboard", "Hydra Core", "A <script>"):
+            store = HydraStore(self.database)
+            try:
+                store.connection.execute(
+                    "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
+                    (display_name,),
+                )
+                store.connection.commit()
+            finally:
+                store.close()
+            with patch(
+                "hydra_codex.dashboard_queries.list_reconciled_reports",
+                side_effect=lambda _store, project_id: self.reports[project_id],
+            ):
+                payload = self.service.snapshot(
+                    project_ref=project_ref, task_ref=None, refresh=self.refresh,
+                ).as_dict()
+            with self.subTest(safe_display_name=display_name):
+                self.assertEqual(payload["project"]["display_name"], display_name)
 
     def test_pilot_and_storage_numbers_are_dashboard_numeric_facts(self) -> None:
         store = HydraStore(self.database)

@@ -1,0 +1,310 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-22T14:13:50Z",
+  "title": "Design System: Hydra",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Verification Blue",
+        "canonical": "#1d5fd1",
+        "tonalRamp": ["#091f43", "#103370", "#16479d", "#1c5cca", "#3575e3", "#709deb", "#aec8f4", "#e4edfb"]
+      },
+      "primary-soft": {
+        "role": "primary",
+        "displayName": "Verification Wash",
+        "canonical": "#dce9ff",
+        "tonalRamp": ["#001c4c", "#002f80", "#0042b2", "#0055e6", "#1a6fff", "#5c98ff", "#a3c5ff", "#e0ecff"]
+      },
+      "primary-foreground": {
+        "role": "primary",
+        "displayName": "Primary Foreground",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#262626", "#404040", "#595959", "#737373", "#8c8c8c", "#adadad", "#d1d1d1", "#f0f0f0"]
+      },
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Day Canvas",
+        "canonical": "#f7f8fa",
+        "tonalRamp": ["#1d232f", "#313b4e", "#45526e", "#586a8d", "#7283a7", "#9ba7c0", "#c7cedc", "#eceff3"]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Day Surface",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#262626", "#404040", "#595959", "#737373", "#8c8c8c", "#adadad", "#d1d1d1", "#f0f0f0"]
+      },
+      "surface-subtle": {
+        "role": "neutral",
+        "displayName": "Day Subtle Surface",
+        "canonical": "#eef1f5",
+        "tonalRamp": ["#1c2530", "#2f3d50", "#425670", "#556e91", "#6e88aa", "#98aac3", "#c5cfdd", "#eceff4"]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Day Ink",
+        "canonical": "#18212f",
+        "tonalRamp": ["#1a2433", "#2b3b54", "#3c5376", "#4e6b98", "#6784b1", "#93a8c8", "#c2cee0", "#ebeff5"]
+      },
+      "ink-muted": {
+        "role": "neutral",
+        "displayName": "Day Muted Ink",
+        "canonical": "#526071",
+        "tonalRamp": ["#20262c", "#363f4a", "#4b5867", "#617185", "#7a8a9e", "#a0acba", "#cad0d8", "#edeff2"]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Day Border",
+        "canonical": "#cbd3dd",
+        "tonalRamp": ["#1e252e", "#323e4d", "#47576c", "#5b708b", "#748aa4", "#9cacbe", "#c7d0db", "#eceff3"]
+      },
+      "track": {
+        "role": "neutral",
+        "displayName": "Day Track",
+        "canonical": "#e5e9ef",
+        "tonalRamp": ["#1d242f", "#313d4f", "#44556e", "#576d8e", "#7187a8", "#9aaac1", "#c6cfdc", "#eceff3"]
+      },
+      "dark-canvas": {
+        "role": "neutral",
+        "displayName": "Night Canvas",
+        "canonical": "#101318",
+        "tonalRamp": ["#1f242e", "#333d4c", "#47556b", "#5c6d8a", "#7587a3", "#9da9be", "#c8cfda", "#edeff3"]
+      },
+      "dark-surface": {
+        "role": "neutral",
+        "displayName": "Night Surface",
+        "canonical": "#171c23",
+        "tonalRamp": ["#1e252e", "#333e4d", "#47566c", "#5b6f8a", "#7588a4", "#9dabbe", "#c8d0db", "#edeff3"]
+      },
+      "dark-surface-subtle": {
+        "role": "neutral",
+        "displayName": "Night Subtle Surface",
+        "canonical": "#232a34",
+        "tonalRamp": ["#1f252e", "#333e4c", "#48566b", "#5c6f89", "#7688a3", "#9dabbd", "#c8d0da", "#edeff3"]
+      },
+      "dark-ink": {
+        "role": "neutral",
+        "displayName": "Night Ink",
+        "canonical": "#edf2f7",
+        "tonalRamp": ["#182635", "#274058", "#37597c", "#47739f", "#608cb8", "#8eadcd", "#bfd1e3", "#eaf0f6"]
+      },
+      "dark-ink-muted": {
+        "role": "neutral",
+        "displayName": "Night Muted Ink",
+        "canonical": "#b6c0cc",
+        "tonalRamp": ["#1f262d", "#343f4b", "#495869", "#5e7187", "#788aa1", "#9facbc", "#c9d0d9", "#edeff2"]
+      },
+      "dark-border": {
+        "role": "neutral",
+        "displayName": "Night Border",
+        "canonical": "#3b4654",
+        "tonalRamp": ["#20252d", "#353e4b", "#4a5769", "#5f7087", "#788aa0", "#9facbc", "#c9d0d9", "#edeff2"]
+      },
+      "dark-track": {
+        "role": "neutral",
+        "displayName": "Night Track",
+        "canonical": "#29313c",
+        "tonalRamp": ["#1f252d", "#343e4c", "#48576a", "#5d6f88", "#7789a2", "#9eabbd", "#c8d0da", "#edeff3"]
+      },
+      "dark-primary": {
+        "role": "primary",
+        "displayName": "Night Verification Blue",
+        "canonical": "#7db2ff",
+        "tonalRamp": ["#001f4c", "#003480", "#0049b2", "#005ee6", "#1a77ff", "#5c9eff", "#a3c9ff", "#e0edff"]
+      },
+      "dark-primary-soft": {
+        "role": "primary",
+        "displayName": "Night Verification Wash",
+        "canonical": "#1c3558",
+        "tonalRamp": ["#12233a", "#1f3a61", "#2b5287", "#3769ae", "#5182c8", "#83a6d8", "#b9cde9", "#e8eef8"]
+      },
+      "dark-primary-foreground": {
+        "role": "primary",
+        "displayName": "Night Primary Foreground",
+        "canonical": "#101318",
+        "tonalRamp": ["#1f242e", "#333d4c", "#47556b", "#5c6d8a", "#7587a3", "#9da9be", "#c8cfda", "#edeff3"]
+      },
+      "phase-understand": {
+        "role": "series",
+        "displayName": "Understand Phase",
+        "canonical": "#63aef2",
+        "tonalRamp": ["#062847", "#0a4276", "#0e5da5", "#1278d4", "#2b91ed", "#68b1f2", "#aad3f8", "#e3f0fd"]
+      },
+      "phase-implement": {
+        "role": "series",
+        "displayName": "Implement Phase",
+        "canonical": "#f59e62",
+        "tonalRamp": ["#482005", "#783508", "#a84b0b", "#d8600e", "#f17a27", "#f5a066", "#facaa9", "#fdede2"]
+      },
+      "phase-test": {
+        "role": "series",
+        "displayName": "Test Phase",
+        "canonical": "#6fcf8c",
+        "tonalRamp": ["#13391f", "#206033", "#2d8648", "#39ac5c", "#53c676", "#85d69d", "#bae8c8", "#e8f7ed"]
+      },
+      "phase-review": {
+        "role": "series",
+        "displayName": "Review Phase",
+        "canonical": "#9b8cf2",
+        "tonalRamp": ["#110845", "#1c0d73", "#2712a0", "#3217ce", "#4c31e8", "#7f6cee", "#b7adf6", "#e7e4fc"]
+      },
+      "phase-fix": {
+        "role": "series",
+        "displayName": "Fix Phase",
+        "canonical": "#ec6f72",
+        "tonalRamp": ["#44090a", "#710f11", "#9e1518", "#cb1b1f", "#e43438", "#ec6f72", "#f4aeb0", "#fbe4e5"]
+      },
+      "phase-unclassified": {
+        "role": "series",
+        "displayName": "Unclassified Phase",
+        "canonical": "#9299a3",
+        "tonalRamp": ["#232629", "#3a3f45", "#525861", "#69717c", "#838b96", "#a6acb4", "#cdd0d5", "#eeeff1"]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Page identity and selected-project headings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Explanations, task detail, tables, and system state."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Section and master-detail headings."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Navigation, table headers, controls, and secondary metadata."
+      },
+      "mono": {
+        "displayName": "Evidence Mono",
+        "purpose": "Opaque references, evidence IDs, commands, and schemas only."
+      }
+    },
+    "shadows": [
+      {
+        "name": "overlay-structural",
+        "value": "0 6px 8px rgba(8, 15, 26, 0.16)",
+        "purpose": "Temporary popovers and evidence drawers only."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-fast",
+        "value": "180ms cubic-bezier(0.22, 1, 0.36, 1)",
+        "purpose": "Selection, disclosure, theme, and refresh-state transitions."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "rail-collapse",
+        "value": "900px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Refresh Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single high-emphasis action that starts ingest and reconciliation.",
+      "html": "<button class=\"ds-refresh\" type=\"button\">Refresh</button>",
+      "css": ":host { --ds-primary:#1d5fd1; --ds-primary-fg:#fff; --ds-focus:#8eb0f0; } @media (prefers-color-scheme: dark) { :host { --ds-primary:#7db2ff; --ds-primary-fg:#101318; --ds-focus:#7db2ff; } } .ds-refresh { min-height:36px; padding:8px 14px; border:0; border-radius:6px; background:var(--ds-primary); color:var(--ds-primary-fg); font:500 14px/1 system-ui,sans-serif; transition:filter 180ms cubic-bezier(.22,1,.36,1); } .ds-refresh:hover { filter:brightness(.92); } .ds-refresh:focus-visible { outline:3px solid var(--ds-focus); outline-offset:2px; } @media (prefers-reduced-motion: reduce) { .ds-refresh { transition:none; } }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "A low-emphasis action for theme and secondary navigation.",
+      "html": "<button class=\"ds-ghost\" type=\"button\">Theme</button>",
+      "css": ":host { --ds-surface:#fff; --ds-ink:#18212f; --ds-border:#cbd3dd; --ds-hover:#eef1f5; --ds-focus:#1d5fd1; } @media (prefers-color-scheme: dark) { :host { --ds-surface:#171c23; --ds-ink:#edf2f7; --ds-border:#3b4654; --ds-hover:#232a34; --ds-focus:#7db2ff; } } .ds-ghost { min-height:36px; padding:8px 12px; border:1px solid var(--ds-border); border-radius:6px; background:var(--ds-surface); color:var(--ds-ink); font:500 14px/1 system-ui,sans-serif; transition:background 180ms cubic-bezier(.22,1,.36,1); } .ds-ghost:hover { background:var(--ds-hover); } .ds-ghost:focus-visible { outline:3px solid var(--ds-focus); outline-offset:2px; } @media (prefers-reduced-motion: reduce) { .ds-ghost { transition:none; } }"
+    },
+    {
+      "name": "Evidence Search",
+      "kind": "input",
+      "description": "A native search field for exact evidence IDs and public task references.",
+      "html": "<label class=\"ds-field\">Evidence <input class=\"ds-input\" type=\"search\" placeholder=\"ev_…\"></label>",
+      "css": ":host { --ds-surface:#fff; --ds-ink:#18212f; --ds-border:#cbd3dd; --ds-focus:#1d5fd1; } @media (prefers-color-scheme: dark) { :host { --ds-surface:#171c23; --ds-ink:#edf2f7; --ds-border:#3b4654; --ds-focus:#7db2ff; } } .ds-field { display:grid; gap:6px; color:var(--ds-ink); font:500 13px/1.25 system-ui,sans-serif; } .ds-input { min-height:36px; padding:8px 10px; border:1px solid var(--ds-border); border-radius:6px; background:var(--ds-surface); color:var(--ds-ink); font:400 14px/1.4 ui-monospace,monospace; } .ds-input:focus-visible { outline:3px solid var(--ds-focus); outline-offset:1px; border-color:var(--ds-focus); }"
+    },
+    {
+      "name": "Project Navigation",
+      "kind": "nav",
+      "description": "A quiet current-project row in the desktop rail.",
+      "html": "<nav class=\"ds-nav\" aria-label=\"Projects\"><a class=\"ds-nav-item\" aria-current=\"page\" href=\"#\">Hydra</a><a class=\"ds-nav-item\" href=\"#\">Malena LMS</a></nav>",
+      "css": ":host { --ds-ink:#18212f; --ds-muted:#526071; --ds-hover:#eef1f5; --ds-selected:#dce9ff; --ds-focus:#1d5fd1; } @media (prefers-color-scheme: dark) { :host { --ds-ink:#edf2f7; --ds-muted:#b6c0cc; --ds-hover:#232a34; --ds-selected:#1c3558; --ds-focus:#7db2ff; } } .ds-nav { display:grid; gap:4px; font:400 14px/1.3 system-ui,sans-serif; } .ds-nav-item { padding:8px 10px; border-radius:6px; color:var(--ds-muted); text-decoration:none; } .ds-nav-item:hover { background:var(--ds-hover); color:var(--ds-ink); } .ds-nav-item[aria-current=page] { background:var(--ds-selected); color:var(--ds-ink); font-weight:500; } .ds-nav-item:focus-visible { outline:3px solid var(--ds-focus); outline-offset:1px; }"
+    },
+    {
+      "name": "Headline Metric",
+      "kind": "card",
+      "refersTo": "metric-card",
+      "description": "One of at most three decision-relevant summaries.",
+      "html": "<section class=\"ds-metric\" aria-label=\"Working tokens\"><span class=\"ds-metric-label\">Working tokens</span><strong class=\"ds-metric-value\">56 169</strong><span class=\"ds-metric-note\">derived · cached input excluded</span></section>",
+      "css": ":host { --ds-surface:#eef1f5; --ds-ink:#18212f; --ds-muted:#526071; } @media (prefers-color-scheme: dark) { :host { --ds-surface:#232a34; --ds-ink:#edf2f7; --ds-muted:#b6c0cc; } } .ds-metric { display:grid; gap:5px; padding:20px; border-radius:14px; background:var(--ds-surface); color:var(--ds-ink); font-family:system-ui,sans-serif; } .ds-metric-label,.ds-metric-note { color:var(--ds-muted); font-size:13px; } .ds-metric-value { font-size:28px; font-weight:500; font-variant-numeric:tabular-nums; }"
+    },
+    {
+      "name": "Status Chip",
+      "kind": "chip",
+      "refersTo": "status-chip",
+      "description": "A display-only status paired with plain-language text.",
+      "html": "<span class=\"ds-chip\">Current</span>",
+      "css": ":host { --ds-chip:#dce9ff; --ds-ink:#18212f; } @media (prefers-color-scheme: dark) { :host { --ds-chip:#1c3558; --ds-ink:#edf2f7; } } .ds-chip { display:inline-flex; align-items:center; min-height:24px; padding:3px 9px; border-radius:999px; background:var(--ds-chip); color:var(--ds-ink); font:500 13px/1 system-ui,sans-serif; }"
+    },
+    {
+      "name": "Phase Allocation",
+      "kind": "custom",
+      "description": "A labeled part-to-whole bar for working-token allocation.",
+      "html": "<figure class=\"ds-phase\"><figcaption>Working tokens by phase</figcaption><div class=\"ds-phase-track\" role=\"img\" aria-label=\"Understand 61 percent, implement 15 percent, test 17 percent, unclassified 7 percent\"><span class=\"ds-phase-a\"></span><span class=\"ds-phase-b\"></span><span class=\"ds-phase-c\"></span><span class=\"ds-phase-d\"></span></div></figure>",
+      "css": ":host { --ds-ink:#18212f; --ds-track:#e5e9ef; } @media (prefers-color-scheme: dark) { :host { --ds-ink:#edf2f7; --ds-track:#29313c; } } .ds-phase { display:grid; gap:10px; margin:0; color:var(--ds-ink); font:500 16px/1.3 system-ui,sans-serif; } .ds-phase-track { display:flex; height:14px; overflow:hidden; border-radius:999px; background:var(--ds-track); } .ds-phase-a { width:61%; background:#63aef2; } .ds-phase-b { width:15%; background:#f59e62; } .ds-phase-c { width:17%; background:#6fcf8c; } .ds-phase-d { width:7%; background:#9299a3; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Evidence Desk",
+    "overview": "Hydra is a calm working surface for examining demanding Codex tasks. It should feel closer to a carefully arranged analyst's desk than to a monitoring wall: the current project and freshness are obvious, the most useful evidence is near at hand, and deeper records stay organized until requested.\n\nThe interface is information-dense without being compressed. A wide, mostly unframed workspace carries the task; tonal layers and dividers establish structure. Three headline summaries are the only repeated cards. Everything else uses navigation, tables, bars, and disclosure rather than decorative containers.\n\nIt explicitly rejects a generic SaaS KPI wall, a terminal or evidence dump, a neon observability control room, and AI-styled glass or gradient decoration.",
+    "keyCharacteristics": [
+      "Evidence-first hierarchy with visible provenance and freshness.",
+      "Restrained neutrals with one interaction accent.",
+      "Wide desktop workspace with structural narrow-window adaptation.",
+      "Fast state transitions and no decorative choreography.",
+      "Privacy-safe identifiers and progressive detail."
+    ],
+    "rules": [
+      {
+        "name": "The One Accent Rule",
+        "body": "Verification Blue is limited to actions, current selection, focus, and links. Its scarcity is part of the hierarchy.",
+        "section": "colors"
+      },
+      {
+        "name": "The Data Color Rule",
+        "body": "Phase colors may color marks and swatches only. Labels and numeric values remain Ink.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tabular Evidence Rule",
+        "body": "Numeric columns use tabular figures and end alignment so differences can be scanned without visual jitter.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat Desk Rule",
+        "body": "Resting surfaces never float. If a region looks like a detached marketing card, the hierarchy is wrong.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do show freshness, provenance, lower bounds, and caveats adjacent to the fact they qualify.",
+      "Do use exactly three headline metric summaries when those metrics are decision-relevant.",
+      "Do keep long task collections and evidence in quiet tables with progressive disclosure.",
+      "Do preserve system theme as the initial state and persist an explicit light or dark user choice.",
+      "Do use semantic HTML, visible focus, text alternatives, and color-independent labels."
+    ],
+    "donts": [
+      "Don't build a generic SaaS KPI wall made from interchangeable cards.",
+      "Don't present a terminal or evidence dump before its meaning.",
+      "Don't turn Hydra into a neon observability control room with decorative alerts and saturated color.",
+      "Don't use glass surfaces, gradient text, ornamental grids, oversized radii, or decorative motion.",
+      "Don't turn unavailable, lower-bound, or incomparable evidence into a confident score or conclusion.",
+      "Don't expose raw paths, prompts, commands, session identifiers, or tool output in browser-visible UI."
+    ]
+  }
+}

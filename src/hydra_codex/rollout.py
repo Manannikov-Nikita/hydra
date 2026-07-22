@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 import json
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -14,7 +16,16 @@ from .lineage import (
     persist_inferred_parent,
 )
 from .project import ProjectNotFound, resolve_project
-from .rollout_identity import ACTIVE_HASHER, IngestReport, Pseudonymizer, RolloutRoot, discover_rollouts, opaque
+from .rollout_identity import (
+    ACTIVE_HASHER,
+    IngestReport,
+    Pseudonymizer,
+    RolloutRoot,
+    TrustedRolloutCandidate,
+    discover_rollouts,
+    opaque,
+    revalidate_trusted_rollout,
+)
 from .rollout_observations import fingerprint as observation_fingerprint
 from .rollout_observations import path_key, safe_int, usage as parse_usage
 from .rollout_privacy import (
@@ -26,7 +37,20 @@ from .rollout_persistence import insert_diagnostic as _persist_diagnostic
 from .rollout_persistence import persist_file as _persist_file
 from .rollout_persistence import tool_end_state as _tool_end_state
 from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
-from .rollout_sources import line_fingerprint, located_lineage, prefix_lineage, relation_to, revision_lines, scan_source
+from .rollout_sources import (
+    SOURCE_CHANGED_MESSAGE,
+    SourceChanged,
+    SourceScan,
+    SourceStat,
+    line_fingerprint,
+    located_lineage,
+    open_source,
+    prefix_lineage,
+    relation_to,
+    revision_lines,
+    scan_source,
+    source_stat,
+)
 from .storage import HydraStore, StorageUnavailable
 from .test_evidence import TestEvidenceBuffer, parse_structured_result
 from .tool_normalization import custom_exec_outcome
@@ -36,17 +60,29 @@ from .tool_spans import persist_tool_end, persist_tool_start
 SOURCE_SCANNER_VERSION = 1
 
 
-def _source_stat(path: Path) -> tuple[int, int, int, int, int]:
-    details = path.stat()
+@dataclass(frozen=True)
+class UnchangedLocationAttribution:
+    project_id: str = field(repr=False)
+    logical: str = field(repr=False)
+    revision: str = field(repr=False)
+
+    def __iter__(self):
+        return iter((self.project_id, self.logical, self.revision))
+
+
+def _source_stat(path: Path) -> SourceStat:
+    return source_stat(path)
+
+
+def _stat_values(value: SourceStat) -> tuple[int, int, int, int, int]:
     return (
-        int(details.st_dev), int(details.st_ino), int(details.st_size),
-        int(details.st_mtime_ns), int(details.st_ctime_ns),
+        value.dev, value.ino, value.size, value.mtime_ns, value.ctime_ns,
     )
 
 
 def _unchanged_location(
     connection: Any, project_id: str, location: str,
-    source_stat: tuple[int, int, int, int, int],
+    source_stat: SourceStat,
 ) -> tuple[str, str] | None:
     row = connection.execute(
         """SELECT state.logical_source_key,state.revision_digest
@@ -66,14 +102,54 @@ def _unchanged_location(
               AND state.st_dev=? AND state.st_ino=? AND state.st_size=?
               AND state.st_mtime_ns=? AND state.st_ctime_ns=?
               AND state.scanner_version=?""",
-        (project_id, location, *source_stat, SOURCE_SCANNER_VERSION),
+        (
+            project_id, location, *_stat_values(source_stat),
+            SOURCE_SCANNER_VERSION,
+        ),
     ).fetchone()
     return None if row is None else (str(row[0]), str(row[1]))
 
 
+def unchanged_location_attribution(
+    connection: Any, location: str, source_stat: SourceStat,
+) -> UnchangedLocationAttribution | None:
+    """Return one current materialized project binding, never an ambiguous one."""
+    rows = connection.execute(
+        """SELECT state.project_id,state.logical_source_key,state.revision_digest
+             FROM rollout_source_location_states AS state
+             JOIN rollout_logical_sources AS logical
+               ON logical.logical_source_key=state.logical_source_key
+              AND logical.project_id=state.project_id
+             JOIN rollout_sources AS revision
+               ON revision.source_digest=state.revision_digest
+              AND revision.logical_source_key=state.logical_source_key
+              AND revision.materialized=1
+             JOIN rollout_source_locations AS location
+               ON location.logical_source_key=state.logical_source_key
+              AND location.location_key=state.location_key
+              AND location.revision_digest=state.revision_digest
+            WHERE state.location_key=?
+              AND state.st_dev=? AND state.st_ino=? AND state.st_size=?
+              AND state.st_mtime_ns=? AND state.st_ctime_ns=?
+              AND state.scanner_version=?
+            ORDER BY state.project_id,state.logical_source_key,state.revision_digest
+            LIMIT 2""",
+        (
+            location, *_stat_values(source_stat), SOURCE_SCANNER_VERSION,
+        ),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    return UnchangedLocationAttribution(
+        project_id=str(rows[0][0]),
+        logical=str(rows[0][1]),
+        revision=str(rows[0][2]),
+    )
+
+
 def _persist_location_state(
     connection: Any, project_id: str, location: str, logical: str,
-    revision: str, source_stat: tuple[int, int, int, int, int],
+    revision: str, source_stat: SourceStat,
 ) -> None:
     connection.execute(
         """INSERT INTO rollout_source_location_states(
@@ -90,7 +166,8 @@ def _persist_location_state(
              st_ctime_ns=excluded.st_ctime_ns,
              scanner_version=excluded.scanner_version""",
         (
-            project_id, location, logical, revision, *source_stat,
+            project_id, location, logical, revision,
+            *_stat_values(source_stat),
             SOURCE_SCANNER_VERSION,
         ),
     )
@@ -132,13 +209,17 @@ def _parse_source(
     store: HydraStore, path: Path, source: str, project_root: Path, project_id: str,
     model_causes: dict[str, str], *, logical_source: str | None = None,
     line_fingerprints: tuple[str, ...] = (), authoritative_identity: str | None = None,
+    expected_source_stat: SourceStat | None = None,
 ) -> int:
     diagnostics = 0
     session_key: str | None = None
     session_meta_at: str | None = None
     current_turn: str | None = None
     seen_session = False
-    with store.rollout_transaction() as connection, path.open("rb") as handle:
+    with (
+        store.rollout_transaction() as connection,
+        open_source(path, expected_source_stat) as handle,
+    ):
         logical_binding = (
             connection.execute(
                 "SELECT session_key FROM rollout_logical_sources "
@@ -184,7 +265,7 @@ def _parse_source(
             parsed_lines = line_number
             active_hasher = ACTIVE_HASHER.get()
             if active_hasher is None or line_number > len(line_fingerprints) or line_fingerprint(raw_bytes, active_hasher.key) != line_fingerprints[line_number - 1]:
-                raise RuntimeError("rollout source changed during ingest")
+                raise SourceChanged(SOURCE_CHANGED_MESSAGE)
             raw_line = raw_bytes.decode("utf-8", errors="replace")
             try:
                 envelope = json.loads(raw_line)
@@ -582,7 +663,7 @@ def _parse_source(
                 )
         test_evidence.flush()
         if parsed_lines != len(line_fingerprints):
-            raise RuntimeError("rollout source changed during ingest")
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE)
         reconcile_turn_attempts(
             connection,
             lambda digest, ordinal, kind: _insert_diagnostic(connection, digest, ordinal, kind, {}),
@@ -590,9 +671,96 @@ def _parse_source(
     return diagnostics
 
 
+@dataclass(frozen=True)
+class _IngestSource:
+    path: Path = field(repr=False)
+    label: str
+    scan: SourceScan | None = field(default=None, repr=False)
+    trusted: TrustedRolloutCandidate | None = field(default=None, repr=False)
+
+
+def _prepared_sources(
+    roots: tuple[Path | str | RolloutRoot, ...],
+    prepared_scans: Mapping[Path, SourceScan],
+) -> tuple[_IngestSource, ...]:
+    scans: dict[Path, SourceScan] = {}
+    try:
+        entries = tuple(prepared_scans.items())
+    except AttributeError as error:
+        raise ValueError("prepared_scans must be a canonical path mapping") from error
+    for path, scan in entries:
+        if not isinstance(path, Path) or not isinstance(scan, SourceScan):
+            raise ValueError("prepared_scans must be a canonical path mapping")
+        try:
+            canonical = path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("prepared_scans must match direct trusted roots") from error
+        if not path.is_absolute() or path != canonical:
+            raise ValueError("prepared_scans must use exact canonical paths")
+        if scan.path != path:
+            raise ValueError("prepared scans must match their canonical paths")
+        scans[path] = scan
+
+    candidates: dict[Path, TrustedRolloutCandidate] = {}
+    for item in roots:
+        if not isinstance(item, RolloutRoot) or item.label not in {"active", "archived"}:
+            raise ValueError("prepared roots must be direct active or archived files")
+        requested = Path(item.path)
+        try:
+            canonical = requested.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("prepared roots must match exact canonical files") from error
+        if (
+            not requested.is_absolute()
+            or requested != canonical
+            or requested.suffix != ".jsonl"
+            or requested.is_symlink()
+            or not requested.is_file()
+        ):
+            raise ValueError("prepared roots must match exact canonical files")
+        candidate = TrustedRolloutCandidate(
+            path=canonical, label=item.label, root=canonical, root_is_file=True,
+        )
+        existing = candidates.get(canonical)
+        if existing is not None and existing.label != candidate.label:
+            raise ValueError("prepared root labels must be unambiguous")
+        candidates[canonical] = candidate
+    if set(candidates) != set(scans):
+        raise ValueError("prepared_scans must exactly match direct trusted roots")
+    return tuple(
+        _IngestSource(path, candidates[path].label, scans[path], candidates[path])
+        for path in sorted(candidates)
+    )
+
+
+def _verified_source_stat(
+    source: _IngestSource, expected: SourceStat | None = None,
+) -> SourceStat:
+    current = (
+        revalidate_trusted_rollout(source.trusted)
+        if source.trusted is not None
+        else _source_stat(source.path)
+    )
+    if expected is not None and current != expected:
+        raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+    return current
+
+
+def _emit_ingest_progress(
+    progress: Callable[[str, int, int], None] | None,
+    stage: str,
+    current: int,
+    total: int,
+) -> None:
+    if progress is not None:
+        progress(stage, current, total)
+
+
 def ingest_rollouts(
     store: HydraStore, roots: Iterable[Path | str | RolloutRoot], project_root: Path | str, project_id: str,
     model_causes: dict[str, str] | None = None, hash_key: bytes | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
+    prepared_scans: Mapping[Path, SourceScan] | None = None,
 ) -> IngestReport:
     """Ingest explicit v1 JSONL roots idempotently, storing only normalized safe facts."""
     root = Path(project_root)
@@ -602,23 +770,48 @@ def ingest_rollouts(
     hash_token = ACTIVE_HASHER.set(hasher)
     try:
         root_specs = tuple(roots)
-        files = discover_rollouts(root_specs)
+        if prepared_scans is None:
+            files = discover_rollouts(root_specs)
+            sources = tuple(
+                _IngestSource(
+                    path,
+                    next(
+                        (
+                            item.label
+                            for item in root_specs
+                            if isinstance(item, RolloutRoot)
+                            and path.is_relative_to(Path(item.path).resolve())
+                        ),
+                        "explicit",
+                    ),
+                )
+                for path in files
+            )
+        else:
+            sources = _prepared_sources(root_specs, prepared_scans)
         diagnostics = 0
         unique: set[str] = set()
-        for path in files:
+        total_sources = len(sources)
+        _emit_ingest_progress(progress, "inspect", 0, total_sources)
+        for index, ingest_source in enumerate(sources, start=1):
+            _emit_ingest_progress(progress, "inspect", index, total_sources)
+            path = ingest_source.path
+            label = ingest_source.label
             location = opaque("source", str(path))
-            label = next(
-                (item.label for item in root_specs if isinstance(item, RolloutRoot)
-                 and path.is_relative_to(Path(item.path).resolve())),
-                "explicit",
+            scan = ingest_source.scan
+            before_stat = _verified_source_stat(
+                ingest_source,
+                scan.source_stat if scan is not None else None,
             )
-            before_stat = _source_stat(path)
             with store.rollout_transaction() as connection:
                 unchanged = _unchanged_location(
                     connection, project_id, location, before_stat,
                 )
                 if unchanged is not None:
-                    after_candidate_stat = _source_stat(path)
+                    after_candidate_stat = _verified_source_stat(
+                        ingest_source,
+                        scan.source_stat if scan is not None else None,
+                    )
                     if after_candidate_stat == before_stat:
                         logical, digest = unchanged
                         connection.execute(
@@ -629,7 +822,9 @@ def ingest_rollouts(
                         unique.add(digest)
                         continue
                     before_stat = after_candidate_stat
-            scan = scan_source(path, hasher.key, opaque)
+            if scan is None:
+                scan = scan_source(path, hasher.key, opaque)
+                before_stat = scan.source_stat
             digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
             unique.add(digest)
             with store.rollout_transaction() as connection:
@@ -655,9 +850,9 @@ def ingest_rollouts(
                         (known[0], location, label, digest),
                     )
                     if known[1]:
-                        after_stat = _source_stat(path)
-                        if after_stat != before_stat:
-                            raise RuntimeError("rollout source changed during ingest")
+                        after_stat = _verified_source_stat(
+                            ingest_source, scan.source_stat,
+                        )
                         _persist_location_state(
                             connection, project_id, location, str(known[0]),
                             digest, after_stat,
@@ -720,7 +915,9 @@ def ingest_rollouts(
                         store, path, digest, root, project_id, model_causes or {},
                         logical_source=logical, line_fingerprints=scan.line_fingerprints,
                         authoritative_identity=scan.identity,
+                        expected_source_stat=scan.source_stat,
                     )
+                    _verified_source_stat(ingest_source, scan.source_stat)
                     bound = connection.execute(
                         "SELECT session_key FROM rollout_logical_sources "
                         "WHERE logical_source_key=?",
@@ -758,12 +955,13 @@ def ingest_rollouts(
                     (digest,),
                 ).fetchone()
                 if materialized is not None and materialized[0]:
-                    after_stat = _source_stat(path)
-                    if after_stat != before_stat:
-                        raise RuntimeError("rollout source changed during ingest")
+                    after_stat = _verified_source_stat(
+                        ingest_source, scan.source_stat,
+                    )
                     _persist_location_state(
                         connection, project_id, location, logical, digest, after_stat,
                     )
+        _emit_ingest_progress(progress, "reconcile", 0, 1)
         with store.rollout_transaction() as connection:
             from .token_selection import refresh_token_source_selection
 
@@ -775,6 +973,7 @@ def ingest_rollouts(
                 ),
             )
             reconcile_fork_baselines(connection, project_id)
-        return IngestReport(len(files), len(unique), diagnostics)
+        _emit_ingest_progress(progress, "reconcile", 1, 1)
+        return IngestReport(len(sources), len(unique), diagnostics)
     finally:
         ACTIVE_HASHER.reset(hash_token)

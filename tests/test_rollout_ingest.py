@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hydra_codex.classifier import classify_test_command, classify_test_outcome
 from hydra_codex.metrics import SessionEdge, TokenSnapshot, TurnAttempt, aggregate_project, aggregate_tokens, aggregate_turns, tree_contribution
@@ -463,3 +465,305 @@ class RolloutIngestTests(unittest.TestCase):
         ingest_rollouts(self.store, (self.root / "rollouts",), self.project, "project-synthetic", model_causes={"call-test": "infra_failure"})
 
         self.assertEqual((self.store.count("rollout_test_runs"), self.store.count("semantic_conflicts")), (1, 1))
+
+    @staticmethod
+    def prepared_scan(source: Path, key: bytes):
+        from hydra_codex.rollout_identity import Pseudonymizer
+        from hydra_codex.rollout_sources import scan_source
+
+        return scan_source(source, key, Pseudonymizer(key).digest)
+
+    def test_prepared_ingest_uses_exact_scans_without_legacy_discovery_or_rescan(self) -> None:
+        key = b"p" * 32
+        source = self.root / "active" / "thread.jsonl"
+        write_jsonl(source, [v1("session_meta", {"id": "prepared", "cwd": str(self.project)})])
+        scan = self.prepared_scan(source, key)
+        progress: list[tuple[str, int, int]] = []
+
+        with (
+            patch(
+                "hydra_codex.rollout.discover_rollouts",
+                side_effect=AssertionError("prepared ingest must not use legacy discovery"),
+            ),
+            patch(
+                "hydra_codex.rollout.scan_source",
+                side_effect=AssertionError("prepared ingest must not rescan"),
+            ),
+        ):
+            report = ingest_rollouts(
+                self.store,
+                (RolloutRoot(source.resolve(), "active"),),
+                self.project,
+                "project-synthetic",
+                hash_key=key,
+                progress=lambda stage, current, total: progress.append(
+                    (stage, current, total)
+                ),
+                prepared_scans={source.resolve(): scan},
+            )
+
+        self.assertEqual((report.files_seen, report.unique_sources), (1, 1))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT location_type FROM rollout_source_locations"
+            ).fetchone()[0],
+            "active",
+        )
+        self.assertTrue(progress)
+        self.assertTrue(all(
+            stage in {"inspect", "reconcile"}
+            and isinstance(current, int)
+            and isinstance(total, int)
+            and 0 <= current <= total
+            for stage, current, total in progress
+        ))
+        self.assertNotIn(str(source), repr(progress))
+
+    def test_prepared_ingest_rejects_missing_extra_noncanonical_and_explicit_sets(self) -> None:
+        from hydra_codex.rollout_identity import ACTIVE_HASHER
+
+        key = b"q" * 32
+        first = self.root / "active" / "first.jsonl"
+        second = self.root / "active" / "second.jsonl"
+        write_jsonl(first, [v1("session_meta", {"id": "first", "cwd": str(self.project)})])
+        write_jsonl(second, [v1("session_meta", {"id": "second", "cwd": str(self.project)})])
+        first_scan = self.prepared_scan(first, key)
+        second_scan = self.prepared_scan(second, key)
+        cases = (
+            (
+                (
+                    RolloutRoot(first.resolve(), "active"),
+                    RolloutRoot(second.resolve(), "active"),
+                ),
+                {first.resolve(): first_scan},
+            ),
+            (
+                (RolloutRoot(first.resolve(), "active"),),
+                {first.resolve(): first_scan, second.resolve(): second_scan},
+            ),
+            (
+                (RolloutRoot(first.resolve(), "active"),),
+                {first.parent / "nested" / ".." / first.name: first_scan},
+            ),
+            (
+                (RolloutRoot(first.resolve(), "explicit"),),
+                {first.resolve(): first_scan},
+            ),
+        )
+
+        for roots, prepared in cases:
+            with self.subTest(roots=roots, keys=tuple(prepared)), self.assertRaises(ValueError):
+                ingest_rollouts(
+                    self.store,
+                    roots,
+                    self.project,
+                    "project-synthetic",
+                    hash_key=key,
+                    prepared_scans=prepared,
+                )
+            self.assertIsNone(ACTIVE_HASHER.get())
+        self.assertEqual(self.store.count("rollout_sources"), 0)
+
+    def test_prepared_scan_is_bound_to_its_canonical_path_even_for_a_hardlink(self) -> None:
+        key = b"u" * 32
+        original = self.root / "active" / "original.jsonl"
+        alias = self.root / "active" / "alias.jsonl"
+        write_jsonl(original, [v1("session_meta", {"id": "bound", "cwd": str(self.project)})])
+        os.link(original, alias)
+        scan = self.prepared_scan(original, key)
+
+        with self.assertRaises(ValueError):
+            ingest_rollouts(
+                self.store, (RolloutRoot(alias.resolve(), "active"),), self.project,
+                "project-synthetic", hash_key=key,
+                prepared_scans={alias.resolve(): scan},
+            )
+        self.assertEqual(self.store.count("rollout_sources"), 0)
+
+    def test_prepared_unchanged_and_known_fast_paths_revalidate_source_stat(self) -> None:
+        from hydra_codex.rollout_sources import SourceChanged
+
+        key = b"r" * 32
+        active = self.root / "active" / "thread.jsonl"
+        archived = self.root / "archived" / "thread.jsonl"
+        rows = [v1("session_meta", {"id": "stat-bound", "cwd": str(self.project)})]
+        write_jsonl(active, rows)
+        ingest_rollouts(
+            self.store, (RolloutRoot(active, "active"),), self.project,
+            "project-synthetic", hash_key=key,
+        )
+
+        unchanged_scan = self.prepared_scan(active, key)
+        from hydra_codex import rollout as rollout_module
+
+        original_unchanged = rollout_module._unchanged_location
+
+        def touch_after_unchanged(*args, **kwargs):
+            result = original_unchanged(*args, **kwargs)
+            details = active.stat()
+            os.utime(active, ns=(details.st_atime_ns, details.st_mtime_ns + 1_000_000))
+            return result
+
+        with (
+            patch(
+                "hydra_codex.rollout._unchanged_location",
+                side_effect=touch_after_unchanged,
+            ),
+            self.assertRaises(SourceChanged),
+        ):
+            ingest_rollouts(
+                self.store, (RolloutRoot(active.resolve(), "active"),), self.project,
+                "project-synthetic", hash_key=key,
+                prepared_scans={active.resolve(): unchanged_scan},
+            )
+
+        write_jsonl(active, rows)
+        write_jsonl(archived, rows)
+        known_scan = self.prepared_scan(archived, key)
+
+        def touch_before_known(*args, **kwargs):
+            result = original_unchanged(*args, **kwargs)
+            details = archived.stat()
+            os.utime(
+                archived,
+                ns=(details.st_atime_ns, details.st_mtime_ns + 1_000_000),
+            )
+            return result
+
+        with (
+            patch(
+                "hydra_codex.rollout._unchanged_location",
+                side_effect=touch_before_known,
+            ),
+            self.assertRaises(SourceChanged),
+        ):
+            ingest_rollouts(
+                self.store, (RolloutRoot(archived.resolve(), "archived"),), self.project,
+                "project-synthetic", hash_key=key,
+                prepared_scans={archived.resolve(): known_scan},
+            )
+
+    def test_prepared_ingest_preserves_archive_label_on_unchanged_source(self) -> None:
+        key = b"v" * 32
+        source = self.root / "thread.jsonl"
+        write_jsonl(source, [v1("session_meta", {"id": "label", "cwd": str(self.project)})])
+        scan = self.prepared_scan(source, key)
+        ingest_rollouts(
+            self.store, (RolloutRoot(source.resolve(), "active"),), self.project,
+            "project-synthetic", hash_key=key,
+            prepared_scans={source.resolve(): scan},
+        )
+        ingest_rollouts(
+            self.store, (RolloutRoot(source.resolve(), "archived"),), self.project,
+            "project-synthetic", hash_key=key,
+            prepared_scans={source.resolve(): scan},
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT location_type FROM rollout_source_locations"
+            ).fetchone()[0],
+            "archived",
+        )
+
+    def test_prepared_materialization_rejects_swap_at_descriptor_open(self) -> None:
+        from hydra_codex.rollout_sources import SourceChanged
+
+        key = b"x" * 32
+        source = self.root / "active" / "materialize.jsonl"
+        replacement = self.root / "external" / "materialize.jsonl"
+        write_jsonl(source, [v1("session_meta", {"id": "expected", "cwd": str(self.project)})])
+        write_jsonl(replacement, [v1("session_meta", {"id": "replacement", "cwd": str(self.project)})])
+        scan = self.prepared_scan(source, key)
+        canonical_source = source.resolve()
+        original_open = os.open
+        swapped = False
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if Path(path) == canonical_source and not swapped:
+                swapped = True
+                source.unlink()
+                source.symlink_to(replacement)
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            patch("os.open", side_effect=swap_then_open),
+            self.assertRaises(SourceChanged),
+        ):
+            ingest_rollouts(
+                self.store, (RolloutRoot(canonical_source, "active"),), self.project,
+                "project-synthetic", hash_key=key,
+                prepared_scans={canonical_source: scan},
+            )
+        self.assertEqual(self.store.count("rollout_sources"), 0)
+
+    def test_global_unchanged_attribution_is_private_and_ambiguity_fails_closed(self) -> None:
+        from hydra_codex.rollout import (
+            SOURCE_SCANNER_VERSION,
+            UnchangedLocationAttribution,
+            unchanged_location_attribution,
+        )
+        from hydra_codex.rollout_identity import Pseudonymizer
+        from hydra_codex.rollout_sources import source_stat
+
+        key = b"w" * 32
+        source = self.root / "active" / "attribution.jsonl"
+        write_jsonl(source, [v1("session_meta", {"id": "attribution", "cwd": str(self.project)})])
+        ingest_rollouts(
+            self.store, (RolloutRoot(source, "active"),), self.project,
+            "project-synthetic", hash_key=key,
+        )
+        location = Pseudonymizer(key).digest("source", str(source.resolve()))
+        stat_value = source_stat(source)
+
+        attribution = unchanged_location_attribution(
+            self.store.connection, location, stat_value,
+        )
+
+        self.assertIsInstance(attribution, UnchangedLocationAttribution)
+        assert attribution is not None
+        self.assertEqual(attribution.project_id, "project-synthetic")
+        self.assertEqual(len(tuple(attribution)), 3)
+        rendered = repr(attribution)
+        for private_value in (attribution.project_id, attribution.logical, attribution.revision):
+            self.assertNotIn(private_value, rendered)
+
+        other_logical = "private-other-logical"
+        other_revision = "private-other-revision"
+        self.store.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES (?, 'project-other', NULL, ?, 'clean')""",
+            (other_logical, other_revision),
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_sources(
+                   source_digest,source_type,logical_source_key,relation,
+                   line_count,byte_count,chain_digest,materialized)
+               VALUES (?,'jsonl',?,'initial',0,0,'safe',1)""",
+            (other_revision, other_logical),
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_source_locations(
+                   logical_source_key,location_key,location_type,revision_digest)
+               VALUES (?,?,'active',?)""",
+            (other_logical, location, other_revision),
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_source_location_states(
+                   project_id,location_key,logical_source_key,revision_digest,
+                   st_dev,st_ino,st_size,st_mtime_ns,st_ctime_ns,scanner_version)
+               VALUES ('project-other',?,?,?,?,?,?,?,?,?)""",
+            (
+                location, other_logical, other_revision,
+                stat_value.dev, stat_value.ino, stat_value.size,
+                stat_value.mtime_ns, stat_value.ctime_ns,
+                SOURCE_SCANNER_VERSION,
+            ),
+        )
+        self.store.connection.commit()
+
+        self.assertIsNone(unchanged_location_attribution(
+            self.store.connection, location, stat_value,
+        ))

@@ -2,15 +2,34 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import sqlite3
-from typing import Callable
+import stat
+from typing import BinaryIO, Callable, Iterator
 
 from .rollout_privacy import canonical_timestamp, nonempty_string
+
+
+SOURCE_CHANGED_MESSAGE = "rollout source changed during ingest"
+
+
+class SourceChanged(RuntimeError):
+    """The source stopped matching the exact regular file being ingested."""
+
+
+@dataclass(frozen=True)
+class SourceStat:
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 @dataclass(frozen=True)
@@ -20,11 +39,60 @@ class SourceScan:
     line_count: int
     byte_count: int
     chain_digest: str
-    identity: str | None
-    conversation: str | None
-    cwd: str | None
+    identity: str | None = field(repr=False)
+    conversation: str | None = field(repr=False)
+    cwd: str | None = field(repr=False)
     meta_timestamp: str | None
     segment_marker: str
+    source_stat: SourceStat
+    path: Path = field(repr=False)
+
+
+def _regular_source_stat(details: os.stat_result) -> SourceStat:
+    if not stat.S_ISREG(details.st_mode):
+        raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+    return SourceStat(
+        dev=int(details.st_dev),
+        ino=int(details.st_ino),
+        size=int(details.st_size),
+        mtime_ns=int(details.st_mtime_ns),
+        ctime_ns=int(details.st_ctime_ns),
+    )
+
+
+def source_stat(path: Path) -> SourceStat:
+    """Return the exact no-follow metadata for one regular source file."""
+    try:
+        return _regular_source_stat(path.stat(follow_symlinks=False))
+    except OSError as error:
+        raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+
+
+@contextmanager
+def open_source(
+    path: Path, expected_stat: SourceStat | None = None,
+) -> Iterator[BinaryIO]:
+    """Open one exact regular file without following a replacement symlink."""
+    expected = source_stat(path) if expected_stat is None else expected_stat
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        if _regular_source_stat(os.fstat(descriptor)) != expected:
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            yield handle
+            after_stream = _regular_source_stat(os.fstat(handle.fileno()))
+        if after_stream != expected or source_stat(path) != expected:
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+    except SourceChanged:
+        raise
+    except OSError as error:
+        raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def line_fingerprint(value: bytes, key: bytes) -> str:
@@ -34,13 +102,18 @@ def line_fingerprint(value: bytes, key: bytes) -> str:
 
 def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str]) -> SourceScan:
     """Read a rollout incrementally, retaining only keyed hashes and safe header fields."""
+    before_stat = source_stat(path)
+    try:
+        canonical_path = path.resolve(strict=True)
+    except OSError as error:
+        raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
     revision = hmac.new(key, b"hydra/source-revision/", hashlib.sha256)
     chain = hmac.new(key, b"hydra/source-chain/", hashlib.sha256)
     fingerprints: list[str] = []
     first_meta: tuple[str, str | None, str | None, str | None, str] | None = None
     matched_meta: tuple[int, tuple[str, str | None, str | None, str | None, str]] | None = None
     byte_count = 0
-    with path.open("rb") as handle:
+    with open_source(path, before_stat) as handle:
         for raw_line in handle:
             byte_count += len(raw_line)
             revision.update(raw_line)
@@ -84,6 +157,7 @@ def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str])
     return SourceScan(
         revision.hexdigest(), tuple(fingerprints), len(fingerprints), byte_count,
         chain.hexdigest(), identity, conversation, cwd, meta_timestamp, marker,
+        before_stat, canonical_path,
     )
 
 

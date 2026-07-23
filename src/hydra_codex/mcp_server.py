@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Mapping, Protocol, Sequence, TextIO
 
 from . import __version__
@@ -59,7 +62,7 @@ class SubprocessRunner:
         except OSError:
             pass
         finally:
-            stream.close()
+            self._close(stream)
 
     @staticmethod
     def _write(stream, content: bytes) -> None:
@@ -69,12 +72,66 @@ class SubprocessRunner:
         except (BrokenPipeError, OSError):
             pass
         finally:
+            SubprocessRunner._close(stream)
+
+    @staticmethod
+    def _close(stream) -> None:
+        try:
             stream.close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _force_close(stream) -> None:
+        if stream is None:
+            return
+        try:
+            descriptor = stream.fileno()
+        except (OSError, ValueError):
+            return
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _reap(process: subprocess.Popen[bytes]) -> None:
+        try:
+            process.wait()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _terminate(
+        process: subprocess.Popen[bytes],
+        *,
+        process_group: bool,
+    ) -> None:
+        if process_group:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                return
+            except (AttributeError, OSError):
+                pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _join_until(thread: threading.Thread, deadline: float) -> bool:
+        if thread.is_alive():
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return not thread.is_alive()
 
     def run(self, command: tuple[str, ...], stdin_text: str | None = None) -> ProcessResult:
+        deadline = time.monotonic() + self._timeout_seconds
         input_bytes = None if stdin_text is None else stdin_text.encode("utf-8")
         if input_bytes is not None and len(input_bytes) > _SUBPROCESS_INPUT_MAX_BYTES:
             return ProcessResult(1, "", "")
+        use_process_group = (
+            sys.platform == "darwin" or sys.platform.startswith("linux")
+        )
         try:
             process = subprocess.Popen(
                 command,
@@ -82,6 +139,8 @@ class SubprocessRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=False,
+                bufsize=0,
+                start_new_session=use_process_group,
             )
         except OSError:
             return ProcessResult(1, "", "")
@@ -104,20 +163,31 @@ class SubprocessRunner:
                 daemon=True,
             )
             writer.start()
+        workers = (() if writer is None else (writer,)) + readers
+        timed_out = False
         try:
-            returncode = process.wait(timeout=self._timeout_seconds)
+            returncode = process.wait(
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            if writer is not None:
-                writer.join()
-            for reader in readers:
-                reader.join()
+            timed_out = True
+            returncode = 1
+        if not timed_out:
+            timed_out = not all(
+                self._join_until(worker, deadline) for worker in workers
+            )
+        if timed_out:
+            self._terminate(process, process_group=use_process_group)
+            self._force_close(process.stdin)
+            self._force_close(process.stdout)
+            self._force_close(process.stderr)
+            if process.poll() is None:
+                threading.Thread(
+                    target=self._reap,
+                    args=(process,),
+                    daemon=True,
+                ).start()
             return ProcessResult(1, "", "")
-        if writer is not None:
-            writer.join()
-        for reader in readers:
-            reader.join()
         return ProcessResult(
             returncode,
             stdout.decode("utf-8", errors="ignore"),

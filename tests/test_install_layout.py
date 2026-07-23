@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from hydra_codex import __version__
 from hydra_codex.install_layout import (
+    CANONICAL_PLUGIN_FILES as SHARED_CANONICAL_PLUGIN_FILES,
     InvalidBundle,
     UnsupportedTarget,
     frozen_bundle_root,
@@ -18,6 +19,15 @@ from hydra_codex.install_layout import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_PLUGIN_FILES = (
+    Path(".codex-plugin/plugin.json"),
+    Path(".mcp.json"),
+    Path("README.md"),
+    Path("hooks/hooks.json"),
+    Path("skills/hydra-report/SKILL.md"),
+    Path("skills/hydra-report/agents/openai.yaml"),
+    Path("skills/hydra-report/references/report-schema.md"),
+)
 
 
 class InstallLayoutTests(unittest.TestCase):
@@ -97,6 +107,28 @@ class InstallLayoutTests(unittest.TestCase):
                             )
                     finally:
                         self.bundle = original
+
+    def test_validate_bundle_rejects_every_missing_canonical_plugin_asset(self) -> None:
+        self.assertEqual(SHARED_CANONICAL_PLUGIN_FILES, CANONICAL_PLUGIN_FILES)
+        for relative in CANONICAL_PLUGIN_FILES:
+            with self.subTest(relative=relative.as_posix()):
+                with tempfile.TemporaryDirectory() as temporary:
+                    candidate = Path(temporary) / "bundle"
+                    shutil.copytree(self.bundle, candidate)
+                    (
+                        candidate
+                        / "marketplace"
+                        / "plugins"
+                        / "hydra-codex"
+                        / relative
+                    ).unlink()
+
+                    with self.assertRaises(InvalidBundle):
+                        validate_bundle(
+                            candidate,
+                            expected_version=__version__,
+                            expected_target="darwin-arm64",
+                        )
 
     def test_platform_allowlist_maps_alias_and_rejects_unknown_architecture(self) -> None:
         self.assertEqual(platform_target("Darwin", "arm64"), "darwin-arm64")

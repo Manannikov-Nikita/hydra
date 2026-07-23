@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import argparse
 from importlib import metadata
-import json
 from pathlib import Path
 import platform
 import shutil
 import sys
-from typing import Iterator, Mapping, Sequence, TextIO
+from typing import Iterator, Sequence, TextIO
 
 from . import __version__
 from .install_layout import (
@@ -18,31 +17,24 @@ from .install_layout import (
     frozen_bundle_root,
     platform_target,
     validate_bundle,
+    validate_marketplace,
+    validate_plugin_bundle,
 )
 
 
 _DISTRIBUTION_NAME = "hydra-codex"
 _MANIFEST_SUFFIX = (".codex-plugin", "plugin.json")
 _MARKETPLACE_SUFFIX = (".agents", "plugins", "marketplace.json")
-_REQUIRED_FILES = (
-    Path(".codex-plugin/plugin.json"),
-    Path(".mcp.json"),
-    Path("README.md"),
-    Path("hooks/hooks.json"),
-    Path("skills/hydra-report/SKILL.md"),
-    Path("skills/hydra-report/agents/openai.yaml"),
-    Path("skills/hydra-report/references/report-schema.md"),
-)
-
-
 class PluginBundleUnavailable(FileNotFoundError):
     """Raised when the installed distribution has no complete plugin bundle."""
 
 
 def _is_complete_bundle(candidate: Path) -> bool:
-    return candidate.is_dir() and all(
-        (candidate / relative).is_file() for relative in _REQUIRED_FILES
-    )
+    try:
+        validate_plugin_bundle(candidate, expected_version=__version__)
+    except InvalidBundle:
+        return False
+    return True
 
 
 def _distribution_candidates() -> Iterator[Path]:
@@ -78,26 +70,11 @@ def _checkout_marketplace_candidate() -> Path:
 
 
 def _is_complete_marketplace(candidate: Path) -> bool:
-    manifest_path = candidate / ".agents" / "plugins" / "marketplace.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        validate_marketplace(candidate, expected_version=__version__)
+    except InvalidBundle:
         return False
-    if not isinstance(manifest, Mapping) or manifest.get("name") != "hydra":
-        return False
-    plugins = manifest.get("plugins")
-    if not isinstance(plugins, list) or len(plugins) != 1:
-        return False
-    record = plugins[0]
-    if not isinstance(record, Mapping) or record.get("name") != "hydra-codex":
-        return False
-    source = record.get("source")
-    if not isinstance(source, Mapping) or source != {
-        "source": "local",
-        "path": "./plugins/hydra-codex",
-    }:
-        return False
-    return _is_complete_bundle(candidate / "plugins" / "hydra-codex")
+    return True
 
 
 def _frozen_marketplace() -> Path | None:

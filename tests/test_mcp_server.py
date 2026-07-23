@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import io
 import json
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -89,6 +90,28 @@ class StdioMcpServerTests(unittest.TestCase):
             "import time; time.sleep(2)",
         ))
         self.assertEqual(timed_out, ProcessResult(1, "", ""))
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "process-group cleanup is required on macOS and Linux",
+    )
+    def test_subprocess_timeout_bounds_inherited_pipe_cleanup(self) -> None:
+        runner = SubprocessRunner(timeout_seconds=0.1)
+        command = (
+            sys.executable,
+            "-c",
+            "import subprocess, sys; "
+            "sys.stdout.write('private child output'); sys.stdout.flush(); "
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(2)'])",
+        )
+
+        started = time.monotonic()
+        result = runner.run(command)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(result, ProcessResult(1, "", ""))
 
     def test_initialize_and_tool_list_are_stable(self) -> None:
         server = StdioMcpServer(FakeRunner([]))

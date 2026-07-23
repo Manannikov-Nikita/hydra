@@ -19,11 +19,14 @@ SUPPORTED_TARGETS = (
 
 _MARKER_MAX_BYTES = 256
 _MANIFEST_MAX_BYTES = 64 * 1024
-_PLUGIN_REQUIRED_FILES = (
+CANONICAL_PLUGIN_FILES = (
     Path(".codex-plugin/plugin.json"),
     Path(".mcp.json"),
+    Path("README.md"),
     Path("hooks/hooks.json"),
     Path("skills/hydra-report/SKILL.md"),
+    Path("skills/hydra-report/agents/openai.yaml"),
+    Path("skills/hydra-report/references/report-schema.md"),
 )
 
 
@@ -120,7 +123,37 @@ def _read_manifest(path: Path) -> Mapping[str, object]:
     return value
 
 
-def _validate_marketplace(marketplace: Path, *, version: str) -> None:
+def validate_plugin_bundle(
+    plugin: Path,
+    *,
+    expected_version: str | None = None,
+) -> Path:
+    """Require the complete canonical plugin inventory and manifest identity."""
+    try:
+        mode = plugin.lstat().st_mode
+    except OSError as error:
+        raise InvalidBundle("bundle plugin is unavailable") from error
+    if not stat.S_ISDIR(mode) or not all(
+        _regular_file(plugin / relative) for relative in CANONICAL_PLUGIN_FILES
+    ):
+        raise InvalidBundle("bundle plugin is incomplete")
+    manifest = _read_manifest(plugin / ".codex-plugin" / "plugin.json")
+    if manifest.get("name") != "hydra-codex":
+        raise InvalidBundle("bundle plugin manifest is invalid")
+    if (
+        expected_version is not None
+        and manifest.get("version") != expected_version
+    ):
+        raise InvalidBundle("bundle plugin version does not match")
+    return plugin
+
+
+def validate_marketplace(
+    marketplace: Path,
+    *,
+    expected_version: str | None = None,
+) -> Path:
+    """Require the canonical marketplace manifest and complete plugin."""
     try:
         mode = marketplace.lstat().st_mode
     except OSError as error:
@@ -147,11 +180,8 @@ def _validate_marketplace(marketplace: Path, *, version: str) -> None:
         raise InvalidBundle("bundle marketplace is invalid")
 
     plugin = marketplace / "plugins" / "hydra-codex"
-    if not all(_regular_file(plugin / relative) for relative in _PLUGIN_REQUIRED_FILES):
-        raise InvalidBundle("bundle plugin is incomplete")
-    manifest = _read_manifest(plugin / ".codex-plugin" / "plugin.json")
-    if manifest.get("name") != "hydra-codex" or manifest.get("version") != version:
-        raise InvalidBundle("bundle plugin version does not match")
+    validate_plugin_bundle(plugin, expected_version=expected_version)
+    return marketplace
 
 
 def validate_bundle(
@@ -192,5 +222,5 @@ def validate_bundle(
         raise InvalidBundle("bundle executable is not executable")
 
     marketplace = candidate / "marketplace"
-    _validate_marketplace(marketplace, version=version)
+    validate_marketplace(marketplace, expected_version=version)
     return BundleLayout(candidate, version, target, executable, marketplace)

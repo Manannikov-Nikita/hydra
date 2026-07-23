@@ -1320,9 +1320,13 @@ gh repo create Manannikov-Nikita/hydra \
   --remote origin \
   --push
 gh repo view Manannikov-Nikita/hydra --json nameWithOwner,visibility,defaultBranchRef,url
+gh api --method PUT repos/Manannikov-Nikita/hydra/immutable-releases
+gh api repos/Manannikov-Nikita/hydra/immutable-releases
 ```
 
-Expected: visibility is `PUBLIC`, default branch is `main`, and the pushed SHA equals local `HEAD`.
+Expected: visibility is `PUBLIC`, default branch is `main`, the pushed SHA
+equals local `HEAD`, and GitHub reports release immutability enabled before any
+release is published.
 
 - [ ] **Step 4: Require terminal-green Quality on exact main**
 
@@ -1378,9 +1382,11 @@ hydra-codex dashboard
 
 Expected: no Python dependency, plugin active, only `.hydra/project.toml` added to the project, status valid, dashboard reachable on loopback, and a test Codex task appears after refresh.
 
-- [ ] **Step 7: Record the release receipt**
+- [ ] **Step 7: Record the post-publish canary receipt**
 
-Create a GitHub release note section containing:
+Create a dedicated GitHub issue titled `Release v0.1.0 canary receipt` and link
+the immutable release. Do not edit the published release or its assets after
+the repository immutability setting has locked them. The receipt contains:
 
 ```text
 exact source SHA
@@ -1397,4 +1403,7 @@ uninstall data-preservation result
 known limitations
 ```
 
-Expected: all supported targets have evidence before announcing the installer as generally available.
+Expected: all supported targets have evidence before announcing the installer
+as generally available. The issue links the exact immutable release and
+workflow runs; its history remains the post-publish operational record without
+weakening release immutability.

@@ -501,9 +501,26 @@ def main(
     output_stream = sys.stdout if stdout is None else stdout
     error_stream = sys.stderr if stderr is None else stderr
     environment = os.environ if environ is None else environ
+    effective_argv = tuple(sys.argv[1:] if argv is None else argv)
+    if (
+        len(effective_argv) == 2
+        and effective_argv[0] == "__installer-activate"
+        and environment.get("HYDRA_INTERNAL_INSTALLER_ACTIVATION") == "1"
+    ):
+        try:
+            from .installation_cli import activate_staged_runtime
+
+            activate_staged_runtime(
+                Path(effective_argv[1]),
+                environ=environment,
+            )
+        except Exception:
+            error_stream.write("hydra-codex: command failed\n")
+            return 1
+        return 0
     with redirect_stdout(output_stream), redirect_stderr(error_stream):
         try:
-            arguments = build_parser().parse_args(argv)
+            arguments = build_parser().parse_args(effective_argv)
         except SystemExit as exit_request:
             return int(exit_request.code or 0)
     try:

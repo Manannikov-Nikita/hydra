@@ -18,6 +18,7 @@ from .platform_paths import default_data_directory
 from .plugin_bundle import marketplace_root_path
 from .project_lifecycle import initialize_project, uninitialize_project
 from .release_management import (
+    activate_version,
     default_install_roots,
     uninstall as uninstall_release,
     upgrade as upgrade_release,
@@ -27,6 +28,24 @@ from .status import collect_status
 
 class ConfirmationRequired(RuntimeError):
     """Raised when a mutating installation command lacks operator approval."""
+
+
+def activate_staged_runtime(
+    candidate: Path,
+    *,
+    environ: Mapping[str, str],
+    executable: Path | None = None,
+) -> Path:
+    """Activate only the bundle containing the currently running frozen CLI."""
+    from .install_layout import frozen_bundle_root, validate_bundle
+
+    runtime_root = frozen_bundle_root(executable)
+    selected = Path(candidate).absolute()
+    if runtime_root is None or runtime_root.absolute() != selected:
+        raise ValueError("staged activation identity is invalid")
+    layout = validate_bundle(selected)
+    roots = default_install_roots(_home(environ))
+    return activate_version(layout, roots=roots, environ=environ)
 
 
 def _write_json(stdout: TextIO, value: Mapping[str, object]) -> None:

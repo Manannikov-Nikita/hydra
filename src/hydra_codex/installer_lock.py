@@ -49,6 +49,7 @@ def _file_flags(read_write: bool = False) -> int:
     access = os.O_RDWR if read_write else os.O_RDONLY
     return (
         access
+        | os.O_NONBLOCK
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )

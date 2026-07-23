@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,6 +30,81 @@ class InstallerLockTests(unittest.TestCase):
     def publish_lock(self, content: bytes = LOCK_RECORD, mode: int = 0o600) -> None:
         self.lock.write_bytes(content)
         self.lock.chmod(mode)
+
+    def run_lock_subprocess(
+        self,
+        source: str,
+        *arguments: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        source_root = str(Path(__file__).resolve().parents[1] / "src")
+        existing = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            source_root if not existing else os.pathsep.join((source_root, existing))
+        )
+        return subprocess.run(
+            [sys.executable, "-c", source, *(str(argument) for argument in arguments)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env=environment,
+        )
+
+    def test_canonical_fifo_fails_closed_without_blocking(self) -> None:
+        os.mkfifo(self.lock, mode=0o600)
+
+        result = self.run_lock_subprocess(
+            """
+import sys
+from pathlib import Path
+from hydra_codex.installer_lock import InstallerLockError, acquire_installer_lock
+try:
+    acquire_installer_lock(Path(sys.argv[1]), nonce="a" * 64)
+except InstallerLockError:
+    print("rejected")
+else:
+    raise SystemExit("FIFO lock was accepted")
+""",
+            self.lock,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "rejected")
+        self.assertTrue(self.lock.is_fifo())
+
+    def test_replaced_capability_fifo_cleanup_fails_closed_without_blocking(
+        self,
+    ) -> None:
+        result = self.run_lock_subprocess(
+            """
+import os
+import sys
+from pathlib import Path
+from hydra_codex.installer_lock import (
+    InstallerLockError,
+    acquire_installer_lock,
+    release_installer_lock,
+)
+lock = Path(sys.argv[1])
+held = acquire_installer_lock(lock, nonce="a" * 64)
+held.capability_path.unlink()
+os.mkfifo(held.capability_path, mode=0o600)
+try:
+    release_installer_lock(held)
+except InstallerLockError:
+    print("rejected")
+else:
+    raise SystemExit("FIFO capability replacement was accepted")
+""",
+            self.lock,
+        )
+
+        capability = self.home / (".hydra-installer-capability." + "a" * 64)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "rejected")
+        self.assertTrue(capability.is_fifo())
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
 
     def test_crash_before_owner_receipt_leaves_reusable_canonical_lock(self) -> None:
         # The immutable canonical file is the complete atomic publication. A

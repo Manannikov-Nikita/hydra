@@ -26,6 +26,9 @@ test = [
     "build>=1.2",
     "setuptools>=68",
 ]
+release = [
+    "pyinstaller==6.21.0",
+]
 
 [project.scripts]
 hydra-codex = "hydra_codex.__main__:main"

@@ -17,6 +17,7 @@ REQUIRED_FILES = {
     "VERSION": (b"0.1.0\n", 0o644),
     "TARGET": (TARGET.encode() + b"\n", 0o644),
     "LICENSE": (b"MIT\n", 0o644),
+    "install.sh": (b"#!/bin/sh\n", 0o755),
     "bin/hydra-codex": (b"#!/bin/sh\n", 0o755),
     "marketplace/.agents/plugins/marketplace.json": (b"{}\n", 0o644),
     "marketplace/plugins/hydra-codex/.codex-plugin/plugin.json": (

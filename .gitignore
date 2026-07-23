@@ -4,6 +4,7 @@ __pycache__/
 .worktrees/
 build/
 dist/
+release/
 *.egg-info/
 .superpowers/
 *.sqlite3

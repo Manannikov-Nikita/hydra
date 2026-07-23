@@ -23,6 +23,7 @@ _REQUIRED_FILES = frozenset(
         "VERSION",
         "TARGET",
         "LICENSE",
+        "install.sh",
         "bin/hydra-codex",
         "marketplace/.agents/plugins/marketplace.json",
         "marketplace/plugins/hydra-codex/.codex-plugin/plugin.json",

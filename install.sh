@@ -268,7 +268,7 @@ validate_bundle_directory()
         path_exists "$entry" || continue
         name=${entry##*/}
         case "$name" in
-            VERSION|TARGET|LICENSE|bin|runtime|marketplace) ;;
+            VERSION|TARGET|LICENSE|install.sh|bin|runtime|marketplace) ;;
             *) fail "release bundle inventory is invalid" ;;
         esac
     done
@@ -296,6 +296,7 @@ validate_bundle_directory()
     fi
 
     require_regular "$bundle/LICENSE"
+    require_regular "$bundle/install.sh"
     [ -d "$bundle/bin" ] && [ ! -L "$bundle/bin" ] ||
         fail "release bundle inventory is invalid"
     require_regular "$bundle/bin/hydra-codex"

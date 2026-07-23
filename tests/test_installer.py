@@ -87,6 +87,12 @@ def make_archive(
         )
         add_file(
             bundle,
+            f"{top}/install.sh",
+            b"#!/bin/sh\n",
+            modes.get("install.sh", 0o755),
+        )
+        add_file(
+            bundle,
             f"{top}/bin/hydra-codex",
             executable,
             modes.get("bin/hydra-codex", 0o755),
@@ -698,6 +704,7 @@ class InstallerTests(unittest.TestCase):
             "VERSION",
             "TARGET",
             "LICENSE",
+            "install.sh",
             "marketplace/.agents/plugins/marketplace.json",
             "marketplace/plugins/hydra-codex/.codex-plugin/plugin.json",
         )

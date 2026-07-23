@@ -1,7 +1,15 @@
 # Install Hydra
 
-The public standalone installer supports macOS on Apple Silicon and Intel, and
-Linux on x86-64. The installed runtime is per-user and does not require Python.
+The first public standalone release is tested and supported on:
+
+- macOS 15 on Apple Silicon;
+- macOS 15 on Intel;
+- Ubuntu 24.04 on x86-64 with glibc 2.39.
+
+These are runtime compatibility baselines, not architecture-only promises.
+Other macOS and Linux versions remain unsupported until their released archive
+passes a clean-system runtime canary. The installed runtime is per-user and
+does not require Python.
 
 ## Public installation
 

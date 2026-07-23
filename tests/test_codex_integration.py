@@ -26,6 +26,36 @@ from hydra_codex.codex_integration import (
     _write_receipt_bytes,
 )
 
+CODEX_0_136_FIXTURES = (
+    Path(__file__).resolve().parent / "fixtures" / "codex_cli_0_136"
+)
+
+
+def _fixture(name: str) -> bytes:
+    return (CODEX_0_136_FIXTURES / name).read_bytes()
+
+
+def _plugin_listing(
+    *,
+    selector: str = "hydra-codex@hydra",
+    status: str = "installed, enabled",
+    version: str = "0.1.0",
+    path: str = "/opt/hydra/marketplace/plugins/hydra-codex",
+) -> bytes:
+    plugin_width = max(len("PLUGIN"), len(selector)) + 2
+    status_width = max(len("STATUS"), len(status)) + 2
+    version_width = max(len("VERSION"), len(version)) + 2
+    return (
+        "Marketplace `hydra`\n"
+        "/opt/hydra/marketplace/.agents/plugins/marketplace.json\n\n"
+        f"{'PLUGIN':<{plugin_width}}"
+        f"{'STATUS':<{status_width}}"
+        f"{'VERSION':<{version_width}}PATH\n"
+        f"{selector:<{plugin_width}}"
+        f"{status:<{status_width}}"
+        f"{version:<{version_width}}{path}\n"
+    ).encode()
+
 
 class SimulatedCrash(BaseException):
     """Model process termination after a Codex mutation took effect."""
@@ -39,6 +69,7 @@ class StatefulCodexClient:
         self.marketplaces: dict[str, Path] = {}
         self.available_versions: dict[Path, str] = {}
         self.installed_version: str | None = None
+        self.hide_available_version = False
         self.version_supported = True
         self.marketplace_listing_supported = True
         self.plugin_listing_supported = True
@@ -103,7 +134,11 @@ class StatefulCodexClient:
                 "hydra-codex",
                 marketplace,
                 self.installed_version is not None,
-                version,
+                (
+                    None
+                    if self.installed_version is None and self.hide_available_version
+                    else version
+                ),
             ),
         )
 
@@ -195,6 +230,36 @@ class CodexIntegrationTests(unittest.TestCase):
         self.assertFalse(report.changed)
         self.assertEqual(self.client.calls, [])
 
+    def test_versionless_available_plugin_is_verified_after_install(self) -> None:
+        self.client.hide_available_version = True
+
+        report = self.install_once()
+
+        self.assertTrue(report.changed)
+        self.assertEqual(
+            self.client.calls,
+            [
+                ("add_marketplace", self.marketplace.resolve()),
+                ("add_plugin", "hydra-codex@hydra"),
+            ],
+        )
+        self.assertEqual(self.client.installed_version, "0.1.0")
+
+    def test_versionless_available_plugin_mismatch_is_rolled_back(self) -> None:
+        self.client.hide_available_version = True
+        self.client.available_versions[self.marketplace.resolve()] = "9.9.9"
+
+        with self.assertRaises(IntegrationError):
+            self.install_once()
+
+        self.assertIn(
+            ("add_plugin", "hydra-codex@hydra"),
+            self.client.calls,
+        )
+        self.assertNotIn("hydra", self.client.marketplaces)
+        self.assertIsNone(self.client.installed_version)
+        self.assertFalse(self.receipt.exists())
+
     def test_exact_repeat_with_refresh_is_also_a_noop(self) -> None:
         self.install_once()
         self.client.calls.clear()
@@ -265,6 +330,28 @@ class CodexIntegrationTests(unittest.TestCase):
         original = self.install_once()
         original_receipt = self.receipt.read_bytes()
         second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.fail_on = ("add_plugin", "hydra-codex@hydra")
+
+        with self.assertRaises(IntegrationError):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+
+        self.assertEqual(self.receipt.read_bytes(), original_receipt)
+        self.assertEqual(self.client.marketplaces["hydra"], self.marketplace.resolve())
+        self.assertEqual(self.client.installed_version, original.runtime_version)
+
+    def test_versionless_listing_refresh_failure_restores_previous_plugin(
+        self,
+    ) -> None:
+        self.client.hide_available_version = True
+        original = self.install_once()
+        original_receipt = self.receipt.read_bytes()
+        second = self.root / "marketplace-v2-versionless"
         second.mkdir()
         self.client.available_versions[second.resolve()] = "0.2.0"
         self.client.fail_on = ("add_plugin", "hydra-codex@hydra")
@@ -907,17 +994,20 @@ class CodexIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(self.receipt.exists())
 
-    def test_rendered_config_uses_supported_commands_and_never_config_toml(self) -> None:
+    def test_rendered_config_uses_codex_0_136_commands_and_never_config_toml(
+        self,
+    ) -> None:
         rendered = render_codex_config(
             marketplace_root=self.marketplace,
             runtime_version="0.1.0",
         )
 
         self.assertIn(
-            f"codex plugin marketplace add {self.marketplace.resolve()} --json",
+            f"codex plugin marketplace add {self.marketplace.resolve()}",
             rendered,
         )
-        self.assertIn("codex plugin add hydra-codex@hydra --json", rendered)
+        self.assertIn("codex plugin add hydra-codex@hydra", rendered)
+        self.assertNotIn("--json", rendered)
         self.assertIn("0.1.0", rendered)
         self.assertNotIn("config.toml", rendered)
 
@@ -943,22 +1033,11 @@ class CodexCommandClientTests(unittest.TestCase):
                 max_output_bytes=1024,
             )
 
-    def test_supported_commands_and_strict_json_shapes(self) -> None:
+    def test_supported_codex_0_136_text_commands_and_shapes(self) -> None:
         completed = [
-            (0, b"codex-cli 1.2\n", b""),
-            (
-                0,
-                b'[{"name":"hydra","source":"/marketplace"}]\n',
-                b"",
-            ),
-            (
-                0,
-                (
-                    b'[{"name":"hydra-codex","marketplace":"hydra",'
-                    b'"installed":true,"version":"0.1.0"}]\n'
-                ),
-                b"",
-            ),
+            (0, b"codex-cli 0.136.0\n", b""),
+            (0, _fixture("marketplace-list.txt"), b""),
+            (0, _fixture("plugin-list-installed.txt"), b""),
         ]
         with (
             mock.patch("hydra_codex.codex_integration.shutil.which", return_value="/bin/codex"),
@@ -968,10 +1047,10 @@ class CodexCommandClientTests(unittest.TestCase):
             ) as run,
         ):
             client = CodexCommandClient(environ={"HOME": "/private/home", "PATH": "/unsafe"})
-            self.assertEqual(client.version(), "codex-cli 1.2")
+            self.assertEqual(client.version(), "codex-cli 0.136.0")
             self.assertEqual(
                 client.list_marketplaces(),
-                (MarketplaceRecord("hydra", Path("/marketplace")),),
+                (MarketplaceRecord("hydra", Path("/opt/hydra/marketplace")),),
             )
             self.assertEqual(
                 client.list_plugins("hydra", include_available=True),
@@ -982,10 +1061,10 @@ class CodexCommandClientTests(unittest.TestCase):
             [call.args[0] for call in run.call_args_list],
             [
                 ["/bin/codex", "--version"],
-                ["/bin/codex", "plugin", "marketplace", "list", "--json"],
+                ["/bin/codex", "plugin", "marketplace", "list"],
                 [
                     "/bin/codex", "plugin", "list",
-                    "--marketplace", "hydra", "--available", "--json",
+                    "--marketplace", "hydra",
                 ],
             ],
         )
@@ -993,6 +1072,221 @@ class CodexCommandClientTests(unittest.TestCase):
             self.assertNotEqual(call.kwargs["environ"]["PATH"], "/unsafe")
             self.assertEqual(call.kwargs["timeout"], 10.0)
             self.assertEqual(call.kwargs["max_output_bytes"], 1024 * 1024)
+
+    def test_codex_0_136_empty_list_messages_are_strictly_supported(self) -> None:
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                side_effect=[
+                    (0, _fixture("marketplace-empty.txt"), b""),
+                    (0, _fixture("plugin-empty.txt"), b""),
+                ],
+            ),
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            self.assertEqual(client.list_marketplaces(), ())
+            self.assertEqual(
+                client.list_plugins("hydra", include_available=True),
+                (),
+            )
+
+    def test_available_plugin_fixture_can_be_filtered_to_installed_only(self) -> None:
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                return_value=(0, _fixture("plugin-list-available.txt"), b""),
+            ),
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            self.assertEqual(
+                client.list_plugins("hydra", include_available=True),
+                (PluginRecord("hydra-codex", "hydra", False, None),),
+            )
+            self.assertEqual(
+                client.list_plugins("hydra", include_available=False),
+                (),
+            )
+
+    def test_plugin_table_accepts_codex_0_136_header_padding(self) -> None:
+        payload = _fixture("plugin-list-installed.txt").replace(
+            b"VERSION  PATH\n",
+            b"VERSION  PATH                                      \n",
+        ).replace(
+            b"/opt/hydra/marketplace/plugins/hydra-codex\n",
+            b"/opt/hydra/marketplace/plugins/hydra-codex        \n",
+        )
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                return_value=(0, payload, b""),
+            ),
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            self.assertEqual(
+                client.list_plugins("hydra", include_available=True),
+                (PluginRecord("hydra-codex", "hydra", True, "0.1.0"),),
+            )
+
+    def test_codex_0_136_mutation_commands_use_exact_argv_and_text_contract(
+        self,
+    ) -> None:
+        source = Path("/opt/hydra/marketplace")
+        completed = [
+            (
+                0,
+                (
+                    b"Added marketplace `hydra` from /opt/hydra/marketplace.\n"
+                    b"Installed marketplace root: /opt/hydra/marketplace\n"
+                ),
+                b"",
+            ),
+            (
+                0,
+                (
+                    b"Added plugin `hydra-codex` from marketplace `hydra`.\n"
+                    b"Installed plugin root: /private/tmp/codex/plugins/cache/"
+                    b"hydra/hydra-codex/0.1.0\n"
+                ),
+                b"",
+            ),
+            (
+                0,
+                b"Removed plugin `hydra-codex` from marketplace `hydra`.\n",
+                b"",
+            ),
+            (0, b"Removed marketplace `hydra`.\n", b""),
+        ]
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                side_effect=completed,
+            ) as run,
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            client.add_marketplace(source)
+            client.add_plugin("hydra-codex@hydra")
+            client.remove_plugin("hydra-codex@hydra")
+            client.remove_marketplace("hydra")
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["/bin/codex", "plugin", "marketplace", "add", str(source)],
+                ["/bin/codex", "plugin", "add", "hydra-codex@hydra"],
+                ["/bin/codex", "plugin", "remove", "hydra-codex@hydra"],
+                ["/bin/codex", "plugin", "marketplace", "remove", "hydra"],
+            ],
+        )
+
+    def test_ambiguous_text_listings_fail_closed_without_disclosure(self) -> None:
+        private = "/private/home/secret-output"
+        cases = (
+            (
+                b"MARKETPLACE  ROOT\n"
+                b"hydra        /opt/hydra/marketplace\n"
+                b"hydra        /private/home/secret-output\n"
+            ),
+            b"MARKETPLACE ROOT\nhydra relative\n",
+        )
+        for payload in cases:
+            with (
+                self.subTest(payload=payload[:24]),
+                mock.patch(
+                    "hydra_codex.codex_integration.shutil.which",
+                    return_value="/bin/codex",
+                ),
+                mock.patch(
+                    "hydra_codex.codex_integration._run_bounded",
+                    return_value=(0, payload, b""),
+                ),
+            ):
+                client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+                with self.assertRaises(IncompatibleCodexError) as raised:
+                    client.list_marketplaces()
+                self.assertNotIn(private, str(raised.exception))
+
+        duplicate = _plugin_listing() + _plugin_listing().split(b"\n", 4)[4]
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                return_value=(0, duplicate, b""),
+            ),
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            with self.assertRaises(IncompatibleCodexError):
+                client.list_plugins("hydra", include_available=True)
+
+    def test_malformed_mutation_output_fails_closed(self) -> None:
+        private = "/private/home/secret-output"
+        cases = (
+            b"",
+            b"Added plugin `hydra-codex` from marketplace `hydra`.\n",
+            (
+                b"Added plugin `hydra-codex` from marketplace `hydra`.\n"
+                + f"Installed plugin root: {private}\nextra\n".encode()
+            ),
+        )
+        for payload in cases:
+            with (
+                self.subTest(payload=payload[:24]),
+                mock.patch(
+                    "hydra_codex.codex_integration.shutil.which",
+                    return_value="/bin/codex",
+                ),
+                mock.patch(
+                    "hydra_codex.codex_integration._run_bounded",
+                    return_value=(0, payload, b""),
+                ),
+            ):
+                client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+                with self.assertRaises(IncompatibleCodexError) as raised:
+                    client.add_plugin("hydra-codex@hydra")
+                self.assertNotIn(private, str(raised.exception))
+
+    def test_foreign_or_ambiguous_mutation_targets_fail_before_subprocess(
+        self,
+    ) -> None:
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+            ) as run,
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            operations = (
+                lambda: client.add_plugin("foreign@hydra"),
+                lambda: client.remove_plugin("foreign@hydra"),
+                lambda: client.remove_marketplace("foreign"),
+                lambda: client.add_marketplace(Path("/opt/hydra\nforeign")),
+            )
+            for operation in operations:
+                with self.assertRaises(IncompatibleCodexError):
+                    operation()
+
+        run.assert_not_called()
 
     def test_explicit_codex_home_is_forwarded_without_normalization(self) -> None:
         supplied = "/private/profile/../codex-profile"
@@ -1056,12 +1350,7 @@ class CodexCommandClientTests(unittest.TestCase):
             "0.104.0-alpha.1",
         )
         for version in versions:
-            payload = json.dumps([{
-                "name": "hydra-codex",
-                "marketplace": "hydra",
-                "installed": True,
-                "version": version,
-            }]).encode()
+            payload = _plugin_listing(version=version)
             with (
                 self.subTest(version=version),
                 mock.patch(
@@ -1086,12 +1375,7 @@ class CodexCommandClientTests(unittest.TestCase):
             "v" * 129,
         )
         for version in versions:
-            payload = json.dumps([{
-                "name": "hydra-codex",
-                "marketplace": "hydra",
-                "installed": True,
-                "version": version,
-            }]).encode()
+            payload = _plugin_listing(version=version)
             with (
                 self.subTest(kind=len(version)),
                 mock.patch(
@@ -1113,12 +1397,8 @@ class CodexCommandClientTests(unittest.TestCase):
         cases = (
             (1, b"", private.encode()),
             (0, private.encode(), b""),
-            (0, b'[{"name":"hydra"}]', b""),
-            (
-                0,
-                b'[{"name":"hydra","source":"relative"}]',
-                b"",
-            ),
+            (0, b"MARKETPLACE  ROOT\nhydra\n", b""),
+            (0, b"MARKETPLACE  ROOT\nhydra        relative\n", b""),
         )
         for completed in cases:
             with (

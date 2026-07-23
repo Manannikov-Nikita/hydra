@@ -1204,13 +1204,17 @@ Release workflow:
 
 ```text
 1. Trigger only on v* tag pushes.
-2. Verify clean exact tag and tag == "v" + hydra_codex.__version__.
-3. Rerun source suite.
-4. Build and accept one native target per matrix job.
-5. Aggregate exactly three expected archives and reject extra files.
-6. Generate sorted SHA256SUMS.
-7. Attest archives through subject-checksums and attest SHA256SUMS.
-8. Use the authenticated GitHub CLI to create a draft release, attach all assets without overwrite, then publish it; do not add a third-party release action.
+2. Serialize every tag workflow through one non-cancelling repository-wide
+   concurrency group before checking or updating the latest stable release.
+3. Verify clean exact tag and tag == "v" + hydra_codex.__version__.
+4. Install the complete release toolchain only from reviewed, exact,
+   binary-only SHA-256 locked wheels.
+5. Rerun source suite without build isolation.
+6. Build and accept one native target per matrix job.
+7. Aggregate exactly three expected archives and reject extra files.
+8. Generate sorted SHA256SUMS.
+9. Attest archives through subject-checksums and attest SHA256SUMS.
+10. Use the authenticated GitHub CLI to create a draft release, attach all assets without overwrite, then publish it; do not add a third-party release action.
 ```
 
 Use the current GitHub runner and attestation contracts:
@@ -1243,7 +1247,14 @@ gh attestation verify \
   --repo Manannikov-Nikita/hydra
 ```
 
-Privacy documentation states exactly what persists, what never persists by default, platform database paths, and that uninstall preserves telemetry. Troubleshooting covers PATH, unsupported platform, Codex missing/incompatible, integration ownership conflict, checksum failure, read-only status, and dashboard port conflicts.
+Privacy documentation states exactly what persists, what never persists by
+default, platform database paths, and that uninstall preserves telemetry.
+Public compatibility is limited to the tested runner baselines: macOS 15 on
+each native architecture and Ubuntu 24.04 x86-64 with glibc 2.39. User
+checksum instructions must filter exactly one selected archive row when only
+one archive is downloaded. Troubleshooting covers PATH, unsupported platform,
+Codex missing/incompatible, integration ownership conflict, checksum failure,
+read-only status, and dashboard port conflicts.
 
 - [ ] **Step 5: Run source, workflow, docs, and build gates**
 

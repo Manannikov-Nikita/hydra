@@ -1,0 +1,2 @@
+MARKETPLACE  ROOT
+hydra        /opt/hydra/marketplace

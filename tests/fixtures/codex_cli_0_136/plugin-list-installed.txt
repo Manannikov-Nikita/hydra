@@ -1,0 +1,5 @@
+Marketplace `hydra`
+/opt/hydra/marketplace/.agents/plugins/marketplace.json
+
+PLUGIN             STATUS              VERSION  PATH
+hydra-codex@hydra  installed, enabled  0.1.0    /opt/hydra/marketplace/plugins/hydra-codex

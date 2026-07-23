@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import shlex
 import shutil
@@ -37,6 +38,8 @@ _SAFE_PATH_PARTS = (
     "/usr/sbin",
     "/sbin",
 )
+_CLI_NAME_PUNCTUATION = frozenset("-_.")
+_MARKETPLACE_EMPTY = "No plugin marketplaces in scope."
 
 
 class IntegrationError(RuntimeError):
@@ -192,6 +195,162 @@ def _run_bounded(
         process.stderr.close()
 
 
+def _safe_cli_name(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value.isascii()
+        and value[0].isalnum()
+        and all(
+            character.isalnum() or character in _CLI_NAME_PUNCTUATION
+            for character in value
+        )
+    )
+
+
+def _safe_absolute_cli_path(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+        and Path(value).is_absolute()
+        and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+    )
+
+
+def _strict_output_lines(raw: str) -> list[str]:
+    if not raw.endswith("\n") or "\r" in raw or "\0" in raw:
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    return raw[:-1].split("\n")
+
+
+def _padded_table_value(field: str, *, allow_empty: bool = False) -> str:
+    value = field.rstrip(" ")
+    if (
+        field != value + (" " * (len(field) - len(value)))
+        or len(field) - len(value) < 2
+        or (not allow_empty and not value)
+        or value.startswith(" ")
+    ):
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    return value
+
+
+def _parse_marketplace_listing(raw: str) -> tuple[MarketplaceRecord, ...]:
+    lines = _strict_output_lines(raw)
+    if lines == [_MARKETPLACE_EMPTY]:
+        return ()
+    if len(lines) < 2:
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    header = re.fullmatch(r"MARKETPLACE(?P<gap> {2,})ROOT", lines[0])
+    if header is None:
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    root_start = header.start() + lines[0].index("ROOT")
+    records: list[MarketplaceRecord] = []
+    seen: set[str] = set()
+    for line in lines[1:]:
+        if len(line) <= root_start:
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        name = _padded_table_value(line[:root_start])
+        source_value = line[root_start:]
+        if (
+            not _safe_cli_name(name)
+            or name in seen
+            or not _safe_absolute_cli_path(source_value)
+        ):
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        seen.add(name)
+        records.append(
+            MarketplaceRecord(
+                name,
+                Path(source_value).expanduser().resolve(),
+            ),
+        )
+    return tuple(records)
+
+
+def _parse_plugin_listing(
+    raw: str,
+    *,
+    marketplace: str,
+    include_available: bool,
+) -> tuple[PluginRecord, ...]:
+    if not _safe_cli_name(marketplace):
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    lines = _strict_output_lines(raw)
+    if lines == [f"No plugins found in marketplace `{marketplace}`."]:
+        return ()
+    if (
+        len(lines) < 5
+        or lines[0] != f"Marketplace `{marketplace}`"
+        or lines[2] != ""
+        or not _safe_absolute_cli_path(lines[1])
+    ):
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    header_line = lines[3].rstrip(" ")
+    header = re.fullmatch(
+        r"PLUGIN(?P<plugin_gap> {2,})"
+        r"STATUS(?P<status_gap> {2,})"
+        r"VERSION(?P<version_gap> {2,})PATH",
+        header_line,
+    )
+    if header is None:
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    status_start = header_line.index("STATUS")
+    version_start = header_line.index("VERSION")
+    path_start = header_line.index("PATH")
+    records: list[PluginRecord] = []
+    seen: set[str] = set()
+    for line in lines[4:]:
+        if len(line) <= path_start:
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        selector = _padded_table_value(line[:status_start])
+        status_value = _padded_table_value(line[status_start:version_start])
+        version_value = _padded_table_value(
+            line[version_start:path_start],
+            allow_empty=True,
+        )
+        plugin_path_field = line[path_start:]
+        plugin_path = plugin_path_field.rstrip(" ")
+        if (
+            selector.count("@") != 1
+            or selector in seen
+            or not plugin_path
+            or plugin_path.startswith(" ")
+            or not _safe_absolute_cli_path(plugin_path)
+        ):
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        name, listed_marketplace = selector.rsplit("@", 1)
+        if (
+            not _safe_cli_name(name)
+            or listed_marketplace != marketplace
+        ):
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        if status_value == "not installed":
+            installed = False
+            version = None
+            if version_value:
+                raise IncompatibleCodexError("Codex integration is unavailable")
+        elif status_value in {"installed, enabled", "installed, disabled"}:
+            installed = True
+            version = version_value
+            if not _is_safe_version_token(version):
+                raise IncompatibleCodexError("Codex integration is unavailable")
+        else:
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        seen.add(selector)
+        if include_available or installed:
+            records.append(
+                PluginRecord(name, marketplace, installed, version),
+            )
+    return tuple(records)
+
+
+def _expect_exact_output(raw: str, expected: str) -> None:
+    if raw != expected:
+        raise IncompatibleCodexError("Codex integration is unavailable")
+
+
 class CodexCommandClient:
     """Bounded subprocess adapter for the supported ``codex plugin`` surface."""
 
@@ -260,19 +419,6 @@ class CodexCommandClient:
             )
         return rendered
 
-    def _json(self, arguments: list[str]) -> object:
-        raw = self._run(arguments)
-        try:
-            return json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            raise IncompatibleCodexError(
-                "Codex integration is unavailable",
-            ) from None
-
-    def _mutation(self, arguments: list[str]) -> None:
-        if not isinstance(self._json(arguments), Mapping):
-            raise IncompatibleCodexError("Codex integration is unavailable")
-
     def version(self) -> str:
         value = self._run(["--version"]).strip()
         if (
@@ -286,37 +432,28 @@ class CodexCommandClient:
         return value
 
     def list_marketplaces(self) -> tuple[MarketplaceRecord, ...]:
-        payload = self._json(["plugin", "marketplace", "list", "--json"])
-        if not isinstance(payload, list):
-            raise IncompatibleCodexError("Codex integration is unavailable")
-        records: list[MarketplaceRecord] = []
-        for item in payload:
-            if (
-                not isinstance(item, Mapping)
-                or not isinstance(item.get("name"), str)
-                or not item["name"]
-                or not isinstance(item.get("source"), str)
-                or not item["source"]
-                or not Path(item["source"]).is_absolute()
-            ):
-                raise IncompatibleCodexError("Codex integration is unavailable")
-            records.append(
-                MarketplaceRecord(
-                    item["name"],
-                    Path(item["source"]).expanduser().resolve(),
-                ),
-            )
-        return tuple(records)
+        return _parse_marketplace_listing(
+            self._run(["plugin", "marketplace", "list"]),
+        )
 
     def add_marketplace(self, root: Path) -> None:
-        self._mutation([
-            "plugin", "marketplace", "add", str(root), "--json",
+        source = Path(root).expanduser().resolve()
+        if not _safe_absolute_cli_path(str(source)):
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        raw = self._run([
+            "plugin", "marketplace", "add", str(source),
         ])
+        _expect_exact_output(
+            raw,
+            f"Added marketplace `{MARKETPLACE_NAME}` from {source}.\n"
+            f"Installed marketplace root: {source}\n",
+        )
 
     def remove_marketplace(self, name: str) -> None:
-        self._mutation([
-            "plugin", "marketplace", "remove", name, "--json",
-        ])
+        if name != MARKETPLACE_NAME:
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        raw = self._run(["plugin", "marketplace", "remove", name])
+        _expect_exact_output(raw, f"Removed marketplace `{name}`.\n")
 
     def list_plugins(
         self,
@@ -324,41 +461,44 @@ class CodexCommandClient:
         *,
         include_available: bool,
     ) -> tuple[PluginRecord, ...]:
-        arguments = ["plugin", "list", "--marketplace", marketplace]
-        if include_available:
-            arguments.append("--available")
-        arguments.append("--json")
-        payload = self._json(arguments)
-        if not isinstance(payload, list):
-            raise IncompatibleCodexError("Codex integration is unavailable")
-        records: list[PluginRecord] = []
-        for item in payload:
-            version = item.get("version") if isinstance(item, Mapping) else object()
-            if (
-                not isinstance(item, Mapping)
-                or not isinstance(item.get("name"), str)
-                or not item["name"]
-                or not isinstance(item.get("marketplace"), str)
-                or not item["marketplace"]
-                or not isinstance(item.get("installed"), bool)
-                or not (version is None or _is_safe_version_token(version))
-            ):
-                raise IncompatibleCodexError("Codex integration is unavailable")
-            records.append(
-                PluginRecord(
-                    item["name"],
-                    item["marketplace"],
-                    item["installed"],
-                    version,
-                ),
-            )
-        return tuple(records)
+        return _parse_plugin_listing(
+            self._run([
+                "plugin", "list", "--marketplace", marketplace,
+            ]),
+            marketplace=marketplace,
+            include_available=include_available,
+        )
 
     def add_plugin(self, selector: str) -> None:
-        self._mutation(["plugin", "add", selector, "--json"])
+        if selector != PLUGIN_SELECTOR:
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        raw = self._run(["plugin", "add", selector])
+        lines = _strict_output_lines(raw)
+        expected = (
+            f"Added plugin `{PLUGIN_NAME}` from marketplace "
+            f"`{MARKETPLACE_NAME}`."
+        )
+        if (
+            len(lines) != 2
+            or lines[0] != expected
+            or not lines[1].startswith("Installed plugin root: ")
+            or lines[1] == "Installed plugin root: "
+            or lines[1] != lines[1].strip()
+            or not _safe_absolute_cli_path(
+                lines[1].removeprefix("Installed plugin root: "),
+            )
+        ):
+            raise IncompatibleCodexError("Codex integration is unavailable")
 
     def remove_plugin(self, selector: str) -> None:
-        self._mutation(["plugin", "remove", selector, "--json"])
+        if selector != PLUGIN_SELECTOR:
+            raise IncompatibleCodexError("Codex integration is unavailable")
+        raw = self._run(["plugin", "remove", selector])
+        _expect_exact_output(
+            raw,
+            f"Removed plugin `{PLUGIN_NAME}` from marketplace "
+            f"`{MARKETPLACE_NAME}`.\n",
+        )
 
 
 def _one_marketplace(
@@ -915,9 +1055,18 @@ def _state_is_known(
     if (
         state.marketplace is None
         or state.plugin is None
-        or state.plugin.installed
     ):
         return False
+    if state.plugin.installed:
+        return bool(
+            journal.operation == "configure"
+            and state.marketplace == journal.desired.marketplace
+            and journal.desired.plugin is not None
+            and journal.desired.plugin.installed
+            and state.plugin.name == PLUGIN_NAME
+            and state.plugin.marketplace == MARKETPLACE_NAME
+            and _is_safe_version_token(state.plugin.version)
+        )
     return state.marketplace.source in {
         snapshot.marketplace.source
         for snapshot in (journal.prior, journal.desired)
@@ -970,7 +1119,13 @@ def _restore_state(
         and target.plugin.installed
         and not bool(current.plugin is not None and current.plugin.installed)
     ):
-        if current.plugin is None or current.plugin.version != target.plugin.version:
+        if (
+            current.plugin is None
+            or (
+                current.plugin.version is not None
+                and current.plugin.version != target.plugin.version
+            )
+        ):
             raise IntegrationError("Codex integration live rollback failed")
         _guard_expected(client, current, journal)
         client.add_plugin(PLUGIN_SELECTOR)
@@ -1165,7 +1320,13 @@ def configure_codex(
                 mutation_started = True
                 client.add_marketplace(source)
                 current = _inspect_known(client, journal)
-            if current.plugin is None or current.plugin.version != runtime_version:
+            if (
+                current.plugin is None
+                or (
+                    current.plugin.version is not None
+                    and current.plugin.version != runtime_version
+                )
+            ):
                 raise IntegrationError(
                     "Bundled plugin version does not match Hydra runtime",
                 )
@@ -1284,6 +1445,6 @@ def render_codex_config(*, marketplace_root: Path, runtime_version: str) -> str:
     version = _receipt_for(source, runtime_version).runtime_version
     return (
         f"# Hydra for Codex {version}\n"
-        f"codex plugin marketplace add {shlex.quote(str(source))} --json\n"
-        f"codex plugin add {PLUGIN_SELECTOR} --json\n"
+        f"codex plugin marketplace add {shlex.quote(str(source))}\n"
+        f"codex plugin add {PLUGIN_SELECTOR}\n"
     )

@@ -15,6 +15,10 @@ The first public release supports:
 - Linux x86_64.
 
 Windows and Linux arm64 are explicitly outside the first release.
+The first release's runtime compatibility claim is narrower than these
+architecture labels: macOS 15 on each native architecture and Ubuntu 24.04
+x86-64 with glibc 2.39. Other OS/libc baselines require an exact released
+archive canary before they can be described as supported.
 
 ## User experience
 

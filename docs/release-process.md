@@ -13,11 +13,23 @@ native PyInstaller build, and standalone acceptance on exactly:
 - `macos-15-intel` as `darwin-x86_64`;
 - `ubuntu-24.04` as `linux-x86_64`.
 
+Those runners define the first release's runtime compatibility contract:
+macOS 15 on each native architecture, and Ubuntu 24.04 x86-64 with glibc 2.39.
+Do not describe an older OS or libc as supported until the exact released
+archive has passed a clean-system canary there. PyInstaller does not make an
+architecture-only Linux compatibility guarantee by bundling glibc.
+
 The Linux job also downloads the official ShellCheck 0.11.0 archive, verifies
 its pinned SHA-256 digest, and checks `install.sh` plus
 `packaging/accept_standalone.sh`. Workflow actions are pinned to reviewed commit
 SHAs. Quality has read-only repository permission and receives no release
 credentials.
+
+Release tooling is installed only as wheels from
+`requirements/release-tools.txt`, with exact versions and reviewed SHA-256
+digests under pip's `--require-hashes` mode. Builds use `--no-isolation`; a
+release-tool update therefore requires an explicit lock review rather than
+resolving a new PyInstaller hook, setuptools, or build backend during CI.
 
 ## Tag contract
 
@@ -30,6 +42,8 @@ dirty checkout.
 Each stable version must be strictly newer than the repository's current latest
 stable release. The workflow refuses older tags and backfilled versions rather
 than moving the installer's `/releases/latest` pointer backward.
+All release tags share one non-cancelling concurrency group, so two versions
+cannot pass the latest-release guard and publish out of order.
 
 The tag workflow rebuilds and accepts one native archive per matrix runner. The
 publish job downloads each matrix artifact into a separate directory and
@@ -74,15 +88,23 @@ overwrite path, but does not by itself turn that repository setting on.
 
 ## User verification
 
-After downloading an archive and `SHA256SUMS`, first verify every manifest
-entry. On Linux:
+After downloading one archive and `SHA256SUMS`, bind verification to exactly
+that archive's manifest row. For example:
 
 ```bash
-sha256sum -c SHA256SUMS
+archive=hydra-codex-0.1.0-darwin-arm64.tar.gz
+awk -v file="$archive" '$2 == file {print}' SHA256SUMS > SHA256SUMS.target
+[ "$(wc -l < SHA256SUMS.target | tr -d '[:space:]')" = 1 ]
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c SHA256SUMS.target
+else
+  shasum -a 256 -c SHA256SUMS.target
+fi
 ```
 
-On macOS use `shasum -a 256 -c SHA256SUMS`. Then verify both the manifest
-attestation and the archive attestation:
+Do not run the unfiltered three-archive manifest after downloading only one
+archive: the two absent files correctly make that command fail. Then verify
+both the manifest attestation and the archive attestation:
 
 ```bash
 gh attestation verify \

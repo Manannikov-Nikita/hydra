@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
@@ -70,6 +73,72 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertNotIn("hydra-codex install -y --refresh", plugin)
         self.assertIn("hydra-codex upgrade", plugin)
         self.assertIn("refreshes the Codex integration atomically", plugin)
+
+    def test_public_installation_names_exact_first_release_os_baselines(self) -> None:
+        installation = (ROOT / "docs" / "installation.md").read_text(
+            encoding="utf-8",
+        )
+        troubleshooting = (ROOT / "docs" / "troubleshooting.md").read_text(
+            encoding="utf-8",
+        )
+        for document in (installation, troubleshooting):
+            self.assertIn("macOS 15", document)
+            self.assertIn("Ubuntu 24.04", document)
+            self.assertIn("glibc 2.39", document)
+        self.assertNotIn(
+            "supports macOS on Apple Silicon and Intel, and\nLinux on x86-64",
+            installation,
+        )
+
+    def test_release_checksum_recipe_filters_one_exact_archive_entry(self) -> None:
+        runbook = (ROOT / "docs" / "release-process.md").read_text(
+            encoding="utf-8",
+        )
+        filter_command = (
+            "awk -v file=\"$archive\" '$2 == file {print}' "
+            "SHA256SUMS > SHA256SUMS.target"
+        )
+        count_command = (
+            "[ \"$(wc -l < SHA256SUMS.target | tr -d '[:space:]')\" = 1 ]"
+        )
+        self.assertIn(filter_command, runbook)
+        self.assertIn(count_command, runbook)
+        self.assertIn("sha256sum -c SHA256SUMS.target", runbook)
+        self.assertIn("shasum -a 256 -c SHA256SUMS.target", runbook)
+        self.assertNotIn("sha256sum -c SHA256SUMS\n", runbook)
+        self.assertNotIn("shasum -a 256 -c SHA256SUMS`", runbook)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = (
+                "hydra-codex-0.1.0-darwin-arm64.tar.gz",
+                "hydra-codex-0.1.0-darwin-x86_64.tar.gz",
+                "hydra-codex-0.1.0-linux-x86_64.tar.gz",
+            )
+            lines = []
+            for index, name in enumerate(names):
+                payload = f"archive-{index}".encode()
+                (root / name).write_bytes(payload)
+                lines.append(f"{sha256(payload).hexdigest()}  {name}")
+            (root / "SHA256SUMS").write_text(
+                "\n".join(lines) + "\n",
+                encoding="ascii",
+            )
+            script = "\n".join((
+                f"archive={names[0]}",
+                filter_command,
+                count_command,
+            ))
+            subprocess.run(
+                ["sh", "-ceu", script],
+                cwd=root,
+                check=True,
+                timeout=5,
+            )
+            self.assertEqual(
+                (root / "SHA256SUMS.target").read_text(encoding="ascii"),
+                lines[0] + "\n",
+            )
 
     def test_readme_describes_the_shipped_mvp_without_overclaiming_the_pilot(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

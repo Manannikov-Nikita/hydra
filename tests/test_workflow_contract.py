@@ -127,7 +127,11 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(target, architecture)
 
         install = _step(job, "Install test and release tooling")["run"]
-        self.assertIn("python -m pip install '.[test,release]'", install)
+        self.assertEqual(
+            install,
+            "python -m pip install --only-binary=:all: --require-hashes "
+            "-r requirements/release-tools.txt",
+        )
         source = _step(job, "Run full source suite")["run"]
         self.assertIn(
             "python -m unittest discover -s tests -t .",
@@ -170,6 +174,46 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(checkout["with"], {"persist-credentials": False})
         self.assert_action_refs_are_immutable_and_reviewed(text, workflow)
 
+    def test_release_toolchain_is_exact_and_hash_locked(self) -> None:
+        lock = ROOT / "requirements" / "release-tools.txt"
+        self.assertTrue(lock.is_file())
+        text = lock.read_text(encoding="ascii")
+        expected = {
+            "altgraph",
+            "build",
+            "macholib",
+            "packaging",
+            "pyinstaller",
+            "pyinstaller-hooks-contrib",
+            "pyproject-hooks",
+            "setuptools",
+        }
+        logical_lines = [
+            line for line in text.splitlines()
+            if line and not line.startswith("#")
+        ]
+        names = set()
+        for line in logical_lines:
+            match = re.fullmatch(
+                r"([a-z0-9-]+)==([0-9][a-zA-Z0-9.+-]*)"
+                r"(?: --hash=sha256:[0-9a-f]{64})+",
+                line,
+            )
+            self.assertIsNotNone(match, line)
+            assert match is not None
+            names.add(match.group(1))
+        self.assertEqual(names, expected)
+
+        for workflow_name in ("quality.yml", "release.yml"):
+            _, workflow = _document(workflow_name)
+            jobs = workflow["jobs"]
+            selected = jobs["quality"] if workflow_name == "quality.yml" else jobs["build"]
+            install = _step(selected, "Install test and release tooling")["run"]
+            self.assertIn("--only-binary=:all:", install)
+            self.assertIn("--require-hashes", install)
+            self.assertIn("requirements/release-tools.txt", install)
+            self.assertNotIn(".[test,release]", install)
+
     def test_release_is_tag_only_and_write_permissions_are_publish_only(self) -> None:
         text, workflow = _document("release.yml")
         self.assertEqual(workflow["on"], {"push": {"tags": ["v*"]}})
@@ -178,7 +222,7 @@ class WorkflowContractTests(unittest.TestCase):
             workflow["concurrency"],
             {
                 "cancel-in-progress": False,
-                "group": "release-${{ github.ref }}",
+                "group": "hydra-release-publish",
             },
         )
         jobs = workflow["jobs"]

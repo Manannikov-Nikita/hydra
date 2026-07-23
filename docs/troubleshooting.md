@@ -18,18 +18,21 @@ For a developer installation, activate `.venv` or invoke
 
 ## Unsupported platform
 
-Standalone archives are published only for:
+The first release is tested and supported only on:
 
-- macOS `arm64`;
-- macOS `x86_64`;
-- Linux `x86_64`.
+- macOS 15 `arm64`;
+- macOS 15 `x86_64`;
+- Ubuntu 24.04 `x86_64` with glibc 2.39.
 
 The installer rejects every other operating-system and architecture pair
-before downloading a runtime.
+before downloading a runtime. It cannot detect every older compatible-looking
+OS or libc version, so architecture detection alone is not a support claim.
+Do not use the archive on another OS baseline until that exact released
+archive has passed a clean-system runtime canary there.
 
 ## Codex is missing or incompatible
 
-`hydra-codex install` requires the `codex` command and its JSON plugin
+`hydra-codex install` requires the `codex` command and its supported plugin
 management interface. If Codex is missing or incompatible, update Codex first;
 Hydra does not edit unknown configuration files as a fallback.
 

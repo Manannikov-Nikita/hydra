@@ -32,6 +32,32 @@ sha256_file()
     printf '%s\n' "$digest"
 }
 
+wait_for_server_port()
+{
+    wait_server_pid=$1
+    wait_port_file=$2
+    wait_log_file=$3
+    wait_limit=$4
+    wait_interval=$5
+    wait_count=0
+    while [ ! -s "$wait_port_file" ] &&
+        [ "$wait_count" -lt "$wait_limit" ] &&
+        kill -0 "$wait_server_pid" 2>/dev/null
+    do
+        wait_count=$((wait_count + 1))
+        sleep "$wait_interval"
+    done
+    if [ -s "$wait_port_file" ]; then
+        return 0
+    fi
+    if kill -0 "$wait_server_pid" 2>/dev/null; then
+        kill -KILL "$wait_server_pid" 2>/dev/null || :
+    fi
+    wait "$wait_server_pid" 2>/dev/null || :
+    sed -n '1,20p' "$wait_log_file" >&2
+    return 1
+}
+
 cleanup()
 {
     if [ -n "$DASHBOARD_PID" ]; then
@@ -271,10 +297,20 @@ SERVER_PORT_FILE=$TEMP_ROOT/server-port
 import http.server
 import os
 from pathlib import Path
+import socketserver
 import sys
 
 root = Path(sys.argv[1])
 os.chdir(root)
+
+
+class LoopbackServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves an FQDN after binding.  A release fixture only
+        # needs its numeric loopback address, and hosted macOS DNS can stall.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -294,18 +330,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, _format, *_arguments):
         return
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server = LoopbackServer(("127.0.0.1", 0), Handler)
 print(server.server_address[1], flush=True)
 server.serve_forever()
 ' "$SERVER_ROOT" > "$SERVER_PORT_FILE" 2>"$TEMP_ROOT/server.log" &
 SERVER_PID=$!
-count=0
-while [ ! -s "$SERVER_PORT_FILE" ] && [ "$count" -lt 100 ]
-do
-    count=$((count + 1))
-    sleep 0.05
-done
-[ -s "$SERVER_PORT_FILE" ] || fail "release server did not start"
+if ! wait_for_server_port \
+    "$SERVER_PID" "$SERVER_PORT_FILE" "$TEMP_ROOT/server.log" 100 0.05
+then
+    SERVER_PID=
+    fail "release server did not start"
+fi
 SERVER_PORT=$(sed -n '1p' "$SERVER_PORT_FILE")
 RELEASE_BASE=http://127.0.0.1:$SERVER_PORT/releases
 HYDRA_INSTALLER_RELEASE_BASE_URL=$RELEASE_BASE

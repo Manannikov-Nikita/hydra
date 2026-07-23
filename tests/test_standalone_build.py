@@ -592,6 +592,60 @@ class StandaloneBuildTests(unittest.TestCase):
         self.assertEqual(script.count('"$SOURCE_ROOT/install.sh"'), 1)
         self.assertNotIn("HYDRA_VERSION_OVERRIDE", script)
 
+    def test_acceptance_loopback_server_never_resolves_a_hostname(self) -> None:
+        script = ACCEPTANCE_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("import socketserver", script)
+        self.assertIn("class LoopbackServer(http.server.ThreadingHTTPServer):", script)
+        self.assertIn("socketserver.TCPServer.server_bind(self)", script)
+        self.assertIn(
+            'server = LoopbackServer(("127.0.0.1", 0), Handler)',
+            script,
+        )
+        self.assertNotIn("socket.getfqdn", script)
+
+    def test_acceptance_server_start_timeout_terminates_owned_child(self) -> None:
+        source = ACCEPTANCE_PATH.read_text(encoding="utf-8")
+        marker = "wait_for_server_port()\n{\n"
+        self.assertIn(marker, source)
+        start = source.index(marker)
+        end = source.index("\n}\n", start) + len("\n}\n")
+        function = source[start:end]
+        port_file = self.root / "missing-port"
+        log_file = self.root / "server.log"
+        log_file.write_text(
+            "".join(f"diagnostic-{line}\n" for line in range(1, 26)),
+            encoding="utf-8",
+        )
+        harness = self.root / "server-timeout.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f"{function}\n"
+            "sleep 30 &\n"
+            "owned_pid=$!\n"
+            'if wait_for_server_port "$owned_pid" "$1" "$2" 2 0.01; then\n'
+            '    kill "$owned_pid" 2>/dev/null || :\n'
+            "    exit 10\n"
+            "fi\n"
+            'if kill -0 "$owned_pid" 2>/dev/null; then exit 11; fi\n'
+            'printf "%s\\n" "bounded cleanup complete"\n',
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            ["sh", str(harness), str(port_file), str(log_file)],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "bounded cleanup complete\n")
+        self.assertIn("diagnostic-20", completed.stderr)
+        self.assertNotIn("diagnostic-21", completed.stderr)
+
     def test_acceptance_codex_shim_matches_supported_text_protocol(self) -> None:
         script = ACCEPTANCE_PATH.read_text(encoding="utf-8")
 

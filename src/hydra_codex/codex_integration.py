@@ -979,10 +979,10 @@ def _restore_state(
         raise IntegrationError("Codex integration live rollback failed")
 
 
-def _restore_original_receipt(
+def _validate_recovery_receipt(
     receipt_path: Path,
     journal: _TransactionJournal,
-) -> None:
+) -> bytes | None:
     current = _read_private_bytes(receipt_path, limit=_RECEIPT_MAX_BYTES)
     allowed: set[bytes | None] = {journal.prior_receipt}
     if journal.operation == "configure":
@@ -992,6 +992,14 @@ def _restore_original_receipt(
         allowed.add(None)
     if current not in allowed:
         raise _ownership_error()
+    return current
+
+
+def _restore_original_receipt(
+    receipt_path: Path,
+    journal: _TransactionJournal,
+) -> None:
+    current = _validate_recovery_receipt(receipt_path, journal)
     if current == journal.prior_receipt:
         return
     if journal.prior_receipt is None:
@@ -1010,6 +1018,7 @@ def _recover_transaction(
     receipt_path: Path,
     journal: _TransactionJournal,
 ) -> None:
+    _validate_recovery_receipt(receipt_path, journal)
     live_error: Exception | None = None
     receipt_error: Exception | None = None
     try:

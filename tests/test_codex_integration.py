@@ -556,8 +556,9 @@ class CodexIntegrationTests(unittest.TestCase):
 
         self.assertEqual(self.receipt.read_bytes(), replacement)
         self.assertTrue(journal.is_file())
+        self.assertEqual(self.client.calls, [])
 
-    def test_pending_configure_preserves_unknown_receipt_when_live_rollback_fails(
+    def test_pending_configure_preserves_unknown_receipt_when_live_state_is_unknown(
         self,
     ) -> None:
         self.install_once()
@@ -579,18 +580,17 @@ class CodexIntegrationTests(unittest.TestCase):
         self.client.marketplaces["hydra"] = Path("/foreign")
         self.client.calls.clear()
 
-        with self.assertRaises(IntegrationError) as raised:
+        with self.assertRaises(IntegrationOwnershipError):
             self.install_once(
                 version="0.2.0",
                 marketplace=second,
                 refresh=True,
             )
 
-        self.assertIn("live rollback failed", str(raised.exception))
-        self.assertIn("receipt ownership ambiguous", str(raised.exception))
         self.assertEqual(self.receipt.read_bytes(), replacement)
         self.assertTrue(journal.is_file())
         self.assertEqual(self.client.marketplaces["hydra"], Path("/foreign"))
+        self.assertEqual(self.client.calls, [])
 
     def test_pending_remove_preserves_unknown_receipt_with_known_live_state(
         self,
@@ -611,8 +611,9 @@ class CodexIntegrationTests(unittest.TestCase):
 
         self.assertEqual(self.receipt.read_bytes(), replacement)
         self.assertTrue(journal.is_file())
+        self.assertEqual(self.client.calls, [])
 
-    def test_pending_remove_preserves_unknown_receipt_when_live_rollback_fails(
+    def test_pending_remove_preserves_unknown_receipt_when_live_state_is_unknown(
         self,
     ) -> None:
         self.install_once()
@@ -627,14 +628,13 @@ class CodexIntegrationTests(unittest.TestCase):
         self.client.marketplaces["hydra"] = Path("/foreign")
         self.client.calls.clear()
 
-        with self.assertRaises(IntegrationError) as raised:
+        with self.assertRaises(IntegrationOwnershipError):
             remove_codex_integration(client=self.client, receipt_path=self.receipt)
 
-        self.assertIn("live rollback failed", str(raised.exception))
-        self.assertIn("receipt ownership ambiguous", str(raised.exception))
         self.assertEqual(self.receipt.read_bytes(), replacement)
         self.assertTrue(journal.is_file())
         self.assertEqual(self.client.marketplaces["hydra"], Path("/foreign"))
+        self.assertEqual(self.client.calls, [])
 
     def test_uninstall_removes_only_receipted_integration_and_is_repeatable(self) -> None:
         self.install_once()

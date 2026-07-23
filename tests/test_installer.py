@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -242,7 +243,7 @@ class InstallerTests(unittest.TestCase):
         uname.chmod(0o755)
         self.activator = self.root / "activate-staged"
         self.activator.write_text(
-            f"#!{ROOT.parent.parent / '.venv' / 'bin' / 'python'}\n"
+            f"#!{sys.executable}\n"
             "from pathlib import Path\n"
             "import os\n"
             "import sys\n"

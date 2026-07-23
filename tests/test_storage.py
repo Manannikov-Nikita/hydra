@@ -366,6 +366,6 @@ class SQLiteStorageTests(unittest.TestCase):
 
     def test_default_database_path_uses_macos_application_support(self) -> None:
         self.assertEqual(
-            default_database_path(Path("/tmp/hydra-home")),
+            default_database_path(Path("/tmp/hydra-home"), platform="darwin"),
             Path("/tmp/hydra-home/Library/Application Support/Hydra/hydra.sqlite3"),
         )

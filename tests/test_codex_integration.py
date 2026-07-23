@@ -1034,6 +1034,7 @@ class CodexCommandClientTests(unittest.TestCase):
             )
 
     def test_supported_codex_0_136_text_commands_and_shapes(self) -> None:
+        resolved_codex = str(Path("/bin/codex").resolve())
         completed = [
             (0, b"codex-cli 0.136.0\n", b""),
             (0, _fixture("marketplace-list.txt"), b""),
@@ -1060,10 +1061,10 @@ class CodexCommandClientTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
-                ["/bin/codex", "--version"],
-                ["/bin/codex", "plugin", "marketplace", "list"],
+                [resolved_codex, "--version"],
+                [resolved_codex, "plugin", "marketplace", "list"],
                 [
-                    "/bin/codex", "plugin", "list",
+                    resolved_codex, "plugin", "list",
                     "--marketplace", "hydra",
                 ],
             ],
@@ -1142,6 +1143,7 @@ class CodexCommandClientTests(unittest.TestCase):
     def test_codex_0_136_mutation_commands_use_exact_argv_and_text_contract(
         self,
     ) -> None:
+        resolved_codex = str(Path("/bin/codex").resolve())
         source = Path("/opt/hydra/marketplace")
         completed = [
             (
@@ -1187,10 +1189,22 @@ class CodexCommandClientTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
-                ["/bin/codex", "plugin", "marketplace", "add", str(source)],
-                ["/bin/codex", "plugin", "add", "hydra-codex@hydra"],
-                ["/bin/codex", "plugin", "remove", "hydra-codex@hydra"],
-                ["/bin/codex", "plugin", "marketplace", "remove", "hydra"],
+                [
+                    resolved_codex, "plugin", "marketplace", "add",
+                    str(source),
+                ],
+                [
+                    resolved_codex, "plugin", "add",
+                    "hydra-codex@hydra",
+                ],
+                [
+                    resolved_codex, "plugin", "remove",
+                    "hydra-codex@hydra",
+                ],
+                [
+                    resolved_codex, "plugin", "marketplace", "remove",
+                    "hydra",
+                ],
             ],
         )
 

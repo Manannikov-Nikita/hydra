@@ -635,7 +635,10 @@ class DashboardAdapterTests(unittest.TestCase):
         try:
             with socket.create_connection(server.server_address, timeout=2) as client:
                 client.sendall(b"BROKEN\r\n\r\n")
-                payload = client.recv(8192)
+                chunks: list[bytes] = []
+                while chunk := client.recv(8192):
+                    chunks.append(chunk)
+                payload = b"".join(chunks)
             self.assertIn(b"400", payload)
             self.assertIn(b"hydra.dashboard-error/v1", payload)
             self.assertNotIn(b"<!DOCTYPE", payload)

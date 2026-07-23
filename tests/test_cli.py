@@ -1047,7 +1047,7 @@ class IngestCliTests(unittest.TestCase):
             self.assertIn("hydra-codex: ingest complete 1/1", rendered)
             self.assertNotIn(private_name, rendered)
 
-    def test_zero_source_ingest_keeps_db_source_and_project_directories_unchanged(self) -> None:
+    def test_linux_zero_source_ingest_keeps_db_source_and_project_directories_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             project = self.create_project(base)
@@ -1060,10 +1060,11 @@ class IngestCliTests(unittest.TestCase):
             database_parent.mkdir()
             database_parent.chmod(0o755)
 
-            code, stdout, stderr = invoke([
-                "ingest", "--cwd", str(project),
-                "--db", str(database_parent / "hydra.sqlite3"),
-            ], environ={"HOME": str(home)})
+            with mock.patch("hydra_codex.platform_paths.sys.platform", "linux"):
+                code, stdout, stderr = invoke([
+                    "ingest", "--cwd", str(project),
+                    "--db", str(database_parent / "hydra.sqlite3"),
+                ], environ={"HOME": str(home)})
 
             self.assertEqual((code, stderr), (0, ""))
             self.assertEqual(json.loads(stdout)["files_seen"], 0)
@@ -1076,7 +1077,7 @@ class IngestCliTests(unittest.TestCase):
             )
             self.assertEqual(list(active.iterdir()), [])
             self.assertNotIn("rollout-hmac.key", {path.name for path in database_parent.iterdir()})
-            installation_key = home / "Library" / "Application Support" / "Hydra" / "rollout-hmac.key"
+            installation_key = home / ".local" / "share" / "hydra" / "rollout-hmac.key"
             self.assertTrue(installation_key.is_file())
             self.assertEqual(stat.S_IMODE(installation_key.stat().st_mode), 0o600)
 

@@ -121,7 +121,10 @@ class StdioMcpServerTests(unittest.TestCase):
     def test_subprocess_timeout_preserves_worker_descriptor_ownership(self) -> None:
         class DelayedCloseRunner(SubprocessRunner):
             def __init__(self) -> None:
-                super().__init__(timeout_seconds=0.3)
+                # Hosted x86 runners can spend more than 300 ms starting a
+                # Python child under load.  This test exercises descriptor
+                # ownership, not the minimum timeout threshold.
+                super().__init__(timeout_seconds=1.0)
                 self.allow_owned_close = threading.Event()
                 self._close_condition = threading.Condition()
                 self._delayed_closes = 0
@@ -193,13 +196,13 @@ class StdioMcpServerTests(unittest.TestCase):
                 )
                 self.assertTrue(runner.wait_for_delayed_closes())
                 capture_thread.start()
-                self.assertTrue(second_process_started.wait(timeout=1))
+                self.assertTrue(second_process_started.wait(timeout=2))
                 runner.allow_owned_close.set()
-                capture_thread.join(timeout=1)
+                capture_thread.join(timeout=2)
         finally:
             runner.allow_owned_close.set()
             if capture_thread.is_alive():
-                capture_thread.join(timeout=1)
+                capture_thread.join(timeout=2)
 
         self.assertFalse(capture_thread.is_alive())
         self.assertEqual(

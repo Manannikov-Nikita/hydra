@@ -4,6 +4,20 @@ This plugin bundle provides Hydra reports and semantic hooks through Codex. It
 ships in the same verified Hydra release as the CLI and must match that
 release's runtime version.
 
+For the public standalone release, install the CLI bundle first and let Hydra
+register this exact versioned marketplace:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Manannikov-Nikita/hydra/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hydra-codex install -y
+```
+
+Start a new Codex task after installation. The raw `main/install.sh` URL is a
+mutable bootstrap trust boundary; the downloaded versioned archive is checked
+against `SHA256SUMS`, and users who need publisher identity should verify its
+GitHub artifact attestation.
+
 The bundled MCP server advertises `hydra.report` by default. It deliberately
 does not advertise `hydra.annotate` until Codex supplies an authenticated turn
 transport outside model-controlled arguments. During the pilot, the
@@ -31,12 +45,9 @@ hydra-codex install -y
 ```
 
 Start a new Codex task after installation so the task loads the plugin. Running
-the same command again is a no-op. After a Hydra runtime upgrade, refresh the
-owned marketplace and plugin:
-
-```bash
-hydra-codex install -y --refresh
-```
+the same command again is a no-op. `hydra-codex upgrade` refreshes the Codex integration atomically
+with the runtime, so no separate install or refresh command is needed after an
+upgrade.
 
 To inspect the exact supported commands without checking Codex or changing
 state:

@@ -344,6 +344,33 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("cleanup_installer_lock", source)
         self.assertNotIn(".hydra-installer-lock", source)
 
+    def test_path_notice_recognizes_only_expanded_launcher_directory(self) -> None:
+        expanded = self.run_installer(
+            "--version",
+            "1.0.0",
+            environment={
+                "PATH": (
+                    f"{self.shims}:{self.home}/.local/bin:"
+                    "/usr/bin:/bin:/usr/sbin:/sbin"
+                ),
+            },
+        )
+        self.assertEqual(expanded.returncode, 0, expanded.stderr)
+        self.assertNotIn("Add Hydra to PATH", expanded.stdout)
+
+        literal = self.run_installer(
+            "--version",
+            "1.0.0",
+            environment={
+                "PATH": (
+                    f"{self.shims}:$HOME/.local/bin:"
+                    "/usr/bin:/bin:/usr/sbin:/sbin"
+                ),
+            },
+        )
+        self.assertEqual(literal.returncode, 0, literal.stderr)
+        self.assertIn("Add Hydra to PATH", literal.stdout)
+
     def test_private_acquisition_requires_capability_and_preserves_parent_lock(
         self,
     ) -> None:

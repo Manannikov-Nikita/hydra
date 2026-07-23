@@ -57,11 +57,11 @@ ARCHIVE=$1
 [ -f "$ARCHIVE" ] || fail "archive is unavailable"
 case "$ARCHIVE" in
     /*) ;;
-    *) ARCHIVE=$(CDPATH= cd -- "$(dirname -- "$ARCHIVE")" && pwd -P)/$(basename -- "$ARCHIVE") ;;
+    *) ARCHIVE=$(CDPATH='' cd -- "$(dirname -- "$ARCHIVE")" && pwd -P)/$(basename -- "$ARCHIVE") ;;
 esac
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-DEFAULT_SOURCE_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+DEFAULT_SOURCE_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
 SOURCE_ROOT=${HYDRA_ACCEPTANCE_SOURCE_ROOT-"$DEFAULT_SOURCE_ROOT"}
 HOST_PYTHON=${HYDRA_ACCEPTANCE_PYTHON-}
 if [ -z "$HOST_PYTHON" ]; then
@@ -100,6 +100,7 @@ if validated.version != version or validated.target != target:
 print(version, target)
 PY
 ) || fail "first archive identity is invalid"
+# shellcheck disable=SC2086 # ARCHIVE_ID is exactly the two validated fields above.
 set -- $ARCHIVE_ID
 [ "$#" -eq 2 ] || fail "first archive identity is invalid"
 BASE_VERSION=$1
@@ -127,7 +128,7 @@ case "$(uname -s)/$(uname -m)" in
 esac
 [ "$TARGET" = "$NATIVE_TARGET" ] || fail "archive is not native"
 
-TEMP_PARENT=$(CDPATH= cd -- "${TMPDIR-/tmp}" && pwd -P) ||
+TEMP_PARENT=$(CDPATH='' cd -- "${TMPDIR-/tmp}" && pwd -P) ||
     fail "temporary directory is unavailable"
 TEMP_ROOT=$(mktemp -d "$TEMP_PARENT/hydra-standalone-accept.XXXXXXXX") ||
     fail "temporary directory creation failed"
@@ -154,6 +155,7 @@ mkdir "$SHIM_DIR"
 for command in python python3 python3.12 pip uv
 do
     shim=$SHIM_DIR/$command
+    # shellcheck disable=SC2016 # These literals are the generated shim body.
     printf '%s\n' \
         '#!/bin/sh' \
         'printf "%s\n" "$0 $*" >> "$HYDRA_SHIM_LOG"' \
@@ -168,6 +170,7 @@ export CODEX_FAIL_REFRESH
 CODEX_FAIL_VERSION=$NEXT_VERSION
 export CODEX_FAIL_VERSION
 cat_codex=$SHIM_DIR/codex
+# shellcheck disable=SC2016 # These literals are the generated Codex shim body.
 printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
@@ -302,7 +305,8 @@ done
 [ -s "$SERVER_PORT_FILE" ] || fail "release server did not start"
 SERVER_PORT=$(sed -n '1p' "$SERVER_PORT_FILE")
 RELEASE_BASE=http://127.0.0.1:$SERVER_PORT/releases
-export HYDRA_INSTALLER_RELEASE_BASE_URL=$RELEASE_BASE
+HYDRA_INSTALLER_RELEASE_BASE_URL=$RELEASE_BASE
+export HYDRA_INSTALLER_RELEASE_BASE_URL
 
 sh "$SOURCE_ROOT/install.sh" --version "$BASE_VERSION" >/dev/null
 HYDRA=$HOME/.local/bin/hydra-codex
@@ -358,8 +362,9 @@ printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' |
     "$HYDRA" mcp > "$TEMP_ROOT/mcp.jsonl"
-grep -q '"serverInfo"' "$TEMP_ROOT/mcp.jsonl" &&
-    grep -q '"tools"' "$TEMP_ROOT/mcp.jsonl" ||
+grep -q '"serverInfo"' "$TEMP_ROOT/mcp.jsonl" ||
+    fail "frozen MCP failed"
+grep -q '"tools"' "$TEMP_ROOT/mcp.jsonl" ||
     fail "frozen MCP failed"
 
 DASHBOARD_URL_FILE=$TEMP_ROOT/dashboard-url
@@ -411,8 +416,10 @@ PY
 if "$HYDRA" upgrade >/dev/null 2>&1; then
     fail "forced Codex refresh unexpectedly succeeded"
 fi
-[ "$("$HYDRA" --version)" = "hydra-codex $BASE_VERSION" ] &&
-grep -q "/versions/$BASE_VERSION/marketplace" "$CODEX_STATE/marketplace-source" &&
+[ "$("$HYDRA" --version)" = "hydra-codex $BASE_VERSION" ] ||
+    fail "forced Codex refresh rollback failed"
+grep -q "/versions/$BASE_VERSION/marketplace" "$CODEX_STATE/marketplace-source" ||
+    fail "forced Codex refresh rollback failed"
 grep -q "\"runtime_version\":\"$BASE_VERSION\"" \
         "$DATA_DIR/codex-integration.json" ||
     fail "forced Codex refresh rollback failed"

@@ -10,7 +10,38 @@ layers disagree, the deterministic observation wins and the report retains a
 The MVP supports local Codex App, CLI, and IDE tasks. Cloud-only and ephemeral
 tasks that have no local event stream cannot be reconstructed.
 
-## Install and enable the Hydra pilot
+## Public standalone installation
+
+Install the checksum-validated release runtime, connect its bundled plugin to
+Codex, then initialize the project:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Manannikov-Nikita/hydra/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hydra-codex install -y
+cd /path/to/project
+hydra-codex init .
+hydra-codex status . --json
+hydra-codex dashboard
+```
+
+Start a new Codex task after enabling the plugin. The dashboard binds only to
+loopback. For explicit project, port, and browser behavior:
+
+```bash
+hydra-codex dashboard --cwd /path/to/project --port 0 --no-open
+```
+
+The raw `main/install.sh` bootstrap URL is mutable. Read
+[the installation guide](docs/installation.md) for the trust boundary and
+standalone targets, then use:
+
+- [Upgrade and uninstall](docs/upgrade-and-uninstall.md)
+- [Privacy and retained data](docs/privacy.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Release and attestation process](docs/release-process.md)
+
+## Developer installation and Hydra pilot
 
 Hydra requires Python 3.12 and has no runtime dependencies outside the standard
 library:
@@ -58,10 +89,12 @@ repository's `integrations/codex/hook.py`. Start a new task after first enabling
 or changing those hooks; an already-open task does not prove that the new hook
 manifest was loaded.
 
-By default, private state is stored outside the repository at
-`~/Library/Application Support/Hydra/hydra.sqlite3`; the installation HMAC key
-lives beside it. Tests and isolated runs may set `HYDRA_DATABASE_PATH` and
-`HYDRA_INSTALLATION_KEY_PATH`.
+By default, private state is stored outside the repository. macOS uses
+`~/Library/Application Support/Hydra/hydra.sqlite3`; Linux uses
+`~/.local/share/hydra/hydra.sqlite3`, or
+`$XDG_DATA_HOME/hydra/hydra.sqlite3` when `XDG_DATA_HOME` is set. The
+installation HMAC key lives beside it. Tests and isolated runs may set
+`HYDRA_DATABASE_PATH` and `HYDRA_INSTALLATION_KEY_PATH`.
 
 For the supported chat-to-dashboard startup, canary, Refresh, recovery, and
 shutdown procedure, see [Dashboard operations](docs/dashboard-operations.md).

@@ -1,0 +1,163 @@
+{
+  "name": "Release",
+  "on": {
+    "push": {
+      "tags": [
+        "v*"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "release-${{ github.ref }}",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "verify": {
+      "name": "Verify release identity",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 15,
+      "steps": [
+        # reviewed: actions/checkout v7.0.1
+        {"name": "Checkout tagged source", "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "with": {"fetch-depth": 0, "persist-credentials": false, "ref": "${{ github.sha }}"}},
+        # reviewed: actions/setup-python v7.0.0
+        {"name": "Set up Python", "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97", "with": {"python-version": "3.12"}},
+        {
+          "name": "Verify exact release tag",
+          "shell": "bash",
+          "run": "set -euo pipefail\nversion=\"${GITHUB_REF_NAME#v}\"\nif [[ ! \"$version\" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then\n  printf 'release tag is not canonical semver\\n' >&2\n  exit 1\nfi\npackage_version=\"$(PYTHONPATH=src python -c 'import hydra_codex; print(hydra_codex.__version__)')\"\n[ \"$GITHUB_REF_NAME\" = \"v$package_version\" ]\ntag_commit=\"$(git rev-parse \"$GITHUB_REF_NAME^{commit}\")\"\nhead_commit=\"$(git rev-parse HEAD)\"\n[ \"$tag_commit\" = \"$head_commit\" ]\n[ \"$head_commit\" = \"$GITHUB_SHA\" ]\n[ -z \"$(git status --porcelain --untracked-files=all)\" ]"
+        }
+      ]
+    },
+    "build": {
+      "name": "Build (${{ matrix.target }})",
+      "needs": [
+        "verify"
+      ],
+      "runs-on": "${{ matrix.runner }}",
+      "timeout-minutes": 90,
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {
+          "include": [
+            {
+              "runner": "macos-15",
+              "target": "darwin-arm64"
+            },
+            {
+              "runner": "macos-15-intel",
+              "target": "darwin-x86_64"
+            },
+            {
+              "runner": "ubuntu-24.04",
+              "target": "linux-x86_64"
+            }
+          ]
+        }
+      },
+      "steps": [
+        # reviewed: actions/checkout v7.0.1
+        {"name": "Checkout tagged source", "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "with": {"fetch-depth": 0, "persist-credentials": false, "ref": "${{ github.sha }}"}},
+        # reviewed: actions/setup-python v7.0.0
+        {"name": "Set up Python", "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97", "with": {"python-version": "3.12"}},
+        {
+          "name": "Verify native runner architecture",
+          "shell": "bash",
+          "run": "set -euo pipefail\nactual=\"$(uname -s)/$(uname -m)\"\ncase \"${{ matrix.target }}\" in\n  darwin-arm64) expected=\"Darwin/arm64\" ;;\n  darwin-x86_64) expected=\"Darwin/x86_64\" ;;\n  linux-x86_64) expected=\"Linux/x86_64\" ;;\n  *) exit 1 ;;\nesac\n[ \"$actual\" = \"$expected\" ]"
+        },
+        {
+          "name": "Install test and release tooling",
+          "run": "python -m pip install '.[test,release]'"
+        },
+        {
+          "name": "Run full source suite",
+          "run": "env PYTHONPATH=\"$PWD/src\" python -m unittest discover -s tests -t ."
+        },
+        {
+          "name": "Build and accept native standalone archive",
+          "shell": "bash",
+          "run": "set -euo pipefail\nrm -rf build/standalone\npython packaging/build_standalone.py --source-root \"$PWD\" --output build/standalone --target \"${{ matrix.target }}\"\narchive_count=\"$(find build/standalone -maxdepth 1 -type f -name 'hydra-codex-*.tar.gz' | wc -l | tr -d ' ')\"\n[ \"$archive_count\" = 1 ]\narchive=\"$(find build/standalone -maxdepth 1 -type f -name 'hydra-codex-*.tar.gz' -print)\"\ncase \"$archive\" in\n  *-\"${{ matrix.target }}\".tar.gz) ;;\n  *) exit 1 ;;\nesac\nsh packaging/accept_standalone.sh \"$archive\""
+        },
+        # reviewed: actions/upload-artifact v7.0.1
+        {"name": "Upload accepted standalone archive", "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "with": {"name": "hydra-standalone-${{ matrix.target }}", "path": "build/standalone/hydra-codex-*.tar.gz", "if-no-files-found": "error", "retention-days": 7}}
+      ]
+    },
+    "publish": {
+      "name": "Attest and publish release",
+      "needs": [
+        "build"
+      ],
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 30,
+      "permissions": {
+        "artifact-metadata": "write",
+        "attestations": "write",
+        "contents": "write",
+        "id-token": "write"
+      },
+      "steps": [
+        # reviewed: actions/checkout v7.0.1
+        {"name": "Checkout tagged source", "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "with": {"fetch-depth": 0, "persist-credentials": false, "ref": "${{ github.sha }}"}},
+        # reviewed: actions/setup-python v7.0.0
+        {"name": "Set up Python", "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97", "with": {"python-version": "3.12"}},
+        # reviewed: actions/download-artifact v8.0.1
+        {"name": "Download darwin-arm64", "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", "with": {"name": "hydra-standalone-darwin-arm64", "path": "downloads/darwin-arm64"}},
+        # reviewed: actions/download-artifact v8.0.1
+        {"name": "Download darwin-x86_64", "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", "with": {"name": "hydra-standalone-darwin-x86_64", "path": "downloads/darwin-x86_64"}},
+        # reviewed: actions/download-artifact v8.0.1
+        {"name": "Download linux-x86_64", "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", "with": {"name": "hydra-standalone-linux-x86_64", "path": "downloads/linux-x86_64"}},
+        {
+          "name": "Verify remote tag at event commit",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "shell": "bash",
+          "run": "set -euo pipefail\nexport HYDRA_REMOTE_TAG_ENDPOINT=\"repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME\"\npython -I - <<'PY'\nimport json\nimport os\nimport subprocess\n\nrepository = os.environ['GITHUB_REPOSITORY']\nexpected_commit = os.environ['GITHUB_SHA']\nendpoint = os.environ['HYDRA_REMOTE_TAG_ENDPOINT']\npayload = json.loads(subprocess.check_output(['gh', 'api', endpoint], text=True))\nobject_value = payload.get('object')\nseen = set()\nfor _ in range(8):\n    if not isinstance(object_value, dict):\n        raise SystemExit('remote tag object is invalid')\n    object_type = object_value.get('type')\n    object_sha = object_value.get('sha')\n    if not isinstance(object_sha, str) or len(object_sha) != 40:\n        raise SystemExit('remote tag object is invalid')\n    if object_type == 'commit':\n        break\n    if object_type != 'tag' or object_sha in seen:\n        raise SystemExit('remote tag does not peel to a commit')\n    seen.add(object_sha)\n    endpoint = f'repos/{repository}/git/tags/{object_sha}'\n    payload = json.loads(subprocess.check_output(['gh', 'api', endpoint], text=True))\n    object_value = payload.get('object')\nelse:\n    raise SystemExit('remote tag peel depth exceeded')\nif object_type != 'commit' or object_sha != expected_commit:\n    raise SystemExit('remote tag does not match event commit')\nPY"
+        },
+        {
+          "name": "Aggregate exact release assets",
+          "shell": "bash",
+          "run": "set -euo pipefail\npython -I - <<'PY'\nfrom hashlib import sha256\nfrom pathlib import Path\nimport os\nimport re\nimport shutil\n\ntag = os.environ['GITHUB_REF_NAME']\nmatch = re.fullmatch(r'v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)', tag)\nif match is None:\n    raise SystemExit('release tag is not canonical semver')\nversion = tag[1:]\ntargets = ('darwin-arm64', 'darwin-x86_64', 'linux-x86_64')\nexpected_names = tuple(f'hydra-codex-{version}-{target}.tar.gz' for target in targets)\ndestination = Path('dist')\nif destination.exists():\n    raise SystemExit('release destination already exists')\ndestination.mkdir()\nfor target, expected_name in zip(targets, expected_names, strict=True):\n    source_directory = Path('downloads') / target\n    if not source_directory.is_dir() or source_directory.is_symlink():\n        raise SystemExit('unexpected release artifact inventory')\n    inventory = list(source_directory.iterdir())\n    if (\n        len(inventory) != 1\n        or inventory[0].name != expected_name\n        or not inventory[0].is_file()\n        or inventory[0].is_symlink()\n    ):\n        raise SystemExit('unexpected release artifact inventory')\n    shutil.copy2(inventory[0], destination / expected_name, follow_symlinks=False)\nif any(path.is_symlink() or not path.is_file() for path in destination.iterdir()):\n    raise SystemExit('unexpected release artifact inventory')\nif sorted(path.name for path in destination.iterdir()) != sorted(expected_names):\n    raise SystemExit('unexpected release artifact inventory')\nchecksums = [\n    f'{sha256((destination / name).read_bytes()).hexdigest()}  {name}'\n    for name in sorted(expected_names)\n]\n(destination / 'SHA256SUMS').write_text('\\n'.join(checksums) + '\\n', encoding='ascii')\nPY"
+        },
+        {
+          "name": "Require newer stable release",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "shell": "bash",
+          "run": "set -euo pipefail\nlatest_json=\"$RUNNER_TEMP/hydra-latest-release.json\"\nprobe=\"$RUNNER_TEMP/hydra-latest-release-response\"\nendpoint=\"repos/$GITHUB_REPOSITORY/releases/latest\"\nset +e\ngh api --include \"$endpoint\" > \"$probe\" 2>&1\nprobe_code=$?\nset -e\nstatus=\"$(sed -n 's/^HTTP\\/[^ ]* \\([0-9][0-9][0-9]\\).*/\\1/p' \"$probe\" | tail -1)\"\ncase \"$status/$probe_code\" in\n  200/0)\n    gh api \"$endpoint\" > \"$latest_json\"\n    python -I - \"$latest_json\" \"$GITHUB_REF_NAME\" <<'PY'\nfrom pathlib import Path\nimport json\nimport re\nimport sys\n\npattern = re.compile(r'v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)')\npayload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\ncurrent_match = pattern.fullmatch(sys.argv[2])\nlatest_tag = payload.get('tag_name')\nlatest_match = pattern.fullmatch(latest_tag) if isinstance(latest_tag, str) else None\nif (\n    current_match is None\n    or latest_match is None\n    or payload.get('draft') is not False\n    or payload.get('prerelease') is not False\n):\n    raise SystemExit('latest stable release state is invalid')\ncurrent_version = tuple(int(part) for part in current_match.groups())\nlatest_version = tuple(int(part) for part in latest_match.groups())\nif current_version <= latest_version:\n    raise SystemExit('release version must be newer than latest stable release')\nPY\n    ;;\n  404/*) ;;\n  *) printf 'latest release lookup failed\\n' >&2; exit 1 ;;\nesac"
+        },
+        {
+          "name": "Require absent or draft release",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "shell": "bash",
+          "run": "set -euo pipefail\nrelease_json=\"$RUNNER_TEMP/hydra-release-preflight.json\"\nprobe=\"$RUNNER_TEMP/hydra-release-preflight-response\"\nendpoint=\"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME\"\nset +e\ngh api --include \"$endpoint\" > \"$probe\" 2>&1\nprobe_code=$?\nset -e\nstatus=\"$(sed -n 's/^HTTP\\/[^ ]* \\([0-9][0-9][0-9]\\).*/\\1/p' \"$probe\" | tail -1)\"\ncase \"$status/$probe_code\" in\n  200/0)\n    gh api \"$endpoint\" > \"$release_json\"\n    python -I - \"$release_json\" \"$GITHUB_REF_NAME\" <<'PY'\nfrom pathlib import Path\nimport json\nimport sys\n\npayload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\nif payload.get('tag_name') != sys.argv[2]:\n    raise SystemExit('release tag mismatch')\nif payload.get('draft') is not True or payload.get('prerelease') is not False:\n    raise SystemExit('published releases are immutable; prerelease is not allowed')\nPY\n    ;;\n  404/*) ;;\n  *) printf 'release lookup failed\\n' >&2; exit 1 ;;\nesac"
+        },
+        # reviewed: actions/attest v4.2.0
+        {"name": "Attest standalone archives", "uses": "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6", "with": {"subject-checksums": "dist/SHA256SUMS"}},
+        # reviewed: actions/attest v4.2.0
+        {"name": "Attest checksum manifest", "uses": "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6", "with": {"subject-path": "dist/SHA256SUMS"}},
+        {
+          "name": "Reconcile draft release assets",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "shell": "bash",
+          "run": "set -euo pipefail\nrelease_json=\"$RUNNER_TEMP/hydra-release.json\"\nprobe=\"$RUNNER_TEMP/hydra-release-response\"\nendpoint=\"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME\"\nset +e\ngh api --include \"$endpoint\" > \"$probe\" 2>&1\nprobe_code=$?\nset -e\nstatus=\"$(sed -n 's/^HTTP\\/[^ ]* \\([0-9][0-9][0-9]\\).*/\\1/p' \"$probe\" | tail -1)\"\ncase \"$status/$probe_code\" in\n  200/0) gh api \"$endpoint\" > \"$release_json\" ;;\n  404/*)\n    gh release create \"$GITHUB_REF_NAME\" --draft --verify-tag --title \"$GITHUB_REF_NAME\" --generate-notes\n    gh api \"$endpoint\" > \"$release_json\"\n    ;;\n  *) printf 'release lookup failed\\n' >&2; exit 1 ;;\nesac\nremote_names=\"$RUNNER_TEMP/hydra-remote-names\"\npython -I - \"$release_json\" \"$GITHUB_REF_NAME\" \"$remote_names\" <<'PY'\nfrom pathlib import Path\nimport json\nimport re\nimport sys\n\npayload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\ntag = sys.argv[2]\nmatch = re.fullmatch(r'v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)', tag)\nif match is None or payload.get('tag_name') != tag:\n    raise SystemExit('release tag mismatch')\nif payload.get('draft') is not True or payload.get('prerelease') is not False:\n    raise SystemExit('draft release is required; published releases are immutable; prerelease is not allowed')\nversion = tag[1:]\nexpected = {\n    *(f'hydra-codex-{version}-{target}.tar.gz' for target in (\n        'darwin-arm64', 'darwin-x86_64', 'linux-x86_64'\n    )),\n    'SHA256SUMS',\n}\nassets = payload.get('assets')\nif not isinstance(assets, list):\n    raise SystemExit('remote release asset inventory is invalid')\nnames = [asset.get('name') for asset in assets if isinstance(asset, dict)]\nif len(names) != len(assets) or len(names) != len(set(names)) or not set(names) <= expected:\n    raise SystemExit('remote release asset inventory is invalid')\nPath(sys.argv[3]).write_text(''.join(f'{name}\\n' for name in sorted(names)), encoding='ascii')\nPY\nremote_dir=\"$RUNNER_TEMP/hydra-existing-assets\"\nrm -rf \"$remote_dir\"\nmkdir \"$remote_dir\"\nif [ -s \"$remote_names\" ]; then\n  gh release download \"$GITHUB_REF_NAME\" --dir \"$remote_dir\"\n  python -I - \"$remote_names\" \"$remote_dir\" dist <<'PY'\nfrom hashlib import sha256\nfrom pathlib import Path\nimport sys\n\nnames = Path(sys.argv[1]).read_text(encoding='ascii').splitlines()\nremote = Path(sys.argv[2])\nlocal = Path(sys.argv[3])\ninventory = list(remote.iterdir())\nif (\n    sorted(path.name for path in inventory) != sorted(names)\n    or any(path.is_symlink() or not path.is_file() for path in inventory)\n):\n    raise SystemExit('remote release asset inventory is invalid')\nfor name in names:\n    if sha256((remote / name).read_bytes()).digest() != sha256((local / name).read_bytes()).digest():\n        raise SystemExit('remote asset checksum mismatch')\nPY\nfi\nversion=\"${GITHUB_REF_NAME#v}\"\nfor name in \\\n  \"hydra-codex-$version-darwin-arm64.tar.gz\" \\\n  \"hydra-codex-$version-darwin-x86_64.tar.gz\" \\\n  \"hydra-codex-$version-linux-x86_64.tar.gz\" \\\n  SHA256SUMS\ndo\n  if ! grep -Fqx \"$name\" \"$remote_names\"; then\n    gh release upload \"$GITHUB_REF_NAME\" \"dist/$name\"\n  fi\ndone"
+        },
+        {
+          "name": "Verify and publish release",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "shell": "bash",
+          "run": "set -euo pipefail\ntag_commit=\"$(git rev-parse \"$GITHUB_REF_NAME^{commit}\")\"\nhead_commit=\"$(git rev-parse HEAD)\"\n[ \"$tag_commit\" = \"$head_commit\" ]\n[ \"$head_commit\" = \"$GITHUB_SHA\" ]\nversion=\"${GITHUB_REF_NAME#v}\"\nif [[ ! \"$version\" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then\n  printf 'release tag is not canonical semver\\n' >&2\n  exit 1\nfi\ngit diff --quiet\ngit diff --cached --quiet\nexport HYDRA_REMOTE_TAG_ENDPOINT=\"repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME\"\npython -I - <<'PY'\nimport json\nimport os\nimport subprocess\n\nrepository = os.environ['GITHUB_REPOSITORY']\nexpected_commit = os.environ['GITHUB_SHA']\nendpoint = os.environ['HYDRA_REMOTE_TAG_ENDPOINT']\npayload = json.loads(subprocess.check_output(['gh', 'api', endpoint], text=True))\nobject_value = payload.get('object')\nseen = set()\nfor _ in range(8):\n    if not isinstance(object_value, dict):\n        raise SystemExit('remote tag object is invalid')\n    object_type = object_value.get('type')\n    object_sha = object_value.get('sha')\n    if not isinstance(object_sha, str) or len(object_sha) != 40:\n        raise SystemExit('remote tag object is invalid')\n    if object_type == 'commit':\n        break\n    if object_type != 'tag' or object_sha in seen:\n        raise SystemExit('remote tag does not peel to a commit')\n    seen.add(object_sha)\n    endpoint = f'repos/{repository}/git/tags/{object_sha}'\n    payload = json.loads(subprocess.check_output(['gh', 'api', endpoint], text=True))\n    object_value = payload.get('object')\nelse:\n    raise SystemExit('remote tag peel depth exceeded')\nif object_type != 'commit' or object_sha != expected_commit:\n    raise SystemExit('remote tag does not match event commit')\nPY\nlatest_json=\"$RUNNER_TEMP/hydra-latest-release-final.json\"\nlatest_probe=\"$RUNNER_TEMP/hydra-latest-release-final-response\"\nlatest_endpoint=\"repos/$GITHUB_REPOSITORY/releases/latest\"\nset +e\ngh api --include \"$latest_endpoint\" > \"$latest_probe\" 2>&1\nlatest_probe_code=$?\nset -e\nlatest_status=\"$(sed -n 's/^HTTP\\/[^ ]* \\([0-9][0-9][0-9]\\).*/\\1/p' \"$latest_probe\" | tail -1)\"\ncase \"$latest_status/$latest_probe_code\" in\n  200/0)\n    gh api \"$latest_endpoint\" > \"$latest_json\"\n    python -I - \"$latest_json\" \"$GITHUB_REF_NAME\" <<'PY'\nfrom pathlib import Path\nimport json\nimport re\nimport sys\n\npattern = re.compile(r'v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)')\npayload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\ncurrent_match = pattern.fullmatch(sys.argv[2])\nlatest_tag = payload.get('tag_name')\nlatest_match = pattern.fullmatch(latest_tag) if isinstance(latest_tag, str) else None\nif (\n    current_match is None\n    or latest_match is None\n    or payload.get('draft') is not False\n    or payload.get('prerelease') is not False\n):\n    raise SystemExit('latest stable release state is invalid')\ncurrent_version = tuple(int(part) for part in current_match.groups())\nlatest_version = tuple(int(part) for part in latest_match.groups())\nif current_version <= latest_version:\n    raise SystemExit('release version must be newer than latest stable release')\nPY\n    ;;\n  404/*) ;;\n  *) printf 'latest release lookup failed\\n' >&2; exit 1 ;;\nesac\nrelease_json=\"$RUNNER_TEMP/hydra-release-final.json\"\nrelease_endpoint=\"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME\"\ngh api \"$release_endpoint\" > \"$release_json\"\nremote_dir=\"$RUNNER_TEMP/hydra-final-assets\"\nrm -rf \"$remote_dir\"\nmkdir \"$remote_dir\"\ngh release download \"$GITHUB_REF_NAME\" --dir \"$remote_dir\"\npython -I - \"$release_json\" \"$GITHUB_REF_NAME\" \"$remote_dir\" dist <<'PY'\nfrom hashlib import sha256\nfrom pathlib import Path\nimport json\nimport re\nimport sys\n\npayload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\ntag = sys.argv[2]\nmatch = re.fullmatch(r'v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)', tag)\nif match is None or payload.get('tag_name') != tag:\n    raise SystemExit('release tag mismatch')\nif payload.get('draft') is not True or payload.get('prerelease') is not False:\n    raise SystemExit('draft release is required; published releases are immutable; prerelease is not allowed')\nversion = tag[1:]\nexpected = sorted([\n    *(f'hydra-codex-{version}-{target}.tar.gz' for target in (\n        'darwin-arm64', 'darwin-x86_64', 'linux-x86_64'\n    )),\n    'SHA256SUMS',\n])\nassets = payload.get('assets')\nif not isinstance(assets, list):\n    raise SystemExit('remote release asset inventory is invalid')\nnames = [asset.get('name') for asset in assets if isinstance(asset, dict)]\nif len(names) != len(assets) or sorted(names) != expected:\n    raise SystemExit('remote release asset inventory is invalid')\nremote = Path(sys.argv[3])\nlocal = Path(sys.argv[4])\ninventory = list(remote.iterdir())\nif (\n    sorted(path.name for path in inventory) != expected\n    or any(path.is_symlink() or not path.is_file() for path in inventory)\n):\n    raise SystemExit('remote release asset inventory is invalid')\nfor name in expected:\n    if sha256((remote / name).read_bytes()).digest() != sha256((local / name).read_bytes()).digest():\n        raise SystemExit('remote asset checksum mismatch')\nPY\ngh release edit \"$GITHUB_REF_NAME\" --draft=false --latest"
+        }
+      ]
+    }
+  }
+}

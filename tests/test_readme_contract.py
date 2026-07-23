@@ -8,6 +8,69 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReadmeContractTests(unittest.TestCase):
+    def test_primary_install_flow_is_public_standalone_before_developer_setup(
+        self,
+    ) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        commands = (
+            "curl -fsSL https://raw.githubusercontent.com/Manannikov-Nikita/hydra/main/install.sh | sh",
+            "hydra-codex install -y",
+            "hydra-codex init .",
+            "hydra-codex status . --json",
+            "hydra-codex dashboard",
+        )
+        for command in commands:
+            self.assertIn(command, readme)
+        path_export = 'export PATH="$HOME/.local/bin:$PATH"'
+        self.assertIn(path_export, readme)
+        self.assertLess(readme.index(commands[0]), readme.index(path_export))
+        self.assertLess(readme.index(path_export), readme.index(commands[1]))
+        self.assertIn("Developer installation", readme)
+        self.assertLess(readme.index(commands[0]), readme.index("Developer installation"))
+        self.assertIn(
+            "~/Library/Application Support/Hydra/hydra.sqlite3",
+            readme,
+        )
+        self.assertIn("~/.local/share/hydra/hydra.sqlite3", readme)
+        self.assertIn("$XDG_DATA_HOME/hydra/hydra.sqlite3", readme)
+
+    def test_readme_links_public_install_upgrade_privacy_and_release_guides(
+        self,
+    ) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for link in (
+            "docs/installation.md",
+            "docs/upgrade-and-uninstall.md",
+            "docs/privacy.md",
+            "docs/troubleshooting.md",
+            "docs/release-process.md",
+        ):
+            self.assertIn(link, readme)
+        self.assertIn(
+            "hydra-codex dashboard --cwd /path/to/project --port 0 --no-open",
+            readme,
+        )
+
+    def test_plugin_upgrade_instructions_use_atomic_upgrade_refresh(self) -> None:
+        plugin = (
+            ROOT / "plugins" / "hydra-codex" / "README.md"
+        ).read_text(encoding="utf-8")
+        bootstrap = (
+            "curl -fsSL "
+            "https://raw.githubusercontent.com/Manannikov-Nikita/hydra/"
+            "main/install.sh | sh"
+        )
+        path_export = 'export PATH="$HOME/.local/bin:$PATH"'
+        self.assertIn(path_export, plugin)
+        self.assertLess(plugin.index(bootstrap), plugin.index(path_export))
+        self.assertLess(
+            plugin.index(path_export),
+            plugin.index("hydra-codex install -y"),
+        )
+        self.assertNotIn("hydra-codex install -y --refresh", plugin)
+        self.assertIn("hydra-codex upgrade", plugin)
+        self.assertIn("refreshes the Codex integration atomically", plugin)
+
     def test_readme_describes_the_shipped_mvp_without_overclaiming_the_pilot(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         normalized = " ".join(readme.lower().split())

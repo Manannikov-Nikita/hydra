@@ -127,7 +127,7 @@ validate_release_base()
             http://127.0.0.1:*)
                 port_path=${RELEASE_BASE#http://127.0.0.1:}
                 ;;
-            http://\[\:\:1\]:*)
+            http://\[::1\]:*)
                 port_path=${RELEASE_BASE#http://\[::1\]:}
                 ;;
             *) fail "release source is invalid" ;;
@@ -648,9 +648,9 @@ inspect_local_state
 
 printf 'Hydra %s installed successfully.\n' "$VERSION"
 case ":${PATH-}:" in
-    *':$HOME/.local/bin:'*) ;;
     *":$HOME/.local/bin:"*) ;;
     *)
+        # shellcheck disable=SC2016 # Printed as a command for the user's shell.
         printf '%s\n' \
             'Add Hydra to PATH: export PATH="$HOME/.local/bin:$PATH"'
         ;;

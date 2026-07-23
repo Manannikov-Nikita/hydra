@@ -1,0 +1,77 @@
+{
+  "name": "Quality",
+  "on": {
+    "push": {},
+    "pull_request": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "quality-${{ github.workflow }}-${{ github.ref }}",
+    "cancel-in-progress": true
+  },
+  "jobs": {
+    "quality": {
+      "name": "Quality (${{ matrix.target }})",
+      "runs-on": "${{ matrix.runner }}",
+      "timeout-minutes": 90,
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {
+          "include": [
+            {
+              "runner": "macos-15",
+              "target": "darwin-arm64"
+            },
+            {
+              "runner": "macos-15-intel",
+              "target": "darwin-x86_64"
+            },
+            {
+              "runner": "ubuntu-24.04",
+              "target": "linux-x86_64"
+            }
+          ]
+        }
+      },
+      "steps": [
+        # reviewed: actions/checkout v7.0.1
+        {"name": "Checkout source", "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "with": {"persist-credentials": false}},
+        # reviewed: actions/setup-python v7.0.0
+        {"name": "Set up Python", "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97", "with": {"python-version": "3.12"}},
+        {
+          "name": "Verify native runner architecture",
+          "shell": "bash",
+          "run": "set -euo pipefail\nactual=\"$(uname -s)/$(uname -m)\"\ncase \"${{ matrix.target }}\" in\n  darwin-arm64) expected=\"Darwin/arm64\" ;;\n  darwin-x86_64) expected=\"Darwin/x86_64\" ;;\n  linux-x86_64) expected=\"Linux/x86_64\" ;;\n  *) exit 1 ;;\nesac\nif [ \"$actual\" != \"$expected\" ]; then\n  printf 'native runner mismatch: expected %s, got %s\\n' \"$expected\" \"$actual\" >&2\n  exit 1\nfi"
+        },
+        {
+          "name": "Install test and release tooling",
+          "run": "python -m pip install '.[test,release]'"
+        },
+        {
+          "name": "Run full source suite",
+          "run": "env PYTHONPATH=\"$PWD/src\" python -m unittest discover -s tests -t ."
+        },
+        {
+          "name": "Build and verify wheel and source archive",
+          "shell": "bash",
+          "run": "set -euo pipefail\nrm -rf dist\npython -m build --no-isolation\nwheel_count=\"$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')\"\nsdist_count=\"$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')\"\ntotal_count=\"$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')\"\n[ \"$wheel_count\" = 1 ]\n[ \"$sdist_count\" = 1 ]\n[ \"$total_count\" = 2 ]"
+        },
+        {
+          "name": "Run pinned ShellCheck",
+          "if": "${{ matrix.target == 'linux-x86_64' }}",
+          "shell": "bash",
+          "run": "set -euo pipefail\narchive=\"$RUNNER_TEMP/shellcheck-v0.11.0.linux.x86_64.tar.gz\"\ncurl -fsSLo \"$archive\" https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz\nprintf '%s  %s\\n' 'b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6' \"$archive\" | sha256sum -c -\ntar -xzf \"$archive\" -C \"$RUNNER_TEMP\"\n\"$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck\" install.sh packaging/accept_standalone.sh"
+        },
+        {
+          "name": "Build and accept native standalone archive",
+          "shell": "bash",
+          "run": "set -euo pipefail\nrm -rf build/standalone\npython packaging/build_standalone.py --source-root \"$PWD\" --output build/standalone --target \"${{ matrix.target }}\"\narchive_count=\"$(find build/standalone -maxdepth 1 -type f -name 'hydra-codex-*.tar.gz' | wc -l | tr -d ' ')\"\n[ \"$archive_count\" = 1 ]\narchive=\"$(find build/standalone -maxdepth 1 -type f -name 'hydra-codex-*.tar.gz' -print)\"\ncase \"$archive\" in\n  *-\"${{ matrix.target }}\".tar.gz) ;;\n  *) exit 1 ;;\nesac\nsh packaging/accept_standalone.sh \"$archive\""
+        },
+        # reviewed: actions/upload-artifact v7.0.1
+        {"name": "Upload accepted standalone archive", "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "with": {"name": "hydra-standalone-${{ matrix.target }}", "path": "build/standalone/hydra-codex-*.tar.gz", "if-no-files-found": "error", "retention-days": 7}}
+      ]
+    }
+  }
+}

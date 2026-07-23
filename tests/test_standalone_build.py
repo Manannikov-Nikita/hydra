@@ -559,7 +559,10 @@ class StandaloneBuildTests(unittest.TestCase):
         self.assertTrue(script.startswith("#!/bin/sh\nset -eu\n"))
         self.assertNotIn("0.1.0", script)
         self.assertNotIn("0.1.1", script)
-        self.assertIn('TEMP_PARENT=$(CDPATH= cd -- "${TMPDIR-/tmp}" && pwd -P)', script)
+        self.assertIn(
+            'TEMP_PARENT=$(CDPATH=\'\' cd -- "${TMPDIR-/tmp}" && pwd -P)',
+            script,
+        )
         self.assertIn('"$TEMP_PARENT"/hydra-standalone-accept.*)', script)
         self.assertIn("for command in python python3 python3.12 pip uv", script)
         self.assertIn("shim=$SHIM_DIR/$command", script)

@@ -133,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    install = commands.add_parser("install")
+    install.add_argument("-y", "--yes", action="store_true")
+    install.add_argument("--refresh", action="store_true")
+    install.add_argument("--print-config", choices=("codex",))
+
+    uninstall = commands.add_parser("uninstall")
+    uninstall.add_argument("-y", "--yes", action="store_true")
+    uninstall.add_argument("--keep-cli", action="store_true")
+
     commands.add_parser("hook")
     commands.add_parser("mcp")
 
@@ -480,6 +489,9 @@ def main(
     environ: Mapping[str, str] | None = None,
     services: CommandServices | None = None,
     installation_key_path: Path | None = None,
+    codex_client: object | None = None,
+    integration_receipt_path: Path | None = None,
+    marketplace_root: Path | None = None,
 ) -> int:
     input_stream = sys.stdin if stdin is None else stdin
     output_stream = sys.stdout if stdout is None else stdout
@@ -498,6 +510,22 @@ def main(
                 arguments,
                 environ=environment,
                 stdout=output_stream,
+                codex_client=codex_client,
+                marketplace_root=marketplace_root,
+            )
+            return 0
+        if arguments.command in {"install", "uninstall"}:
+            from .installation_cli import run_codex_integration
+
+            run_codex_integration(
+                arguments,
+                environ=environment,
+                stdin=input_stream,
+                stdout=output_stream,
+                stderr=error_stream,
+                client=codex_client,
+                receipt_path=integration_receipt_path,
+                marketplace_root=marketplace_root,
             )
             return 0
         if arguments.command in {"hook", "mcp"}:
@@ -580,12 +608,18 @@ def main(
     except ProjectConfigError:
         error_stream.write("hydra-codex: invalid project configuration\n")
         return 2
-    except StorageUnavailable:
-        error_stream.write("hydra-codex: storage unavailable\n")
-    except (ProjectNotFound, ValueError, json.JSONDecodeError):
-        error_stream.write("hydra-codex: validation failed\n")
-    except OSError:
-        error_stream.write("hydra-codex: I/O operation failed\n")
-    except Exception:
-        error_stream.write("hydra-codex: command failed\n")
-    return 1
+    except Exception as error:
+        from .installation_cli import ConfirmationRequired
+
+        if isinstance(error, ConfirmationRequired):
+            error_stream.write("hydra-codex: confirmation required\n")
+            return 1
+        if isinstance(error, StorageUnavailable):
+            error_stream.write("hydra-codex: storage unavailable\n")
+        elif isinstance(error, (ProjectNotFound, ValueError, json.JSONDecodeError)):
+            error_stream.write("hydra-codex: validation failed\n")
+        elif isinstance(error, OSError):
+            error_stream.write("hydra-codex: I/O operation failed\n")
+        else:
+            error_stream.write("hydra-codex: command failed\n")
+        return 1

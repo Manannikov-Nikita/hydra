@@ -299,18 +299,18 @@ class PluginHookContractTests(unittest.TestCase):
             "category": "Developer Tools",
         }])
 
-    def test_plugin_documents_post_pilot_installation_precondition(self) -> None:
+    def test_plugin_documents_owned_codex_installation(self) -> None:
         plugin_readme = (
             ROOT / "plugins" / "hydra-codex" / "README.md"
         ).read_text(encoding="utf-8")
         normalized = " ".join(plugin_readme.lower().split())
-        self.assertIn("post-pilot", normalized)
-        self.assertIn("hydra-codex must be installed", normalized)
-        self.assertIn("hydra-codex-hook", normalized)
-        self.assertIn("hydra-codex-plugin path", normalized)
-        self.assertIn("hydra-codex-plugin materialize", normalized)
-        self.assertIn("plugin_bundle_path", normalized)
-        self.assertIn("materialize_plugin_bundle", normalized)
+        self.assertIn("hydra-codex install -y", normalized)
+        self.assertIn("hydra-codex install -y --refresh", normalized)
+        self.assertIn("hydra-codex install --print-config codex", normalized)
+        self.assertIn("hydra-codex uninstall --keep-cli", normalized)
+        self.assertIn("new codex task", normalized)
+        self.assertNotIn("post-pilot", normalized)
+        self.assertNotIn("config.toml", normalized)
         self.assertIn("hydra.report", normalized)
         self.assertIn("authenticated turn transport", normalized)
         self.assertNotIn("trusted turn transport", normalized)

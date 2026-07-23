@@ -210,6 +210,17 @@ class PluginBundleApiTests(unittest.TestCase):
             self.assertEqual(Path(output.getvalue().strip()), target.resolve())
             self.assertEqual(_inventory(target), _inventory(PLUGIN_ROOT))
 
+    def test_plugin_readme_uses_reconciled_codex_installation_commands(self) -> None:
+        readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("hydra-codex install -y", readme)
+        self.assertIn("hydra-codex install -y --refresh", readme)
+        self.assertIn("hydra-codex install --print-config codex", readme)
+        self.assertIn("hydra-codex uninstall --keep-cli", readme)
+        self.assertIn("new Codex task", readme)
+        self.assertNotIn("post-pilot activation", readme.lower())
+        self.assertNotIn("config.toml", readme)
+
 
 if __name__ == "__main__":
     unittest.main()

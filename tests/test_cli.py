@@ -98,6 +98,7 @@ class FakeServices:
 
 def invoke(
     argv, *, stdin="", environ=None, services=None, installation_key_path=None,
+    codex_client=None, integration_receipt_path=None, marketplace_root=None,
 ):
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -106,6 +107,13 @@ def invoke(
         {"installation_key_path": installation_key_path}
         if installation_key_path is not None else {}
     )
+    integration_options = {}
+    if codex_client is not None:
+        integration_options["codex_client"] = codex_client
+    if integration_receipt_path is not None:
+        integration_options["integration_receipt_path"] = integration_receipt_path
+    if marketplace_root is not None:
+        integration_options["marketplace_root"] = marketplace_root
     code = main(
         argv,
         stdin=input_stream,
@@ -114,6 +122,7 @@ def invoke(
         environ={} if environ is None else environ,
         services=services,
         **key_options,
+        **integration_options,
     )
     return code, stdout.getvalue(), stderr.getvalue()
 
@@ -129,6 +138,110 @@ class NoReadStdin:
 class TtyBuffer(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class CodexInstallationCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_codex_integration import StatefulCodexClient
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.marketplace = self.root / "marketplace"
+        self.marketplace.mkdir()
+        self.receipt = self.root / "private" / "codex-integration.json"
+        self.client = StatefulCodexClient()
+        self.client.available_versions[self.marketplace.resolve()] = "0.1.0"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def call(self, argv, *, stdin=""):
+        return invoke(
+            argv,
+            stdin=stdin,
+            environ={"HOME": str(self.home)},
+            codex_client=self.client,
+            integration_receipt_path=self.receipt,
+            marketplace_root=self.marketplace,
+        )
+
+    def test_print_config_is_read_only_without_codex_or_confirmation(self) -> None:
+        class UnusableClient:
+            def version(self):
+                raise AssertionError("Codex client must not be used")
+
+        code, stdout, stderr = invoke(
+            ["install", "--print-config", "codex"],
+            stdin=NoReadStdin(),
+            environ={"HOME": str(self.home)},
+            codex_client=UnusableClient(),
+            integration_receipt_path=self.receipt,
+            marketplace_root=self.marketplace,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("codex plugin marketplace add", stdout)
+        self.assertIn("hydra-codex@hydra", stdout)
+        self.assertEqual(list(self.root.rglob("codex-integration.json")), [])
+
+    def test_noninteractive_install_requires_yes_and_never_mutates(self) -> None:
+        code, stdout, stderr = self.call(["install"])
+
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertEqual(stderr, "hydra-codex: confirmation required\n")
+        self.assertEqual(self.client.calls, [])
+
+    def test_confirmed_install_and_repeat_are_idempotent(self) -> None:
+        first = self.call(["install", "-y"])
+        self.client.calls.clear()
+        second = self.call(["install", "-y"])
+
+        self.assertEqual(first[0], 0)
+        self.assertEqual(second[0], 0)
+        self.assertEqual(json.loads(first[1])["changed"], True)
+        self.assertEqual(json.loads(second[1])["changed"], False)
+        self.assertEqual(self.client.calls, [])
+
+    def test_interactive_confirmation_allows_install(self) -> None:
+        confirmed_input = TtyBuffer("yes\n")
+
+        code, stdout, stderr = self.call(["install"], stdin=confirmed_input)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(stdout)["changed"])
+        self.assertIn("Install Hydra into Codex?", stderr)
+
+    def test_uninstall_keep_cli_detaches_only_owned_integration(self) -> None:
+        self.call(["install", "-y"])
+        data = self.root / "telemetry.sqlite3"
+        data.write_bytes(b"preserve")
+
+        code, stdout, stderr = self.call(["uninstall", "-y", "--keep-cli"])
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertTrue(json.loads(stdout)["changed"])
+        self.assertEqual(data.read_bytes(), b"preserve")
+        self.assertFalse(self.receipt.exists())
+
+    def test_uninstall_does_not_require_the_current_marketplace_bundle(self) -> None:
+        self.call(["install", "-y"])
+
+        with mock.patch(
+            "hydra_codex.installation_cli.marketplace_root_path",
+            side_effect=FileNotFoundError("private missing bundle"),
+        ):
+            code, stdout, stderr = invoke(
+                ["uninstall", "-y", "--keep-cli"],
+                environ={"HOME": str(self.home)},
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertTrue(json.loads(stdout)["changed"])
+        self.assertFalse(self.receipt.exists())
 
 
 class CliParserTests(unittest.TestCase):
@@ -157,7 +270,8 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual((code, stderr), (0, ""))
         for command in (
             "ingest", "annotate", "reconcile", "report", "compare", "audit",
-            "doctor", "storage", "init", "status", "uninit",
+            "doctor", "storage", "init", "status", "uninit", "install",
+            "uninstall",
         ):
             self.assertIn(command, stdout)
 
@@ -355,6 +469,8 @@ class ServiceDelegationTests(unittest.TestCase):
 
 class ProjectLifecycleCliTests(unittest.TestCase):
     def setUp(self) -> None:
+        from tests.test_codex_integration import StatefulCodexClient
+
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.home = self.root / "home"
@@ -362,6 +478,7 @@ class ProjectLifecycleCliTests(unittest.TestCase):
         self.project = self.root / "project"
         self.project.mkdir()
         self.environ = {"HOME": str(self.home)}
+        self.codex_client = StatefulCodexClient()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -385,6 +502,7 @@ class ProjectLifecycleCliTests(unittest.TestCase):
             ["status", str(self.project), "--json"],
             environ=self.environ,
             services=services,
+            codex_client=self.codex_client,
         )
         self.assertEqual((code, stderr), (0, ""))
         self.assertTrue(json.loads(stdout)["project"]["initialized"])
@@ -408,6 +526,7 @@ class ProjectLifecycleCliTests(unittest.TestCase):
         code, stdout, stderr = invoke(
             ["status", str(self.project), "--json"],
             environ=self.environ,
+            codex_client=self.codex_client,
         )
 
         self.assertEqual((code, stderr), (0, ""))
@@ -422,6 +541,7 @@ class ProjectLifecycleCliTests(unittest.TestCase):
         code, stdout, stderr = invoke(
             ["status", str(self.project)],
             environ=self.environ,
+            codex_client=self.codex_client,
         )
 
         self.assertEqual((code, stderr), (0, ""))
@@ -440,6 +560,7 @@ class ProjectLifecycleCliTests(unittest.TestCase):
         code, stdout, stderr = invoke(
             ["status", str(self.project), "--json"],
             environ=self.environ,
+            codex_client=self.codex_client,
         )
 
         self.assertEqual(code, 2)

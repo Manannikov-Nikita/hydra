@@ -1,4 +1,4 @@
-"""Locate or materialize the canonical Hydra Codex plugin bundle."""
+"""Locate the canonical, runtime-matched Hydra Codex marketplace and plugin."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def _frozen_marketplace() -> Path | None:
 
 
 def marketplace_root_path() -> Path:
-    """Return the complete frozen, checkout, or wheel marketplace root."""
+    """Return the complete active-version marketplace used for reconciliation."""
     frozen = _frozen_marketplace()
     if frozen is not None:
         return frozen

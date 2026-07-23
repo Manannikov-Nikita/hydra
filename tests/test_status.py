@@ -31,6 +31,8 @@ def inventory(root: Path) -> tuple[tuple[str, int, int], ...]:
 
 class StatusTests(unittest.TestCase):
     def setUp(self) -> None:
+        from tests.test_codex_integration import StatefulCodexClient
+
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.home = self.root / "home"
@@ -38,14 +40,26 @@ class StatusTests(unittest.TestCase):
         self.project = self.root / "project"
         self.project.mkdir()
         self.environ = {"HOME": str(self.home)}
+        self.marketplace = self.root / "marketplace"
+        self.marketplace.mkdir()
+        self.client = StatefulCodexClient()
+        self.client.available_versions[self.marketplace.resolve()] = "0.1.0"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def status(self, path: Path | None = None):
+        return collect_status(
+            self.project if path is None else path,
+            environ=self.environ,
+            codex_client=self.client,
+            marketplace_root=self.marketplace,
+        )
+
     def test_uninitialized_status_is_successful_read_only_and_path_private(self) -> None:
         before = inventory(self.root)
 
-        result = collect_status(self.project, environ=self.environ)
+        result = self.status()
 
         self.assertEqual(
             result["project"],
@@ -65,7 +79,7 @@ class StatusTests(unittest.TestCase):
             home=self.home,
         )
 
-        result = collect_status(self.project / "missing", environ=self.environ)
+        result = self.status(self.project / "missing")
 
         self.assertEqual(
             result["project"],
@@ -86,7 +100,7 @@ class StatusTests(unittest.TestCase):
         before = inventory(self.root)
 
         with self.assertRaises(ProjectConfigError) as raised:
-            collect_status(self.project, environ=self.environ)
+            self.status()
 
         self.assertEqual(inventory(self.root), before)
         self.assertNotIn(str(self.root), str(raised.exception))
@@ -121,7 +135,7 @@ class StatusTests(unittest.TestCase):
             "hydra_codex.status.sqlite3.connect",
             side_effect=recording_connect,
         ):
-            result = collect_status(self.project, environ=self.environ)
+            result = self.status()
 
         self.assertEqual(result["storage"], {"exists": True, "schema_version": 22})
         self.assertEqual(database.read_bytes(), before)
@@ -134,7 +148,7 @@ class StatusTests(unittest.TestCase):
         database = default_database_path(self.home, environ=self.environ)
         key = default_installation_key_path(self.home, environ=self.environ)
 
-        result = collect_status(self.project, environ=self.environ)
+        result = self.status()
 
         self.assertEqual(result["storage"], {"exists": False, "schema_version": None})
         self.assertEqual(result["installation"], {"identity_key_exists": False})
@@ -147,10 +161,68 @@ class StatusTests(unittest.TestCase):
         key.parent.mkdir(parents=True)
         key.write_bytes(b"k" * 32)
 
-        result = collect_status(self.project, environ=self.environ)
+        result = self.status()
 
         self.assertEqual(result["installation"], {"identity_key_exists": True})
         self.assertNotIn(str(key), json.dumps(result))
+
+    def test_codex_status_reports_exact_version_parity_and_new_task_action(self) -> None:
+        self.client.marketplaces["hydra"] = self.marketplace.resolve()
+        self.client.installed_version = "0.1.0"
+
+        result = self.status()
+
+        self.assertEqual(
+            result["codex"],
+            {
+                "available": True,
+                "compatible": True,
+                "marketplace_installed": True,
+                "plugin_installed": True,
+                "plugin_version": "0.1.0",
+                "version_matches": True,
+                "new_task_required": True,
+                "next_actions": ["Start a new Codex task to load Hydra."],
+            },
+        )
+        self.assertNotIn(str(self.root), json.dumps(result))
+        self.assertEqual(self.client.calls, [])
+
+    def test_codex_status_reports_capability_failure_without_mutation(self) -> None:
+        self.client.plugin_listing_supported = False
+        before = inventory(self.root)
+
+        result = self.status()
+
+        self.assertEqual(
+            result["codex"],
+            {
+                "available": True,
+                "compatible": False,
+                "marketplace_installed": None,
+                "plugin_installed": None,
+                "plugin_version": None,
+                "version_matches": None,
+                "new_task_required": False,
+                "next_actions": [
+                    "Install or update Codex with plugin marketplace support.",
+                ],
+            },
+        )
+        self.assertEqual(inventory(self.root), before)
+        self.assertEqual(self.client.calls, [])
+
+    def test_status_without_an_executable_path_never_runs_or_creates_codex_state(self) -> None:
+        before = inventory(self.root)
+
+        with mock.patch(
+            "hydra_codex.codex_integration._run_bounded",
+            side_effect=AssertionError("Codex must not run without a supplied PATH"),
+        ):
+            result = collect_status(self.project, environ=self.environ)
+
+        self.assertFalse(result["codex"]["available"])
+        self.assertEqual(inventory(self.root), before)
 
 
 if __name__ == "__main__":

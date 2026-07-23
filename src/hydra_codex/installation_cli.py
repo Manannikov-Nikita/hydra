@@ -1,4 +1,4 @@
-"""Privacy-safe rendering for project installation lifecycle commands."""
+"""Privacy-safe rendering for project and Codex installation commands."""
 
 from __future__ import annotations
 
@@ -6,8 +6,22 @@ import json
 from pathlib import Path
 from typing import Mapping, TextIO
 
+from . import __version__
+from .codex_integration import (
+    CodexClient,
+    CodexCommandClient,
+    configure_codex,
+    remove_codex_integration,
+    render_codex_config,
+)
+from .platform_paths import default_data_directory
+from .plugin_bundle import marketplace_root_path
 from .project_lifecycle import initialize_project, uninitialize_project
 from .status import collect_status
+
+
+class ConfirmationRequired(RuntimeError):
+    """Raised when a mutating installation command lacks operator approval."""
 
 
 def _write_json(stdout: TextIO, value: Mapping[str, object]) -> None:
@@ -19,6 +33,8 @@ def run_project_lifecycle(
     *,
     environ: Mapping[str, str],
     stdout: TextIO,
+    codex_client: CodexClient | None = None,
+    marketplace_root: Path | None = None,
 ) -> None:
     """Execute one parsed lifecycle command without constructing app services."""
     command = getattr(arguments, "command")
@@ -56,16 +72,31 @@ def run_project_lifecycle(
         })
         return
 
-    status = collect_status(path, environ=environ)
+    try:
+        status_client = (
+            CodexCommandClient(environ=environ)
+            if codex_client is None
+            else codex_client
+        )
+    except Exception:
+        status_client = None
+    status = collect_status(
+        path,
+        environ=environ,
+        codex_client=status_client,
+        marketplace_root=marketplace_root,
+    )
     if getattr(arguments, "json"):
         _write_json(stdout, status)
         return
     project = status["project"]
     storage = status["storage"]
     installation = status["installation"]
+    codex = status["codex"]
     assert isinstance(project, Mapping)
     assert isinstance(storage, Mapping)
     assert isinstance(installation, Mapping)
+    assert isinstance(codex, Mapping)
     stdout.write(
         "Hydra status\n"
         f"project initialized: {'yes' if project['initialized'] else 'no'}\n"
@@ -75,7 +106,117 @@ def run_project_lifecycle(
         f"storage schema: {_human(storage['schema_version'])}\n"
         "installation identity: "
         f"{'present' if installation['identity_key_exists'] else 'missing'}\n"
+        f"Codex available: {'yes' if codex['available'] else 'no'}\n"
+        f"Codex plugin compatible: {_human(codex['compatible'])}\n"
+        f"Hydra plugin installed: {_human(codex['plugin_installed'])}\n"
+        f"Hydra plugin version: {_human(codex['plugin_version'])}\n"
+        f"Hydra runtime parity: {_human(codex['version_matches'])}\n"
+        f"new Codex task required: {'yes' if codex['new_task_required'] else 'no'}\n"
     )
+    actions = codex["next_actions"]
+    if isinstance(actions, list):
+        for action in actions:
+            stdout.write(f"next action: {action}\n")
+
+
+def _home(environ: Mapping[str, str]) -> Path:
+    home_value = environ.get("HOME")
+    return (
+        Path(home_value).expanduser()
+        if isinstance(home_value, str) and home_value
+        else Path.home()
+    )
+
+
+def _confirmed(arguments: object, stdin: TextIO, stderr: TextIO, prompt: str) -> None:
+    if bool(getattr(arguments, "yes", False)):
+        return
+    try:
+        interactive = stdin.isatty()
+    except (AttributeError, OSError):
+        interactive = False
+    if not interactive:
+        raise ConfirmationRequired("confirmation required")
+    stderr.write(prompt)
+    stderr.flush()
+    if stdin.readline().strip().lower() not in {"y", "yes"}:
+        raise ConfirmationRequired("confirmation required")
+
+
+def run_codex_integration(
+    arguments: object,
+    *,
+    environ: Mapping[str, str],
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    client: CodexClient | None = None,
+    receipt_path: Path | None = None,
+    marketplace_root: Path | None = None,
+) -> None:
+    """Execute one parsed Codex integration command."""
+    command = getattr(arguments, "command")
+    root = None
+    if command == "install":
+        root = (
+            marketplace_root_path()
+            if marketplace_root is None
+            else Path(marketplace_root).expanduser().resolve()
+        )
+    if command == "install" and getattr(arguments, "print_config") == "codex":
+        assert root is not None
+        stdout.write(
+            render_codex_config(
+                marketplace_root=root,
+                runtime_version=__version__,
+            ),
+        )
+        return
+
+    _confirmed(
+        arguments,
+        stdin,
+        stderr,
+        (
+            "Install Hydra into Codex? [y/N] "
+            if command == "install"
+            else "Remove Hydra from Codex? [y/N] "
+        ),
+    )
+    adapter = CodexCommandClient(environ=environ) if client is None else client
+    target = (
+        default_data_directory(_home(environ), environ=environ)
+        / "codex-integration.json"
+        if receipt_path is None
+        else Path(receipt_path).expanduser()
+    )
+    if command == "install":
+        assert root is not None
+        report = configure_codex(
+            client=adapter,
+            marketplace_root=root,
+            runtime_version=__version__,
+            receipt_path=target,
+            refresh=bool(getattr(arguments, "refresh")),
+        )
+        rendered_command = "install"
+    else:
+        report = remove_codex_integration(
+            client=adapter,
+            receipt_path=target,
+        )
+        rendered_command = "uninstall"
+    _write_json(stdout, {
+        "changed": report.changed,
+        "command": rendered_command,
+        "marketplace": report.marketplace,
+        "new_task_required": bool(
+            rendered_command == "install" and report.changed
+        ),
+        "runtime_version": report.runtime_version,
+        "selector": report.selector,
+        "status": "ok",
+    })
 
 
 def _human(value: object) -> str:

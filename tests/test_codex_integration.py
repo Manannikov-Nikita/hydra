@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -19,8 +21,14 @@ from hydra_codex.codex_integration import (
     configure_codex,
     remove_codex_integration,
     render_codex_config,
+    _read_receipt,
     _run_bounded,
+    _write_receipt_bytes,
 )
+
+
+class SimulatedCrash(BaseException):
+    """Model process termination after a Codex mutation took effect."""
 
 
 class StatefulCodexClient:
@@ -35,6 +43,11 @@ class StatefulCodexClient:
         self.marketplace_listing_supported = True
         self.plugin_listing_supported = True
         self.fail_on: tuple[str, object] | None = None
+        self.fail_sequence: list[tuple[str, object]] = []
+        self.crash_after_mutation: int | None = None
+        self.mutation_count = 0
+        self.inspection_count = 0
+        self.replace_marketplace_on_inspection: tuple[int, Path] | None = None
 
     @property
     def mutation_calls(self) -> list[tuple[str, object]]:
@@ -48,6 +61,10 @@ class StatefulCodexClient:
     def list_marketplaces(self) -> tuple[MarketplaceRecord, ...]:
         if not self.marketplace_listing_supported:
             raise IncompatibleCodexError("Codex integration is unavailable")
+        self.inspection_count += 1
+        replacement = self.replace_marketplace_on_inspection
+        if replacement is not None and self.inspection_count == replacement[0]:
+            self.marketplaces["hydra"] = replacement[1]
         return tuple(
             MarketplaceRecord(name, source)
             for name, source in sorted(self.marketplaces.items())
@@ -56,10 +73,12 @@ class StatefulCodexClient:
     def add_marketplace(self, root: Path) -> None:
         self._mutate("add_marketplace", root)
         self.marketplaces["hydra"] = root.resolve()
+        self._after_mutation()
 
     def remove_marketplace(self, name: str) -> None:
         self._mutate("remove_marketplace", name)
         self.marketplaces.pop(name, None)
+        self._after_mutation()
 
     def list_plugins(
         self,
@@ -92,17 +111,28 @@ class StatefulCodexClient:
         self._mutate("add_plugin", selector)
         source = self.marketplaces["hydra"]
         self.installed_version = self.available_versions[source]
+        self._after_mutation()
 
     def remove_plugin(self, selector: str) -> None:
         self._mutate("remove_plugin", selector)
         self.installed_version = None
+        self._after_mutation()
 
     def _mutate(self, operation: str, argument: object) -> None:
         call = (operation, argument)
         self.calls.append(call)
+        if self.fail_sequence and self.fail_sequence[0] == call:
+            self.fail_sequence.pop(0)
+            raise RuntimeError("private adapter failure")
         if self.fail_on == call:
             self.fail_on = None
             raise RuntimeError("private adapter failure")
+
+    def _after_mutation(self) -> None:
+        self.mutation_count += 1
+        if self.crash_after_mutation == self.mutation_count:
+            self.crash_after_mutation = None
+            raise SimulatedCrash
 
 
 class CodexIntegrationTests(unittest.TestCase):
@@ -161,6 +191,15 @@ class CodexIntegrationTests(unittest.TestCase):
         self.client.calls.clear()
 
         report = self.install_once()
+
+        self.assertFalse(report.changed)
+        self.assertEqual(self.client.calls, [])
+
+    def test_exact_repeat_with_refresh_is_also_a_noop(self) -> None:
+        self.install_once()
+        self.client.calls.clear()
+
+        report = self.install_once(refresh=True)
 
         self.assertFalse(report.changed)
         self.assertEqual(self.client.calls, [])
@@ -261,6 +300,221 @@ class CodexIntegrationTests(unittest.TestCase):
 
         self.assertEqual(self.receipt.read_bytes(), exact)
 
+    def test_crash_recovery_covers_every_configure_mutation_boundary(self) -> None:
+        for boundary in range(1, 5):
+            with self.subTest(boundary=boundary):
+                root = self.root / f"crash-configure-{boundary}"
+                old_marketplace = root / "old"
+                new_marketplace = root / "new"
+                old_marketplace.mkdir(parents=True)
+                new_marketplace.mkdir()
+                receipt = root / "data" / "codex-integration.json"
+                client = StatefulCodexClient()
+                client.available_versions[old_marketplace.resolve()] = "0.1.0"
+                client.available_versions[new_marketplace.resolve()] = "0.2.0"
+                configure_codex(
+                    client=client,
+                    marketplace_root=old_marketplace,
+                    runtime_version="0.1.0",
+                    receipt_path=receipt,
+                    refresh=False,
+                )
+                client.mutation_count = 0
+                client.crash_after_mutation = boundary
+
+                with self.assertRaises(SimulatedCrash):
+                    configure_codex(
+                        client=client,
+                        marketplace_root=new_marketplace,
+                        runtime_version="0.2.0",
+                        receipt_path=receipt,
+                        refresh=True,
+                    )
+
+                journal = receipt.with_name(receipt.name + ".journal")
+                self.assertTrue(journal.is_file())
+                self.assertEqual(stat.S_IMODE(journal.stat().st_mode), 0o600)
+                report = configure_codex(
+                    client=client,
+                    marketplace_root=new_marketplace,
+                    runtime_version="0.2.0",
+                    receipt_path=receipt,
+                    refresh=True,
+                )
+                self.assertTrue(report.changed)
+                self.assertEqual(client.marketplaces["hydra"], new_marketplace.resolve())
+                self.assertEqual(client.installed_version, "0.2.0")
+                self.assertFalse(journal.exists())
+
+    def test_crash_recovery_covers_every_remove_mutation_boundary(self) -> None:
+        for boundary in range(1, 3):
+            with self.subTest(boundary=boundary):
+                root = self.root / f"crash-remove-{boundary}"
+                marketplace = root / "marketplace"
+                marketplace.mkdir(parents=True)
+                receipt = root / "data" / "codex-integration.json"
+                client = StatefulCodexClient()
+                client.available_versions[marketplace.resolve()] = "0.1.0"
+                configure_codex(
+                    client=client,
+                    marketplace_root=marketplace,
+                    runtime_version="0.1.0",
+                    receipt_path=receipt,
+                    refresh=False,
+                )
+                client.mutation_count = 0
+                client.crash_after_mutation = boundary
+
+                with self.assertRaises(SimulatedCrash):
+                    remove_codex_integration(client=client, receipt_path=receipt)
+
+                journal = receipt.with_name(receipt.name + ".journal")
+                self.assertTrue(journal.is_file())
+                self.assertEqual(stat.S_IMODE(journal.stat().st_mode), 0o600)
+                report = remove_codex_integration(
+                    client=client,
+                    receipt_path=receipt,
+                )
+                self.assertTrue(report.changed)
+                self.assertNotIn("hydra", client.marketplaces)
+                self.assertIsNone(client.installed_version)
+                self.assertFalse(receipt.exists())
+                self.assertFalse(journal.exists())
+
+    def test_crash_recovery_covers_every_rollback_mutation_boundary(self) -> None:
+        for boundary in range(4, 7):
+            with self.subTest(boundary=boundary):
+                root = self.root / f"crash-rollback-{boundary}"
+                old_marketplace = root / "old"
+                new_marketplace = root / "new"
+                old_marketplace.mkdir(parents=True)
+                new_marketplace.mkdir()
+                receipt = root / "data" / "codex-integration.json"
+                client = StatefulCodexClient()
+                client.available_versions[old_marketplace.resolve()] = "0.1.0"
+                client.available_versions[new_marketplace.resolve()] = "0.2.0"
+                configure_codex(
+                    client=client,
+                    marketplace_root=old_marketplace,
+                    runtime_version="0.1.0",
+                    receipt_path=receipt,
+                    refresh=False,
+                )
+                client.mutation_count = 0
+                client.fail_on = ("add_plugin", "hydra-codex@hydra")
+                client.crash_after_mutation = boundary
+
+                with self.assertRaises(SimulatedCrash):
+                    configure_codex(
+                        client=client,
+                        marketplace_root=new_marketplace,
+                        runtime_version="0.2.0",
+                        receipt_path=receipt,
+                        refresh=True,
+                    )
+
+                journal = receipt.with_name(receipt.name + ".journal")
+                self.assertTrue(journal.is_file())
+                report = configure_codex(
+                    client=client,
+                    marketplace_root=new_marketplace,
+                    runtime_version="0.2.0",
+                    receipt_path=receipt,
+                    refresh=True,
+                )
+                self.assertTrue(report.changed)
+                self.assertEqual(client.marketplaces["hydra"], new_marketplace.resolve())
+                self.assertEqual(client.installed_version, "0.2.0")
+                self.assertFalse(journal.exists())
+
+    def test_concurrent_namespace_replacement_fails_before_destructive_mutation(
+        self,
+    ) -> None:
+        self.install_once()
+        second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.calls.clear()
+        self.client.inspection_count = 0
+        self.client.replace_marketplace_on_inspection = (2, Path("/foreign"))
+
+        with self.assertRaises(IntegrationOwnershipError):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.client.marketplaces["hydra"], Path("/foreign"))
+
+    def test_concurrent_namespace_replacement_during_rollback_is_preserved(
+        self,
+    ) -> None:
+        self.install_once()
+        second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.calls.clear()
+        self.client.inspection_count = 0
+        self.client.fail_on = ("add_plugin", "hydra-codex@hydra")
+        self.client.replace_marketplace_on_inspection = (10, Path("/foreign"))
+
+        with self.assertRaises(IntegrationError) as raised:
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+
+        self.assertIn("live rollback failed", str(raised.exception))
+        self.assertEqual(self.client.marketplaces["hydra"], Path("/foreign"))
+        self.assertTrue(
+            self.receipt.with_name(self.receipt.name + ".journal").is_file(),
+        )
+
+    def test_live_and_receipt_rollback_failures_are_both_reported_with_evidence(
+        self,
+    ) -> None:
+        self.install_once()
+        original_receipt = self.receipt.read_bytes()
+        second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.fail_sequence = [
+            ("add_plugin", "hydra-codex@hydra"),
+            ("add_marketplace", self.marketplace.resolve()),
+        ]
+        real_write = _write_receipt_bytes
+
+        def fail_original_restore(path: Path, content: bytes) -> None:
+            if content == original_receipt:
+                raise OSError("private receipt restore failure")
+            real_write(path, content)
+
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration._write_receipt_bytes",
+                side_effect=fail_original_restore,
+            ),
+            self.assertRaises(IntegrationError) as raised,
+        ):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("live rollback failed", message)
+        self.assertIn("receipt restore failed", message)
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(
+            base64.b64decode(payload["prior_receipt_b64"]),
+            original_receipt,
+        )
+
     def test_uninstall_removes_only_receipted_integration_and_is_repeatable(self) -> None:
         self.install_once()
         self.client.calls.clear()
@@ -322,6 +576,141 @@ class CodexIntegrationTests(unittest.TestCase):
 
         with self.assertRaises(IntegrationOwnershipError):
             self.install_once()
+
+        self.assertEqual(self.client.calls, [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership contract")
+    def test_receipt_reader_rejects_wrong_owner_from_open_descriptor(self) -> None:
+        self.install_once()
+        real_fstat = os.fstat
+
+        def foreign_owner(descriptor: int):
+            result = real_fstat(descriptor)
+            return mock.Mock(
+                st_mode=result.st_mode,
+                st_uid=os.getuid() + 1,
+                st_size=result.st_size,
+            )
+
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.os.fstat",
+                side_effect=foreign_owner,
+            ),
+            self.assertRaises(IntegrationOwnershipError),
+        ):
+            _read_receipt(self.receipt)
+
+    def test_receipt_reader_rejects_symlink(self) -> None:
+        target = self.root / "target-receipt"
+        target.write_text("{}", encoding="utf-8")
+        self.receipt.parent.mkdir()
+        self.receipt.symlink_to(target)
+
+        with self.assertRaises(IntegrationOwnershipError):
+            _read_receipt(self.receipt)
+
+    def test_receipt_reader_uses_one_open_descriptor_without_path_reread(self) -> None:
+        self.install_once()
+        original = self.receipt.read_bytes()
+        replacement = self.receipt.with_name("replacement")
+        replacement.write_text('{"not":"owned"}', encoding="utf-8")
+        replacement.chmod(0o600)
+        real_lstat = Path.lstat
+        intercepted = False
+
+        def replace_after_metadata(path: Path):
+            nonlocal intercepted
+            result = real_lstat(path)
+            if path == self.receipt and not intercepted:
+                intercepted = True
+                os.replace(replacement, self.receipt)
+            return result
+
+        with mock.patch(
+            "hydra_codex.codex_integration.Path.lstat",
+            side_effect=replace_after_metadata,
+        ):
+            receipt, raw = _read_receipt(self.receipt)
+
+        self.assertIsNotNone(receipt)
+        self.assertEqual(raw, original)
+
+    def test_pending_journal_symlink_and_nonprivate_mode_fail_closed(self) -> None:
+        for case in ("symlink", "mode"):
+            with self.subTest(case=case):
+                root = self.root / f"journal-{case}"
+                old_marketplace = root / "old"
+                new_marketplace = root / "new"
+                old_marketplace.mkdir(parents=True)
+                new_marketplace.mkdir()
+                receipt = root / "data" / "codex-integration.json"
+                client = StatefulCodexClient()
+                client.available_versions[old_marketplace.resolve()] = "0.1.0"
+                client.available_versions[new_marketplace.resolve()] = "0.2.0"
+                configure_codex(
+                    client=client,
+                    marketplace_root=old_marketplace,
+                    runtime_version="0.1.0",
+                    receipt_path=receipt,
+                    refresh=False,
+                )
+                client.mutation_count = 0
+                client.crash_after_mutation = 1
+                with self.assertRaises(SimulatedCrash):
+                    configure_codex(
+                        client=client,
+                        marketplace_root=new_marketplace,
+                        runtime_version="0.2.0",
+                        receipt_path=receipt,
+                        refresh=True,
+                    )
+                journal = receipt.with_name(receipt.name + ".journal")
+                if case == "mode":
+                    journal.chmod(0o644)
+                else:
+                    saved = journal.with_name("saved-journal")
+                    journal.replace(saved)
+                    journal.symlink_to(saved)
+                client.calls.clear()
+
+                with self.assertRaises(IntegrationOwnershipError):
+                    configure_codex(
+                        client=client,
+                        marketplace_root=new_marketplace,
+                        runtime_version="0.2.0",
+                        receipt_path=receipt,
+                        refresh=True,
+                    )
+
+                self.assertEqual(client.calls, [])
+
+    def test_pending_journal_must_bind_desired_receipt_to_desired_state(self) -> None:
+        self.install_once()
+        second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.mutation_count = 0
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["desired_receipt"]["runtime_version"] = "9.9.9"
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        journal.chmod(0o600)
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationOwnershipError):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
 
         self.assertEqual(self.client.calls, [])
 

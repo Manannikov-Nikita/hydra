@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -13,7 +16,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import Mapping, Protocol
+from typing import Iterator, Mapping, Protocol
 
 
 MARKETPLACE_NAME = "hydra"
@@ -21,6 +24,8 @@ PLUGIN_NAME = "hydra-codex"
 PLUGIN_SELECTOR = "hydra-codex@hydra"
 RECEIPT_SCHEMA_VERSION = 1
 _RECEIPT_MAX_BYTES = 16 * 1024
+_JOURNAL_SCHEMA_VERSION = 1
+_JOURNAL_MAX_BYTES = 64 * 1024
 _COMMAND_MAX_BYTES = 1024 * 1024
 _SAFE_PATH_PARTS = (
     "/opt/homebrew/bin",
@@ -109,6 +114,15 @@ class _Receipt:
 class CodexState:
     marketplace: MarketplaceRecord | None
     plugin: PluginRecord | None
+
+
+@dataclass(frozen=True)
+class _TransactionJournal:
+    operation: str
+    prior: CodexState
+    desired: CodexState
+    prior_receipt: bytes | None
+    desired_receipt: _Receipt | None
 
 
 def _run_bounded(
@@ -393,36 +407,60 @@ def _receipt_for(source: Path, runtime_version: str) -> _Receipt:
     )
 
 
-def _read_receipt(path: Path) -> tuple[_Receipt | None, bytes | None]:
+def _ownership_error() -> IntegrationOwnershipError:
+    return IntegrationOwnershipError("Codex integration ownership is ambiguous")
+
+
+def _open_flags(*, writable: bool = False, create: bool = False) -> int:
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    if create:
+        flags |= os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return flags
+
+
+def _read_private_bytes(path: Path, *, limit: int) -> bytes | None:
+    """Read one private regular file through exactly one verified descriptor."""
     try:
-        mode = path.lstat().st_mode
+        descriptor = os.open(path, _open_flags())
     except FileNotFoundError:
-        return None, None
+        return None
     except OSError:
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        ) from None
-    if not stat.S_ISREG(mode) or os.name == "posix" and mode & 0o077:
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        )
+        raise _ownership_error() from None
     try:
-        with path.open("rb") as stream:
-            raw = stream.read(_RECEIPT_MAX_BYTES + 1)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size < 0
+            or metadata.st_size > limit
+            or os.name == "posix"
+            and (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            )
+        ):
+            raise _ownership_error()
+        content = bytearray()
+        while len(content) <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > limit:
+            raise _ownership_error()
+        return bytes(content)
     except OSError:
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        ) from None
-    if len(raw) > _RECEIPT_MAX_BYTES:
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        )
+        raise _ownership_error() from None
+    finally:
+        os.close(descriptor)
+
+
+def _parse_receipt_bytes(raw: bytes) -> _Receipt:
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        ) from None
+        raise _ownership_error() from None
     keys = {
         "marketplace",
         "runtime_version",
@@ -438,28 +476,55 @@ def _read_receipt(path: Path) -> tuple[_Receipt | None, bytes | None]:
         or payload.get("schema_version") != RECEIPT_SCHEMA_VERSION
         or not isinstance(payload.get("runtime_version"), str)
         or not payload["runtime_version"]
+        or len(payload["runtime_version"].encode("utf-8")) > 256
+        or any(character in payload["runtime_version"] for character in "\r\n\0")
         or not isinstance(payload.get("source"), str)
         or not Path(payload["source"]).is_absolute()
     ):
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        )
-    return (
-        _Receipt(
-            MARKETPLACE_NAME,
-            Path(payload["source"]).resolve(),
-            PLUGIN_SELECTOR,
-            payload["runtime_version"],
-        ),
-        raw,
+        raise _ownership_error()
+    return _Receipt(
+        MARKETPLACE_NAME,
+        Path(payload["source"]).resolve(),
+        PLUGIN_SELECTOR,
+        payload["runtime_version"],
     )
+
+
+def _read_receipt(path: Path) -> tuple[_Receipt | None, bytes | None]:
+    raw = _read_private_bytes(path, limit=_RECEIPT_MAX_BYTES)
+    if raw is None:
+        return None, None
+    return _parse_receipt_bytes(raw), raw
+
+
+def _prepare_private_parent(parent: Path) -> None:
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = parent.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise _ownership_error()
+        if os.name == "posix":
+            if metadata.st_uid != os.getuid():
+                raise _ownership_error()
+            os.chmod(parent, 0o700)
+    except IntegrationOwnershipError:
+        raise
+    except OSError:
+        raise _ownership_error() from None
+
+
+def _fsync_directory(parent: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _write_receipt_bytes(path: Path, content: bytes) -> None:
     parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name == "posix":
-        os.chmod(parent, 0o700)
+    _prepare_private_parent(parent)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".codex-integration-",
         dir=parent,
@@ -475,11 +540,7 @@ def _write_receipt_bytes(path: Path, content: bytes) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         os.chmod(path, 0o600)
-        directory = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(parent)
     finally:
         if descriptor_open:
             try:
@@ -492,8 +553,8 @@ def _write_receipt_bytes(path: Path, content: bytes) -> None:
             pass
 
 
-def _write_receipt(path: Path, receipt: _Receipt) -> None:
-    content = (
+def _receipt_bytes(receipt: _Receipt) -> bytes:
+    return (
         json.dumps(
             receipt.payload(),
             sort_keys=True,
@@ -501,21 +562,256 @@ def _write_receipt(path: Path, receipt: _Receipt) -> None:
         )
         + "\n"
     ).encode("utf-8")
-    _write_receipt_bytes(path, content)
+
+
+def _write_receipt(path: Path, receipt: _Receipt) -> None:
+    _write_receipt_bytes(path, _receipt_bytes(receipt))
+
+
+def _delete_private_file(path: Path, *, limit: int) -> None:
+    existing = _read_private_bytes(path, limit=limit)
+    if existing is None:
+        return
+    try:
+        os.unlink(path)
+        _fsync_directory(path.parent)
+    except OSError:
+        raise _ownership_error() from None
 
 
 def _delete_receipt(path: Path) -> None:
-    mode = path.lstat().st_mode
-    if not stat.S_ISREG(mode):
-        raise IntegrationOwnershipError(
-            "Codex integration ownership is ambiguous",
-        )
-    path.unlink()
-    directory = os.open(path.parent, os.O_RDONLY)
+    _delete_private_file(path, limit=_RECEIPT_MAX_BYTES)
+
+
+def _journal_path(receipt_path: Path) -> Path:
+    return receipt_path.with_name(receipt_path.name + ".journal")
+
+
+def _lock_path(receipt_path: Path) -> Path:
+    return receipt_path.with_name(receipt_path.name + ".lock")
+
+
+@contextmanager
+def _integration_lock(receipt_path: Path) -> Iterator[None]:
+    _prepare_private_parent(receipt_path.parent)
+    path = _lock_path(receipt_path)
     try:
-        os.fsync(directory)
+        descriptor = os.open(
+            path,
+            _open_flags(writable=True, create=True),
+            0o600,
+        )
+    except OSError:
+        raise _ownership_error() from None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or os.name == "posix" and metadata.st_uid != os.getuid()
+        ):
+            raise _ownership_error()
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OSError:
+        raise _ownership_error() from None
     finally:
-        os.close(directory)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _state_payload(state: CodexState) -> dict[str, object]:
+    marketplace: dict[str, object] | None = None
+    if state.marketplace is not None:
+        marketplace = {
+            "name": state.marketplace.name,
+            "source": str(state.marketplace.source),
+        }
+    plugin: dict[str, object] | None = None
+    if state.plugin is not None:
+        plugin = {
+            "installed": state.plugin.installed,
+            "marketplace": state.plugin.marketplace,
+            "name": state.plugin.name,
+            "version": state.plugin.version,
+        }
+    return {"marketplace": marketplace, "plugin": plugin}
+
+
+def _state_from_payload(payload: object) -> CodexState:
+    if not isinstance(payload, Mapping) or set(payload) != {"marketplace", "plugin"}:
+        raise _ownership_error()
+    marketplace_payload = payload["marketplace"]
+    marketplace = None
+    if marketplace_payload is not None:
+        if (
+            not isinstance(marketplace_payload, Mapping)
+            or set(marketplace_payload) != {"name", "source"}
+            or marketplace_payload.get("name") != MARKETPLACE_NAME
+            or not isinstance(marketplace_payload.get("source"), str)
+            or not Path(marketplace_payload["source"]).is_absolute()
+        ):
+            raise _ownership_error()
+        marketplace = MarketplaceRecord(
+            MARKETPLACE_NAME,
+            Path(marketplace_payload["source"]).resolve(),
+        )
+    plugin_payload = payload["plugin"]
+    plugin = None
+    if plugin_payload is not None:
+        version = (
+            plugin_payload.get("version")
+            if isinstance(plugin_payload, Mapping)
+            else object()
+        )
+        if (
+            not isinstance(plugin_payload, Mapping)
+            or set(plugin_payload)
+            != {"installed", "marketplace", "name", "version"}
+            or plugin_payload.get("name") != PLUGIN_NAME
+            or plugin_payload.get("marketplace") != MARKETPLACE_NAME
+            or not isinstance(plugin_payload.get("installed"), bool)
+            or not (version is None or isinstance(version, str) and version)
+            or marketplace is None
+        ):
+            raise _ownership_error()
+        plugin = PluginRecord(
+            PLUGIN_NAME,
+            MARKETPLACE_NAME,
+            plugin_payload["installed"],
+            version,
+        )
+    return CodexState(marketplace, plugin)
+
+
+def _journal_payload(journal: _TransactionJournal) -> dict[str, object]:
+    return {
+        "desired_receipt": (
+            None
+            if journal.desired_receipt is None
+            else journal.desired_receipt.payload()
+        ),
+        "desired_state": _state_payload(journal.desired),
+        "operation": journal.operation,
+        "prior_receipt_b64": (
+            None
+            if journal.prior_receipt is None
+            else base64.b64encode(journal.prior_receipt).decode("ascii")
+        ),
+        "prior_state": _state_payload(journal.prior),
+        "schema_version": _JOURNAL_SCHEMA_VERSION,
+    }
+
+
+def _write_journal(path: Path, journal: _TransactionJournal) -> None:
+    content = (
+        json.dumps(
+            _journal_payload(journal),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(content) > _JOURNAL_MAX_BYTES:
+        raise IntegrationError("Codex integration transaction is invalid")
+    _write_receipt_bytes(path, content)
+
+
+def _read_journal(path: Path) -> _TransactionJournal | None:
+    raw = _read_private_bytes(path, limit=_JOURNAL_MAX_BYTES)
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _ownership_error() from None
+    keys = {
+        "desired_receipt",
+        "desired_state",
+        "operation",
+        "prior_receipt_b64",
+        "prior_state",
+        "schema_version",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != keys
+        or payload.get("schema_version") != _JOURNAL_SCHEMA_VERSION
+        or payload.get("operation") not in {"configure", "remove"}
+    ):
+        raise _ownership_error()
+    encoded = payload.get("prior_receipt_b64")
+    if encoded is None:
+        prior_receipt = None
+    elif isinstance(encoded, str):
+        try:
+            prior_receipt = base64.b64decode(encoded, validate=True)
+        except (ValueError, UnicodeEncodeError):
+            raise _ownership_error() from None
+        if len(prior_receipt) > _RECEIPT_MAX_BYTES:
+            raise _ownership_error()
+        _parse_receipt_bytes(prior_receipt)
+    else:
+        raise _ownership_error()
+    desired_payload = payload.get("desired_receipt")
+    desired_receipt = None
+    if desired_payload is not None:
+        try:
+            encoded_receipt = (
+                json.dumps(
+                    desired_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise _ownership_error() from None
+        desired_receipt = _parse_receipt_bytes(encoded_receipt)
+    journal = _TransactionJournal(
+        payload["operation"],
+        _state_from_payload(payload["prior_state"]),
+        _state_from_payload(payload["desired_state"]),
+        prior_receipt,
+        desired_receipt,
+    )
+    if journal.operation == "configure":
+        if journal.desired_receipt is None:
+            raise _ownership_error()
+        expected_desired = CodexState(
+            MarketplaceRecord(
+                MARKETPLACE_NAME,
+                journal.desired_receipt.source,
+            ),
+            PluginRecord(
+                PLUGIN_NAME,
+                MARKETPLACE_NAME,
+                True,
+                journal.desired_receipt.runtime_version,
+            ),
+        )
+        if journal.desired != expected_desired:
+            raise _ownership_error()
+    elif (
+        journal.desired_receipt is not None
+        or journal.desired != CodexState(None, None)
+    ):
+        raise _ownership_error()
+    if journal.prior_receipt is not None:
+        prior_owned = _parse_receipt_bytes(journal.prior_receipt)
+        if (
+            journal.prior.marketplace is not None
+            and journal.prior.marketplace.source != prior_owned.source
+        ):
+            raise _ownership_error()
+    if (
+        journal.prior.plugin is not None
+        and journal.prior.marketplace is None
+    ):
+        raise _ownership_error()
+    return journal
 
 
 def _state_is_exact(state: CodexState, receipt: _Receipt) -> bool:
@@ -558,49 +854,161 @@ def _ensure_owned(
         )
 
 
-def _clear_state(client: CodexClient) -> None:
-    state = inspect_codex(client)
-    if state.plugin is not None and state.plugin.installed:
-        client.remove_plugin(PLUGIN_SELECTOR)
-    if state.marketplace is not None:
-        client.remove_marketplace(MARKETPLACE_NAME)
-
-
-def _restore_state(client: CodexClient, previous: CodexState) -> None:
-    _clear_state(client)
-    if previous.marketplace is not None:
-        client.add_marketplace(previous.marketplace.source)
-    if previous.plugin is not None and previous.plugin.installed:
-        client.add_plugin(PLUGIN_SELECTOR)
-    restored = inspect_codex(client)
-    if previous.marketplace is None:
-        if restored.marketplace is not None or (
-            restored.plugin is not None and restored.plugin.installed
-        ):
-            raise IntegrationError("Codex integration rollback failed")
-        return
-    if (
-        restored.marketplace is None
-        or restored.marketplace.source != previous.marketplace.source
-        or bool(restored.plugin and restored.plugin.installed)
-        != bool(previous.plugin and previous.plugin.installed)
-        or (
-            previous.plugin is not None
-            and previous.plugin.installed
-            and (
-                restored.plugin is None
-                or restored.plugin.version != previous.plugin.version
+def _known_snapshots(journal: _TransactionJournal) -> set[CodexState]:
+    snapshots = {journal.prior, journal.desired, CodexState(None, None)}
+    for state in (journal.prior, journal.desired):
+        if state.marketplace is None:
+            continue
+        snapshots.add(CodexState(state.marketplace, None))
+        if state.plugin is not None:
+            snapshots.add(
+                CodexState(
+                    state.marketplace,
+                    PluginRecord(
+                        PLUGIN_NAME,
+                        MARKETPLACE_NAME,
+                        False,
+                        state.plugin.version,
+                    ),
+                ),
             )
-        )
+    return snapshots
+
+
+def _state_is_known(
+    state: CodexState,
+    journal: _TransactionJournal,
+) -> bool:
+    if state in _known_snapshots(journal):
+        return True
+    if (
+        state.marketplace is None
+        or state.plugin is None
+        or state.plugin.installed
     ):
-        raise IntegrationError("Codex integration rollback failed")
+        return False
+    return state.marketplace.source in {
+        snapshot.marketplace.source
+        for snapshot in (journal.prior, journal.desired)
+        if snapshot.marketplace is not None
+    }
 
 
-def _available_version(client: CodexClient) -> str | None:
-    plugin = _one_plugin(
-        client.list_plugins(MARKETPLACE_NAME, include_available=True),
-    )
-    return None if plugin is None else plugin.version
+def _inspect_known(
+    client: CodexClient,
+    journal: _TransactionJournal,
+) -> CodexState:
+    state = inspect_codex(client)
+    if not _state_is_known(state, journal):
+        raise _ownership_error()
+    return state
+
+
+def _guard_expected(
+    client: CodexClient,
+    expected: CodexState,
+    journal: _TransactionJournal,
+) -> None:
+    observed = _inspect_known(client, journal)
+    if observed != expected:
+        raise _ownership_error()
+
+
+def _restore_state(
+    client: CodexClient,
+    journal: _TransactionJournal,
+) -> None:
+    target = journal.prior
+    current = _inspect_known(client, journal)
+    if current == target:
+        return
+    if current.plugin is not None and current.plugin.installed:
+        _guard_expected(client, current, journal)
+        client.remove_plugin(PLUGIN_SELECTOR)
+        current = _inspect_known(client, journal)
+    if current.marketplace is not None and current != target:
+        _guard_expected(client, current, journal)
+        client.remove_marketplace(MARKETPLACE_NAME)
+        current = _inspect_known(client, journal)
+    if target.marketplace is not None and current.marketplace is None:
+        _guard_expected(client, current, journal)
+        client.add_marketplace(target.marketplace.source)
+        current = _inspect_known(client, journal)
+    if (
+        target.plugin is not None
+        and target.plugin.installed
+        and not bool(current.plugin is not None and current.plugin.installed)
+    ):
+        if current.plugin is None or current.plugin.version != target.plugin.version:
+            raise IntegrationError("Codex integration live rollback failed")
+        _guard_expected(client, current, journal)
+        client.add_plugin(PLUGIN_SELECTOR)
+        current = _inspect_known(client, journal)
+    if current != target:
+        raise IntegrationError("Codex integration live rollback failed")
+
+
+def _restore_original_receipt(
+    receipt_path: Path,
+    journal: _TransactionJournal,
+) -> None:
+    if journal.prior_receipt is None:
+        _delete_receipt(receipt_path)
+        if _read_private_bytes(receipt_path, limit=_RECEIPT_MAX_BYTES) is not None:
+            raise IntegrationError("Codex integration receipt restore failed")
+        return
+    _write_receipt_bytes(receipt_path, journal.prior_receipt)
+    restored = _read_private_bytes(receipt_path, limit=_RECEIPT_MAX_BYTES)
+    if restored != journal.prior_receipt:
+        raise IntegrationError("Codex integration receipt restore failed")
+
+
+def _recover_transaction(
+    client: CodexClient,
+    receipt_path: Path,
+    journal: _TransactionJournal,
+) -> None:
+    live_error: Exception | None = None
+    receipt_error: Exception | None = None
+    try:
+        _restore_state(client, journal)
+    except Exception as error:
+        live_error = error
+    try:
+        _restore_original_receipt(receipt_path, journal)
+    except Exception as error:
+        receipt_error = error
+    if live_error is None and receipt_error is None:
+        try:
+            _delete_private_file(
+                _journal_path(receipt_path),
+                limit=_JOURNAL_MAX_BYTES,
+            )
+            return
+        except Exception:
+            raise IntegrationError(
+                "Codex integration recovery failed: journal finalization failed",
+            ) from None
+    outcomes = [
+        "live rollback failed" if live_error is not None else "live rollback restored",
+        (
+            "receipt restore failed"
+            if receipt_error is not None
+            else "receipt restored"
+        ),
+    ]
+    raise IntegrationError(
+        "Codex integration recovery failed: " + "; ".join(outcomes),
+    ) from None
+
+
+def _recover_pending_transaction(
+    client: CodexClient,
+    receipt_path: Path,
+) -> None:
+    journal = _read_journal(_journal_path(receipt_path))
+    if journal is not None:
+        _recover_transaction(client, receipt_path, journal)
 
 
 def configure_codex(
@@ -615,85 +1023,130 @@ def configure_codex(
     source = Path(marketplace_root).expanduser().resolve()
     desired = _receipt_for(source, runtime_version)
     receipt_target = Path(receipt_path).expanduser()
-    owned, original_receipt = _read_receipt(receipt_target)
-    current = inspect_codex(client)
-    _ensure_owned(current, owned)
-    if _state_is_exact(current, desired) and owned == desired and not refresh:
+    with _integration_lock(receipt_target):
+        _recover_pending_transaction(client, receipt_target)
+        owned, original_receipt = _read_receipt(receipt_target)
+        current = inspect_codex(client)
+        _ensure_owned(current, owned)
+        if _state_is_exact(current, desired) and owned == desired:
+            return IntegrationReport(
+                False,
+                MARKETPLACE_NAME,
+                PLUGIN_SELECTOR,
+                runtime_version,
+            )
+        if (
+            owned is not None
+            and (
+                owned.runtime_version != runtime_version
+                or owned.source != source
+            )
+            and not refresh
+        ):
+            raise IntegrationError("Codex integration refresh is required")
+
+        desired_state = CodexState(
+            MarketplaceRecord(MARKETPLACE_NAME, source),
+            PluginRecord(
+                PLUGIN_NAME,
+                MARKETPLACE_NAME,
+                True,
+                runtime_version,
+            ),
+        )
+        if current == desired_state:
+            _write_receipt(receipt_target, desired)
+            verified_receipt, _raw = _read_receipt(receipt_target)
+            if verified_receipt != desired:
+                raise IntegrationError("Codex integration verification failed")
+            return IntegrationReport(
+                True,
+                MARKETPLACE_NAME,
+                PLUGIN_SELECTOR,
+                runtime_version,
+            )
+
+        journal = _TransactionJournal(
+            "configure",
+            current,
+            desired_state,
+            original_receipt,
+            desired,
+        )
+        _write_journal(_journal_path(receipt_target), journal)
+        mutation_started = False
+        try:
+            plugin_version_mismatch = bool(
+                current.plugin is not None
+                and current.plugin.version != runtime_version
+            )
+            replace_marketplace = bool(
+                current.marketplace is not None
+                and (
+                    current.marketplace.source != source
+                    or plugin_version_mismatch
+                )
+            )
+            replace_plugin = bool(
+                current.plugin is not None
+                and current.plugin.installed
+                and (
+                    current.plugin.version != runtime_version
+                    or replace_marketplace
+                )
+            )
+            if replace_plugin:
+                _guard_expected(client, current, journal)
+                mutation_started = True
+                client.remove_plugin(PLUGIN_SELECTOR)
+                current = _inspect_known(client, journal)
+            if replace_marketplace:
+                _guard_expected(client, current, journal)
+                mutation_started = True
+                client.remove_marketplace(MARKETPLACE_NAME)
+                current = _inspect_known(client, journal)
+            if current.marketplace is None:
+                _guard_expected(client, current, journal)
+                mutation_started = True
+                client.add_marketplace(source)
+                current = _inspect_known(client, journal)
+            if current.plugin is None or current.plugin.version != runtime_version:
+                raise IntegrationError(
+                    "Bundled plugin version does not match Hydra runtime",
+                )
+            if not current.plugin.installed:
+                _guard_expected(client, current, journal)
+                mutation_started = True
+                client.add_plugin(PLUGIN_SELECTOR)
+                current = _inspect_known(client, journal)
+            verified = inspect_codex(client)
+            if verified != desired_state or not _state_is_exact(verified, desired):
+                raise IntegrationError("Codex integration verification failed")
+            _write_receipt(receipt_target, desired)
+            verified_receipt, _raw = _read_receipt(receipt_target)
+            if verified_receipt != desired:
+                raise IntegrationError("Codex integration verification failed")
+            _delete_private_file(
+                _journal_path(receipt_target),
+                limit=_JOURNAL_MAX_BYTES,
+            )
+        except Exception as error:
+            if isinstance(error, IntegrationOwnershipError) and not mutation_started:
+                _delete_private_file(
+                    _journal_path(receipt_target),
+                    limit=_JOURNAL_MAX_BYTES,
+                )
+                raise
+            _recover_transaction(client, receipt_target, journal)
+            if isinstance(error, IntegrationError):
+                raise error
+            raise IntegrationError("Codex integration update failed") from None
         return IntegrationReport(
-            False,
+            True,
             MARKETPLACE_NAME,
             PLUGIN_SELECTOR,
             runtime_version,
         )
-    if (
-        owned is not None
-        and (
-            owned.runtime_version != runtime_version
-            or owned.source != source
-        )
-        and not refresh
-    ):
-        raise IntegrationError("Codex integration refresh is required")
-
-    try:
-        plugin_version_mismatch = bool(
-            current.plugin is not None
-            and current.plugin.version != runtime_version
-        )
-        replace_marketplace = bool(
-            current.marketplace is not None
-            and (
-                current.marketplace.source != source
-                or plugin_version_mismatch
-                or refresh
-            )
-        )
-        replace_plugin = bool(
-            current.plugin is not None
-            and current.plugin.installed
-            and (
-                current.plugin.version != runtime_version
-                or replace_marketplace
-                or refresh
-            )
-        )
-        if replace_plugin:
-            client.remove_plugin(PLUGIN_SELECTOR)
-        if replace_marketplace:
-            client.remove_marketplace(MARKETPLACE_NAME)
-        if current.marketplace is None or replace_marketplace:
-            client.add_marketplace(source)
-        if _available_version(client) != runtime_version:
-            raise IntegrationError(
-                "Bundled plugin version does not match Hydra runtime",
-            )
-        state_before_plugin = inspect_codex(client)
-        if state_before_plugin.plugin is None or not state_before_plugin.plugin.installed:
-            client.add_plugin(PLUGIN_SELECTOR)
-        verified = inspect_codex(client)
-        if not _state_is_exact(verified, desired):
-            raise IntegrationError("Codex integration verification failed")
-        _write_receipt(receipt_target, desired)
-    except Exception as error:
-        try:
-            _restore_state(client, current)
-            if original_receipt is not None:
-                _write_receipt_bytes(receipt_target, original_receipt)
-            elif receipt_target.exists():
-                _delete_receipt(receipt_target)
-        except Exception:
-            raise IntegrationError(
-                "Codex integration update and rollback failed",
-            ) from None
-        if isinstance(error, IntegrationError):
-            raise error
-        raise IntegrationError("Codex integration update failed") from None
-    return IntegrationReport(
-        True,
-        MARKETPLACE_NAME,
-        PLUGIN_SELECTOR,
-        runtime_version,
-    )
 
 
 def remove_codex_integration(
@@ -703,40 +1156,71 @@ def remove_codex_integration(
 ) -> IntegrationReport:
     """Detach only receipt-owned Hydra state and preserve every unrelated file."""
     target = Path(receipt_path).expanduser()
-    owned, original_receipt = _read_receipt(target)
-    current = inspect_codex(client)
-    _ensure_owned(current, owned)
-    if owned is None:
-        return IntegrationReport(False, MARKETPLACE_NAME, PLUGIN_SELECTOR, "")
-    try:
-        if current.plugin is not None and current.plugin.installed:
-            client.remove_plugin(PLUGIN_SELECTOR)
-        if current.marketplace is not None:
-            client.remove_marketplace(MARKETPLACE_NAME)
-        removed = inspect_codex(client)
-        if removed.marketplace is not None or bool(
-            removed.plugin is not None and removed.plugin.installed
-        ):
-            raise IntegrationError("Codex integration removal verification failed")
-        _delete_receipt(target)
-    except Exception as error:
+    with _integration_lock(target):
+        _recover_pending_transaction(client, target)
+        owned, original_receipt = _read_receipt(target)
+        current = inspect_codex(client)
+        _ensure_owned(current, owned)
+        if owned is None:
+            return IntegrationReport(False, MARKETPLACE_NAME, PLUGIN_SELECTOR, "")
+        if current == CodexState(None, None):
+            _delete_receipt(target)
+            return IntegrationReport(
+                True,
+                MARKETPLACE_NAME,
+                PLUGIN_SELECTOR,
+                owned.runtime_version,
+            )
+        journal = _TransactionJournal(
+            "remove",
+            current,
+            CodexState(None, None),
+            original_receipt,
+            None,
+        )
+        _write_journal(_journal_path(target), journal)
+        mutation_started = False
         try:
-            _restore_state(client, current)
-            if original_receipt is not None:
-                _write_receipt_bytes(target, original_receipt)
-        except Exception:
-            raise IntegrationError(
-                "Codex integration removal and rollback failed",
-            ) from None
-        if isinstance(error, IntegrationError):
-            raise error
-        raise IntegrationError("Codex integration removal failed") from None
-    return IntegrationReport(
-        True,
-        MARKETPLACE_NAME,
-        PLUGIN_SELECTOR,
-        owned.runtime_version,
-    )
+            if current.plugin is not None and current.plugin.installed:
+                _guard_expected(client, current, journal)
+                mutation_started = True
+                client.remove_plugin(PLUGIN_SELECTOR)
+                current = _inspect_known(client, journal)
+            if current.marketplace is not None:
+                _guard_expected(client, current, journal)
+                mutation_started = True
+                client.remove_marketplace(MARKETPLACE_NAME)
+                current = _inspect_known(client, journal)
+            if current != CodexState(None, None):
+                raise IntegrationError(
+                    "Codex integration removal verification failed",
+                )
+            _delete_receipt(target)
+            if _read_private_bytes(target, limit=_RECEIPT_MAX_BYTES) is not None:
+                raise IntegrationError(
+                    "Codex integration removal verification failed",
+                )
+            _delete_private_file(
+                _journal_path(target),
+                limit=_JOURNAL_MAX_BYTES,
+            )
+        except Exception as error:
+            if isinstance(error, IntegrationOwnershipError) and not mutation_started:
+                _delete_private_file(
+                    _journal_path(target),
+                    limit=_JOURNAL_MAX_BYTES,
+                )
+                raise
+            _recover_transaction(client, target, journal)
+            if isinstance(error, IntegrationError):
+                raise error
+            raise IntegrationError("Codex integration removal failed") from None
+        return IntegrationReport(
+            True,
+            MARKETPLACE_NAME,
+            PLUGIN_SELECTOR,
+            owned.runtime_version,
+        )
 
 
 def render_codex_config(*, marketplace_root: Path, runtime_version: str) -> str:

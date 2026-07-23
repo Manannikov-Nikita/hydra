@@ -22,7 +22,8 @@ from .annotation_core import (
 from .annotation_spool import drain_annotations
 from .project import ProjectResolution, resolve_project
 from .rollout_identity import Pseudonymizer
-from .storage import HydraStore, StorageUnavailable, default_database_path
+from .platform_paths import default_installation_key_path
+from .storage import HydraStore, StorageUnavailable
 
 
 Clock = Callable[[], datetime]
@@ -64,7 +65,7 @@ def _key_path(environ: Mapping[str, str]) -> Path:
         return Path(configured).expanduser()
     home_value = environ.get("HOME")
     home = Path(home_value).expanduser() if isinstance(home_value, str) and home_value else Path.home()
-    return default_database_path(home).parent / "rollout-hmac.key"
+    return default_installation_key_path(home, environ=environ)
 
 
 def _open_store(factory: StoreFactory, path: Path | None) -> HydraStore:

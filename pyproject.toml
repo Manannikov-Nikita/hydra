@@ -4,10 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hydra-codex"
-version = "0.1.0"
-description = "Private, hybrid telemetry contracts for Codex work."
+dynamic = ["version"]
+description = "Local, privacy-preserving telemetry and evidence for Codex."
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = []
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Repository = "https://github.com/Manannikov-Nikita/hydra"
+Issues = "https://github.com/Manannikov-Nikita/hydra/issues"
 
 [project.optional-dependencies]
 test = [
@@ -23,6 +35,12 @@ hydra-codex-plugin = "hydra_codex.plugin_bundle:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+
+[tool.setuptools.dynamic]
+version = {attr = "hydra_codex.__version__"}
 
 [tool.setuptools.package-data]
 hydra_codex = [

@@ -17,7 +17,8 @@ from .report_renderers import (
     render_report_collection,
 )
 from .rollout_identity import Pseudonymizer
-from .storage import HydraStore, default_database_path
+from .platform_paths import default_installation_key_path
+from .storage import HydraStore
 
 
 Clock = Callable[[], datetime]
@@ -50,7 +51,7 @@ def configured_installation_key_path(
         if isinstance(home_value, str) and home_value
         else Path.home()
     )
-    return default_database_path(home).parent / "rollout-hmac.key"
+    return default_installation_key_path(home, environ=environ)
 
 
 def _utc_now(clock: Clock) -> str:

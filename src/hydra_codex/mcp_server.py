@@ -14,6 +14,7 @@ import subprocess
 import sys
 from typing import Any, Mapping, Protocol, TextIO
 
+from . import __version__
 from .contracts import ModelAnnotationInput
 
 
@@ -221,7 +222,7 @@ class StdioMcpServer:
             result: object = {
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "hydra-codex", "version": "0.1.0"},
+                "serverInfo": {"name": "hydra-codex", "version": __version__},
             }
         elif method == "ping":
             result = {}

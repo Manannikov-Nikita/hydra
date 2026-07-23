@@ -11,6 +11,7 @@ import sys
 import tempfile
 from typing import Any, Callable, Mapping, Protocol, Sequence, TextIO
 
+from . import __version__
 from .contracts import ModelAnnotationInput
 from .project import ProjectNotFound, resolve_project
 from .rollout import ingest_rollouts
@@ -106,6 +107,7 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(prog="hydra-codex")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
     ingest = commands.add_parser("ingest")

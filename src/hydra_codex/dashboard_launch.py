@@ -28,7 +28,8 @@ from .exact_time import public_timestamp
 from .project import resolve_project
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .services import configured_database_path, configured_installation_key_path
-from .storage import MIGRATIONS, HydraStore, default_database_path
+from .platform_paths import default_database_path
+from .storage import MIGRATIONS, HydraStore
 
 
 _ASSETS = MappingProxyType({

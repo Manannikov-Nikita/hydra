@@ -46,6 +46,7 @@ from .migrations_u21 import (
     U21_REQUIRED_SCHEMA,
 )
 from .migrations_v22 import V22_MIGRATIONS
+from .platform_paths import default_database_path
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
@@ -55,11 +56,6 @@ class StorageUnavailable(RuntimeError):
 class WriteResult:
     inserted: bool
     conflicted: bool
-
-
-def default_database_path(home: Path | None = None) -> Path:
-    base = Path.home() if home is None else Path(home)
-    return base / "Library" / "Application Support" / "Hydra" / "hydra.sqlite3"
 
 
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (

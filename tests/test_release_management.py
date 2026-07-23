@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -66,6 +67,32 @@ def _bundle(parent: Path, version: str, *, marker: str = "original") -> BundleLa
             content = f"{relative.as_posix()}\n"
         target.write_text(content, encoding="utf-8")
     return validate_bundle(root)
+
+
+def _inventory(root: Path) -> tuple[tuple[str, int, bytes | None], ...]:
+    if not root.exists():
+        return ()
+    rows = []
+    for path in root.rglob("*"):
+        mode = path.lstat().st_mode
+        content = path.read_bytes() if stat.S_ISREG(mode) else None
+        rows.append((path.relative_to(root).as_posix(), mode, content))
+    return tuple(sorted(rows))
+
+
+def _cli_inventory(
+    roots: InstallRoots,
+) -> tuple[tuple[str, tuple[tuple[str, int, bytes | None], ...]], ...]:
+    rows = []
+    for label, root in (("home", roots.home), ("bin", roots.launcher.parent)):
+        if not root.exists():
+            rows.append((label, ()))
+            continue
+        mode = root.lstat().st_mode
+        content = root.read_bytes() if stat.S_ISREG(mode) else None
+        tree = ((".", mode, content),) + _inventory(root)
+        rows.append((label, tree))
+    return tuple(rows)
 
 
 class ReleaseManagementTests(unittest.TestCase):
@@ -161,6 +188,32 @@ class ReleaseManagementTests(unittest.TestCase):
         self.assertEqual(list(foreign.iterdir()), [])
         self.assertTrue(layout.root.exists())
 
+    def test_activation_refuses_a_symlinked_selected_home(self) -> None:
+        actual_home = self.base / "actual-home"
+        actual_home.mkdir()
+        selected_home = self.base / "selected-home"
+        selected_home.symlink_to(actual_home)
+        roots = default_install_roots(selected_home)
+        layout = _bundle(self.base, "0.1.0")
+
+        with self.assertRaises(InstallOwnershipError) as raised:
+            activate_version(layout, roots=roots)
+
+        self.assertEqual(_inventory(actual_home), ())
+        self.assertNotIn(str(actual_home), str(raised.exception))
+
+    def test_activation_refuses_publicly_writable_hydra_home(self) -> None:
+        self.roots.home.mkdir(parents=True)
+        self.roots.home.chmod(0o777)
+        before = _inventory(self.user_home)
+        layout = _bundle(self.base, "0.1.0")
+
+        with self.assertRaises(InstallOwnershipError) as raised:
+            activate_version(layout, roots=self.roots)
+
+        self.assertEqual(_inventory(self.user_home), before)
+        self.assertNotIn(str(self.user_home), str(raised.exception))
+
     def test_activation_refuses_foreign_or_malformed_current(self) -> None:
         foreign = self.base / "foreign"
         foreign.mkdir()
@@ -206,7 +259,8 @@ class ReleaseManagementTests(unittest.TestCase):
             os.readlink(self.roots.launcher),
             str(self.roots.current / "bin" / "hydra-codex"),
         )
-        lock = self.roots.home / "release.lock"
+        lock = self.user_home / ".local" / "share" / "hydra" / "release-lifecycle.lock"
+        self.assertEqual(stat.S_IMODE(lock.parent.stat().st_mode), 0o700)
         self.assertTrue(stat.S_ISREG(lock.lstat().st_mode))
         self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
         self.assertEqual(
@@ -389,6 +443,127 @@ class ReleaseManagementTests(unittest.TestCase):
         self.assertEqual(self.roots.current.resolve().name, "0.2.0")
         self.assertFalse((self.roots.home / "release-journal.json").exists())
 
+    def test_crash_at_first_refresh_commit_write_reconciles_candidate(self) -> None:
+        self.activate("0.1.0")
+        candidate = _bundle(self.base, "0.2.0")
+        plugin = ["0.1.0"]
+        refreshes: list[str] = []
+        from hydra_codex import release_management
+
+        real_write = release_management._write_journal
+        crashed = False
+
+        def refresh(layout: BundleLayout) -> None:
+            plugin[0] = layout.version
+            refreshes.append(layout.version)
+
+        def crash_first_commit(roots: InstallRoots, journal) -> None:
+            nonlocal crashed
+            if journal.phase == "refresh_committed" and not crashed:
+                crashed = True
+                self.assertEqual(plugin[0], "0.2.0")
+                raise SimulatedCrash
+            real_write(roots, journal)
+
+        with patch(
+            "hydra_codex.release_management._write_journal",
+            side_effect=crash_first_commit,
+        ):
+            with self.assertRaises(SimulatedCrash):
+                upgrade(
+                    check=False,
+                    environ=self.environ,
+                    stdout=io.StringIO(),
+                    verified_candidate=candidate,
+                    refresh_integration=refresh,
+                    roots=self.roots,
+                )
+
+        plugin[0] = "0.1.0"
+        installed = validate_bundle(self.roots.versions / "0.2.0")
+        upgrade(
+            check=False,
+            environ=self.environ,
+            stdout=io.StringIO(),
+            verified_candidate=installed,
+            refresh_integration=refresh,
+            roots=self.roots,
+        )
+        self.assertEqual(plugin[0], "0.2.0")
+        self.assertEqual(self.roots.current.resolve().name, "0.2.0")
+        self.assertGreaterEqual(refreshes.count("0.2.0"), 3)
+
+    def test_crash_during_initial_refresh_is_reconciled_on_retry(self) -> None:
+        self.activate("0.1.0")
+        candidate = _bundle(self.base, "0.2.0")
+
+        def crash(_layout: BundleLayout) -> None:
+            raise SimulatedCrash
+
+        with self.assertRaises(SimulatedCrash):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=candidate,
+                refresh_integration=crash,
+                roots=self.roots,
+            )
+
+        reconciled: list[str] = []
+        installed = validate_bundle(self.roots.versions / "0.2.0")
+        upgrade(
+            check=False,
+            environ=self.environ,
+            stdout=io.StringIO(),
+            verified_candidate=installed,
+            refresh_integration=lambda layout: reconciled.append(layout.version),
+            roots=self.roots,
+        )
+        self.assertEqual(self.roots.current.resolve().name, "0.2.0")
+        self.assertGreaterEqual(reconciled.count("0.2.0"), 2)
+
+    def test_failed_recovery_retry_preserves_candidate_for_next_retry(self) -> None:
+        self.activate("0.1.0")
+        candidate = _bundle(self.base, "0.2.0")
+
+        with self.assertRaises(SimulatedCrash):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=candidate,
+                refresh_integration=lambda _layout: (_ for _ in ()).throw(
+                    SimulatedCrash,
+                ),
+                roots=self.roots,
+            )
+        installed = validate_bundle(self.roots.versions / "0.2.0")
+        with self.assertRaises(IntegrationError):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=installed,
+                refresh_integration=lambda _layout: (_ for _ in ()).throw(
+                    IntegrationError("retry failed"),
+                ),
+                roots=self.roots,
+            )
+        self.assertEqual(self.roots.current.resolve().name, "0.1.0")
+        self.assertTrue((self.roots.home / "release-journal.json").exists())
+
+        upgrade(
+            check=False,
+            environ=self.environ,
+            stdout=io.StringIO(),
+            verified_candidate=installed,
+            refresh_integration=lambda _layout: None,
+            roots=self.roots,
+        )
+        self.assertEqual(self.roots.current.resolve().name, "0.2.0")
+        self.assertFalse((self.roots.home / "release-journal.json").exists())
+
     def test_concurrent_lifecycle_calls_are_refused(self) -> None:
         self.activate("0.1.0")
         entered = threading.Event()
@@ -426,10 +601,81 @@ class ReleaseManagementTests(unittest.TestCase):
             thread.join(5)
         self.assertEqual(errors, [])
 
+    def test_concurrent_empty_uninstalls_share_data_root_coordination(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        before = _cli_inventory(self.roots)
+
+        def holding_detach() -> None:
+            entered.set()
+            release.wait(5)
+
+        def first() -> None:
+            try:
+                uninstall(
+                    keep_cli=True,
+                    environ=self.environ,
+                    detach_integration=holding_detach,
+                    roots=self.roots,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=first)
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        try:
+            with self.assertRaises(LifecycleBusyError):
+                uninstall(
+                    keep_cli=True,
+                    environ=self.environ,
+                    detach_integration=lambda: None,
+                    roots=self.roots,
+                )
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(_cli_inventory(self.roots), before)
+
+    def test_empty_uninstall_and_activation_share_one_lock_domain(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        candidate = _bundle(self.base, "0.1.0")
+
+        def holding_detach() -> None:
+            entered.set()
+            release.wait(5)
+
+        def first() -> None:
+            try:
+                uninstall(
+                    keep_cli=True,
+                    environ=self.environ,
+                    detach_integration=holding_detach,
+                    roots=self.roots,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=first)
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        try:
+            with self.assertRaises(LifecycleBusyError):
+                activate_version(candidate, roots=self.roots)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertTrue(candidate.root.exists())
+        self.assertFalse(self.roots.current.exists())
+
     def test_detach_failure_makes_zero_cli_mutations(self) -> None:
         installed = self.activate("0.1.0")
-        current_relation = os.readlink(self.roots.current)
-        launcher_relation = os.readlink(self.roots.launcher)
+        before = _inventory(self.user_home)
 
         def fail() -> None:
             raise IntegrationError("detach failed")
@@ -443,8 +689,42 @@ class ReleaseManagementTests(unittest.TestCase):
             )
 
         self.assertEqual(self.roots.current.resolve(), installed.resolve())
-        self.assertEqual(os.readlink(self.roots.current), current_relation)
-        self.assertEqual(os.readlink(self.roots.launcher), launcher_relation)
+        self.assertEqual(_inventory(self.user_home), before)
+
+    def test_detach_failure_from_empty_home_creates_zero_cli_paths(self) -> None:
+        before = _cli_inventory(self.roots)
+
+        with self.assertRaises(IntegrationError):
+            uninstall(
+                keep_cli=False,
+                environ=self.environ,
+                detach_integration=lambda: (_ for _ in ()).throw(
+                    IntegrationError("detach failed"),
+                ),
+                roots=self.roots,
+            )
+
+        self.assertEqual(_cli_inventory(self.roots), before)
+        self.assertFalse(self.roots.home.exists())
+
+    def test_detach_failure_from_legacy_home_creates_zero_cli_paths(self) -> None:
+        legacy = self.roots.home / "legacy-note"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("preserve", encoding="utf-8")
+        legacy.parent.chmod(0o700)
+        before = _cli_inventory(self.roots)
+
+        with self.assertRaises(IntegrationError):
+            uninstall(
+                keep_cli=True,
+                environ=self.environ,
+                detach_integration=lambda: (_ for _ in ()).throw(
+                    IntegrationError("detach failed"),
+                ),
+                roots=self.roots,
+            )
+
+        self.assertEqual(_cli_inventory(self.roots), before)
 
     def test_keep_cli_stops_after_successful_detachment(self) -> None:
         installed = self.activate("0.1.0")
@@ -459,23 +739,116 @@ class ReleaseManagementTests(unittest.TestCase):
         self.assertEqual(self.roots.current.resolve(), installed.resolve())
         self.assertTrue(self.roots.launcher.is_symlink())
 
-    def test_keep_cli_detaches_even_when_cli_state_is_foreign(self) -> None:
+    def test_keep_cli_refuses_foreign_cli_before_detachment(self) -> None:
         self.roots.launcher.parent.mkdir(parents=True)
         self.roots.launcher.write_text("foreign", encoding="utf-8")
         detached: list[bool] = []
 
-        uninstall(
-            keep_cli=True,
-            environ=self.environ,
-            detach_integration=lambda: detached.append(True),
-            roots=self.roots,
-        )
+        with self.assertRaises(InstallOwnershipError):
+            uninstall(
+                keep_cli=True,
+                environ=self.environ,
+                detach_integration=lambda: detached.append(True),
+                roots=self.roots,
+            )
 
-        self.assertEqual(detached, [True])
+        self.assertEqual(detached, [])
         self.assertEqual(
             self.roots.launcher.read_text(encoding="utf-8"),
             "foreign",
         )
+
+    def test_wrong_uid_lock_is_rejected_before_detachment(self) -> None:
+        self.activate("0.1.0")
+        detached: list[bool] = []
+        real_fstat = os.fstat
+
+        def foreign_fstat(descriptor: int):
+            value = real_fstat(descriptor)
+            return SimpleNamespace(
+                st_mode=value.st_mode,
+                st_uid=os.getuid() + 1,
+            )
+
+        with patch(
+            "hydra_codex.release_management.os.fstat",
+            side_effect=foreign_fstat,
+        ):
+            with self.assertRaises(InstallOwnershipError) as raised:
+                uninstall(
+                    keep_cli=True,
+                    environ=self.environ,
+                    detach_integration=lambda: detached.append(True),
+                    roots=self.roots,
+                )
+
+        self.assertEqual(detached, [])
+        self.assertNotIn(str(self.user_home), str(raised.exception))
+
+    def test_uninstall_rejects_unowned_versions_root_before_detach_or_unlink(self) -> None:
+        self.activate("0.1.0")
+        actual_versions = self.roots.home / "actual-versions"
+        self.roots.versions.rename(actual_versions)
+        self.roots.versions.symlink_to(actual_versions)
+        current_relation = os.readlink(self.roots.current)
+        launcher_relation = os.readlink(self.roots.launcher)
+        detached: list[bool] = []
+
+        with self.assertRaises(InstallOwnershipError):
+            uninstall(
+                keep_cli=False,
+                environ=self.environ,
+                detach_integration=lambda: detached.append(True),
+                roots=self.roots,
+            )
+
+        self.assertEqual(detached, [])
+        self.assertEqual(os.readlink(self.roots.current), current_relation)
+        self.assertEqual(os.readlink(self.roots.launcher), launcher_relation)
+
+    def test_uninstall_refuses_nonregular_versions_root_before_detachment(self) -> None:
+        self.roots.home.mkdir(parents=True)
+        self.roots.home.chmod(0o700)
+        self.roots.versions.write_text("foreign", encoding="utf-8")
+        before = _inventory(self.user_home)
+        detached: list[bool] = []
+
+        with self.assertRaises(InstallOwnershipError):
+            uninstall(
+                keep_cli=False,
+                environ=self.environ,
+                detach_integration=lambda: detached.append(True),
+                roots=self.roots,
+            )
+
+        self.assertEqual(detached, [])
+        self.assertEqual(_inventory(self.user_home), before)
+
+    def test_uninstall_refuses_foreign_uid_versions_root_before_detachment(self) -> None:
+        self.activate("0.1.0")
+        detached: list[bool] = []
+        real_lstat = Path.lstat
+
+        def foreign_versions(path: Path):
+            value = real_lstat(path)
+            if path == self.roots.versions:
+                return SimpleNamespace(
+                    st_mode=value.st_mode,
+                    st_uid=os.getuid() + 1,
+                    st_size=value.st_size,
+                )
+            return value
+
+        with patch.object(Path, "lstat", autospec=True, side_effect=foreign_versions):
+            with self.assertRaises(InstallOwnershipError):
+                uninstall(
+                    keep_cli=False,
+                    environ=self.environ,
+                    detach_integration=lambda: detached.append(True),
+                    roots=self.roots,
+                )
+
+        self.assertEqual(detached, [])
 
     def test_uninstall_preserves_private_data_project_and_unknown_entries(self) -> None:
         installed = self.activate("0.1.0")

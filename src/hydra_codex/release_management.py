@@ -18,7 +18,7 @@ from typing import TextIO
 
 from .install_layout import BundleLayout, InvalidBundle, validate_bundle
 
-_LOCK_NAME = "release.lock"
+_COORDINATION_LOCK_NAME = "release-lifecycle.lock"
 _JOURNAL_NAME = "release-journal.json"
 _JOURNAL_LIMIT = 4096
 
@@ -106,7 +106,12 @@ def _ensure_directory(path: Path, *, mode: int) -> None:
         except OSError:
             pass
         return
-    if not stat.S_ISDIR(current_mode) or stat.S_ISLNK(current_mode):
+    if (
+        not stat.S_ISDIR(current_mode)
+        or stat.S_ISLNK(current_mode)
+        or path.stat().st_uid != os.getuid()
+        or stat.S_IMODE(current_mode) & 0o077
+    ):
         raise InstallOwnershipError("invalid release directory")
 
 
@@ -118,7 +123,31 @@ def _lexists(path: Path) -> bool:
     return True
 
 
-def _validate_directory_ancestors(base: Path, target: Path) -> None:
+def _validate_owned_directory(path: Path, *, private: bool) -> bool:
+    if not _lexists(path):
+        return False
+    try:
+        status = path.lstat()
+    except OSError as error:
+        raise InstallOwnershipError("invalid release directory") from error
+    permissions = stat.S_IMODE(status.st_mode)
+    unsafe = permissions & (0o077 if private else 0o022)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or stat.S_ISLNK(status.st_mode)
+        or status.st_uid != os.getuid()
+        or unsafe
+    ):
+        raise InstallOwnershipError("invalid release directory")
+    return True
+
+
+def _validate_directory_ancestors(
+    base: Path,
+    target: Path,
+    *,
+    private_final: bool,
+) -> None:
     anchor = base.absolute()
     selected = target.absolute()
     try:
@@ -126,13 +155,34 @@ def _validate_directory_ancestors(base: Path, target: Path) -> None:
     except ValueError as error:
         raise InstallOwnershipError("release path escapes selected home") from error
     current = anchor
-    for component in relative.parts:
+    parts = relative.parts
+    for index, component in enumerate(parts):
         current = current / component
-        if not _lexists(current):
-            continue
-        mode = current.lstat().st_mode
-        if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
-            raise InstallOwnershipError("invalid release directory ancestry")
+        _validate_owned_directory(
+            current,
+            private=bool(private_final and index == len(parts) - 1),
+        )
+
+
+def _validate_root_ownership(roots: InstallRoots) -> None:
+    user_home = roots.home.parent
+    _validate_owned_directory(user_home, private=False)
+    _validate_directory_ancestors(
+        user_home,
+        roots.home,
+        private_final=True,
+    )
+    _validate_directory_ancestors(
+        user_home,
+        roots.launcher.parent,
+        private_final=False,
+    )
+
+
+def _validate_versions_root(roots: InstallRoots) -> bool:
+    if not _lexists(roots.versions):
+        return False
+    return _validate_owned_directory(roots.versions, private=True)
 
 
 def _owned_current(roots: InstallRoots) -> tuple[str, Path] | None:
@@ -167,9 +217,8 @@ def _owned_current(roots: InstallRoots) -> tuple[str, Path] | None:
 
 
 def _validate_link_state(roots: InstallRoots) -> _LinkState:
-    user_home = roots.home.parent
-    _validate_directory_ancestors(user_home, roots.home)
-    _validate_directory_ancestors(user_home, roots.launcher.parent)
+    _validate_root_ownership(roots)
+    _validate_versions_root(roots)
     current = _owned_current(roots)
     launcher_present = _lexists(roots.launcher)
     if launcher_present:
@@ -194,26 +243,42 @@ def _validate_link_state(roots: InstallRoots) -> _LinkState:
     )
 
 
+def _coordination_root(roots: InstallRoots) -> Path:
+    return roots.home.parent / ".local" / "share" / "hydra"
+
+
 @contextmanager
 def _lifecycle_lock(roots: InstallRoots) -> Iterator[None]:
-    _validate_directory_ancestors(roots.home.parent, roots.home)
-    _ensure_directory(roots.home, mode=0o700)
-    lock_path = roots.home / _LOCK_NAME
+    _validate_root_ownership(roots)
+    coordination_root = _coordination_root(roots)
+    _validate_directory_ancestors(
+        roots.home.parent,
+        coordination_root,
+        private_final=True,
+    )
+    _ensure_directory(coordination_root, mode=0o700)
+    lock_path = coordination_root / _COORDINATION_LOCK_NAME
     if _lexists(lock_path):
-        mode = lock_path.lstat().st_mode
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-            raise InstallOwnershipError("invalid release lifecycle lock")
-        if stat.S_IMODE(mode) != 0o600:
+        status = lock_path.lstat()
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or stat.S_IMODE(status.st_mode) != 0o600
+            or status.st_uid != os.getuid()
+        ):
             raise InstallOwnershipError("invalid release lifecycle lock")
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_path, flags, 0o600)
     try:
-        mode = os.fstat(descriptor).st_mode
-        if not stat.S_ISREG(mode):
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.getuid()
+        ):
             raise InstallOwnershipError("invalid release lifecycle lock")
-        os.fchmod(descriptor, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -295,10 +360,17 @@ def _read_journal(roots: InstallRoots) -> _Journal | None:
     path = _journal_path(roots)
     if not _lexists(path):
         return None
-    mode = path.lstat().st_mode
-    if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+    status = path.lstat()
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or stat.S_ISLNK(status.st_mode)
+        or status.st_uid != os.getuid()
+    ):
         raise InstallOwnershipError("invalid release journal")
-    if stat.S_IMODE(mode) != 0o600 or path.stat().st_size > _JOURNAL_LIMIT:
+    if (
+        stat.S_IMODE(status.st_mode) != 0o600
+        or status.st_size > _JOURNAL_LIMIT
+    ):
         raise InstallOwnershipError("invalid release journal")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -313,6 +385,7 @@ def _read_journal(roots: InstallRoots) -> _Journal | None:
             "bundle_moved",
             "current_switched",
             "links_switched",
+            "refreshing",
             "refresh_committed",
         }
         or not isinstance(value.get("new_version"), str)
@@ -338,21 +411,13 @@ def _clear_journal(roots: InstallRoots) -> None:
         _unlink_owned(path)
 
 
-def _recover_pending(roots: InstallRoots) -> None:
-    journal = _read_journal(roots)
-    if journal is None:
-        return
+def _restore_previous_links(
+    roots: InstallRoots,
+    journal: _Journal,
+    *,
+    clear: bool,
+) -> None:
     state = _validate_link_state(roots)
-    if journal.phase == "refresh_committed":
-        committed = roots.versions / journal.new_version
-        validate_bundle(committed, expected_version=journal.new_version)
-        _atomic_symlink(roots.current, committed)
-        _atomic_symlink(
-            roots.launcher,
-            roots.current / "bin" / "hydra-codex",
-        )
-        _clear_journal(roots)
-        return
     if journal.previous_version is None:
         if state.launcher_present:
             _unlink_owned(roots.launcher)
@@ -366,7 +431,59 @@ def _recover_pending(roots: InstallRoots) -> None:
             roots.launcher,
             roots.current / "bin" / "hydra-codex",
         )
-    _clear_journal(roots)
+    if clear:
+        _clear_journal(roots)
+
+
+def _recover_pending(
+    roots: InstallRoots,
+    *,
+    reconcile_integration: Callable[[BundleLayout], None] | None = None,
+) -> None:
+    journal = _read_journal(roots)
+    if journal is None:
+        return
+    _validate_link_state(roots)
+    if journal.phase == "refreshing":
+        if reconcile_integration is None:
+            raise InstallOwnershipError(
+                "Codex integration recovery is required",
+            )
+        candidate = validate_bundle(
+            roots.versions / journal.new_version,
+            expected_version=journal.new_version,
+        )
+        try:
+            reconcile_integration(candidate)
+        except Exception:
+            _restore_previous_links(roots, journal, clear=False)
+            raise
+        _atomic_symlink(roots.current, candidate.root)
+        _atomic_symlink(
+            roots.launcher,
+            roots.current / "bin" / "hydra-codex",
+        )
+        _write_journal(
+            roots,
+            _Journal(
+                "refresh_committed",
+                journal.previous_version,
+                journal.new_version,
+            ),
+        )
+        _clear_journal(roots)
+        return
+    if journal.phase == "refresh_committed":
+        committed = roots.versions / journal.new_version
+        validate_bundle(committed, expected_version=journal.new_version)
+        _atomic_symlink(roots.current, committed)
+        _atomic_symlink(
+            roots.launcher,
+            roots.current / "bin" / "hydra-codex",
+        )
+        _clear_journal(roots)
+        return
+    _restore_previous_links(roots, journal, clear=True)
 
 
 def _validated_candidate(layout: BundleLayout) -> BundleLayout:
@@ -389,6 +506,7 @@ def _activate_locked(
 ) -> Path:
     candidate = _validated_candidate(layout)
     state = _validate_link_state(roots)
+    _ensure_directory(roots.home, mode=0o700)
     _ensure_directory(roots.versions, mode=0o700)
     version_root = roots.versions / candidate.version
     if _lexists(version_root):
@@ -498,7 +616,10 @@ def upgrade(
 
     _validate_link_state(selected)
     with _lifecycle_lock(selected):
-        _recover_pending(selected)
+        _recover_pending(
+            selected,
+            reconcile_integration=refresh_integration,
+        )
         _validate_link_state(selected)
         installed = _activate_locked(
             candidate,
@@ -510,15 +631,29 @@ def upgrade(
             expected_version=candidate.version,
             expected_target=candidate.target,
         )
-        try:
-            if refresh_integration is not None:
-                refresh_integration(active)
-        except Exception:
-            _recover_pending(selected)
-            raise
         journal = _read_journal(selected)
         if journal is None:
             raise InstallOwnershipError("release journal is missing")
+        if refresh_integration is None:
+            _clear_journal(selected)
+            return UpgradeStatus(
+                candidate.version,
+                candidate.version,
+                False,
+            )
+        _write_journal(
+            selected,
+            _Journal(
+                "refreshing",
+                journal.previous_version,
+                journal.new_version,
+            ),
+        )
+        try:
+            refresh_integration(active)
+        except Exception:
+            _restore_previous_links(selected, journal, clear=True)
+            raise
         _write_journal(
             selected,
             _Journal(
@@ -554,6 +689,16 @@ def _remove_owned_versions(roots: InstallRoots) -> None:
         _fsync_directory(roots.versions)
 
 
+def _uninstall_preflight(roots: InstallRoots) -> None:
+    _validate_link_state(roots)
+    _read_journal(roots)
+
+
+def _discard_pending_for_uninstall(roots: InstallRoots) -> None:
+    if _read_journal(roots) is not None:
+        _clear_journal(roots)
+
+
 def uninstall(
     *,
     keep_cli: bool,
@@ -563,11 +708,13 @@ def uninstall(
 ) -> None:
     """Detach Codex first, then remove only individually proven-owned CLI state."""
     selected = default_install_roots(_home(environ)) if roots is None else roots
+    _uninstall_preflight(selected)
     with _lifecycle_lock(selected):
+        _uninstall_preflight(selected)
         detach_integration()
         if keep_cli:
             return
-        _recover_pending(selected)
+        _discard_pending_for_uninstall(selected)
         state = _validate_link_state(selected)
         if state.launcher_present:
             _unlink_owned(selected.launcher)

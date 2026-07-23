@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from hydra_codex.install_layout import validate_bundle
 from hydra_codex.release_management import (
@@ -32,6 +33,16 @@ class ReleaseAcquisitionTests(unittest.TestCase):
         installer.chmod(0o700)
         activate_version(first, roots=self.roots, environ=self.environ)
         self.active = self.roots.current.resolve()
+        process_start = patch(
+            "hydra_codex.installer_lock._process_start_query",
+            side_effect=lambda pid: (
+                "darwin:Wed Jul 23 12:34:56 2026"
+                if pid == os.getpid()
+                else None
+            ),
+        )
+        process_start.start()
+        self.addCleanup(process_start.stop)
 
     def acquisition_api(self):
         try:
@@ -62,7 +73,26 @@ class ReleaseAcquisitionTests(unittest.TestCase):
             nonlocal candidate
             candidate = self.staged_candidate()
             observed.update(command=command, **options)
-            self.assertTrue((self.home / ".hydra-installer-lock").is_dir())
+            lock = self.home / ".hydra-installer-lock"
+            self.assertTrue(lock.is_dir())
+            owner = lock / "owner-v1"
+            self.assertEqual(owner.stat().st_mode & 0o777, 0o600)
+            self.assertRegex(
+                owner.read_text(encoding="ascii"),
+                (
+                    r"\Ahydra-installer-lock/v1\n"
+                    r"pid=[1-9][0-9]*\n"
+                    r"start=[^\n]{1,80}\n"
+                    r"nonce=[0-9a-f]{64}\n\Z"
+                ),
+            )
+            capability = options["env"][
+                "HYDRA_INTERNAL_RELEASE_ACQUISITION"
+            ]
+            self.assertIn(
+                f"nonce={capability}\n",
+                owner.read_text(encoding="ascii"),
+            )
             return subprocess.CompletedProcess(command, 0, str(candidate) + "\n", "")
 
         with acquire(

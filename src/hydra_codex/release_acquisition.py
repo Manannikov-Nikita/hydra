@@ -18,6 +18,11 @@ import subprocess
 import time
 
 from .install_layout import BundleLayout, frozen_bundle_root, validate_bundle
+from .installer_lock import (
+    InstallerLockError,
+    acquire_installer_lock,
+    release_installer_lock,
+)
 from .release_management import default_install_roots, inspect_active_installation
 
 
@@ -413,17 +418,19 @@ def acquire_release_candidate(
     installer = _owned_installer(active_root)
 
     lock = roots.home.parent / ".hydra-installer-lock"
+    capability = secrets.token_hex(32)
+    if _CAPABILITY_PATTERN.fullmatch(capability) is None:
+        raise ReleaseAcquisitionError("release acquisition capability failed")
     try:
-        lock.mkdir(mode=0o700)
-    except OSError as error:
-        raise ReleaseAcquisitionError("another installation is in progress") from error
+        held_lock = acquire_installer_lock(lock, nonce=capability)
+    except InstallerLockError as error:
+        raise ReleaseAcquisitionError(
+            "another installation is in progress",
+        ) from error
 
     staging: Path | None = None
     try:
         _recover_stale(roots.home)
-        capability = secrets.token_hex(32)
-        if _CAPABILITY_PATTERN.fullmatch(capability) is None:
-            raise ReleaseAcquisitionError("release acquisition capability failed")
         environment = _acquisition_environment(
             environ,
             home=roots.home.parent,
@@ -466,8 +473,8 @@ def acquire_release_candidate(
         except Exception as error:
             cleanup_error = error
         try:
-            lock.rmdir()
-        except OSError as error:
+            release_installer_lock(held_lock)
+        except Exception as error:
             cleanup_error = cleanup_error or error
         if cleanup_error is not None:
             raise ReleaseAcquisitionError(

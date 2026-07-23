@@ -9,6 +9,10 @@ DOWNLOAD_DIR=
 STAGE_DIR=
 LOCK_DIR=
 LOCK_OWNED=0
+LOCK_SELF_PID=
+LOCK_SELF_START=
+LOCK_SELF_NONCE=
+ACQUISITION_CAPABILITY=
 INSTALLED_VERSION=
 BUNDLE_TARGET=
 
@@ -38,9 +42,7 @@ cleanup()
         esac
     fi
     if [ "$LOCK_OWNED" = 1 ] && [ -n "$LOCK_DIR" ]; then
-        case "$LOCK_DIR" in
-            "$HOME/.hydra-installer-lock") rmdir "$LOCK_DIR" 2>/dev/null || : ;;
-        esac
+        cleanup_installer_lock || :
     fi
     :
 }
@@ -68,6 +70,314 @@ validate_home()
     case "$home_mode" in
         ?????w*|????????w*) fail "HOME permissions are unsafe" ;;
     esac
+}
+
+lock_metadata()
+{
+    selected=$1
+    case "$(uname -s 2>/dev/null)" in
+        Darwin) stat -f '%Lp:%u:%d:%i' "$selected" 2>/dev/null ;;
+        Linux) stat -c '%a:%u:%d:%i' "$selected" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+process_start_identity()
+{
+    selected_pid=$1
+    case "$(uname -s 2>/dev/null)" in
+        Darwin)
+            set +e
+            value=$(
+                LC_ALL=C ps -o lstart= -p "$selected_pid" 2>/dev/null
+            )
+            process_status=$?
+            set -e
+            case "$process_status" in
+                0) ;;
+                1) return 1 ;;
+                *) return 2 ;;
+            esac
+            value=$(
+                printf '%s\n' "$value" |
+                    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+            ) || return 1
+            [ -n "$value" ] || return 1
+            [ "$(printf '%s\n' "$value" | wc -l | tr -d ' ')" = 1 ] ||
+                return 1
+            [ "${#value}" -le 72 ] || return 1
+            printf '%s\n' "$value" |
+                LC_ALL=C grep -Eq '^[ -~]+$' ||
+                return 1
+            printf 'darwin:%s\n' "$value"
+            ;;
+        Linux)
+            process_stat=/proc/$selected_pid/stat
+            path_exists "$process_stat" || return 1
+            [ -f "$process_stat" ] && [ ! -L "$process_stat" ] ||
+                return 2
+            bytes=$(wc -c < "$process_stat" 2>/dev/null | tr -d ' ') ||
+                return 2
+            case "$bytes" in
+                ''|*[!0-9]*) return 1 ;;
+            esac
+            [ "$bytes" -le 4096 ] 2>/dev/null || return 2
+            suffix=$(sed 's/^.*) //' "$process_stat" 2>/dev/null) ||
+                return 2
+            set -- $suffix
+            [ "$#" -ge 20 ] || return 2
+            shift 19
+            value=$1
+            printf '%s\n' "$value" |
+                LC_ALL=C grep -Eq '^[0-9]{1,32}$' ||
+                return 2
+            printf 'linux:%s\n' "$value"
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+new_lock_nonce()
+{
+    value=$(
+        od -An -N32 -tx1 /dev/urandom 2>/dev/null |
+            tr -d ' \n'
+    ) || return 1
+    printf '%s\n' "$value" |
+        LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+        return 1
+    printf '%s\n' "$value"
+}
+
+validate_lock_directory()
+{
+    directory=$1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    metadata=$(lock_metadata "$directory") || return 1
+    case "$metadata" in
+        "700:$EFFECTIVE_UID:"*) ;;
+        *) return 1 ;;
+    esac
+    LOCK_READ_DIRECTORY_METADATA=$metadata
+}
+
+lock_has_only_owner()
+{
+    directory=$1
+    count=0
+    for entry in \
+        "$directory"/* \
+        "$directory"/.[!.]* \
+        "$directory"/..?*
+    do
+        path_exists "$entry" || continue
+        count=$((count + 1))
+        [ "$entry" = "$directory/owner-v1" ] || return 1
+    done
+    [ "$count" = 1 ]
+}
+
+read_lock_owner()
+{
+    directory=$1
+    validate_lock_directory "$directory" || return 1
+    lock_has_only_owner "$directory" || return 1
+    owner=$directory/owner-v1
+    [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
+    owner_metadata=$(lock_metadata "$owner") || return 1
+    case "$owner_metadata" in
+        "600:$EFFECTIVE_UID:"*) ;;
+        *) return 1 ;;
+    esac
+    bytes=$(wc -c < "$owner" 2>/dev/null | tr -d ' ') || return 1
+    case "$bytes" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$bytes" -le 256 ] 2>/dev/null || return 1
+    [ "$(wc -l < "$owner" 2>/dev/null | tr -d ' ')" = 4 ] ||
+        return 1
+    schema=$(sed -n '1p' "$owner" 2>/dev/null) || return 1
+    pid_line=$(sed -n '2p' "$owner" 2>/dev/null) || return 1
+    start_line=$(sed -n '3p' "$owner" 2>/dev/null) || return 1
+    nonce_line=$(sed -n '4p' "$owner" 2>/dev/null) || return 1
+    [ "$schema" = hydra-installer-lock/v1 ] || return 1
+    case "$pid_line" in
+        pid=*) read_pid=${pid_line#pid=} ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$read_pid" |
+        LC_ALL=C grep -Eq '^[1-9][0-9]{0,19}$' ||
+        return 1
+    case "$start_line" in
+        start=*) read_start=${start_line#start=} ;;
+        *) return 1 ;;
+    esac
+    case "$(uname -s 2>/dev/null):$read_start" in
+        Darwin:darwin:*)
+            [ "${#read_start}" -le 80 ] || return 1
+            printf '%s\n' "${read_start#darwin:}" |
+                LC_ALL=C grep -Eq '^[ -~]+$' ||
+                return 1
+            ;;
+        Linux:linux:*)
+            printf '%s\n' "${read_start#linux:}" |
+                LC_ALL=C grep -Eq '^[0-9]{1,32}$' ||
+                return 1
+            ;;
+        *) return 1 ;;
+    esac
+    case "$nonce_line" in
+        nonce=*) read_nonce=${nonce_line#nonce=} ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$read_nonce" |
+        LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+        return 1
+    LOCK_READ_PID=$read_pid
+    LOCK_READ_START=$read_start
+    LOCK_READ_NONCE=$read_nonce
+    LOCK_READ_OWNER_METADATA=$owner_metadata
+}
+
+create_lock_owner()
+{
+    directory=$1
+    LOCK_SELF_PID=$$
+    LOCK_SELF_START=$(process_start_identity "$LOCK_SELF_PID") ||
+        return 1
+    LOCK_SELF_NONCE=$(new_lock_nonce) || return 1
+    temporary=$directory/.owner-v1.$LOCK_SELF_PID.$LOCK_SELF_NONCE
+    (
+        umask 077
+        printf '%s\n' \
+            hydra-installer-lock/v1 \
+            "pid=$LOCK_SELF_PID" \
+            "start=$LOCK_SELF_START" \
+            "nonce=$LOCK_SELF_NONCE" > "$temporary"
+    ) || return 1
+    chmod 600 "$temporary" 2>/dev/null || {
+        rm "$temporary" 2>/dev/null || :
+        return 1
+    }
+    ln "$temporary" "$directory/owner-v1" 2>/dev/null || {
+        rm "$temporary" 2>/dev/null || :
+        return 1
+    }
+    rm "$temporary" 2>/dev/null || return 1
+    read_lock_owner "$directory" || return 1
+    [ "$LOCK_READ_PID" = "$LOCK_SELF_PID" ] &&
+        [ "$LOCK_READ_START" = "$LOCK_SELF_START" ] &&
+        [ "$LOCK_READ_NONCE" = "$LOCK_SELF_NONCE" ]
+}
+
+cleanup_installer_lock()
+{
+    case "$LOCK_DIR" in
+        "$HOME/.hydra-installer-lock") ;;
+        *) return ;;
+    esac
+    read_lock_owner "$LOCK_DIR" 2>/dev/null || return
+    [ "$LOCK_READ_PID" = "$LOCK_SELF_PID" ] &&
+        [ "$LOCK_READ_START" = "$LOCK_SELF_START" ] &&
+        [ "$LOCK_READ_NONCE" = "$LOCK_SELF_NONCE" ] ||
+        return
+    saved_directory_metadata=$LOCK_READ_DIRECTORY_METADATA
+    saved_owner_metadata=$LOCK_READ_OWNER_METADATA
+    read_lock_owner "$LOCK_DIR" 2>/dev/null || return
+    [ "$LOCK_READ_PID" = "$LOCK_SELF_PID" ] &&
+        [ "$LOCK_READ_START" = "$LOCK_SELF_START" ] &&
+        [ "$LOCK_READ_NONCE" = "$LOCK_SELF_NONCE" ] &&
+        [ "$LOCK_READ_DIRECTORY_METADATA" = "$saved_directory_metadata" ] &&
+        [ "$LOCK_READ_OWNER_METADATA" = "$saved_owner_metadata" ] ||
+        return
+    retire_nonce=$(new_lock_nonce) || return
+    retired=$HOME/.hydra-installer-lock.retired.$retire_nonce
+    path_exists "$retired" && return
+    mv "$LOCK_DIR" "$retired" 2>/dev/null || return
+    LOCK_OWNED=0
+    if ! read_lock_owner "$retired" ||
+        [ "$LOCK_READ_PID" != "$LOCK_SELF_PID" ] ||
+        [ "$LOCK_READ_START" != "$LOCK_SELF_START" ] ||
+        [ "$LOCK_READ_NONCE" != "$LOCK_SELF_NONCE" ] ||
+        [ "$LOCK_READ_DIRECTORY_METADATA" != "$saved_directory_metadata" ] ||
+        [ "$LOCK_READ_OWNER_METADATA" != "$saved_owner_metadata" ]
+    then
+        if ! path_exists "$LOCK_DIR"; then
+            mv "$retired" "$LOCK_DIR" 2>/dev/null || :
+        fi
+        return
+    fi
+    rm "$retired/owner-v1" 2>/dev/null || return
+    rmdir "$retired" 2>/dev/null || :
+}
+
+reclaim_dead_installer_lock()
+{
+    directory=$1
+    read_lock_owner "$directory" || return 1
+    saved_pid=$LOCK_READ_PID
+    saved_start=$LOCK_READ_START
+    saved_nonce=$LOCK_READ_NONCE
+    saved_directory_metadata=$LOCK_READ_DIRECTORY_METADATA
+    saved_owner_metadata=$LOCK_READ_OWNER_METADATA
+    set +e
+    live_start=$(process_start_identity "$saved_pid" 2>/dev/null)
+    process_status=$?
+    set -e
+    case "$process_status" in
+        0) return 1 ;;
+        1) ;;
+        *) return 1 ;;
+    esac
+
+    claim_nonce=$(new_lock_nonce) || return 1
+    claimed=$HOME/.hydra-installer-lock.reclaim.$claim_nonce
+    path_exists "$claimed" && return 1
+    mv "$directory" "$claimed" 2>/dev/null || return 1
+    if ! read_lock_owner "$claimed" ||
+        [ "$LOCK_READ_PID" != "$saved_pid" ] ||
+        [ "$LOCK_READ_START" != "$saved_start" ] ||
+        [ "$LOCK_READ_NONCE" != "$saved_nonce" ] ||
+        [ "$LOCK_READ_DIRECTORY_METADATA" != "$saved_directory_metadata" ] ||
+        [ "$LOCK_READ_OWNER_METADATA" != "$saved_owner_metadata" ]
+    then
+        if ! path_exists "$directory"; then
+            mv "$claimed" "$directory" 2>/dev/null || :
+        fi
+        return 1
+    fi
+    set +e
+    process_start_identity "$saved_pid" >/dev/null 2>&1
+    process_status=$?
+    set -e
+    [ "$process_status" = 1 ] || {
+        if ! path_exists "$directory"; then
+            mv "$claimed" "$directory" 2>/dev/null || :
+        fi
+        return 1
+    }
+    if ! read_lock_owner "$claimed" ||
+        [ "$LOCK_READ_PID" != "$saved_pid" ] ||
+        [ "$LOCK_READ_START" != "$saved_start" ] ||
+        [ "$LOCK_READ_NONCE" != "$saved_nonce" ] ||
+        [ "$LOCK_READ_DIRECTORY_METADATA" != "$saved_directory_metadata" ] ||
+        [ "$LOCK_READ_OWNER_METADATA" != "$saved_owner_metadata" ]
+    then
+        if ! path_exists "$directory"; then
+            mv "$claimed" "$directory" 2>/dev/null || :
+        fi
+        return 1
+    fi
+    rm "$claimed/owner-v1" 2>/dev/null || return 1
+    rmdir "$claimed" 2>/dev/null || return 1
+}
+
+validate_live_installer_lock()
+{
+    directory=$1
+    read_lock_owner "$directory" || return 1
+    live_start=$(process_start_identity "$LOCK_READ_PID" 2>/dev/null || :)
+    [ -n "$live_start" ] && [ "$live_start" = "$LOCK_READ_START" ]
 }
 
 valid_version()
@@ -505,6 +815,7 @@ parse_arguments()
                     printf '%s\n' "$capability" |
                         LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
                         fail "unsupported arguments"
+                    ACQUISITION_CAPABILITY=$capability
                     MODE=acquire
                     ;;
                 --resolve)
@@ -566,10 +877,22 @@ fi
 
 LOCK_DIR=$HOME/.hydra-installer-lock
 if [ "$MODE" = acquire ]; then
-    safe_private_directory "$LOCK_DIR"
-else
-    mkdir -m 700 "$LOCK_DIR" 2>/dev/null ||
+    validate_live_installer_lock "$LOCK_DIR" ||
         fail "another installation is in progress"
+    [ "$LOCK_READ_NONCE" = "$ACQUISITION_CAPABILITY" ] ||
+        fail "another installation is in progress"
+else
+    if ! mkdir -m 700 "$LOCK_DIR" 2>/dev/null; then
+        reclaim_dead_installer_lock "$LOCK_DIR" ||
+            fail "another installation is in progress"
+        mkdir -m 700 "$LOCK_DIR" 2>/dev/null ||
+            fail "another installation is in progress"
+    fi
+    if ! create_lock_owner "$LOCK_DIR"; then
+        cleanup_installer_lock || :
+        rmdir "$LOCK_DIR" 2>/dev/null || :
+        fail "installer lock owner creation failed"
+    fi
     LOCK_OWNED=1
 fi
 

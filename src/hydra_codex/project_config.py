@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import errno
 import json
+import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import tomllib
 
 from .project import normalize_project_display_name
 
 
 PROJECT_CONFIG_SCHEMA_VERSION = 1
+PROJECT_CONFIG_MAX_BYTES = 64 * 1024
 PROJECT_ID_PATTERN = re.compile(r"\Ahprj_[0-9a-f]{16}\Z")
 _FIELDS = frozenset({"schema_version", "project_id", "display_name", "telemetry"})
 
@@ -107,11 +111,43 @@ def render_project_config(config: ProjectConfig) -> bytes:
     return rendered
 
 
-def read_project_config(path: Path) -> ProjectConfig:
-    """Read and strictly parse one project configuration."""
+def _read_project_config_bytes(path: Path) -> bytes:
+    """Read a bounded regular file without following its final path component."""
     try:
-        with path.open("rb") as config_file:
-            raw = config_file.read()
+        expected = path.lstat()
     except OSError:
         raise
-    return parse_project_config(raw, source=path)
+    if not stat.S_ISREG(expected.st_mode):
+        raise _fail()
+
+    flags = os.O_RDONLY
+    for option in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, option, 0)
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENXIO}:
+                raise _fail() from error
+            raise
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise _fail()
+        with os.fdopen(descriptor, "rb") as config_file:
+            descriptor = -1
+            raw = config_file.read(PROJECT_CONFIG_MAX_BYTES + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > PROJECT_CONFIG_MAX_BYTES:
+        raise _fail()
+    return raw
+
+
+def read_project_config(path: Path) -> ProjectConfig:
+    """Read and strictly parse one project configuration."""
+    return parse_project_config(_read_project_config_bytes(path), source=path)

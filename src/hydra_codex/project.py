@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import stat
 import tomllib
 import unicodedata
 
@@ -55,50 +56,56 @@ def resolve_project(cwd: Path | str) -> ProjectResolution:
         current = current.parent
     for directory in (current, *current.parents):
         config_path = directory / ".hydra" / "project.toml"
-        if config_path.is_file():
-            from .project_config import (
-                ProjectConfig,
-                ProjectConfigError,
-                read_project_config,
-            )
+        try:
+            metadata = config_path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        from .project_config import (
+            ProjectConfig,
+            ProjectConfigError,
+            _read_project_config_bytes,
+            parse_project_config,
+        )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ProjectConfigError("invalid Hydra project configuration")
 
+        raw = _read_project_config_bytes(config_path)
+        try:
+            config = parse_project_config(raw, source=config_path)
+        except ProjectConfigError as strict_error:
+            # Older internal Hydra builds accepted opaque, non-canonical IDs.
+            # Keep those schema-less files usable by existing commands while
+            # init/status/uninit enforce the public canonical contract.
             try:
-                config = read_project_config(config_path)
-            except ProjectConfigError as strict_error:
-                # Older internal Hydra builds accepted opaque, non-canonical IDs.
-                # Keep those schema-less files usable by existing commands while
-                # init/status/uninit enforce the public canonical contract.
-                try:
-                    with config_path.open("rb") as config_file:
-                        legacy = tomllib.load(config_file)
-                    if (
-                        set(legacy) - {"project_id", "display_name", "telemetry"}
-                        or "schema_version" in legacy
-                    ):
-                        raise strict_error
-                    project_id = legacy.get("project_id")
-                    telemetry = legacy.get("telemetry")
-                    if (
-                        not isinstance(project_id, str)
-                        or not project_id.strip()
-                        or telemetry not in {None, "hybrid"}
-                    ):
-                        raise strict_error
-                    config = ProjectConfig(
-                        None,
-                        project_id,
-                        _trusted_display_name(
-                            legacy.get("display_name"),
-                            Path("project.toml"),
-                        ),
-                        telemetry,
-                    )
-                except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
-                    raise strict_error from None
-            return ProjectResolution(
-                config.project_id,
-                directory,
-                current.relative_to(directory),
-                config.display_name,
-            )
+                legacy = tomllib.loads(raw.decode("utf-8"))
+                if (
+                    set(legacy) - {"project_id", "display_name", "telemetry"}
+                    or "schema_version" in legacy
+                ):
+                    raise strict_error
+                project_id = legacy.get("project_id")
+                telemetry = legacy.get("telemetry")
+                if (
+                    not isinstance(project_id, str)
+                    or not project_id.strip()
+                    or telemetry not in {None, "hybrid"}
+                ):
+                    raise strict_error
+                config = ProjectConfig(
+                    None,
+                    project_id,
+                    _trusted_display_name(
+                        legacy.get("display_name"),
+                        Path("project.toml"),
+                    ),
+                    telemetry,
+                )
+            except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
+                raise strict_error from None
+        return ProjectResolution(
+            config.project_id,
+            directory,
+            current.relative_to(directory),
+            config.display_name,
+        )
     raise ProjectNotFound(f"no .hydra/project.toml found from {cwd}")

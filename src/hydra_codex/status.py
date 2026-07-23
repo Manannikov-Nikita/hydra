@@ -31,9 +31,11 @@ def _project_status(path: Path | str) -> ProjectStatus:
         config_path = hydra / "project.toml"
         if hydra.is_symlink():
             raise ProjectConfigError("invalid Hydra project configuration")
-        if config_path.exists():
-            if config_path.is_symlink() or not config_path.is_file():
-                raise ProjectConfigError("invalid Hydra project configuration")
+        try:
+            config_path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        else:
             config = read_project_config(config_path)
             return ProjectStatus(True, True, config.schema_version, directory)
     return ProjectStatus(False, None, None, None)

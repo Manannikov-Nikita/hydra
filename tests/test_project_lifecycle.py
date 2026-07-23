@@ -16,6 +16,7 @@ from hydra_codex.project_lifecycle import (
     initialize_project,
     uninitialize_project,
 )
+from hydra_codex.status import collect_status
 
 
 def config_path(project: Path) -> Path:
@@ -132,6 +133,43 @@ class ProjectLifecycleTests(unittest.TestCase):
             initialize_project(self.project, home=self.home)
         self.assertEqual(list(external.iterdir()), [])
 
+    def test_symlinked_target_and_project_descendant_are_rejected_before_resolution(
+        self,
+    ) -> None:
+        external_target = self.root / "external-target"
+        external_target.mkdir()
+        target_link = self.root / "target-link"
+        target_link.symlink_to(external_target, target_is_directory=True)
+
+        with self.assertRaises(UnsafeProjectTarget):
+            initialize_project(target_link, home=self.home)
+        self.assertEqual(list(external_target.iterdir()), [])
+
+        (self.project / ".git").mkdir()
+        external_descendant = self.root / "external-descendant"
+        (external_descendant / "nested").mkdir(parents=True)
+        (self.project / "linked").symlink_to(
+            external_descendant,
+            target_is_directory=True,
+        )
+
+        with self.assertRaises(UnsafeProjectTarget):
+            initialize_project(self.project / "linked" / "nested", home=self.home)
+        self.assertFalse((self.project / ".hydra").exists())
+        self.assertEqual(list(external_descendant.iterdir()), [external_descendant / "nested"])
+
+    def test_symlinked_prefix_above_project_boundary_is_tolerated(self) -> None:
+        real_prefix = self.root / "real-prefix"
+        project = real_prefix / "project"
+        project.mkdir(parents=True)
+        alias = self.root / "prefix-alias"
+        alias.symlink_to(real_prefix, target_is_directory=True)
+
+        result = initialize_project(alias / "project", home=self.home)
+
+        self.assertEqual(result.project_root, project.resolve())
+        self.assertTrue(config_path(project).is_file())
+
     def test_malformed_existing_config_is_preserved_and_rejected(self) -> None:
         (self.project / ".hydra").mkdir()
         original = b'project_id = "/private/not-canonical"\n'
@@ -142,7 +180,9 @@ class ProjectLifecycleTests(unittest.TestCase):
 
         self.assertEqual(config_path(self.project).read_bytes(), original)
 
-    def test_publish_failure_removes_its_temporary_file(self) -> None:
+    def test_publish_failure_removes_its_temporary_file_and_owned_empty_directory(
+        self,
+    ) -> None:
         with mock.patch(
             "hydra_codex.project_lifecycle.os.link",
             side_effect=OSError("link failed"),
@@ -151,8 +191,114 @@ class ProjectLifecycleTests(unittest.TestCase):
                 initialize_project(self.project, home=self.home)
 
         hydra = self.project / ".hydra"
-        self.assertEqual(list(hydra.glob(".project.toml-*")), [])
+        self.assertFalse(hydra.exists())
         self.assertFalse(config_path(self.project).exists())
+
+    def test_publish_failure_never_removes_preexisting_or_newly_nonempty_directory(
+        self,
+    ) -> None:
+        hydra = self.project / ".hydra"
+        hydra.mkdir()
+        with mock.patch(
+            "hydra_codex.project_lifecycle.os.link",
+            side_effect=OSError("link failed"),
+        ):
+            with self.assertRaises(OSError):
+                initialize_project(self.project, home=self.home)
+        self.assertTrue(hydra.is_dir())
+        self.assertEqual(list(hydra.iterdir()), [])
+
+        hydra.rmdir()
+        sidecar = hydra / "concurrent-entry"
+
+        def fail_after_concurrent_write(*_args) -> None:
+            sidecar.write_text("keep", encoding="utf-8")
+            raise OSError("link failed")
+
+        with mock.patch(
+            "hydra_codex.project_lifecycle.os.link",
+            side_effect=fail_after_concurrent_write,
+        ):
+            with self.assertRaises(OSError):
+                initialize_project(self.project, home=self.home)
+        self.assertEqual(sidecar.read_text(encoding="utf-8"), "keep")
+
+    def test_config_symlink_fails_closed_for_init_status_and_uninit(self) -> None:
+        hydra = self.project / ".hydra"
+        hydra.mkdir()
+        external = self.root / "external-project.toml"
+        original = b'project_id = "hprj_0123456789abcdef"\n'
+        external.write_bytes(original)
+        config_path(self.project).symlink_to(external)
+
+        operations = (
+            lambda: initialize_project(self.project, home=self.home),
+            lambda: collect_status(self.project, environ={"HOME": str(self.home)}),
+            lambda: uninitialize_project(
+                self.project,
+                confirmation="remove hydra project",
+                home=self.home,
+            ),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaises(ProjectConfigError):
+                operation()
+
+        self.assertTrue(config_path(self.project).is_symlink())
+        self.assertEqual(external.read_bytes(), original)
+
+    def test_fifo_and_socket_configs_fail_closed_without_opening(self) -> None:
+        hydra = self.project / ".hydra"
+        hydra.mkdir()
+        path = config_path(self.project)
+        operations = (
+            lambda: initialize_project(self.project, home=self.home),
+            lambda: collect_status(self.project, environ={"HOME": str(self.home)}),
+            lambda: uninitialize_project(
+                self.project,
+                confirmation="remove hydra project",
+                home=self.home,
+            ),
+        )
+
+        os.mkfifo(path)
+        try:
+            with mock.patch.object(
+                Path,
+                "open",
+                side_effect=AssertionError("nonregular config must not be opened"),
+            ):
+                for operation in operations:
+                    with self.subTest(kind="fifo", operation=operation):
+                        with self.assertRaises(ProjectConfigError):
+                            operation()
+        finally:
+            path.unlink(missing_ok=True)
+
+        path.touch()
+        regular_metadata = path.lstat()
+        socket_metadata = os.stat_result(
+            (stat.S_IFSOCK | 0o600, *regular_metadata[1:]),
+        )
+        real_lstat = Path.lstat
+
+        def socket_lstat(candidate: Path):
+            if candidate == path:
+                return socket_metadata
+            return real_lstat(candidate)
+
+        with (
+            mock.patch.object(Path, "lstat", autospec=True, side_effect=socket_lstat),
+            mock.patch.object(
+                Path,
+                "open",
+                side_effect=AssertionError("nonregular config must not be opened"),
+            ),
+        ):
+            for operation in operations:
+                with self.subTest(kind="socket", operation=operation):
+                    with self.assertRaises(ProjectConfigError):
+                        operation()
 
     def test_uninit_requires_exact_confirmation_and_valid_config(self) -> None:
         initialized = initialize_project(self.project, home=self.home)

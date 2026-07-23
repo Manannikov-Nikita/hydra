@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
+import hydra_codex.project_config as project_config
 from hydra_codex.project_config import (
     PROJECT_CONFIG_SCHEMA_VERSION,
     PROJECT_ID_PATTERN,
@@ -10,6 +12,7 @@ from hydra_codex.project_config import (
     ProjectConfigError,
     generate_project_id,
     parse_project_config,
+    read_project_config,
     render_project_config,
 )
 
@@ -100,6 +103,21 @@ class ProjectConfigTests(unittest.TestCase):
     def test_render_rejects_invalid_programmatic_config(self) -> None:
         with self.assertRaises(ProjectConfigError):
             render_project_config(ProjectConfig(1, "not-canonical", None, "hybrid"))
+
+    def test_streamed_reader_rejects_content_above_exported_size_cap(self) -> None:
+        self.assertEqual(project_config.PROJECT_CONFIG_MAX_BYTES, 64 * 1024)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "private-project-name.toml"
+            path.write_bytes(
+                b'project_id = "hprj_0123456789abcdef"\n'
+                + b"#" * project_config.PROJECT_CONFIG_MAX_BYTES,
+            )
+
+            with self.assertRaises(ProjectConfigError) as raised:
+                read_project_config(path)
+
+        self.assertNotIn(str(path), str(raised.exception))
+        self.assertNotIn("private-project-name", str(raised.exception))
 
 
 if __name__ == "__main__":

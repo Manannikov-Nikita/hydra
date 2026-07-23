@@ -7,12 +7,14 @@ from dataclasses import dataclass
 import errno
 import os
 from pathlib import Path
+import stat
 import tempfile
 
 from .project import normalize_project_display_name
 from .project_config import (
     PROJECT_CONFIG_SCHEMA_VERSION,
     ProjectConfig,
+    ProjectConfigError,
     generate_project_id,
     read_project_config,
     render_project_config,
@@ -38,10 +40,24 @@ class ProjectMutationResult:
 
 
 def _directory(path: Path | str) -> Path:
-    candidate = Path(path).expanduser()
-    if not candidate.exists() or not candidate.is_dir():
+    candidate = Path(os.path.abspath(Path(path).expanduser()))
+    try:
+        metadata = candidate.lstat()
+    except OSError as error:
+        raise UnsafeProjectTarget(
+            "project target must be an existing directory",
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode):
         raise UnsafeProjectTarget("project target must be an existing directory")
-    return candidate.resolve()
+    return candidate
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
 
 
 def _nearest_root(start: Path, marker: Callable[[Path], bool]) -> Path | None:
@@ -49,6 +65,26 @@ def _nearest_root(start: Path, marker: Callable[[Path], bool]) -> Path | None:
         if marker(directory):
             return directory
     return None
+
+
+def _validate_project_components(target: Path, exact: Path) -> None:
+    """Reject redirects at or below the selected project boundary."""
+    local_components = [target]
+    current = target
+    for component in exact.relative_to(target).parts:
+        current /= component
+        local_components.append(current)
+    for component in local_components:
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            raise UnsafeProjectTarget(
+                "project target must be an existing directory",
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise UnsafeProjectTarget("symlinked project path is not supported")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise UnsafeProjectTarget("project target must be an existing directory")
 
 
 def canonical_project_target(
@@ -60,13 +96,15 @@ def canonical_project_target(
     exact = _directory(path)
     hydra_root = _nearest_root(
         exact,
-        lambda directory: (directory / ".hydra" / "project.toml").exists(),
+        lambda directory: _entry_exists(directory / ".hydra" / "project.toml"),
     )
     git_root = _nearest_root(
         exact,
-        lambda directory: (directory / ".git").exists(),
+        lambda directory: _entry_exists(directory / ".git"),
     )
     target = hydra_root or git_root or exact
+    _validate_project_components(target, exact)
+    target = target.resolve(strict=True)
     protected_home = (Path.home() if home is None else Path(home)).expanduser().resolve()
     if target == Path(target.anchor) or target == protected_home:
         raise UnsafeProjectTarget("unsafe project target")
@@ -87,20 +125,26 @@ def _fsync_directory(directory: Path) -> None:
 def publish_exclusively(path: Path, content: bytes) -> bool:
     """Publish bytes only if *path* is absent, without replacing another writer."""
     directory = path.parent
-    directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+    created_directory = False
+    try:
+        directory.mkdir(mode=0o700, parents=False)
+        created_directory = True
+    except FileExistsError:
+        pass
     if directory.is_symlink():
         raise UnsafeProjectTarget("symlinked .hydra is not supported")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".project.toml-",
-        dir=directory,
-    )
-    temporary = Path(temporary_name)
-    descriptor_open = True
+    descriptor = -1
+    temporary: Path | None = None
     published = False
     try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".project.toml-",
+            dir=directory,
+        )
+        temporary = Path(temporary_name)
         os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "wb")
-        descriptor_open = False
+        descriptor = -1
         try:
             handle.write(content)
             handle.flush()
@@ -114,18 +158,31 @@ def publish_exclusively(path: Path, content: bytes) -> bool:
             published = False
         return published
     finally:
-        if descriptor_open:
+        if descriptor >= 0:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
         try:
-            try:
+            if temporary is not None:
                 temporary.unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            try:
+                _fsync_directory(directory)
             except FileNotFoundError:
                 pass
-        finally:
-            _fsync_directory(directory)
+            if created_directory and not published:
+                try:
+                    directory.rmdir()
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                        raise
+                else:
+                    _fsync_directory(directory.parent)
 
 
 def _normalized_name(name: str | None, root: Path) -> str | None:
@@ -143,7 +200,7 @@ def initialize_project(
     """Initialize the selected project exactly once."""
     root = canonical_project_target(path, home=home)
     config_path = root / ".hydra" / "project.toml"
-    if config_path.exists():
+    if _entry_exists(config_path):
         current = read_project_config(config_path)
         return ProjectMutationResult(root, current.project_id, False)
     config = ProjectConfig(
@@ -173,11 +230,12 @@ def uninitialize_project(
     root = canonical_project_target(path, home=home)
     hydra = root / ".hydra"
     config_path = hydra / "project.toml"
-    if not config_path.exists():
+    if not _entry_exists(config_path):
         return ProjectMutationResult(root, "", False)
-    if config_path.is_symlink():
-        raise UnsafeProjectTarget("symlinked project configuration is not supported")
     current = read_project_config(config_path)
+    metadata = config_path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ProjectConfigError("invalid Hydra project configuration")
     try:
         config_path.unlink()
     except FileNotFoundError:

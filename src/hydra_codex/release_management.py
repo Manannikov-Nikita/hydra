@@ -17,9 +17,7 @@ import stat
 from typing import TextIO
 
 from .install_layout import BundleLayout, InvalidBundle, validate_bundle
-from .platform_paths import default_data_directory
 
-_COORDINATION_LOCK_NAME = "release-lifecycle.lock"
 _JOURNAL_NAME = "release-journal.json"
 _JOURNAL_LIMIT = 4096
 
@@ -244,74 +242,27 @@ def _validate_link_state(roots: InstallRoots) -> _LinkState:
     )
 
 
-def _coordination_root(
-    roots: InstallRoots,
-    *,
-    environ: Mapping[str, str],
-) -> Path:
-    user_home = roots.home.parent
-    root = default_data_directory(user_home, environ=environ)
-    xdg_data_home = environ.get("XDG_DATA_HOME")
-    linux_fallback = user_home / ".local" / "share" / "hydra"
-    if (
-        isinstance(xdg_data_home, str)
-        and xdg_data_home
-        and not Path(xdg_data_home).is_absolute()
-        and root == linux_fallback
-    ):
-        raise InstallOwnershipError("invalid release data directory")
-    return root
-
-
-def _validate_coordination_root(user_home: Path, root: Path) -> None:
-    try:
-        root.relative_to(user_home)
-    except ValueError:
-        base = root.parent
-        _validate_owned_directory(base, private=False)
-    else:
-        base = user_home
-    _validate_directory_ancestors(
-        base,
-        root,
-        private_final=True,
-    )
-
-
 @contextmanager
-def _lifecycle_lock(
-    roots: InstallRoots,
-    *,
-    environ: Mapping[str, str],
-) -> Iterator[None]:
+def _lifecycle_lock(roots: InstallRoots) -> Iterator[None]:
     _validate_root_ownership(roots)
     user_home = roots.home.parent
-    coordination_root = _coordination_root(roots, environ=environ)
-    _validate_coordination_root(user_home, coordination_root)
-    _ensure_directory(coordination_root, mode=0o700)
-    _validate_coordination_root(user_home, coordination_root)
-    lock_path = coordination_root / _COORDINATION_LOCK_NAME
-    if _lexists(lock_path):
-        status = lock_path.lstat()
-        if (
-            not stat.S_ISREG(status.st_mode)
-            or stat.S_ISLNK(status.st_mode)
-            or stat.S_IMODE(status.st_mode) != 0o600
-            or status.st_uid != os.getuid()
-        ):
-            raise InstallOwnershipError("invalid release lifecycle lock")
-    flags = os.O_RDWR | os.O_CREAT
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        descriptor = os.open(user_home, flags)
+    except OSError as error:
+        raise InstallOwnershipError("invalid selected home") from error
     try:
         opened = os.fstat(descriptor)
         if (
-            not stat.S_ISREG(opened.st_mode)
-            or stat.S_IMODE(opened.st_mode) != 0o600
+            not stat.S_ISDIR(opened.st_mode)
             or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) & 0o022
         ):
-            raise InstallOwnershipError("invalid release lifecycle lock")
+            raise InstallOwnershipError("invalid selected home")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -589,8 +540,9 @@ def activate_version(
     environ: Mapping[str, str],
 ) -> Path:
     """Activate a verified bundle without overwriting any installed version."""
+    _ = environ
     _validate_link_state(roots)
-    with _lifecycle_lock(roots, environ=environ):
+    with _lifecycle_lock(roots):
         _recover_pending(roots)
         _validate_link_state(roots)
         return _activate_locked(layout, roots=roots, retain_journal=False)
@@ -653,7 +605,7 @@ def upgrade(
         raise ValueError("verified release candidate is unavailable")
 
     _validate_link_state(selected)
-    with _lifecycle_lock(selected, environ=environ):
+    with _lifecycle_lock(selected):
         _recover_pending(
             selected,
             reconcile_integration=refresh_integration,
@@ -747,7 +699,7 @@ def uninstall(
     """Detach Codex first, then remove only individually proven-owned CLI state."""
     selected = default_install_roots(_home(environ)) if roots is None else roots
     _uninstall_preflight(selected)
-    with _lifecycle_lock(selected, environ=environ):
+    with _lifecycle_lock(selected):
         _uninstall_preflight(selected)
         detach_integration()
         if keep_cli:

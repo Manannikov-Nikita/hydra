@@ -19,7 +19,6 @@ from hydra_codex.install_layout import (
     InvalidBundle,
     validate_bundle,
 )
-from hydra_codex.platform_paths import default_data_directory
 from hydra_codex.release_management import (
     InstallOwnershipError,
     InstallRoots,
@@ -81,26 +80,12 @@ def _inventory(root: Path) -> tuple[tuple[str, int, bytes | None], ...]:
     return tuple(sorted(rows))
 
 
-def _cli_inventory(
-    roots: InstallRoots,
-) -> tuple[tuple[str, tuple[tuple[str, int, bytes | None], ...]], ...]:
-    rows = []
-    for label, root in (("home", roots.home), ("bin", roots.launcher.parent)):
-        if not root.exists():
-            rows.append((label, ()))
-            continue
-        mode = root.lstat().st_mode
-        content = root.read_bytes() if stat.S_ISREG(mode) else None
-        tree = ((".", mode, content),) + _inventory(root)
-        rows.append((label, tree))
-    return tuple(rows)
-
-
 class ReleaseManagementTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)
         self.user_home = self.base / "user"
+        self.user_home.mkdir()
         hydra_home = self.user_home / ".hydra"
         self.roots = InstallRoots(
             home=hydra_home,
@@ -277,16 +262,6 @@ class ReleaseManagementTests(unittest.TestCase):
             os.readlink(self.roots.launcher),
             str(self.roots.current / "bin" / "hydra-codex"),
         )
-        lock = (
-            default_data_directory(
-                self.user_home,
-                environ=self.environ,
-            )
-            / "release-lifecycle.lock"
-        )
-        self.assertEqual(stat.S_IMODE(lock.parent.stat().st_mode), 0o700)
-        self.assertTrue(stat.S_ISREG(lock.lstat().st_mode))
-        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
         self.assertEqual(
             (installed / "bin" / "hydra-codex").read_text(encoding="utf-8"),
             "#!/bin/sh\n# original\n",
@@ -304,79 +279,6 @@ class ReleaseManagementTests(unittest.TestCase):
             "#!/bin/sh\n# original\n",
         )
         self.assertTrue(replacement.root.exists())
-
-    def test_macos_coordination_lock_uses_application_support(self) -> None:
-        candidate = _bundle(self.base, "0.1.0")
-
-        with patch("hydra_codex.platform_paths.sys.platform", "darwin"):
-            activate_version(
-                candidate,
-                roots=self.roots,
-                environ=self.environ,
-            )
-
-        lock = (
-            self.user_home
-            / "Library"
-            / "Application Support"
-            / "Hydra"
-            / "release-lifecycle.lock"
-        )
-        self.assertTrue(lock.is_file())
-        self.assertFalse((self.user_home / ".local" / "share").exists())
-
-    def test_linux_coordination_lock_uses_absolute_xdg_data_home(self) -> None:
-        candidate = _bundle(self.base, "0.1.0")
-        xdg_data = self.base / "xdg-data"
-        environ = {
-            "HOME": str(self.user_home),
-            "XDG_DATA_HOME": str(xdg_data),
-        }
-
-        with patch("hydra_codex.platform_paths.sys.platform", "linux"):
-            activate_version(candidate, roots=self.roots, environ=environ)
-
-        self.assertTrue(
-            (xdg_data / "hydra" / "release-lifecycle.lock").is_file(),
-        )
-        self.assertFalse((self.user_home / ".local" / "share").exists())
-
-    def test_linux_coordination_lock_uses_home_fallback(self) -> None:
-        candidate = _bundle(self.base, "0.1.0")
-
-        with patch("hydra_codex.platform_paths.sys.platform", "linux"):
-            activate_version(
-                candidate,
-                roots=self.roots,
-                environ=self.environ,
-            )
-
-        self.assertTrue(
-            (
-                self.user_home
-                / ".local"
-                / "share"
-                / "hydra"
-                / "release-lifecycle.lock"
-            ).is_file(),
-        )
-
-    def test_relative_xdg_data_home_fails_without_creating_state(self) -> None:
-        candidate = _bundle(self.base, "0.1.0")
-        environ = {
-            "HOME": str(self.user_home),
-            "XDG_DATA_HOME": "relative-data",
-        }
-        before = _inventory(self.user_home)
-
-        with patch("hydra_codex.platform_paths.sys.platform", "linux"):
-            with self.assertRaises(InstallOwnershipError):
-                activate_version(candidate, roots=self.roots, environ=environ)
-
-        self.assertEqual(_inventory(self.user_home), before)
-        self.assertFalse(self.roots.home.exists())
-        self.assertFalse((self.user_home / ".local" / "share").exists())
-        self.assertTrue(candidate.root.exists())
 
     def test_activation_rejects_an_invalid_existing_version(self) -> None:
         installed = self.activate("0.1.0")
@@ -702,11 +604,11 @@ class ReleaseManagementTests(unittest.TestCase):
             thread.join(5)
         self.assertEqual(errors, [])
 
-    def test_concurrent_empty_uninstalls_share_data_root_coordination(self) -> None:
+    def test_concurrent_empty_uninstalls_share_home_coordination(self) -> None:
         entered = threading.Event()
         release = threading.Event()
         errors: list[BaseException] = []
-        before = _cli_inventory(self.roots)
+        before = _inventory(self.user_home)
 
         def holding_detach() -> None:
             entered.set()
@@ -738,13 +640,24 @@ class ReleaseManagementTests(unittest.TestCase):
             release.set()
             thread.join(5)
         self.assertEqual(errors, [])
-        self.assertEqual(_cli_inventory(self.roots), before)
+        self.assertEqual(_inventory(self.user_home), before)
 
-    def test_empty_uninstall_and_activation_share_one_lock_domain(self) -> None:
+    def test_empty_uninstall_and_activation_share_home_lock_with_same_xdg(
+        self,
+    ) -> None:
         entered = threading.Event()
         release = threading.Event()
         errors: list[BaseException] = []
         candidate = _bundle(self.base, "0.1.0")
+        xdg_data = self.base / "same-xdg"
+        environ = {
+            "HOME": str(self.user_home),
+            "XDG_DATA_HOME": str(xdg_data),
+        }
+        before = _inventory(self.user_home)
+        platform = patch("hydra_codex.platform_paths.sys.platform", "linux")
+        platform.start()
+        self.addCleanup(platform.stop)
 
         def holding_detach() -> None:
             entered.set()
@@ -754,7 +667,7 @@ class ReleaseManagementTests(unittest.TestCase):
             try:
                 uninstall(
                     keep_cli=True,
-                    environ=self.environ,
+                    environ=environ,
                     detach_integration=holding_detach,
                     roots=self.roots,
                 )
@@ -766,13 +679,72 @@ class ReleaseManagementTests(unittest.TestCase):
         self.assertTrue(entered.wait(2))
         try:
             with self.assertRaises(LifecycleBusyError):
-                activate_version(candidate, roots=self.roots, environ=self.environ)
+                activate_version(candidate, roots=self.roots, environ=environ)
         finally:
             release.set()
             thread.join(5)
         self.assertEqual(errors, [])
         self.assertTrue(candidate.root.exists())
         self.assertFalse(self.roots.current.exists())
+        self.assertEqual(_inventory(self.user_home), before)
+        self.assertFalse(xdg_data.exists())
+
+    def test_empty_uninstall_and_activation_share_home_lock_across_xdg(
+        self,
+    ) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        candidate = _bundle(self.base, "0.1.0")
+        first_xdg = self.base / "first-xdg"
+        second_xdg = self.base / "second-xdg"
+        first_environ = {
+            "HOME": str(self.user_home),
+            "XDG_DATA_HOME": str(first_xdg),
+        }
+        second_environ = {
+            "HOME": str(self.user_home),
+            "XDG_DATA_HOME": str(second_xdg),
+        }
+        before = _inventory(self.user_home)
+        platform = patch("hydra_codex.platform_paths.sys.platform", "linux")
+        platform.start()
+        self.addCleanup(platform.stop)
+
+        def holding_detach() -> None:
+            entered.set()
+            release.wait(5)
+
+        def first() -> None:
+            try:
+                uninstall(
+                    keep_cli=True,
+                    environ=first_environ,
+                    detach_integration=holding_detach,
+                    roots=self.roots,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=first)
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        try:
+            with self.assertRaises(LifecycleBusyError):
+                activate_version(
+                    candidate,
+                    roots=self.roots,
+                    environ=second_environ,
+                )
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertTrue(candidate.root.exists())
+        self.assertFalse(self.roots.current.exists())
+        self.assertEqual(_inventory(self.user_home), before)
+        self.assertFalse(first_xdg.exists())
+        self.assertFalse(second_xdg.exists())
 
     def test_detach_failure_makes_zero_cli_mutations(self) -> None:
         installed = self.activate("0.1.0")
@@ -793,7 +765,7 @@ class ReleaseManagementTests(unittest.TestCase):
         self.assertEqual(_inventory(self.user_home), before)
 
     def test_detach_failure_from_empty_home_creates_zero_cli_paths(self) -> None:
-        before = _cli_inventory(self.roots)
+        before = _inventory(self.user_home)
 
         with self.assertRaises(IntegrationError):
             uninstall(
@@ -805,7 +777,7 @@ class ReleaseManagementTests(unittest.TestCase):
                 roots=self.roots,
             )
 
-        self.assertEqual(_cli_inventory(self.roots), before)
+        self.assertEqual(_inventory(self.user_home), before)
         self.assertFalse(self.roots.home.exists())
 
     def test_detach_failure_from_legacy_home_creates_zero_cli_paths(self) -> None:
@@ -813,7 +785,7 @@ class ReleaseManagementTests(unittest.TestCase):
         legacy.parent.mkdir(parents=True)
         legacy.write_text("preserve", encoding="utf-8")
         legacy.parent.chmod(0o700)
-        before = _cli_inventory(self.roots)
+        before = _inventory(self.user_home)
 
         with self.assertRaises(IntegrationError):
             uninstall(
@@ -825,7 +797,7 @@ class ReleaseManagementTests(unittest.TestCase):
                 roots=self.roots,
             )
 
-        self.assertEqual(_cli_inventory(self.roots), before)
+        self.assertEqual(_inventory(self.user_home), before)
 
     def test_keep_cli_stops_after_successful_detachment(self) -> None:
         installed = self.activate("0.1.0")
@@ -859,7 +831,7 @@ class ReleaseManagementTests(unittest.TestCase):
             "foreign",
         )
 
-    def test_wrong_uid_lock_is_rejected_before_detachment(self) -> None:
+    def test_wrong_uid_home_lock_is_rejected_before_detachment(self) -> None:
         self.activate("0.1.0")
         detached: list[bool] = []
         real_fstat = os.fstat

@@ -212,6 +212,36 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(inventory(self.root), before)
         self.assertEqual(self.client.calls, [])
 
+    def test_codex_status_never_exposes_unsafe_child_plugin_versions(self) -> None:
+        versions = (
+            "/private/profile/plugin",
+            "0.1.0\nprivate-control",
+            "v" * 129,
+        )
+        self.client.marketplaces["hydra"] = self.marketplace.resolve()
+        for version in versions:
+            with self.subTest(kind=len(version)):
+                self.client.installed_version = version
+
+                result = self.status()
+
+                self.assertEqual(
+                    result["codex"],
+                    {
+                        "available": True,
+                        "compatible": False,
+                        "marketplace_installed": None,
+                        "plugin_installed": None,
+                        "plugin_version": None,
+                        "version_matches": None,
+                        "new_task_required": False,
+                        "next_actions": [
+                            "Install or update Codex with plugin marketplace support.",
+                        ],
+                    },
+                )
+                self.assertNotIn(version, json.dumps(result))
+
     def test_status_without_an_executable_path_never_runs_or_creates_codex_state(self) -> None:
         before = inventory(self.root)
 

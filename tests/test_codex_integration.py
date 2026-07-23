@@ -485,9 +485,21 @@ class CodexIntegrationTests(unittest.TestCase):
             ("add_plugin", "hydra-codex@hydra"),
             ("add_marketplace", self.marketplace.resolve()),
         ]
+        desired_payload = json.loads(original_receipt)
+        desired_payload["runtime_version"] = "0.2.0"
+        desired_payload["source"] = str(second.resolve())
+        desired_receipt = (
+            json.dumps(desired_payload, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode()
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
         real_write = _write_receipt_bytes
 
         def fail_original_restore(path: Path, content: bytes) -> None:
+            if path == journal:
+                real_write(path, content)
+                real_write(self.receipt, desired_receipt)
+                return
             if content == original_receipt:
                 raise OSError("private receipt restore failure")
             real_write(path, content)
@@ -508,12 +520,121 @@ class CodexIntegrationTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("live rollback failed", message)
         self.assertIn("receipt restore failed", message)
-        journal = self.receipt.with_name(self.receipt.name + ".journal")
         payload = json.loads(journal.read_text(encoding="utf-8"))
         self.assertEqual(
             base64.b64decode(payload["prior_receipt_b64"]),
             original_receipt,
         )
+
+    def test_pending_configure_preserves_unknown_receipt_with_known_live_state(
+        self,
+    ) -> None:
+        self.install_once()
+        second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.mutation_count = 0
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        replacement = b'{"private":"/secret/configure-replacement"}\n'
+        self.receipt.write_bytes(replacement)
+        self.receipt.chmod(0o600)
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationOwnershipError):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+
+        self.assertEqual(self.receipt.read_bytes(), replacement)
+        self.assertTrue(journal.is_file())
+
+    def test_pending_configure_preserves_unknown_receipt_when_live_rollback_fails(
+        self,
+    ) -> None:
+        self.install_once()
+        second = self.root / "marketplace-v2"
+        second.mkdir()
+        self.client.available_versions[second.resolve()] = "0.2.0"
+        self.client.mutation_count = 0
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        replacement = b'{"private":"/secret/configure-live-failure"}\n'
+        self.receipt.write_bytes(replacement)
+        self.receipt.chmod(0o600)
+        self.client.marketplaces["hydra"] = Path("/foreign")
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationError) as raised:
+            self.install_once(
+                version="0.2.0",
+                marketplace=second,
+                refresh=True,
+            )
+
+        self.assertIn("live rollback failed", str(raised.exception))
+        self.assertIn("receipt ownership ambiguous", str(raised.exception))
+        self.assertEqual(self.receipt.read_bytes(), replacement)
+        self.assertTrue(journal.is_file())
+        self.assertEqual(self.client.marketplaces["hydra"], Path("/foreign"))
+
+    def test_pending_remove_preserves_unknown_receipt_with_known_live_state(
+        self,
+    ) -> None:
+        self.install_once()
+        self.client.mutation_count = 0
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            remove_codex_integration(client=self.client, receipt_path=self.receipt)
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        replacement = b'{"private":"/secret/remove-replacement"}\n'
+        self.receipt.write_bytes(replacement)
+        self.receipt.chmod(0o600)
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationOwnershipError):
+            remove_codex_integration(client=self.client, receipt_path=self.receipt)
+
+        self.assertEqual(self.receipt.read_bytes(), replacement)
+        self.assertTrue(journal.is_file())
+
+    def test_pending_remove_preserves_unknown_receipt_when_live_rollback_fails(
+        self,
+    ) -> None:
+        self.install_once()
+        self.client.mutation_count = 0
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            remove_codex_integration(client=self.client, receipt_path=self.receipt)
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        replacement = b'{"private":"/secret/remove-live-failure"}\n'
+        self.receipt.write_bytes(replacement)
+        self.receipt.chmod(0o600)
+        self.client.marketplaces["hydra"] = Path("/foreign")
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationError) as raised:
+            remove_codex_integration(client=self.client, receipt_path=self.receipt)
+
+        self.assertIn("live rollback failed", str(raised.exception))
+        self.assertIn("receipt ownership ambiguous", str(raised.exception))
+        self.assertEqual(self.receipt.read_bytes(), replacement)
+        self.assertTrue(journal.is_file())
+        self.assertEqual(self.client.marketplaces["hydra"], Path("/foreign"))
 
     def test_uninstall_removes_only_receipted_integration_and_is_repeatable(self) -> None:
         self.install_once()
@@ -714,6 +835,55 @@ class CodexIntegrationTests(unittest.TestCase):
 
         self.assertEqual(self.client.calls, [])
 
+    def test_pending_configure_without_prior_receipt_requires_empty_prior_state(
+        self,
+    ) -> None:
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            self.install_once()
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["prior_state"] = {
+            "marketplace": {
+                "name": "hydra",
+                "source": str(self.marketplace.resolve()),
+            },
+            "plugin": {
+                "installed": False,
+                "marketplace": "hydra",
+                "name": "hydra-codex",
+                "version": "0.1.0",
+            },
+        }
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        journal.chmod(0o600)
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationOwnershipError):
+            self.install_once()
+
+        self.assertEqual(self.client.calls, [])
+        self.assertTrue(journal.is_file())
+
+    def test_pending_remove_requires_prior_receipt(self) -> None:
+        self.install_once()
+        self.client.mutation_count = 0
+        self.client.crash_after_mutation = 1
+        with self.assertRaises(SimulatedCrash):
+            remove_codex_integration(client=self.client, receipt_path=self.receipt)
+        journal = self.receipt.with_name(self.receipt.name + ".journal")
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["prior_receipt_b64"] = None
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        journal.chmod(0o600)
+        self.client.calls.clear()
+
+        with self.assertRaises(IntegrationOwnershipError):
+            remove_codex_integration(client=self.client, receipt_path=self.receipt)
+
+        self.assertEqual(self.client.calls, [])
+        self.assertTrue(journal.is_file())
+
     def test_incompatible_codex_fails_before_mutation(self) -> None:
         self.client.plugin_listing_supported = False
 
@@ -823,6 +993,120 @@ class CodexCommandClientTests(unittest.TestCase):
             self.assertNotEqual(call.kwargs["environ"]["PATH"], "/unsafe")
             self.assertEqual(call.kwargs["timeout"], 10.0)
             self.assertEqual(call.kwargs["max_output_bytes"], 1024 * 1024)
+
+    def test_explicit_codex_home_is_forwarded_without_normalization(self) -> None:
+        supplied = "/private/profile/../codex-profile"
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                return_value=(0, b"codex-cli 1.2\n", b""),
+            ) as run,
+        ):
+            client = CodexCommandClient(
+                environ={"CODEX_HOME": supplied, "PATH": "/usr/bin"},
+            )
+            client.version()
+
+        self.assertEqual(
+            run.call_args.kwargs["environ"].get("CODEX_HOME"),
+            supplied,
+        )
+
+    def test_missing_codex_home_is_not_invented(self) -> None:
+        with (
+            mock.patch(
+                "hydra_codex.codex_integration.shutil.which",
+                return_value="/bin/codex",
+            ),
+            mock.patch(
+                "hydra_codex.codex_integration._run_bounded",
+                return_value=(0, b"codex-cli 1.2\n", b""),
+            ) as run,
+        ):
+            client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+            client.version()
+
+        self.assertNotIn("CODEX_HOME", run.call_args.kwargs["environ"])
+
+    def test_invalid_codex_home_is_rejected_without_disclosure(self) -> None:
+        values = ("", "/private/profile\0secret", 42)
+        for value in values:
+            with self.subTest(value=type(value).__name__):
+                with mock.patch(
+                    "hydra_codex.codex_integration.shutil.which",
+                    return_value="/bin/codex",
+                ):
+                    with self.assertRaises(IncompatibleCodexError) as raised:
+                        CodexCommandClient(
+                            environ={"CODEX_HOME": value, "PATH": "/usr/bin"},
+                        )
+                self.assertEqual(
+                    str(raised.exception),
+                    "Codex integration is unavailable",
+                )
+
+    def test_plugin_versions_accept_short_pep440_and_codex_tokens(self) -> None:
+        versions = (
+            "0.1.0",
+            "1!2.0.0rc1.post2.dev3+local.1",
+            "0.104.0-alpha.1",
+        )
+        for version in versions:
+            payload = json.dumps([{
+                "name": "hydra-codex",
+                "marketplace": "hydra",
+                "installed": True,
+                "version": version,
+            }]).encode()
+            with (
+                self.subTest(version=version),
+                mock.patch(
+                    "hydra_codex.codex_integration.shutil.which",
+                    return_value="/bin/codex",
+                ),
+                mock.patch(
+                    "hydra_codex.codex_integration._run_bounded",
+                    return_value=(0, payload, b""),
+                ),
+            ):
+                client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+                self.assertEqual(
+                    client.list_plugins("hydra", include_available=True)[0].version,
+                    version,
+                )
+
+    def test_unsafe_plugin_versions_are_rejected_without_echo(self) -> None:
+        versions = (
+            "/private/profile/plugin",
+            "0.1.0\nprivate-control",
+            "v" * 129,
+        )
+        for version in versions:
+            payload = json.dumps([{
+                "name": "hydra-codex",
+                "marketplace": "hydra",
+                "installed": True,
+                "version": version,
+            }]).encode()
+            with (
+                self.subTest(kind=len(version)),
+                mock.patch(
+                    "hydra_codex.codex_integration.shutil.which",
+                    return_value="/bin/codex",
+                ),
+                mock.patch(
+                    "hydra_codex.codex_integration._run_bounded",
+                    return_value=(0, payload, b""),
+                ),
+            ):
+                client = CodexCommandClient(environ={"PATH": "/usr/bin"})
+                with self.assertRaises(IncompatibleCodexError) as raised:
+                    client.list_plugins("hydra", include_available=True)
+                self.assertNotIn(version, str(raised.exception))
 
     def test_failures_and_malformed_output_are_redacted(self) -> None:
         private = "/private/home/secret-output"

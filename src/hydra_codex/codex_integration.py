@@ -27,6 +27,8 @@ _RECEIPT_MAX_BYTES = 16 * 1024
 _JOURNAL_SCHEMA_VERSION = 1
 _JOURNAL_MAX_BYTES = 64 * 1024
 _COMMAND_MAX_BYTES = 1024 * 1024
+_VERSION_MAX_BYTES = 128
+_VERSION_PUNCTUATION = frozenset(".!+-_")
 _SAFE_PATH_PARTS = (
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -202,6 +204,16 @@ class CodexCommandClient:
         max_output_bytes: int = _COMMAND_MAX_BYTES,
     ) -> None:
         values = dict(os.environ if environ is None else environ)
+        if "CODEX_HOME" in values:
+            codex_home = values["CODEX_HOME"]
+            if (
+                not isinstance(codex_home, str)
+                or not codex_home
+                or "\0" in codex_home
+            ):
+                raise IncompatibleCodexError(
+                    "Codex integration is unavailable",
+                )
         resolved = shutil.which(executable, path=values.get("PATH", ""))
         if resolved is None:
             raise IncompatibleCodexError("Codex integration is unavailable")
@@ -210,6 +222,7 @@ class CodexCommandClient:
         self._max_output_bytes = max_output_bytes
         allowed = (
             "HOME",
+            "CODEX_HOME",
             "USER",
             "TMPDIR",
             "XDG_CONFIG_HOME",
@@ -328,7 +341,7 @@ class CodexCommandClient:
                 or not isinstance(item.get("marketplace"), str)
                 or not item["marketplace"]
                 or not isinstance(item.get("installed"), bool)
-                or not (version is None or isinstance(version, str) and version)
+                or not (version is None or _is_safe_version_token(version))
             ):
                 raise IncompatibleCodexError("Codex integration is unavailable")
             records.append(
@@ -370,7 +383,12 @@ def _one_plugin(plugins: tuple[PluginRecord, ...]) -> PluginRecord | None:
     )
     if len(matches) > 1:
         raise IntegrationOwnershipError("Codex integration ownership is ambiguous")
-    return None if not matches else matches[0]
+    if not matches:
+        return None
+    record = matches[0]
+    if record.version is not None and not _is_safe_version_token(record.version):
+        raise IncompatibleCodexError("Codex integration is unavailable")
+    return record
 
 
 def inspect_codex(client: CodexClient) -> CodexState:
@@ -392,12 +410,7 @@ def inspect_codex(client: CodexClient) -> CodexState:
 
 
 def _receipt_for(source: Path, runtime_version: str) -> _Receipt:
-    if (
-        not isinstance(runtime_version, str)
-        or not runtime_version
-        or len(runtime_version.encode("utf-8")) > 256
-        or any(character in runtime_version for character in "\r\n\0")
-    ):
+    if not _is_safe_version_token(runtime_version):
         raise IntegrationError("Hydra runtime version is invalid")
     return _Receipt(
         MARKETPLACE_NAME,
@@ -409,6 +422,20 @@ def _receipt_for(source: Path, runtime_version: str) -> _Receipt:
 
 def _ownership_error() -> IntegrationOwnershipError:
     return IntegrationOwnershipError("Codex integration ownership is ambiguous")
+
+
+def _is_safe_version_token(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value.isascii()
+        and value[0].isalnum()
+        and len(value.encode("ascii")) <= _VERSION_MAX_BYTES
+        and all(
+            character.isalnum() or character in _VERSION_PUNCTUATION
+            for character in value
+        )
+    )
 
 
 def _open_flags(*, writable: bool = False, create: bool = False) -> int:
@@ -474,10 +501,7 @@ def _parse_receipt_bytes(raw: bytes) -> _Receipt:
         or payload.get("marketplace") != MARKETPLACE_NAME
         or payload.get("selector") != PLUGIN_SELECTOR
         or payload.get("schema_version") != RECEIPT_SCHEMA_VERSION
-        or not isinstance(payload.get("runtime_version"), str)
-        or not payload["runtime_version"]
-        or len(payload["runtime_version"].encode("utf-8")) > 256
-        or any(character in payload["runtime_version"] for character in "\r\n\0")
+        or not _is_safe_version_token(payload.get("runtime_version"))
         or not isinstance(payload.get("source"), str)
         or not Path(payload["source"]).is_absolute()
     ):
@@ -673,7 +697,7 @@ def _state_from_payload(payload: object) -> CodexState:
             or plugin_payload.get("name") != PLUGIN_NAME
             or plugin_payload.get("marketplace") != MARKETPLACE_NAME
             or not isinstance(plugin_payload.get("installed"), bool)
-            or not (version is None or isinstance(version, str) and version)
+            or not (version is None or _is_safe_version_token(version))
             or marketplace is None
         ):
             raise _ownership_error()
@@ -810,6 +834,13 @@ def _read_journal(path: Path) -> _TransactionJournal | None:
         journal.prior.plugin is not None
         and journal.prior.marketplace is None
     ):
+        raise _ownership_error()
+    if (
+        journal.prior_receipt is None
+        and journal.prior != CodexState(None, None)
+    ):
+        raise _ownership_error()
+    if journal.operation == "remove" and journal.prior_receipt is None:
         raise _ownership_error()
     return journal
 
@@ -952,6 +983,17 @@ def _restore_original_receipt(
     receipt_path: Path,
     journal: _TransactionJournal,
 ) -> None:
+    current = _read_private_bytes(receipt_path, limit=_RECEIPT_MAX_BYTES)
+    allowed: set[bytes | None] = {journal.prior_receipt}
+    if journal.operation == "configure":
+        assert journal.desired_receipt is not None
+        allowed.add(_receipt_bytes(journal.desired_receipt))
+    else:
+        allowed.add(None)
+    if current not in allowed:
+        raise _ownership_error()
+    if current == journal.prior_receipt:
+        return
     if journal.prior_receipt is None:
         _delete_receipt(receipt_path)
         if _read_private_bytes(receipt_path, limit=_RECEIPT_MAX_BYTES) is not None:
@@ -992,11 +1034,15 @@ def _recover_transaction(
     outcomes = [
         "live rollback failed" if live_error is not None else "live rollback restored",
         (
-            "receipt restore failed"
+            "receipt ownership ambiguous"
+            if isinstance(receipt_error, IntegrationOwnershipError)
+            else "receipt restore failed"
             if receipt_error is not None
             else "receipt restored"
         ),
     ]
+    if live_error is None and isinstance(receipt_error, IntegrationOwnershipError):
+        raise receipt_error
     raise IntegrationError(
         "Codex integration recovery failed: " + "; ".join(outcomes),
     ) from None

@@ -99,6 +99,7 @@ class FakeServices:
 def invoke(
     argv, *, stdin="", environ=None, services=None, installation_key_path=None,
     codex_client=None, integration_receipt_path=None, marketplace_root=None,
+    verified_candidate=None,
 ):
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -114,6 +115,8 @@ def invoke(
         integration_options["integration_receipt_path"] = integration_receipt_path
     if marketplace_root is not None:
         integration_options["marketplace_root"] = marketplace_root
+    if verified_candidate is not None:
+        integration_options["verified_candidate"] = verified_candidate
     code = main(
         argv,
         stdin=input_stream,
@@ -244,6 +247,150 @@ class CodexInstallationCliTests(unittest.TestCase):
         self.assertFalse(self.receipt.exists())
 
 
+class ReleaseLifecycleCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from tests.test_codex_integration import StatefulCodexClient
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.environ = {"HOME": str(self.home)}
+        self.receipt = self.root / "private" / "codex-integration.json"
+        self.client = StatefulCodexClient()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_upgrade_check_is_read_only_path_free_and_reports_candidate(self) -> None:
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import (
+            activate_version,
+            default_install_roots,
+        )
+
+        roots = default_install_roots(self.home)
+        activate_version(_bundle(self.root, "0.1.0"), roots=roots)
+        candidate = _bundle(self.root, "0.2.0")
+        before = tuple(
+            sorted(
+                (path.relative_to(self.root).as_posix(), path.lstat().st_size)
+                for path in self.root.rglob("*")
+            ),
+        )
+
+        code, stdout, stderr = invoke(
+            ["upgrade", "--check"],
+            environ=self.environ,
+            codex_client=self.client,
+            integration_receipt_path=self.receipt,
+            verified_candidate=candidate,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout), {
+            "command": "upgrade",
+            "current_version": "0.1.0",
+            "latest_version": "0.2.0",
+            "status": "ok",
+            "update_available": True,
+        })
+        after = tuple(
+            sorted(
+                (path.relative_to(self.root).as_posix(), path.lstat().st_size)
+                for path in self.root.rglob("*")
+            ),
+        )
+        self.assertEqual(after, before)
+        self.assertNotIn(str(self.root), stdout)
+        self.assertEqual(self.client.calls, [])
+
+    def test_upgrade_refreshes_codex_to_the_activated_candidate(self) -> None:
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import (
+            activate_version,
+            default_install_roots,
+        )
+
+        roots = default_install_roots(self.home)
+        first = _bundle(self.root, "0.1.0")
+        activate_version(first, roots=roots)
+        active_marketplace = roots.current.resolve() / "marketplace"
+        self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
+        installed = invoke(
+            ["install", "-y"],
+            environ=self.environ,
+            codex_client=self.client,
+            integration_receipt_path=self.receipt,
+            marketplace_root=active_marketplace,
+        )
+        self.assertEqual(installed[0], 0)
+        candidate = _bundle(self.root, "0.2.0")
+        self.client.available_versions[
+            (roots.versions / "0.2.0" / "marketplace").resolve()
+        ] = "0.2.0"
+
+        code, stdout, stderr = invoke(
+            ["upgrade"],
+            environ=self.environ,
+            codex_client=self.client,
+            integration_receipt_path=self.receipt,
+            verified_candidate=candidate,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout), {
+            "command": "upgrade",
+            "current_version": "0.2.0",
+            "latest_version": "0.2.0",
+            "status": "ok",
+            "update_available": False,
+        })
+        self.assertEqual(roots.current.resolve().name, "0.2.0")
+        self.assertEqual(self.client.installed_version, "0.2.0")
+        self.assertNotIn(str(self.root), stdout)
+
+    def test_full_uninstall_detaches_then_removes_owned_cli(self) -> None:
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import (
+            activate_version,
+            default_install_roots,
+        )
+
+        roots = default_install_roots(self.home)
+        first = _bundle(self.root, "0.1.0")
+        activate_version(first, roots=roots)
+        active_marketplace = roots.current.resolve() / "marketplace"
+        self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
+        installed = invoke(
+            ["install", "-y"],
+            environ=self.environ,
+            codex_client=self.client,
+            integration_receipt_path=self.receipt,
+            marketplace_root=active_marketplace,
+        )
+        self.assertEqual(installed[0], 0)
+
+        code, stdout, stderr = invoke(
+            ["uninstall", "-y"],
+            environ=self.environ,
+            codex_client=self.client,
+            integration_receipt_path=self.receipt,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(
+            (payload["command"], payload["keep_cli"], payload["status"]),
+            ("uninstall", False, "ok"),
+        )
+        self.assertTrue(payload["changed"])
+        self.assertFalse(roots.current.exists())
+        self.assertFalse(roots.current.is_symlink())
+        self.assertFalse(roots.launcher.exists())
+        self.assertFalse(self.receipt.exists())
+
+
 class CliParserTests(unittest.TestCase):
     def test_argparse_errors_return_two(self) -> None:
         cases = (
@@ -271,7 +418,7 @@ class CliParserTests(unittest.TestCase):
         for command in (
             "ingest", "annotate", "reconcile", "report", "compare", "audit",
             "doctor", "storage", "init", "status", "uninit", "install",
-            "uninstall",
+            "uninstall", "upgrade",
         ):
             self.assertIn(command, stdout)
 

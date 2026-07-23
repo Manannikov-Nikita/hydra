@@ -142,6 +142,9 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("-y", "--yes", action="store_true")
     uninstall.add_argument("--keep-cli", action="store_true")
 
+    upgrade = commands.add_parser("upgrade")
+    upgrade.add_argument("--check", action="store_true")
+
     commands.add_parser("hook")
     commands.add_parser("mcp")
 
@@ -492,6 +495,7 @@ def main(
     codex_client: object | None = None,
     integration_receipt_path: Path | None = None,
     marketplace_root: Path | None = None,
+    verified_candidate: object | None = None,
 ) -> int:
     input_stream = sys.stdin if stdin is None else stdin
     output_stream = sys.stdout if stdout is None else stdout
@@ -514,7 +518,7 @@ def main(
                 marketplace_root=marketplace_root,
             )
             return 0
-        if arguments.command in {"install", "uninstall"}:
+        if arguments.command == "install":
             from .installation_cli import run_codex_integration
 
             run_codex_integration(
@@ -526,6 +530,20 @@ def main(
                 client=codex_client,
                 receipt_path=integration_receipt_path,
                 marketplace_root=marketplace_root,
+            )
+            return 0
+        if arguments.command in {"upgrade", "uninstall"}:
+            from .installation_cli import run_release_lifecycle
+
+            run_release_lifecycle(
+                arguments,
+                environ=environment,
+                stdin=input_stream,
+                stdout=output_stream,
+                stderr=error_stream,
+                client=codex_client,
+                receipt_path=integration_receipt_path,
+                verified_candidate=verified_candidate,
             )
             return 0
         if arguments.command in {"hook", "mcp"}:

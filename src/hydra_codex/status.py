@@ -17,6 +17,10 @@ from .codex_integration import (
 from .platform_paths import default_database_path, default_installation_key_path
 from .plugin_bundle import PluginBundleUnavailable, marketplace_root_path
 from .project_config import ProjectConfigError, read_project_config
+from .release_management import (
+    default_install_roots,
+    inspect_active_installation,
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,29 @@ def _database_schema(path: Path) -> int | None:
         connection.close()
     value = None if row is None else row[0]
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _release_status(home: Path) -> dict[str, object]:
+    try:
+        active = inspect_active_installation(default_install_roots(home))
+    except Exception:
+        return {
+            "active_target": None,
+            "active_version": None,
+            "cli_state": "invalid",
+        }
+    if active is None:
+        return {
+            "active_target": None,
+            "active_version": None,
+            "cli_state": "not-installed",
+        }
+    version, target = active
+    return {
+        "active_target": target,
+        "active_version": version,
+        "cli_state": "active",
+    }
 
 
 def _unavailable_codex(*, available: bool) -> dict[str, object]:
@@ -168,6 +195,7 @@ def collect_status(
             "schema_version": _database_schema(database),
         },
         "installation": {
+            **_release_status(home),
             "identity_key_exists": installation_key.is_file(),
         },
         "codex": _codex_status(

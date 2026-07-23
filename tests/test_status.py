@@ -151,7 +151,12 @@ class StatusTests(unittest.TestCase):
         result = self.status()
 
         self.assertEqual(result["storage"], {"exists": False, "schema_version": None})
-        self.assertEqual(result["installation"], {"identity_key_exists": False})
+        self.assertEqual(result["installation"], {
+            "active_target": None,
+            "active_version": None,
+            "cli_state": "not-installed",
+            "identity_key_exists": False,
+        })
         self.assertFalse(database.exists())
         self.assertFalse(key.exists())
         self.assertFalse(database.parent.exists())
@@ -163,8 +168,65 @@ class StatusTests(unittest.TestCase):
 
         result = self.status()
 
-        self.assertEqual(result["installation"], {"identity_key_exists": True})
+        self.assertEqual(result["installation"], {
+            "active_target": None,
+            "active_version": None,
+            "cli_state": "not-installed",
+            "identity_key_exists": True,
+        })
         self.assertNotIn(str(key), json.dumps(result))
+
+    def test_active_release_status_is_validated_read_only_and_path_free(self) -> None:
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import activate_version, default_install_roots
+
+        roots = default_install_roots(self.home)
+        activate_version(_bundle(self.root, "0.2.0"), roots=roots)
+        before = inventory(self.root)
+
+        result = self.status()
+
+        self.assertEqual(result["installation"], {
+            "active_target": "darwin-arm64",
+            "active_version": "0.2.0",
+            "cli_state": "active",
+            "identity_key_exists": False,
+        })
+        self.assertEqual(inventory(self.root), before)
+        self.assertNotIn(str(self.root), json.dumps(result))
+
+    def test_malformed_release_status_is_diagnostic_read_only_and_path_free(self) -> None:
+        current = self.home / ".hydra" / "current"
+        current.parent.mkdir(parents=True)
+        current.write_text(str(self.root / "private-version"), encoding="utf-8")
+        before = inventory(self.root)
+
+        result = self.status()
+
+        self.assertEqual(result["installation"], {
+            "active_target": None,
+            "active_version": None,
+            "cli_state": "invalid",
+            "identity_key_exists": False,
+        })
+        self.assertEqual(inventory(self.root), before)
+        self.assertNotIn(str(self.root), json.dumps(result))
+
+    def test_current_without_launcher_is_an_incomplete_read_only_diagnostic(self) -> None:
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import activate_version, default_install_roots
+
+        roots = default_install_roots(self.home)
+        activate_version(_bundle(self.root, "0.2.0"), roots=roots)
+        roots.launcher.unlink()
+        before = inventory(self.root)
+
+        result = self.status()
+
+        self.assertEqual(result["installation"]["cli_state"], "invalid")
+        self.assertIsNone(result["installation"]["active_version"])
+        self.assertIsNone(result["installation"]["active_target"])
+        self.assertEqual(inventory(self.root), before)
 
     def test_codex_status_reports_exact_version_parity_and_new_task_action(self) -> None:
         self.client.marketplaces["hydra"] = self.marketplace.resolve()

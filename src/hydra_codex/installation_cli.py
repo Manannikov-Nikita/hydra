@@ -17,6 +17,11 @@ from .codex_integration import (
 from .platform_paths import default_data_directory
 from .plugin_bundle import marketplace_root_path
 from .project_lifecycle import initialize_project, uninitialize_project
+from .release_management import (
+    default_install_roots,
+    uninstall as uninstall_release,
+    upgrade as upgrade_release,
+)
 from .status import collect_status
 
 
@@ -106,6 +111,9 @@ def run_project_lifecycle(
         f"storage schema: {_human(storage['schema_version'])}\n"
         "installation identity: "
         f"{'present' if installation['identity_key_exists'] else 'missing'}\n"
+        f"CLI state: {_human(installation['cli_state'])}\n"
+        f"active CLI version: {_human(installation['active_version'])}\n"
+        f"active CLI target: {_human(installation['active_target'])}\n"
         f"Codex available: {'yes' if codex['available'] else 'no'}\n"
         f"Codex plugin compatible: {_human(codex['compatible'])}\n"
         f"Hydra plugin installed: {_human(codex['plugin_installed'])}\n"
@@ -141,6 +149,104 @@ def _confirmed(arguments: object, stdin: TextIO, stderr: TextIO, prompt: str) ->
     stderr.flush()
     if stdin.readline().strip().lower() not in {"y", "yes"}:
         raise ConfirmationRequired("confirmation required")
+
+
+def _receipt_target(
+    environ: Mapping[str, str],
+    receipt_path: Path | None,
+) -> Path:
+    return (
+        default_data_directory(_home(environ), environ=environ)
+        / "codex-integration.json"
+        if receipt_path is None
+        else Path(receipt_path).expanduser()
+    )
+
+
+def run_release_lifecycle(
+    arguments: object,
+    *,
+    environ: Mapping[str, str],
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    client: CodexClient | None = None,
+    receipt_path: Path | None = None,
+    verified_candidate: object | None = None,
+) -> None:
+    """Execute upgrade or uninstall through the owned local release tree."""
+    from .install_layout import BundleLayout
+
+    command = getattr(arguments, "command")
+    roots = default_install_roots(_home(environ))
+    if command == "upgrade":
+        candidate = (
+            verified_candidate
+            if isinstance(verified_candidate, BundleLayout)
+            else None
+        )
+
+        def refresh(layout: BundleLayout) -> None:
+            adapter = CodexCommandClient(environ=environ) if client is None else client
+            configure_codex(
+                client=adapter,
+                marketplace_root=layout.marketplace,
+                runtime_version=layout.version,
+                receipt_path=_receipt_target(environ, receipt_path),
+                refresh=True,
+            )
+
+        status = upgrade_release(
+            check=bool(getattr(arguments, "check")),
+            environ=environ,
+            stdout=stdout,
+            verified_candidate=candidate,
+            refresh_integration=None if bool(getattr(arguments, "check")) else refresh,
+            roots=roots,
+        )
+        _write_json(stdout, {
+            "command": "upgrade",
+            "current_version": status.current_version,
+            "latest_version": status.latest_version,
+            "status": "ok",
+            "update_available": status.update_available,
+        })
+        return
+
+    _confirmed(
+        arguments,
+        stdin,
+        stderr,
+        "Remove Hydra from Codex? [y/N] ",
+    )
+    adapter = CodexCommandClient(environ=environ) if client is None else client
+    detached = None
+
+    def detach() -> None:
+        nonlocal detached
+        detached = remove_codex_integration(
+            client=adapter,
+            receipt_path=_receipt_target(environ, receipt_path),
+        )
+
+    keep_cli = bool(getattr(arguments, "keep_cli"))
+    uninstall_release(
+        keep_cli=keep_cli,
+        environ=environ,
+        detach_integration=detach,
+        roots=roots,
+    )
+    assert detached is not None
+    _write_json(stdout, {
+        "changed": detached.changed,
+        "command": "uninstall",
+        "keep_cli": keep_cli,
+        "marketplace": detached.marketplace,
+        "new_task_required": False,
+        "runtime_version": detached.runtime_version,
+        "selector": detached.selector,
+        "status": "ok",
+    })
 
 
 def run_codex_integration(
@@ -184,12 +290,7 @@ def run_codex_integration(
         ),
     )
     adapter = CodexCommandClient(environ=environ) if client is None else client
-    target = (
-        default_data_directory(_home(environ), environ=environ)
-        / "codex-integration.json"
-        if receipt_path is None
-        else Path(receipt_path).expanduser()
-    )
+    target = _receipt_target(environ, receipt_path)
     if command == "install":
         assert root is not None
         report = configure_codex(

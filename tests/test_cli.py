@@ -270,7 +270,11 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         )
 
         roots = default_install_roots(self.home)
-        activate_version(_bundle(self.root, "0.1.0"), roots=roots)
+        activate_version(
+            _bundle(self.root, "0.1.0"),
+            roots=roots,
+            environ=self.environ,
+        )
         candidate = _bundle(self.root, "0.2.0")
         before = tuple(
             sorted(
@@ -314,7 +318,7 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
 
         roots = default_install_roots(self.home)
         first = _bundle(self.root, "0.1.0")
-        activate_version(first, roots=roots)
+        activate_version(first, roots=roots, environ=self.environ)
         active_marketplace = roots.current.resolve() / "marketplace"
         self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
         installed = invoke(
@@ -359,7 +363,7 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
 
         roots = default_install_roots(self.home)
         first = _bundle(self.root, "0.1.0")
-        activate_version(first, roots=roots)
+        activate_version(first, roots=roots, environ=self.environ)
         active_marketplace = roots.current.resolve() / "marketplace"
         self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
         installed = invoke(

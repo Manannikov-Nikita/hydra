@@ -181,7 +181,11 @@ class StatusTests(unittest.TestCase):
         from hydra_codex.release_management import activate_version, default_install_roots
 
         roots = default_install_roots(self.home)
-        activate_version(_bundle(self.root, "0.2.0"), roots=roots)
+        activate_version(
+            _bundle(self.root, "0.2.0"),
+            roots=roots,
+            environ={"HOME": str(self.home)},
+        )
         before = inventory(self.root)
 
         result = self.status()
@@ -217,7 +221,11 @@ class StatusTests(unittest.TestCase):
         from hydra_codex.release_management import activate_version, default_install_roots
 
         roots = default_install_roots(self.home)
-        activate_version(_bundle(self.root, "0.2.0"), roots=roots)
+        activate_version(
+            _bundle(self.root, "0.2.0"),
+            roots=roots,
+            environ={"HOME": str(self.home)},
+        )
         roots.launcher.unlink()
         before = inventory(self.root)
 

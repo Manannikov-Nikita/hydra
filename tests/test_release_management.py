@@ -19,6 +19,7 @@ from hydra_codex.install_layout import (
     InvalidBundle,
     validate_bundle,
 )
+from hydra_codex.platform_paths import default_data_directory
 from hydra_codex.release_management import (
     InstallOwnershipError,
     InstallRoots,
@@ -116,6 +117,7 @@ class ReleaseManagementTests(unittest.TestCase):
         return activate_version(
             _bundle(self.base, version, marker=marker),
             roots=self.roots,
+            environ=self.environ,
         )
 
     def test_default_roots_use_only_the_selected_home(self) -> None:
@@ -148,7 +150,11 @@ class ReleaseManagementTests(unittest.TestCase):
                     marketplace=root / "marketplace",
                 )
                 with self.assertRaises(ValueError):
-                    activate_version(layout, roots=self.roots)
+                    activate_version(
+                        layout,
+                        roots=self.roots,
+                        environ=self.environ,
+                    )
         self.assertFalse(self.roots.versions.exists())
 
     def test_activation_rejects_nonportable_but_complete_version_bundles(self) -> None:
@@ -156,7 +162,11 @@ class ReleaseManagementTests(unittest.TestCase):
             with self.subTest(version=version):
                 layout = _bundle(self.base, version)
                 with self.assertRaises(ValueError):
-                    activate_version(layout, roots=self.roots)
+                    activate_version(
+                        layout,
+                        roots=self.roots,
+                        environ=self.environ,
+                    )
                 self.assertTrue(layout.root.exists())
         self.assertFalse(self.roots.versions.exists())
 
@@ -166,7 +176,7 @@ class ReleaseManagementTests(unittest.TestCase):
         layout = _bundle(self.base, "0.1.0")
 
         with self.assertRaises(InstallOwnershipError):
-            activate_version(layout, roots=self.roots)
+            activate_version(layout, roots=self.roots, environ=self.environ)
 
         self.assertEqual(
             self.roots.launcher.read_text(encoding="utf-8"),
@@ -183,7 +193,7 @@ class ReleaseManagementTests(unittest.TestCase):
         layout = _bundle(self.base, "0.1.0")
 
         with self.assertRaises(InstallOwnershipError):
-            activate_version(layout, roots=self.roots)
+            activate_version(layout, roots=self.roots, environ=self.environ)
 
         self.assertEqual(list(foreign.iterdir()), [])
         self.assertTrue(layout.root.exists())
@@ -197,7 +207,11 @@ class ReleaseManagementTests(unittest.TestCase):
         layout = _bundle(self.base, "0.1.0")
 
         with self.assertRaises(InstallOwnershipError) as raised:
-            activate_version(layout, roots=roots)
+            activate_version(
+                layout,
+                roots=roots,
+                environ={"HOME": str(roots.home.parent)},
+            )
 
         self.assertEqual(_inventory(actual_home), ())
         self.assertNotIn(str(actual_home), str(raised.exception))
@@ -209,7 +223,7 @@ class ReleaseManagementTests(unittest.TestCase):
         layout = _bundle(self.base, "0.1.0")
 
         with self.assertRaises(InstallOwnershipError) as raised:
-            activate_version(layout, roots=self.roots)
+            activate_version(layout, roots=self.roots, environ=self.environ)
 
         self.assertEqual(_inventory(self.user_home), before)
         self.assertNotIn(str(self.user_home), str(raised.exception))
@@ -248,7 +262,11 @@ class ReleaseManagementTests(unittest.TestCase):
                         roots.current.symlink_to(roots.versions / "..")
                     layout = _bundle(local, "0.1.0")
                     with self.assertRaises(InstallOwnershipError):
-                        activate_version(layout, roots=roots)
+                        activate_version(
+                            layout,
+                            roots=roots,
+                            environ={"HOME": str(roots.home.parent)},
+                        )
                     self.assertTrue(layout.root.exists())
 
     def test_activation_is_atomic_owned_and_existing_versions_are_immutable(self) -> None:
@@ -259,7 +277,13 @@ class ReleaseManagementTests(unittest.TestCase):
             os.readlink(self.roots.launcher),
             str(self.roots.current / "bin" / "hydra-codex"),
         )
-        lock = self.user_home / ".local" / "share" / "hydra" / "release-lifecycle.lock"
+        lock = (
+            default_data_directory(
+                self.user_home,
+                environ=self.environ,
+            )
+            / "release-lifecycle.lock"
+        )
         self.assertEqual(stat.S_IMODE(lock.parent.stat().st_mode), 0o700)
         self.assertTrue(stat.S_ISREG(lock.lstat().st_mode))
         self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
@@ -269,13 +293,90 @@ class ReleaseManagementTests(unittest.TestCase):
         )
 
         replacement = _bundle(self.base, "0.1.0", marker="replacement")
-        repeated = activate_version(replacement, roots=self.roots)
+        repeated = activate_version(
+            replacement,
+            roots=self.roots,
+            environ=self.environ,
+        )
         self.assertEqual(repeated, installed)
         self.assertEqual(
             (installed / "bin" / "hydra-codex").read_text(encoding="utf-8"),
             "#!/bin/sh\n# original\n",
         )
         self.assertTrue(replacement.root.exists())
+
+    def test_macos_coordination_lock_uses_application_support(self) -> None:
+        candidate = _bundle(self.base, "0.1.0")
+
+        with patch("hydra_codex.platform_paths.sys.platform", "darwin"):
+            activate_version(
+                candidate,
+                roots=self.roots,
+                environ=self.environ,
+            )
+
+        lock = (
+            self.user_home
+            / "Library"
+            / "Application Support"
+            / "Hydra"
+            / "release-lifecycle.lock"
+        )
+        self.assertTrue(lock.is_file())
+        self.assertFalse((self.user_home / ".local" / "share").exists())
+
+    def test_linux_coordination_lock_uses_absolute_xdg_data_home(self) -> None:
+        candidate = _bundle(self.base, "0.1.0")
+        xdg_data = self.base / "xdg-data"
+        environ = {
+            "HOME": str(self.user_home),
+            "XDG_DATA_HOME": str(xdg_data),
+        }
+
+        with patch("hydra_codex.platform_paths.sys.platform", "linux"):
+            activate_version(candidate, roots=self.roots, environ=environ)
+
+        self.assertTrue(
+            (xdg_data / "hydra" / "release-lifecycle.lock").is_file(),
+        )
+        self.assertFalse((self.user_home / ".local" / "share").exists())
+
+    def test_linux_coordination_lock_uses_home_fallback(self) -> None:
+        candidate = _bundle(self.base, "0.1.0")
+
+        with patch("hydra_codex.platform_paths.sys.platform", "linux"):
+            activate_version(
+                candidate,
+                roots=self.roots,
+                environ=self.environ,
+            )
+
+        self.assertTrue(
+            (
+                self.user_home
+                / ".local"
+                / "share"
+                / "hydra"
+                / "release-lifecycle.lock"
+            ).is_file(),
+        )
+
+    def test_relative_xdg_data_home_fails_without_creating_state(self) -> None:
+        candidate = _bundle(self.base, "0.1.0")
+        environ = {
+            "HOME": str(self.user_home),
+            "XDG_DATA_HOME": "relative-data",
+        }
+        before = _inventory(self.user_home)
+
+        with patch("hydra_codex.platform_paths.sys.platform", "linux"):
+            with self.assertRaises(InstallOwnershipError):
+                activate_version(candidate, roots=self.roots, environ=environ)
+
+        self.assertEqual(_inventory(self.user_home), before)
+        self.assertFalse(self.roots.home.exists())
+        self.assertFalse((self.user_home / ".local" / "share").exists())
+        self.assertTrue(candidate.root.exists())
 
     def test_activation_rejects_an_invalid_existing_version(self) -> None:
         installed = self.activate("0.1.0")
@@ -285,7 +386,7 @@ class ReleaseManagementTests(unittest.TestCase):
         replacement = _bundle(self.base, "0.2.0", marker="replacement")
 
         with self.assertRaises(InvalidBundle):
-            activate_version(replacement, roots=self.roots)
+            activate_version(replacement, roots=self.roots, environ=self.environ)
 
         self.assertTrue(replacement.root.exists())
         self.assertEqual(self.roots.current.resolve(), installed.resolve())
@@ -364,7 +465,7 @@ class ReleaseManagementTests(unittest.TestCase):
             side_effect=SimulatedCrash,
         ):
             with self.assertRaises(SimulatedCrash):
-                activate_version(candidate, roots=self.roots)
+                activate_version(candidate, roots=self.roots, environ=self.environ)
         self.assertTrue((self.roots.versions / "0.2.0").is_dir())
 
         malformed_root = self.base / "malformed-recovery"
@@ -377,7 +478,7 @@ class ReleaseManagementTests(unittest.TestCase):
             malformed_root / "marketplace",
         )
         with self.assertRaises(ValueError):
-            activate_version(malformed, roots=self.roots)
+            activate_version(malformed, roots=self.roots, environ=self.environ)
         self.assertEqual(self.roots.current.resolve(), previous.resolve())
         self.assertFalse((self.roots.home / "release-journal.json").exists())
 
@@ -401,7 +502,7 @@ class ReleaseManagementTests(unittest.TestCase):
             side_effect=crash_on_launcher,
         ):
             with self.assertRaises(SimulatedCrash):
-                activate_version(candidate, roots=self.roots)
+                activate_version(candidate, roots=self.roots, environ=self.environ)
         self.assertEqual(self.roots.current.resolve().name, "0.2.0")
 
         self.activate("0.1.0", marker="unused")
@@ -439,7 +540,7 @@ class ReleaseManagementTests(unittest.TestCase):
             malformed_root / "marketplace",
         )
         with self.assertRaises(ValueError):
-            activate_version(malformed, roots=self.roots)
+            activate_version(malformed, roots=self.roots, environ=self.environ)
         self.assertEqual(self.roots.current.resolve().name, "0.2.0")
         self.assertFalse((self.roots.home / "release-journal.json").exists())
 
@@ -665,7 +766,7 @@ class ReleaseManagementTests(unittest.TestCase):
         self.assertTrue(entered.wait(2))
         try:
             with self.assertRaises(LifecycleBusyError):
-                activate_version(candidate, roots=self.roots)
+                activate_version(candidate, roots=self.roots, environ=self.environ)
         finally:
             release.set()
             thread.join(5)

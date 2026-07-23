@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence, TextIO
 from . import __version__
 from .contracts import ModelAnnotationInput
 from .project import ProjectNotFound, resolve_project
+from .project_config import ProjectConfigError
 from .rollout import ingest_rollouts
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .storage import HydraStore, StorageUnavailable
@@ -100,6 +101,12 @@ def _compact_confirmation(value: str) -> str:
     return value
 
 
+def _uninit_confirmation(value: str) -> str:
+    if value != "remove hydra project":
+        raise argparse.ArgumentTypeError("exact confirmation required")
+    return value
+
+
 def _common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db")
     parser.add_argument("--cwd")
@@ -109,6 +116,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(prog="hydra-codex")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    init = commands.add_parser("init")
+    init.add_argument("path", nargs="?", default=".")
+    init.add_argument("--name")
+
+    status = commands.add_parser("status")
+    status.add_argument("path", nargs="?", default=".")
+    status.add_argument("--json", action="store_true")
+
+    uninit = commands.add_parser("uninit")
+    uninit.add_argument("path", nargs="?", default=".")
+    uninit.add_argument(
+        "--confirmation",
+        type=_uninit_confirmation,
+        required=True,
+    )
 
     ingest = commands.add_parser("ingest")
     _common_options(ingest)
@@ -465,6 +488,15 @@ def main(
         except SystemExit as exit_request:
             return int(exit_request.code or 0)
     try:
+        if arguments.command in {"init", "status", "uninit"}:
+            from .installation_cli import run_project_lifecycle
+
+            run_project_lifecycle(
+                arguments,
+                environ=environment,
+                stdout=output_stream,
+            )
+            return 0
         if arguments.command == "dashboard":
             from .dashboard_launch import run_dashboard
 
@@ -521,6 +553,9 @@ def main(
         else:
             _render(arguments, output_stream, command_services)
         return 0
+    except ProjectConfigError:
+        error_stream.write("hydra-codex: invalid project configuration\n")
+        return 2
     except StorageUnavailable:
         error_stream.write("hydra-codex: storage unavailable\n")
     except (ProjectNotFound, ValueError, json.JSONDecodeError):

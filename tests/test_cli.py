@@ -157,7 +157,7 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual((code, stderr), (0, ""))
         for command in (
             "ingest", "annotate", "reconcile", "report", "compare", "audit",
-            "doctor", "storage",
+            "doctor", "storage", "init", "status", "uninit",
         ):
             self.assertIn(command, stdout)
 
@@ -353,6 +353,126 @@ class ServiceDelegationTests(unittest.TestCase):
         self.assertNotIn(private, stderr)
 
 
+class ProjectLifecycleCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.environ = {"HOME": str(self.home)}
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_init_status_and_uninit_round_trip_without_constructing_services(self) -> None:
+        services = mock.Mock()
+
+        code, stdout, stderr = invoke(
+            ["init", str(self.project), "--name", " Hydra Core "],
+            environ=self.environ,
+            services=services,
+        )
+        self.assertEqual((code, stderr), (0, ""))
+        initialized = json.loads(stdout)
+        self.assertEqual(initialized["command"], "init")
+        self.assertEqual(initialized["status"], "ok")
+        self.assertTrue(initialized["changed"])
+        self.assertRegex(initialized["project_id"], r"^hprj_[0-9a-f]{16}$")
+
+        code, stdout, stderr = invoke(
+            ["status", str(self.project), "--json"],
+            environ=self.environ,
+            services=services,
+        )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertTrue(json.loads(stdout)["project"]["initialized"])
+
+        code, stdout, stderr = invoke(
+            [
+                "uninit", str(self.project),
+                "--confirmation", "remove hydra project",
+            ],
+            environ=self.environ,
+            services=services,
+        )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertTrue(json.loads(stdout)["changed"])
+        self.assertFalse((self.project / ".hydra" / "project.toml").exists())
+        services.assert_not_called()
+
+    def test_uninitialized_status_json_is_successful_read_only_and_private(self) -> None:
+        before = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))
+
+        code, stdout, stderr = invoke(
+            ["status", str(self.project), "--json"],
+            environ=self.environ,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertFalse(json.loads(stdout)["project"]["initialized"])
+        self.assertEqual(
+            sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")),
+            before,
+        )
+        self.assertNotIn(str(self.root), stdout)
+
+    def test_status_human_output_is_path_private(self) -> None:
+        code, stdout, stderr = invoke(
+            ["status", str(self.project)],
+            environ=self.environ,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("initialized: no", stdout)
+        self.assertNotIn(str(self.root), stdout)
+
+    def test_malformed_project_returns_two_without_leaking_private_path(self) -> None:
+        hydra = self.project / ".hydra"
+        hydra.mkdir()
+        private = str(self.project / "private-secret")
+        (hydra / "project.toml").write_text(
+            f'project_id = "{private}"\n',
+            encoding="utf-8",
+        )
+
+        code, stdout, stderr = invoke(
+            ["status", str(self.project), "--json"],
+            environ=self.environ,
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "hydra-codex: invalid project configuration\n")
+        self.assertNotIn(str(self.root), stderr)
+        self.assertNotIn(private, stderr)
+
+    def test_uninit_confirmation_is_an_argparse_contract(self) -> None:
+        for argv in (
+            ["uninit", str(self.project)],
+            ["uninit", str(self.project), "--confirmation", "wrong"],
+        ):
+            with self.subTest(argv=argv):
+                code, stdout, stderr = invoke(argv, environ=self.environ)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("usage:", stderr)
+                self.assertNotIn(str(self.project), stderr)
+
+    def test_init_honors_injected_home_protection(self) -> None:
+        code, stdout, stderr = invoke(
+            ["init", str(self.home)],
+            environ=self.environ,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "hydra-codex: validation failed\n")
+        self.assertFalse((self.home / ".hydra").exists())
+        self.assertNotIn(str(self.home), stderr)
+
+
 class AtomicOutputTests(unittest.TestCase):
     def test_report_atomically_overwrites_with_mode_0600(self) -> None:
         services = FakeServices()
@@ -474,7 +594,7 @@ class IngestCliTests(unittest.TestCase):
         project = base / "project"
         (project / ".hydra").mkdir(parents=True)
         (project / ".hydra" / "project.toml").write_text(
-            'project_id = "cli-project"\n', encoding="utf-8",
+            'project_id = "hprj_c1c1c1c1c1c1c1c1"\n', encoding="utf-8",
         )
         return project
 

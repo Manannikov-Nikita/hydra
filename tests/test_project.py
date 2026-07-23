@@ -6,19 +6,28 @@ import unittest
 from pathlib import Path
 
 from hydra_codex.project import normalize_project_display_name, resolve_project
+from hydra_codex.project_config import ProjectConfigError
 
 
 PROJECT_CONFIG = 'project_id = "hprj_4db8fca38ef042f3"\ntelemetry = "hybrid"\n'
 
 
 class ProjectResolutionTests(unittest.TestCase):
-    def project(self, project_id: str, *, display_name: str | None = None) -> Path:
-        root = Path(self.temporary_directory.name) / project_id
+    def project(self, suffix: str, *, display_name: str | None = None) -> Path:
+        project_ids = {
+            "project-a": "hprj_aaaaaaaaaaaaaaaa",
+            "project-b": "hprj_bbbbbbbbbbbbbbbb",
+        }
+        root = Path(self.temporary_directory.name) / suffix
         config = root / ".hydra" / "project.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
-        suffix = "" if display_name is None else f"display_name = {json.dumps(display_name)}\n"
+        display_line = (
+            "" if display_name is None
+            else f"display_name = {json.dumps(display_name)}\n"
+        )
         config.write_text(
-            f'project_id = {project_id!r}\n{suffix}', encoding="utf-8",
+            f'project_id = {project_ids[suffix]!r}\n{display_line}',
+            encoding="utf-8",
         )
         return root
 
@@ -76,3 +85,15 @@ class ProjectResolutionTests(unittest.TestCase):
             self.assertEqual(first_resolution.project_id, second_resolution.project_id)
             self.assertEqual(first_resolution.worktree_path, Path("feature/alpha"))
             self.assertEqual(second_resolution.worktree_path, Path("review/beta"))
+
+    def test_resolution_uses_strict_project_config_parser(self) -> None:
+        root = Path(self.temporary_directory.name) / "invalid"
+        config = root / ".hydra" / "project.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(
+            'project_id = "hprj_0123456789abcdef"\nunknown = true\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ProjectConfigError):
+            resolve_project(root)

@@ -305,7 +305,11 @@ class PluginHookContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         normalized = " ".join(plugin_readme.lower().split())
         self.assertIn("hydra-codex install -y", normalized)
-        self.assertIn("hydra-codex install -y --refresh", normalized)
+        self.assertIn(
+            "`hydra-codex upgrade` refreshes the codex integration atomically",
+            normalized,
+        )
+        self.assertNotIn("hydra-codex install -y --refresh", normalized)
         self.assertIn("hydra-codex install --print-config codex", normalized)
         self.assertIn("hydra-codex uninstall --keep-cli", normalized)
         self.assertIn("new codex task", normalized)

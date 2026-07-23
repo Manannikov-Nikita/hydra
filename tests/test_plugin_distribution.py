@@ -214,7 +214,11 @@ class PluginBundleApiTests(unittest.TestCase):
         readme = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("hydra-codex install -y", readme)
-        self.assertIn("hydra-codex install -y --refresh", readme)
+        self.assertIn(
+            "`hydra-codex upgrade` refreshes the Codex integration atomically",
+            readme,
+        )
+        self.assertNotIn("hydra-codex install -y --refresh", readme)
         self.assertIn("hydra-codex install --print-config codex", readme)
         self.assertIn("hydra-codex uninstall --keep-cli", readme)
         self.assertIn("new Codex task", readme)

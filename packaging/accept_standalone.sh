@@ -182,17 +182,20 @@ printf '%s\n' \
     '  [ -f "$source_file" ] || { printf "%s\n" ""; return; }' \
     '  sed -n '\''s/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'\'' "$(cat "$source_file")/plugins/hydra-codex/.codex-plugin/plugin.json" | head -1' \
     '}' \
-    'if [ "$#" -eq 1 ] && [ "$1" = --version ]; then printf "%s\n" "codex-cli 1.0.0"; exit 0; fi' \
-    'if [ "$1 $2 $3" = "plugin marketplace list" ]; then' \
-    '  if [ -f "$source_file" ]; then printf '\''[{"name":"hydra","source":"%s"}]\n'\'' "$(cat "$source_file")"; else printf "%s\n" "[]"; fi; exit 0' \
+    'if [ "$#" -eq 1 ] && [ "$1" = --version ]; then printf "%s\n" "codex-cli 0.136.0"; exit 0; fi' \
+    'if [ "$#" -eq 3 ] && [ "$1 $2 $3" = "plugin marketplace list" ]; then' \
+    '  if [ -f "$source_file" ]; then printf "%-13s%s\n" "MARKETPLACE" "ROOT" "hydra" "$(cat "$source_file")"; else printf "%s\n" "No plugin marketplaces in scope."; fi; exit 0' \
     'fi' \
-    'if [ "$1 $2 $3" = "plugin marketplace add" ]; then printf "%s\n" "$4" > "$source_file"; printf "%s\n" "{}"; exit 0; fi' \
-    'if [ "$1 $2 $3" = "plugin marketplace remove" ]; then rm -f "$source_file"; printf "%s\n" "{}"; exit 0; fi' \
-    'if [ "$1 $2" = "plugin list" ]; then' \
-    '  if [ -f "$source_file" ]; then current=$(version); installed=false; [ -f "$plugin_file" ] && installed=true; printf '\''[{"name":"hydra-codex","marketplace":"hydra","installed":%s,"version":"%s"}]\n'\'' "$installed" "$current"; else printf "%s\n" "[]"; fi; exit 0' \
+    'if [ "$#" -eq 4 ] && [ "$1 $2 $3" = "plugin marketplace add" ]; then printf "%s\n" "$4" > "$source_file"; printf "%s\n%s\n" "Added marketplace \`hydra\` from $4." "Installed marketplace root: $4"; exit 0; fi' \
+    'if [ "$#" -eq 4 ] && [ "$1 $2 $3 $4" = "plugin marketplace remove hydra" ]; then rm -f "$source_file"; printf "%s\n" "Removed marketplace \`hydra\`."; exit 0; fi' \
+    'if [ "$#" -eq 4 ] && [ "$1 $2 $3 $4" = "plugin list --marketplace hydra" ]; then' \
+    '  if [ ! -f "$source_file" ]; then printf "%s\n" "No plugins found in marketplace \`hydra\`."; exit 0; fi' \
+    '  root=$(cat "$source_file"); printf "%s\n%s\n\n" "Marketplace \`hydra\`" "$root/.agents/plugins/marketplace.json"' \
+    '  printf "%-22s%-22s%-11s%s\n" "PLUGIN" "STATUS" "VERSION" "PATH"' \
+    '  if [ -f "$plugin_file" ]; then installed=$(cat "$plugin_file"); printf "%-22s%-22s%-11s%s\n" "hydra-codex@hydra" "installed, enabled" "$installed" "$root/plugins/hydra-codex"; else printf "%-22s%-22s%-11s%s\n" "hydra-codex@hydra" "not installed" "" "$root/plugins/hydra-codex"; fi; exit 0' \
     'fi' \
-    'if [ "$1 $2" = "plugin add" ]; then current=$(version); if [ -f "$fail_file" ] && [ "$current" = "$CODEX_FAIL_VERSION" ]; then exit 42; fi; printf "%s\n" "$current" > "$plugin_file"; printf "%s\n" "{}"; exit 0; fi' \
-    'if [ "$1 $2" = "plugin remove" ]; then rm -f "$plugin_file"; printf "%s\n" "{}"; exit 0; fi' \
+    'if [ "$#" -eq 3 ] && [ "$1 $2 $3" = "plugin add hydra-codex@hydra" ]; then current=$(version); if [ -f "$fail_file" ] && [ "$current" = "$CODEX_FAIL_VERSION" ]; then exit 42; fi; printf "%s\n" "$current" > "$plugin_file"; root=$(cat "$source_file"); printf "%s\n%s\n" "Added plugin \`hydra-codex\` from marketplace \`hydra\`." "Installed plugin root: $root/plugins/hydra-codex"; exit 0; fi' \
+    'if [ "$#" -eq 3 ] && [ "$1 $2 $3" = "plugin remove hydra-codex@hydra" ]; then rm -f "$plugin_file"; printf "%s\n" "Removed plugin \`hydra-codex\` from marketplace \`hydra\`."; exit 0; fi' \
     'exit 64' > "$cat_codex"
 chmod 700 "$cat_codex"
 

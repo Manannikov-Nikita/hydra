@@ -592,6 +592,34 @@ class StandaloneBuildTests(unittest.TestCase):
         self.assertEqual(script.count('"$SOURCE_ROOT/install.sh"'), 1)
         self.assertNotIn("HYDRA_VERSION_OVERRIDE", script)
 
+    def test_acceptance_codex_shim_matches_supported_text_protocol(self) -> None:
+        script = ACCEPTANCE_PATH.read_text(encoding="utf-8")
+
+        for marker in (
+            "codex-cli 0.136.0",
+            "No plugin marketplaces in scope.",
+            '"%-13s%s\\n" "MARKETPLACE" "ROOT"',
+            "Added marketplace \\`hydra\\` from $4.",
+            "Removed marketplace \\`hydra\\`.",
+            "No plugins found in marketplace \\`hydra\\`.",
+            "Marketplace \\`hydra\\`",
+            "PLUGIN",
+            "STATUS",
+            "VERSION",
+            "PATH",
+            "installed, enabled",
+            "not installed",
+            "Added plugin \\`hydra-codex\\` from marketplace \\`hydra\\`.",
+            "Removed plugin \\`hydra-codex\\` from marketplace \\`hydra\\`.",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, script)
+        self.assertNotIn("codex-cli 1.0.0", script)
+        self.assertNotIn("'--json'", script)
+        self.assertNotIn("'--available'", script)
+        self.assertNotIn('[{"name":"hydra"', script)
+        self.assertNotIn('[{"name":"hydra-codex"', script)
+
     def test_acceptance_sha256_helper_prefers_gnu_then_falls_back_to_shasum(
         self,
     ) -> None:

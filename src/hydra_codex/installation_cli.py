@@ -19,9 +19,14 @@ from .plugin_bundle import marketplace_root_path
 from .project_lifecycle import initialize_project, uninitialize_project
 from .release_management import (
     activate_version,
+    check_upgrade,
     default_install_roots,
     uninstall as uninstall_release,
     upgrade as upgrade_release,
+)
+from .release_acquisition import (
+    acquire_release_candidate,
+    resolve_latest_release,
 )
 from .status import collect_status
 
@@ -215,14 +220,46 @@ def run_release_lifecycle(
                 refresh=True,
             )
 
-        status = upgrade_release(
-            check=bool(getattr(arguments, "check")),
-            environ=environ,
-            stdout=stdout,
-            verified_candidate=candidate,
-            refresh_integration=None if bool(getattr(arguments, "check")) else refresh,
-            roots=roots,
-        )
+        check = bool(getattr(arguments, "check"))
+        if check and candidate is None:
+            resolved = resolve_latest_release(environ=environ)
+            status = check_upgrade(
+                latest_version=resolved.latest_version,
+                expected_current_version=resolved.current_version,
+                environ=environ,
+                roots=roots,
+            )
+            _write_json(stdout, {
+                "command": "upgrade",
+                "current_version": status.current_version,
+                "latest_version": status.latest_version,
+                "status": "ok",
+                "update_available": status.update_available,
+            })
+            return
+
+        def run_upgrade(
+            selected: BundleLayout,
+            expected_current_version: str | None,
+        ):
+            return upgrade_release(
+                check=check,
+                environ=environ,
+                stdout=stdout,
+                verified_candidate=selected,
+                expected_current_version=expected_current_version,
+                refresh_integration=None if check else refresh,
+                roots=roots,
+            )
+
+        if candidate is not None:
+            status = run_upgrade(candidate, None)
+        else:
+            with acquire_release_candidate(environ=environ) as acquired:
+                status = run_upgrade(
+                    acquired.layout,
+                    acquired.current_version,
+                )
         _write_json(stdout, {
             "command": "upgrade",
             "current_version": status.current_version,

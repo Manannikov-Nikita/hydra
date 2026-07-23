@@ -316,6 +316,136 @@ class ReleaseManagementTests(unittest.TestCase):
             os.readlink(self.roots.launcher),
             str(self.roots.current / "bin" / "hydra-codex"),
         )
+        self.assertEqual(
+            json.loads(
+                (self.roots.home / "release-journal.json").read_text(
+                    encoding="utf-8",
+                ),
+            ),
+            {
+                "new_version": "0.2.0",
+                "phase": "refreshing",
+                "previous_version": "0.1.0",
+                "schema_version": 1,
+            },
+        )
+
+    def test_cross_layer_rollback_state_is_retained_until_retry_converges(
+        self,
+    ) -> None:
+        previous = self.activate("0.1.0")
+        candidate = _bundle(self.base, "0.2.0")
+        integration_journal = self.roots.home / "integration-journal.test"
+
+        def fail_refresh(_layout: BundleLayout) -> None:
+            integration_journal.write_text("rollback-required\n", encoding="utf-8")
+            raise IntegrationError("private integration failure")
+
+        with self.assertRaises(IntegrationError):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=candidate,
+                expected_current_version="0.1.0",
+                refresh_integration=fail_refresh,
+                roots=self.roots,
+            )
+
+        self.assertEqual(self.roots.current.resolve(), previous.resolve())
+        self.assertTrue(integration_journal.exists())
+        release_journal = self.roots.home / "release-journal.json"
+        self.assertEqual(
+            json.loads(release_journal.read_text(encoding="utf-8"))["phase"],
+            "refreshing",
+        )
+
+        refreshed: list[str] = []
+
+        def converge(layout: BundleLayout) -> None:
+            integration_journal.unlink(missing_ok=True)
+            refreshed.append(layout.version)
+
+        retry = _bundle(self.base, "0.2.0", marker="retry")
+        upgrade(
+            check=False,
+            environ=self.environ,
+            stdout=io.StringIO(),
+            verified_candidate=retry,
+            expected_current_version="0.1.0",
+            refresh_integration=converge,
+            roots=self.roots,
+        )
+
+        self.assertEqual(self.roots.current.resolve().name, "0.2.0")
+        self.assertFalse(integration_journal.exists())
+        self.assertFalse(release_journal.exists())
+        self.assertEqual(refreshed, ["0.2.0"])
+
+    def test_upgrade_rejects_active_version_drift_and_downgrades(self) -> None:
+        active = self.activate("0.2.0")
+        newer = _bundle(self.base, "0.3.0")
+
+        with self.assertRaises(InstallOwnershipError):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=newer,
+                expected_current_version="0.1.0",
+                refresh_integration=lambda _layout: None,
+                roots=self.roots,
+            )
+        self.assertEqual(self.roots.current.resolve(), active.resolve())
+        self.assertTrue(newer.root.exists())
+
+        older = _bundle(self.base, "0.1.0")
+        with self.assertRaises(InstallOwnershipError):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=older,
+                expected_current_version="0.2.0",
+                refresh_integration=lambda _layout: None,
+                roots=self.roots,
+            )
+        self.assertEqual(self.roots.current.resolve(), active.resolve())
+        self.assertTrue(older.root.exists())
+
+    def test_recovery_cannot_be_followed_by_an_older_candidate(self) -> None:
+        self.activate("0.1.0")
+        pending = _bundle(self.base, "0.3.0")
+        with self.assertRaises(IntegrationError):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=pending,
+                expected_current_version="0.1.0",
+                refresh_integration=lambda _layout: (_ for _ in ()).throw(
+                    IntegrationError("refresh failed"),
+                ),
+                roots=self.roots,
+            )
+
+        older = _bundle(self.base, "0.2.0")
+        reconciled: list[str] = []
+        with self.assertRaises(InstallOwnershipError):
+            upgrade(
+                check=False,
+                environ=self.environ,
+                stdout=io.StringIO(),
+                verified_candidate=older,
+                expected_current_version="0.1.0",
+                refresh_integration=lambda layout: reconciled.append(layout.version),
+                roots=self.roots,
+            )
+
+        self.assertEqual(reconciled, ["0.3.0"])
+        self.assertEqual(self.roots.current.resolve().name, "0.3.0")
+        self.assertTrue(older.root.exists())
+        self.assertFalse((self.roots.home / "release-journal.json").exists())
 
     def test_upgrade_check_success_and_repeat_are_idempotent(self) -> None:
         self.activate("0.1.0")
@@ -356,7 +486,7 @@ class ReleaseManagementTests(unittest.TestCase):
         )
         self.assertEqual(upgraded.current_version, "0.2.0")
         self.assertEqual(repeated.current_version, "0.2.0")
-        self.assertEqual(refreshed, ["0.2.0", "0.2.0"])
+        self.assertEqual(refreshed, ["0.2.0"])
 
     def test_interruption_after_bundle_move_recovers_previous_release(self) -> None:
         previous = self.activate("0.1.0")
@@ -494,7 +624,7 @@ class ReleaseManagementTests(unittest.TestCase):
         )
         self.assertEqual(plugin[0], "0.2.0")
         self.assertEqual(self.roots.current.resolve().name, "0.2.0")
-        self.assertGreaterEqual(refreshes.count("0.2.0"), 3)
+        self.assertEqual(refreshes, ["0.2.0", "0.2.0"])
 
     def test_crash_during_initial_refresh_is_reconciled_on_retry(self) -> None:
         self.activate("0.1.0")
@@ -524,7 +654,7 @@ class ReleaseManagementTests(unittest.TestCase):
             roots=self.roots,
         )
         self.assertEqual(self.roots.current.resolve().name, "0.2.0")
-        self.assertGreaterEqual(reconciled.count("0.2.0"), 2)
+        self.assertEqual(reconciled, ["0.2.0"])
 
     def test_failed_recovery_retry_preserves_candidate_for_next_retry(self) -> None:
         self.activate("0.1.0")

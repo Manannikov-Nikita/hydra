@@ -13,6 +13,25 @@ fail()
     exit 1
 }
 
+sha256_file()
+{
+    selected=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        output=$(sha256sum "$selected" 2>/dev/null) ||
+            fail "checksum calculation failed"
+    elif command -v shasum >/dev/null 2>&1; then
+        output=$(shasum -a 256 "$selected" 2>/dev/null) ||
+            fail "checksum calculation failed"
+    else
+        fail "SHA-256 tool is unavailable"
+    fi
+    digest=${output%% *}
+    printf '%s\n' "$digest" |
+        LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+        fail "checksum calculation failed"
+    printf '%s\n' "$digest"
+}
+
 cleanup()
 {
     if [ -n "$DASHBOARD_PID" ]; then
@@ -54,6 +73,60 @@ fi
     'import PyInstaller; assert PyInstaller.__version__ == "6.21.0"' ||
     fail "PyInstaller 6.21.0 is unavailable"
 
+ARCHIVE_ID=$(
+    "$HOST_PYTHON" - "$SOURCE_ROOT/src" "$ARCHIVE" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from hydra_codex.archive_validation import validate_tar_members
+
+archive = Path(sys.argv[2])
+match = re.fullmatch(
+    r"hydra-codex-((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
+    r"-(darwin-arm64|darwin-x86_64|linux-x86_64)\.tar\.gz",
+    archive.name,
+)
+if match is None:
+    raise SystemExit(1)
+version, target = match.groups()
+validated = validate_tar_members(
+    archive,
+    expected_top_level=f"hydra-codex-{version}",
+)
+if validated.version != version or validated.target != target:
+    raise SystemExit(1)
+print(version, target)
+PY
+) || fail "first archive identity is invalid"
+set -- $ARCHIVE_ID
+[ "$#" -eq 2 ] || fail "first archive identity is invalid"
+BASE_VERSION=$1
+TARGET=$2
+NEXT_VERSION=$(
+    "$HOST_PYTHON" - "$BASE_VERSION" <<'PY'
+import re
+import sys
+
+match = re.fullmatch(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+    sys.argv[1],
+)
+if match is None:
+    raise SystemExit(1)
+major, minor, patch = (int(value) for value in match.groups())
+print(f"{major}.{minor}.{patch + 1}")
+PY
+) || fail "next release version is invalid"
+case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64) NATIVE_TARGET=darwin-arm64 ;;
+    Darwin/x86_64) NATIVE_TARGET=darwin-x86_64 ;;
+    Linux/x86_64|Linux/amd64) NATIVE_TARGET=linux-x86_64 ;;
+    *) fail "unsupported acceptance platform" ;;
+esac
+[ "$TARGET" = "$NATIVE_TARGET" ] || fail "archive is not native"
+
 TEMP_PARENT=$(CDPATH= cd -- "${TMPDIR-/tmp}" && pwd -P) ||
     fail "temporary directory is unavailable"
 TEMP_ROOT=$(mktemp -d "$TEMP_PARENT/hydra-standalone-accept.XXXXXXXX") ||
@@ -92,6 +165,8 @@ CODEX_STATE=$CODEX_HOME/fake-state
 mkdir "$CODEX_STATE"
 CODEX_FAIL_REFRESH=$CODEX_STATE/fail-refresh
 export CODEX_FAIL_REFRESH
+CODEX_FAIL_VERSION=$NEXT_VERSION
+export CODEX_FAIL_VERSION
 cat_codex=$SHIM_DIR/codex
 printf '%s\n' \
     '#!/bin/sh' \
@@ -113,7 +188,7 @@ printf '%s\n' \
     'if [ "$1 $2" = "plugin list" ]; then' \
     '  if [ -f "$source_file" ]; then current=$(version); installed=false; [ -f "$plugin_file" ] && installed=true; printf '\''[{"name":"hydra-codex","marketplace":"hydra","installed":%s,"version":"%s"}]\n'\'' "$installed" "$current"; else printf "%s\n" "[]"; fi; exit 0' \
     'fi' \
-    'if [ "$1 $2" = "plugin add" ]; then current=$(version); if [ -f "$fail_file" ] && [ "$current" = 0.1.1 ]; then exit 42; fi; printf "%s\n" "$current" > "$plugin_file"; printf "%s\n" "{}"; exit 0; fi' \
+    'if [ "$1 $2" = "plugin add" ]; then current=$(version); if [ -f "$fail_file" ] && [ "$current" = "$CODEX_FAIL_VERSION" ]; then exit 42; fi; printf "%s\n" "$current" > "$plugin_file"; printf "%s\n" "{}"; exit 0; fi' \
     'if [ "$1 $2" = "plugin remove" ]; then rm -f "$plugin_file"; printf "%s\n" "{}"; exit 0; fi' \
     'exit 64' > "$cat_codex"
 chmod 700 "$cat_codex"
@@ -124,69 +199,66 @@ PATH=$SHIM_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 unset PYTHONPATH PYTHONHOME
 
-SECOND_SOURCE=$TEMP_ROOT/source-0.1.1
+SECOND_SOURCE=$TEMP_ROOT/source-$NEXT_VERSION
 git clone -q "$SOURCE_ROOT" "$SECOND_SOURCE"
-sed 's/__version__ = "0.1.0"/__version__ = "0.1.1"/' \
-    "$SECOND_SOURCE/src/hydra_codex/__init__.py" > "$SECOND_SOURCE/version.tmp"
-mv "$SECOND_SOURCE/version.tmp" "$SECOND_SOURCE/src/hydra_codex/__init__.py"
-sed 's/"version": "0.1.0"/"version": "0.1.1"/' \
-    "$SECOND_SOURCE/plugins/hydra-codex/.codex-plugin/plugin.json" \
-    > "$SECOND_SOURCE/plugin.tmp"
-mv "$SECOND_SOURCE/plugin.tmp" \
-    "$SECOND_SOURCE/plugins/hydra-codex/.codex-plugin/plugin.json"
-grep -q '__version__ = "0.1.1"' "$SECOND_SOURCE/src/hydra_codex/__init__.py" ||
-    fail "second source version update failed"
-grep -q '"version": "0.1.1"' \
-    "$SECOND_SOURCE/plugins/hydra-codex/.codex-plugin/plugin.json" ||
-    fail "second plugin version update failed"
+"$HOST_PYTHON" - "$BASE_VERSION" "$NEXT_VERSION" "$SECOND_SOURCE" <<'PY'
+from pathlib import Path
+import sys
+
+base, next_version, source_value = sys.argv[1:]
+source = Path(source_value)
+replacements = (
+    (
+        source / "src" / "hydra_codex" / "__init__.py",
+        f'__version__ = "{base}"',
+        f'__version__ = "{next_version}"',
+    ),
+    (
+        source / "plugins" / "hydra-codex" / ".codex-plugin" / "plugin.json",
+        f'"version": "{base}"',
+        f'"version": "{next_version}"',
+    ),
+)
+for path, old, new in replacements:
+    content = path.read_text(encoding="utf-8")
+    if content.count(old) != 1:
+        raise SystemExit(1)
+    path.write_text(content.replace(old, new), encoding="utf-8")
+PY
 git -C "$SECOND_SOURCE" add \
     src/hydra_codex/__init__.py \
     plugins/hydra-codex/.codex-plugin/plugin.json
 git -C "$SECOND_SOURCE" \
     -c user.name=Hydra -c user.email=hydra@example.invalid \
-    commit -qm "build: create acceptance release 0.1.1"
-SECOND_OUTPUT=$TEMP_ROOT/release-0.1.1
+    commit -qm "build: create acceptance next release"
+SECOND_OUTPUT=$TEMP_ROOT/release-$NEXT_VERSION
 "$HOST_PYTHON" "$SECOND_SOURCE/packaging/build_standalone.py" \
     --source-root "$SECOND_SOURCE" --output "$SECOND_OUTPUT" >/dev/null
 SECOND_ARCHIVE=$(find "$SECOND_OUTPUT" -type f \
-    -name 'hydra-codex-0.1.1-*.tar.gz' -print)
+    -name "hydra-codex-$NEXT_VERSION-$TARGET.tar.gz" -print)
 [ -n "$SECOND_ARCHIVE" ] && [ "$(printf '%s\n' "$SECOND_ARCHIVE" | wc -l | tr -d ' ')" = 1 ] ||
     fail "second release build failed"
 
-case "$(basename "$ARCHIVE")" in
-    hydra-codex-0.1.0-darwin-arm64.tar.gz) TARGET=darwin-arm64 ;;
-    hydra-codex-0.1.0-darwin-x86_64.tar.gz) TARGET=darwin-x86_64 ;;
-    hydra-codex-0.1.0-linux-x86_64.tar.gz) TARGET=linux-x86_64 ;;
-    *) fail "first archive identity is invalid" ;;
-esac
-case "$(uname -s)/$(uname -m)" in
-    Darwin/arm64) NATIVE_TARGET=darwin-arm64 ;;
-    Darwin/x86_64) NATIVE_TARGET=darwin-x86_64 ;;
-    Linux/x86_64|Linux/amd64) NATIVE_TARGET=linux-x86_64 ;;
-    *) fail "unsupported acceptance platform" ;;
-esac
-[ "$TARGET" = "$NATIVE_TARGET" ] || fail "archive is not native"
-
 SERVER_ROOT=$TEMP_ROOT/server
-mkdir -p "$SERVER_ROOT/releases/download/v0.1.0" \
-    "$SERVER_ROOT/releases/download/v0.1.1"
-cp "$ARCHIVE" "$SERVER_ROOT/releases/download/v0.1.0/"
-cp "$SECOND_ARCHIVE" "$SERVER_ROOT/releases/download/v0.1.1/"
-printf '%s\n' "0.1.0" > "$SERVER_ROOT/latest-version"
+mkdir -p "$SERVER_ROOT/releases/download/v$BASE_VERSION" \
+    "$SERVER_ROOT/releases/download/v$NEXT_VERSION"
+cp "$ARCHIVE" "$SERVER_ROOT/releases/download/v$BASE_VERSION/"
+cp "$SECOND_ARCHIVE" "$SERVER_ROOT/releases/download/v$NEXT_VERSION/"
+printf '%s\n' "$BASE_VERSION" > "$SERVER_ROOT/latest-version"
 
 write_manifest()
 {
     version=$1
     selected=$2
-    digest=$(shasum -a 256 "$selected" | awk '{print $1}')
+    digest=$(sha256_file "$selected")
     manifest=$SERVER_ROOT/releases/download/v$version/SHA256SUMS
     printf '%s  %s\n' \
         "$digest" "hydra-codex-$version-darwin-arm64.tar.gz" \
         "$digest" "hydra-codex-$version-darwin-x86_64.tar.gz" \
         "$digest" "hydra-codex-$version-linux-x86_64.tar.gz" > "$manifest"
 }
-write_manifest 0.1.0 "$ARCHIVE"
-write_manifest 0.1.1 "$SECOND_ARCHIVE"
+write_manifest "$BASE_VERSION" "$ARCHIVE"
+write_manifest "$NEXT_VERSION" "$SECOND_ARCHIVE"
 
 SERVER_PORT_FILE=$TEMP_ROOT/server-port
 "$HOST_PYTHON" -c '
@@ -232,11 +304,11 @@ SERVER_PORT=$(sed -n '1p' "$SERVER_PORT_FILE")
 RELEASE_BASE=http://127.0.0.1:$SERVER_PORT/releases
 export HYDRA_INSTALLER_RELEASE_BASE_URL=$RELEASE_BASE
 
-sh "$SOURCE_ROOT/install.sh" --version 0.1.0 >/dev/null
+sh "$SOURCE_ROOT/install.sh" --version "$BASE_VERSION" >/dev/null
 HYDRA=$HOME/.local/bin/hydra-codex
 [ -x "$HYDRA" ] && [ ! -L "$HOME/.hydra/current/bin/hydra-codex" ] ||
     fail "installed launcher is unavailable"
-[ "$("$HYDRA" --version)" = "hydra-codex 0.1.0" ] ||
+[ "$("$HYDRA" --version)" = "hydra-codex $BASE_VERSION" ] ||
     fail "installed version smoke failed"
 "$HYDRA" install -y >/dev/null
 "$HYDRA" init "$PROJECT" >/dev/null
@@ -255,6 +327,28 @@ grep -q '"files_seen":1' "$TEMP_ROOT/ingest.json" ||
 "$HYDRA" reconcile --cwd "$PROJECT" > "$TEMP_ROOT/reconcile.json"
 grep -q '"status":"ok"' "$TEMP_ROOT/reconcile.json" ||
     fail "synthetic reconcile failed"
+"$HYDRA" report --last 1 --format json --cwd "$PROJECT" \
+    > "$TEMP_ROOT/report.json"
+"$HOST_PYTHON" - "$TEMP_ROOT/report.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("schema_version") != "hydra.report-list/v1":
+    raise SystemExit(1)
+reports = payload.get("reports")
+if not isinstance(reports, list) or len(reports) != 1:
+    raise SystemExit(1)
+report = reports[0]
+if (
+    not isinstance(report, dict)
+    or report.get("schema_version") != "hydra.report/v3"
+    or not isinstance(report.get("task_ref"), str)
+    or not report["task_ref"].startswith("task_")
+):
+    raise SystemExit(1)
+PY
 
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"acceptance","turn_id":"turn-a","cwd":"%s","prompt":"acceptance"}\n' \
     "$PROJECT" | "$HYDRA" hook > "$TEMP_ROOT/hook.json"
@@ -293,37 +387,51 @@ kill "$DASHBOARD_PID"
 wait "$DASHBOARD_PID" 2>/dev/null || :
 DASHBOARD_PID=
 
-printf '%s\n' "0.1.1" > "$SERVER_ROOT/latest-version"
-sh "$SOURCE_ROOT/install.sh" --check > "$TEMP_ROOT/upgrade-check.txt"
-grep -q 'Hydra update available: 0.1.0 -> 0.1.1' \
-    "$TEMP_ROOT/upgrade-check.txt" || fail "upgrade --check failed"
+printf '%s\n' "$NEXT_VERSION" > "$SERVER_ROOT/latest-version"
 "$HYDRA" upgrade --check > "$TEMP_ROOT/runtime-check.json"
-sh "$SOURCE_ROOT/install.sh" --version 0.1.1 >/dev/null
-[ "$("$HYDRA" --version)" = "hydra-codex 0.1.1" ] ||
-    fail "explicit release switch failed"
+"$HOST_PYTHON" - "$TEMP_ROOT/runtime-check.json" \
+    "$BASE_VERSION" "$NEXT_VERSION" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "command": "upgrade",
+    "current_version": sys.argv[2],
+    "latest_version": sys.argv[3],
+    "status": "ok",
+    "update_available": True,
+}
+if payload != expected:
+    raise SystemExit(1)
+PY
 
 : > "$CODEX_FAIL_REFRESH"
-if "$HYDRA" install -y --refresh >/dev/null 2>&1; then
+if "$HYDRA" upgrade >/dev/null 2>&1; then
     fail "forced Codex refresh unexpectedly succeeded"
 fi
-grep -q '/versions/0.1.0/marketplace' "$CODEX_STATE/marketplace-source" &&
-    grep -q '"runtime_version":"0.1.0"' \
+[ "$("$HYDRA" --version)" = "hydra-codex $BASE_VERSION" ] &&
+grep -q "/versions/$BASE_VERSION/marketplace" "$CODEX_STATE/marketplace-source" &&
+grep -q "\"runtime_version\":\"$BASE_VERSION\"" \
         "$DATA_DIR/codex-integration.json" ||
     fail "forced Codex refresh rollback failed"
 rm -f "$CODEX_FAIL_REFRESH"
-"$HYDRA" install -y --refresh >/dev/null
-grep -q '"runtime_version":"0.1.1"' \
+"$HYDRA" upgrade >/dev/null
+[ "$("$HYDRA" --version)" = "hydra-codex $NEXT_VERSION" ] ||
+    fail "runtime upgrade did not activate"
+grep -q "\"runtime_version\":\"$NEXT_VERSION\"" \
     "$DATA_DIR/codex-integration.json" ||
     fail "Codex refresh did not commit"
 
 DATABASE=$DATA_DIR/hydra.sqlite3
 [ -f "$DATABASE" ] || fail "telemetry database is unavailable"
-DATABASE_DIGEST=$(shasum -a 256 "$DATABASE" | awk '{print $1}')
+DATABASE_DIGEST=$(sha256_file "$DATABASE")
 "$HYDRA" uninstall -y >/dev/null
 [ ! -e "$HYDRA" ] && [ ! -e "$HOME/.hydra/current" ] ||
     fail "full uninstall retained CLI state"
 [ -f "$DATABASE" ] || fail "uninstall removed telemetry"
-[ "$(shasum -a 256 "$DATABASE" | awk '{print $1}')" = "$DATABASE_DIGEST" ] ||
+[ "$(sha256_file "$DATABASE")" = "$DATABASE_DIGEST" ] ||
     fail "uninstall changed telemetry"
 
 if [ -s "$SHIM_LOG" ]; then

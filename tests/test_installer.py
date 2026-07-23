@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from hydra_codex.cli import main as cli_main
+from hydra_codex.install_layout import validate_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -333,6 +334,90 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("umask 077", source)
         self.assertNotIn("python", source.lower())
         self.assertNotIn("jq", source.lower())
+
+    def test_private_acquisition_requires_capability_and_preserves_parent_lock(
+        self,
+    ) -> None:
+        before = tuple(self.state.requests)
+        rejected = self.run_installer("--acquire")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(tuple(self.state.requests), before)
+
+        self.run_installer("--version", "1.0.0")
+        self.publish("1.0.1")
+        lock = self.home / ".hydra-installer-lock"
+        lock.mkdir(mode=0o700)
+        capability = "a" * 64
+        acquired = self.run_installer(
+            "--acquire",
+            environment={
+                "HYDRA_INTERNAL_RELEASE_ACQUISITION": capability,
+            },
+        )
+
+        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        lines = acquired.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        candidate = Path(lines[0])
+        self.assertEqual(candidate.parent.parent, self.home / ".hydra")
+        self.assertTrue(candidate.parent.name.startswith(".acquire."))
+        self.assertEqual(validate_bundle(candidate).version, "1.0.1")
+        self.assertTrue(lock.is_dir())
+
+    def test_private_resolution_is_capability_gated_machine_readable_and_read_only(
+        self,
+    ) -> None:
+        before_requests = tuple(self.state.requests)
+        rejected = self.run_installer("--resolve")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(tuple(self.state.requests), before_requests)
+
+        installed = self.run_installer("--version", "1.0.0")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.publish("1.0.1")
+        before = tuple(
+            sorted(
+                (
+                    path.relative_to(self.home).as_posix(),
+                    path.lstat().st_mode,
+                    os.readlink(path) if path.is_symlink() else (
+                        path.read_bytes() if path.is_file() else None
+                    ),
+                )
+                for path in self.home.rglob("*")
+            ),
+        )
+        requests_before_resolve = len(self.state.requests)
+
+        resolved = self.run_installer(
+            "--resolve",
+            environment={
+                "HYDRA_INTERNAL_RELEASE_RESOLUTION": "b" * 64,
+            },
+        )
+
+        self.assertEqual((resolved.returncode, resolved.stderr), (0, ""))
+        self.assertEqual(
+            resolved.stdout,
+            '{"current_version":"1.0.0","latest_version":"1.0.1"}\n',
+        )
+        self.assertEqual(
+            self.state.requests[requests_before_resolve:],
+            ["/releases/latest", "/releases/tag/v1.0.1"],
+        )
+        after = tuple(
+            sorted(
+                (
+                    path.relative_to(self.home).as_posix(),
+                    path.lstat().st_mode,
+                    os.readlink(path) if path.is_symlink() else (
+                        path.read_bytes() if path.is_file() else None
+                    ),
+                )
+                for path in self.home.rglob("*")
+            ),
+        )
+        self.assertEqual(after, before)
 
     def test_explicit_version_installs_exact_asset_and_is_idempotent(self) -> None:
         first = self.run_installer("--version", "1.0.0")

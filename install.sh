@@ -27,7 +27,9 @@ cleanup()
 {
     if [ -n "$STAGE_DIR" ]; then
         case "$STAGE_DIR" in
-            "$HOME/.hydra"/.staging.*) rm -rf "$STAGE_DIR" ;;
+            "$HOME/.hydra"/.staging.*|"$HOME/.hydra"/.acquire.*)
+                rm -rf "$STAGE_DIR"
+                ;;
         esac
     fi
     if [ -n "$DOWNLOAD_DIR" ]; then
@@ -498,6 +500,20 @@ parse_arguments()
         1)
             case "$1" in
                 --check) MODE=check ;;
+                --acquire)
+                    capability=${HYDRA_INTERNAL_RELEASE_ACQUISITION-}
+                    printf '%s\n' "$capability" |
+                        LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+                        fail "unsupported arguments"
+                    MODE=acquire
+                    ;;
+                --resolve)
+                    capability=${HYDRA_INTERNAL_RELEASE_RESOLUTION-}
+                    printf '%s\n' "$capability" |
+                        LC_ALL=C grep -Eq '^[0-9a-f]{64}$' ||
+                        fail "unsupported arguments"
+                    MODE=resolve
+                    ;;
                 --uninstall) MODE=uninstall ;;
                 *) fail "unsupported arguments" ;;
             esac
@@ -540,10 +556,22 @@ if [ "$MODE" = check ]; then
     exit 0
 fi
 
+if [ "$MODE" = resolve ]; then
+    [ -n "$INSTALLED_VERSION" ] || fail "Hydra is not installed"
+    resolve_latest
+    printf '{"current_version":"%s","latest_version":"%s"}\n' \
+        "$INSTALLED_VERSION" "$VERSION"
+    exit 0
+fi
+
 LOCK_DIR=$HOME/.hydra-installer-lock
-mkdir -m 700 "$LOCK_DIR" 2>/dev/null ||
-    fail "another installation is in progress"
-LOCK_OWNED=1
+if [ "$MODE" = acquire ]; then
+    safe_private_directory "$LOCK_DIR"
+else
+    mkdir -m 700 "$LOCK_DIR" 2>/dev/null ||
+        fail "another installation is in progress"
+    LOCK_OWNED=1
+fi
 
 if [ -z "$VERSION" ]; then
     resolve_latest
@@ -570,8 +598,13 @@ if ! path_exists "$HOME/.hydra"; then
         fail "installation directory creation failed"
 fi
 safe_private_directory "$HOME/.hydra"
-STAGE_DIR=$(mktemp -d "$HOME/.hydra/.staging.XXXXXXXX" 2>/dev/null) ||
-    fail "private release staging failed"
+if [ "$MODE" = acquire ]; then
+    STAGE_DIR=$(mktemp -d "$HOME/.hydra/.acquire.XXXXXXXX" 2>/dev/null) ||
+        fail "private release staging failed"
+else
+    STAGE_DIR=$(mktemp -d "$HOME/.hydra/.staging.XXXXXXXX" 2>/dev/null) ||
+        fail "private release staging failed"
+fi
 tar -xzf "$archive" -C "$STAGE_DIR" 2>/dev/null ||
     fail "release extraction failed"
 staged=$STAGE_DIR/$top
@@ -580,6 +613,12 @@ reported=$("$staged/bin/hydra-codex" --version 2>/dev/null) ||
     fail "staged executable validation failed"
 [ "$reported" = "hydra-codex $VERSION" ] ||
     fail "staged executable version does not match"
+
+if [ "$MODE" = acquire ]; then
+    STAGE_DIR=
+    printf '%s\n' "$staged"
+    exit 0
+fi
 
 HYDRA_INTERNAL_INSTALLER_ACTIVATION=1 \
     "$staged/bin/hydra-codex" __installer-activate "$staged" \

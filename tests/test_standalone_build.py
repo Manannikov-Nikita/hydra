@@ -557,6 +557,8 @@ class StandaloneBuildTests(unittest.TestCase):
         script = ACCEPTANCE_PATH.read_text(encoding="utf-8")
 
         self.assertTrue(script.startswith("#!/bin/sh\nset -eu\n"))
+        self.assertNotIn("0.1.0", script)
+        self.assertNotIn("0.1.1", script)
         self.assertIn('TEMP_PARENT=$(CDPATH= cd -- "${TMPDIR-/tmp}" && pwd -P)', script)
         self.assertIn('"$TEMP_PARENT"/hydra-standalone-accept.*)', script)
         self.assertIn("for command in python python3 python3.12 pip uv", script)
@@ -565,11 +567,17 @@ class StandaloneBuildTests(unittest.TestCase):
             "unset PYTHONPATH PYTHONHOME",
             "HYDRA=$HOME/.local/bin/hydra-codex",
             "HYDRA_INSTALLER_RELEASE_BASE_URL",
-            "0.1.1",
-            'commit -qm "build: create acceptance release 0.1.1"',
-            "--check",
-            "--version 0.1.1",
+            "validate_tar_members",
+            "BASE_VERSION",
+            "NEXT_VERSION",
+            "patch + 1",
+            'commit -qm "build: create acceptance next release"',
+            '"$HYDRA" upgrade --check',
+            '"$HYDRA" upgrade',
             "CODEX_FAIL_REFRESH",
+            '"$HYDRA" report --last 1 --format json --cwd "$PROJECT"',
+            "hydra.report-list/v1",
+            "hydra.report/v3",
             "dashboard --no-open",
             "/assets/views/evidence.js",
             "uninstall -y",
@@ -578,7 +586,68 @@ class StandaloneBuildTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, script)
+        self.assertEqual(script.count('"$SOURCE_ROOT/install.sh"'), 1)
         self.assertNotIn("HYDRA_VERSION_OVERRIDE", script)
+
+    def test_acceptance_sha256_helper_prefers_gnu_then_falls_back_to_shasum(
+        self,
+    ) -> None:
+        script = ACCEPTANCE_PATH.read_text(encoding="utf-8")
+        prefix = script.split('[ "$#" -eq 1 ]', 1)[0]
+        harness = self.root / "sha-harness.sh"
+        harness.write_text(prefix + '\nsha256_file "$1"\n', encoding="utf-8")
+        payload = self.root / "payload"
+        payload.write_bytes(b"payload")
+
+        commands = self.root / "commands"
+        commands.mkdir()
+        gnu = commands / "sha256sum"
+        gnu.write_text(
+            '#!/bin/sh\nprintf "%064d  %s\\n" 0 "$1"\n',
+            encoding="utf-8",
+        )
+        gnu.chmod(0o755)
+        bsd = commands / "shasum"
+        bsd.write_text(
+            '#!/bin/sh\n'
+            '[ "$1" = -a ] && [ "$2" = 256 ] || exit 91\n'
+            'printf "%064d  %s\\n" 1 "$3"\n',
+            encoding="utf-8",
+        )
+        bsd.chmod(0o755)
+        grep = commands / "grep"
+        grep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        grep.chmod(0o755)
+
+        preferred = subprocess.run(
+            ["/bin/sh", str(harness), str(payload)],
+            env={"PATH": str(commands)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual((preferred.returncode, preferred.stdout.strip()), (0, "0" * 64))
+
+        gnu.unlink()
+        fallback = subprocess.run(
+            ["/bin/sh", str(harness), str(payload)],
+            env={"PATH": str(commands)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual((fallback.returncode, fallback.stdout.strip()), (0, "0" * 63 + "1"))
+
+        bsd.unlink()
+        unavailable = subprocess.run(
+            ["/bin/sh", str(harness), str(payload)],
+            env={"PATH": str(commands)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(unavailable.returncode, 0)
+        self.assertIn("SHA-256 tool is unavailable", unavailable.stderr)
 
     def test_installer_accepts_and_requires_bundled_install_script(self) -> None:
         installer = (ROOT / "install.sh").read_text(encoding="utf-8")

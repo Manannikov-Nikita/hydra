@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import io
 import json
 import os
@@ -263,6 +264,7 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_upgrade_check_is_read_only_path_free_and_reports_candidate(self) -> None:
+        from hydra_codex.release_acquisition import ResolvedRelease
         from tests.test_release_management import _bundle
         from hydra_codex.release_management import (
             activate_version,
@@ -275,7 +277,6 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
             roots=roots,
             environ=self.environ,
         )
-        candidate = _bundle(self.root, "0.2.0")
         before = tuple(
             sorted(
                 (path.relative_to(self.root).as_posix(), path.lstat().st_size)
@@ -283,15 +284,22 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
             ),
         )
 
-        code, stdout, stderr = invoke(
-            ["upgrade", "--check"],
-            environ=self.environ,
-            codex_client=self.client,
-            integration_receipt_path=self.receipt,
-            verified_candidate=candidate,
-        )
+        with mock.patch(
+            "hydra_codex.installation_cli.resolve_latest_release",
+            return_value=ResolvedRelease("0.1.0", "0.2.0"),
+        ) as resolve, mock.patch(
+            "hydra_codex.installation_cli.acquire_release_candidate",
+            side_effect=AssertionError("check must not download a release"),
+        ) as acquire:
+            code, stdout, stderr = invoke(
+                ["upgrade", "--check"],
+                environ=self.environ,
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+            )
 
         self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(stdout.count("\n"), 1)
         self.assertEqual(json.loads(stdout), {
             "command": "upgrade",
             "current_version": "0.1.0",
@@ -308,8 +316,11 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertNotIn(str(self.root), stdout)
         self.assertEqual(self.client.calls, [])
+        resolve.assert_called_once_with(environ=self.environ)
+        acquire.assert_not_called()
 
     def test_upgrade_refreshes_codex_to_the_activated_candidate(self) -> None:
+        from hydra_codex.release_acquisition import AcquiredRelease
         from tests.test_release_management import _bundle
         from hydra_codex.release_management import (
             activate_version,
@@ -334,13 +345,16 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
             (roots.versions / "0.2.0" / "marketplace").resolve()
         ] = "0.2.0"
 
-        code, stdout, stderr = invoke(
-            ["upgrade"],
-            environ=self.environ,
-            codex_client=self.client,
-            integration_receipt_path=self.receipt,
-            verified_candidate=candidate,
-        )
+        with mock.patch(
+            "hydra_codex.installation_cli.acquire_release_candidate",
+            return_value=nullcontext(AcquiredRelease(candidate, "0.1.0")),
+        ):
+            code, stdout, stderr = invoke(
+                ["upgrade"],
+                environ=self.environ,
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+            )
 
         self.assertEqual((code, stderr), (0, ""))
         self.assertEqual(json.loads(stdout), {
@@ -353,6 +367,117 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         self.assertEqual(roots.current.resolve().name, "0.2.0")
         self.assertEqual(self.client.installed_version, "0.2.0")
         self.assertNotIn(str(self.root), stdout)
+
+    def test_upgrade_acquisition_failure_is_generic_and_path_free(self) -> None:
+        from hydra_codex.release_acquisition import ReleaseAcquisitionError
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import (
+            activate_version,
+            default_install_roots,
+        )
+
+        roots = default_install_roots(self.home)
+        activate_version(
+            _bundle(self.root, "0.1.0"),
+            roots=roots,
+            environ=self.environ,
+        )
+        private = str(self.root / "private-acquisition-path")
+        with mock.patch(
+            "hydra_codex.installation_cli.acquire_release_candidate",
+            side_effect=ReleaseAcquisitionError(private),
+        ):
+            code, stdout, stderr = invoke(
+                ["upgrade"],
+                environ=self.environ,
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+            )
+
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertEqual(stderr, "hydra-codex: command failed\n")
+        self.assertNotIn(private, stderr)
+
+    def test_public_upgrade_rolls_back_refresh_failure_then_retries(self) -> None:
+        from hydra_codex.release_acquisition import AcquiredRelease
+        from tests.test_release_management import _bundle
+        from hydra_codex.release_management import (
+            activate_version,
+            default_install_roots,
+        )
+
+        roots = default_install_roots(self.home)
+        first = _bundle(self.root, "0.1.0")
+        activate_version(first, roots=roots, environ=self.environ)
+        active_marketplace = roots.current.resolve() / "marketplace"
+        self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
+        self.assertEqual(
+            invoke(
+                ["install", "-y"],
+                environ=self.environ,
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+                marketplace_root=active_marketplace,
+            )[0],
+            0,
+        )
+
+        candidate = _bundle(self.root, "0.2.0")
+        installed_marketplace = roots.versions / "0.2.0" / "marketplace"
+        self.client.available_versions[installed_marketplace.resolve()] = "0.2.0"
+        self.client.fail_on = ("add_plugin", "hydra-codex@hydra")
+        with mock.patch(
+            "hydra_codex.installation_cli.acquire_release_candidate",
+            return_value=nullcontext(AcquiredRelease(candidate, "0.1.0")),
+        ):
+            failed = invoke(
+                ["upgrade"],
+                environ=self.environ,
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+            )
+
+        self.assertEqual(
+            failed,
+            (1, "", "hydra-codex: command failed\n"),
+        )
+        self.assertEqual(roots.current.resolve().name, "0.1.0")
+        self.assertEqual(self.client.installed_version, "0.1.0")
+        self.assertEqual(
+            json.loads(self.receipt.read_text(encoding="utf-8"))[
+                "runtime_version"
+            ],
+            "0.1.0",
+        )
+        release_journal = roots.home / "release-journal.json"
+        self.assertEqual(
+            json.loads(release_journal.read_text(encoding="utf-8"))["phase"],
+            "refreshing",
+        )
+
+        retry = _bundle(self.root, "0.2.0", marker="retry")
+        with mock.patch(
+            "hydra_codex.installation_cli.acquire_release_candidate",
+            return_value=nullcontext(AcquiredRelease(retry, "0.1.0")),
+        ):
+            code, stdout, stderr = invoke(
+                ["upgrade"],
+                environ=self.environ,
+                codex_client=self.client,
+                integration_receipt_path=self.receipt,
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["current_version"], "0.2.0")
+        self.assertEqual(roots.current.resolve().name, "0.2.0")
+        self.assertEqual(self.client.installed_version, "0.2.0")
+        self.assertEqual(
+            json.loads(self.receipt.read_text(encoding="utf-8"))[
+                "runtime_version"
+            ],
+            "0.2.0",
+        )
+        self.assertFalse(release_journal.exists())
 
     def test_full_uninstall_detaches_then_removes_owned_cli(self) -> None:
         from tests.test_release_management import _bundle

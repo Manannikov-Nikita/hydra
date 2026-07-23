@@ -87,6 +87,20 @@ def _safe_version(version: str) -> str:
     return version
 
 
+def _semantic_version(version: str) -> tuple[int, int, int]:
+    match = re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+        version,
+    )
+    if match is None:
+        raise InstallOwnershipError("release version is not canonical")
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+    )
+
+
 def _fsync_directory(directory: Path) -> None:
     descriptor = os.open(directory, os.O_RDONLY)
     try:
@@ -423,10 +437,10 @@ def _recover_pending(
     roots: InstallRoots,
     *,
     reconcile_integration: Callable[[BundleLayout], None] | None = None,
-) -> None:
+) -> str | None:
     journal = _read_journal(roots)
     if journal is None:
-        return
+        return None
     _validate_link_state(roots)
     if journal.phase == "refreshing":
         if reconcile_integration is None:
@@ -456,7 +470,7 @@ def _recover_pending(
             ),
         )
         _clear_journal(roots)
-        return
+        return candidate.version
     if journal.phase == "refresh_committed":
         committed = roots.versions / journal.new_version
         validate_bundle(committed, expected_version=journal.new_version)
@@ -466,8 +480,9 @@ def _recover_pending(
             roots.current / "bin" / "hydra-codex",
         )
         _clear_journal(roots)
-        return
+        return journal.new_version
     _restore_previous_links(roots, journal, clear=True)
+    return None
 
 
 def _validated_candidate(layout: BundleLayout) -> BundleLayout:
@@ -581,12 +596,35 @@ def _status_for(
     return UpgradeStatus(current, latest, bool(latest and latest != current))
 
 
+def check_upgrade(
+    *,
+    latest_version: str,
+    expected_current_version: str,
+    environ: Mapping[str, str],
+    roots: InstallRoots | None = None,
+) -> UpgradeStatus:
+    """Return a path-free, read-only upgrade status for a resolved release."""
+    selected = default_install_roots(_home(environ)) if roots is None else roots
+    state = _validate_link_state(selected)
+    current = state.current_version or ""
+    if current != expected_current_version:
+        raise InstallOwnershipError("active release changed during resolution")
+    if _semantic_version(latest_version) < _semantic_version(current):
+        raise InstallOwnershipError("release downgrade is not permitted")
+    return UpgradeStatus(
+        current,
+        latest_version,
+        latest_version != current,
+    )
+
+
 def upgrade(
     *,
     check: bool,
     environ: Mapping[str, str],
     stdout: TextIO,
     verified_candidate: BundleLayout | None = None,
+    expected_current_version: str | None = None,
     refresh_integration: Callable[[BundleLayout], None] | None = None,
     roots: InstallRoots | None = None,
 ) -> UpgradeStatus:
@@ -599,6 +637,18 @@ def upgrade(
         else _validated_candidate(verified_candidate)
     )
     status = _status_for(selected, candidate)
+    if (
+        expected_current_version is not None
+        and status.current_version != expected_current_version
+    ):
+        raise InstallOwnershipError("active release changed during acquisition")
+    if (
+        candidate is not None
+        and status.current_version
+        and _semantic_version(candidate.version)
+        < _semantic_version(status.current_version)
+    ):
+        raise InstallOwnershipError("release downgrade is not permitted")
     if check:
         return status
     if candidate is None:
@@ -606,11 +656,42 @@ def upgrade(
 
     _validate_link_state(selected)
     with _lifecycle_lock(selected):
-        _recover_pending(
+        locked_state = _validate_link_state(selected)
+        if (
+            expected_current_version is not None
+            and locked_state.current_version != expected_current_version
+        ):
+            raise InstallOwnershipError("active release changed during acquisition")
+        if (
+            locked_state.current_version is not None
+            and _semantic_version(candidate.version)
+            < _semantic_version(locked_state.current_version)
+        ):
+            raise InstallOwnershipError("release downgrade is not permitted")
+        recovered_version = _recover_pending(
             selected,
             reconcile_integration=refresh_integration,
         )
-        _validate_link_state(selected)
+        recovered_state = _validate_link_state(selected)
+        if (
+            recovered_version is not None
+            and recovered_state.current_version != recovered_version
+        ):
+            raise InstallOwnershipError(
+                "release recovery did not converge",
+            )
+        if recovered_state.current_version == candidate.version:
+            return UpgradeStatus(
+                candidate.version,
+                candidate.version,
+                False,
+            )
+        if (
+            recovered_state.current_version is not None
+            and _semantic_version(candidate.version)
+            < _semantic_version(recovered_state.current_version)
+        ):
+            raise InstallOwnershipError("release downgrade is not permitted")
         installed = _activate_locked(
             candidate,
             roots=selected,
@@ -642,7 +723,7 @@ def upgrade(
         try:
             refresh_integration(active)
         except Exception:
-            _restore_previous_links(selected, journal, clear=True)
+            _restore_previous_links(selected, journal, clear=False)
             raise
         _write_journal(
             selected,

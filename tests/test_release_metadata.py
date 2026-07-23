@@ -33,15 +33,19 @@ class ReleaseMetadataTests(unittest.TestCase):
 
     def test_public_metadata_and_license_are_declared_for_distributions(self) -> None:
         metadata = load_pyproject()
+        configuration = tomllib.loads(
+            (_ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+        )
 
         self.assertEqual(metadata["license"], "MIT")
+        self.assertEqual(metadata["license-files"], ["LICENSE"])
+        self.assertNotIn(
+            "License :: OSI Approved :: MIT License",
+            metadata["classifiers"],
+        )
         self.assertEqual(
             metadata["urls"]["Repository"],
             "https://github.com/Manannikov-Nikita/hydra",
         )
-        self.assertEqual(
-            tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-            ["tool"]["setuptools"]["license-files"],
-            ["LICENSE"],
-        )
+        self.assertNotIn("license-files", configuration.get("tool", {}).get("setuptools", {}))
         self.assertTrue((_ROOT / "LICENSE").is_file())

@@ -7,10 +7,10 @@ name = "hydra-codex"
 dynamic = ["version"]
 description = "Local, privacy-preserving telemetry and evidence for Codex."
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = []
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -35,9 +35,6 @@ hydra-codex-plugin = "hydra_codex.plugin_bundle:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools]
-license-files = ["LICENSE"]
 
 [tool.setuptools.dynamic]
 version = {attr = "hydra_codex.__version__"}

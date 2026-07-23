@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import io
 import json
 import sys
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -112,6 +113,107 @@ class StdioMcpServerTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.75)
         self.assertEqual(result, ProcessResult(1, "", ""))
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "process-group cleanup is required on macOS and Linux",
+    )
+    def test_subprocess_timeout_preserves_worker_descriptor_ownership(self) -> None:
+        class DelayedCloseRunner(SubprocessRunner):
+            def __init__(self) -> None:
+                super().__init__(timeout_seconds=0.3)
+                self.allow_owned_close = threading.Event()
+                self._close_condition = threading.Condition()
+                self._delayed_closes = 0
+
+            def _close(self, stream) -> None:
+                with self._close_condition:
+                    should_delay = self._delayed_closes < 2
+                    if should_delay:
+                        self._delayed_closes += 1
+                        self._close_condition.notify_all()
+                if should_delay:
+                    self.allow_owned_close.wait(timeout=2)
+                super()._close(stream)
+
+            def wait_for_delayed_closes(self) -> bool:
+                with self._close_condition:
+                    return self._close_condition.wait_for(
+                        lambda: self._delayed_closes == 2,
+                        timeout=1,
+                    )
+
+        runner = DelayedCloseRunner()
+        inherited_pipe_command = (
+            sys.executable,
+            "-c",
+            "import subprocess, sys; "
+            "sys.stdout.write('private child output'); sys.stdout.flush(); "
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(2)'])",
+        )
+        normal_capture_command = (
+            sys.executable,
+            "-c",
+            "import sys, time; time.sleep(0.1); "
+            "sys.stdout.write('normal stdout\\n'); sys.stdout.flush(); "
+            "sys.stderr.write('normal stderr\\n'); sys.stderr.flush()",
+        )
+        capture: dict[str, ProcessResult] = {}
+        second_process_started = threading.Event()
+        popen_calls = 0
+        popen_lock = threading.Lock()
+        from hydra_codex import mcp_server
+
+        real_popen = mcp_server.subprocess.Popen
+
+        def tracked_popen(*args, **kwargs):
+            nonlocal popen_calls
+            process = real_popen(*args, **kwargs)
+            with popen_lock:
+                popen_calls += 1
+                if popen_calls == 2:
+                    second_process_started.set()
+            return process
+
+        capture_thread = threading.Thread(
+            target=lambda: capture.setdefault(
+                "result",
+                runner.run(normal_capture_command),
+            ),
+        )
+        try:
+            with patch(
+                "hydra_codex.mcp_server.subprocess.Popen",
+                side_effect=tracked_popen,
+            ):
+                self.assertEqual(
+                    runner.run(inherited_pipe_command),
+                    ProcessResult(1, "", ""),
+                )
+                self.assertTrue(runner.wait_for_delayed_closes())
+                capture_thread.start()
+                self.assertTrue(second_process_started.wait(timeout=1))
+                runner.allow_owned_close.set()
+                capture_thread.join(timeout=1)
+        finally:
+            runner.allow_owned_close.set()
+            if capture_thread.is_alive():
+                capture_thread.join(timeout=1)
+
+        self.assertFalse(capture_thread.is_alive())
+        self.assertEqual(
+            capture.get("result"),
+            ProcessResult(0, "normal stdout\n", "normal stderr\n"),
+        )
+        self.assertEqual(
+            [
+                thread.name
+                for thread in threading.enumerate()
+                if thread.name.startswith("hydra-codex-pipe-")
+            ],
+            [],
+        )
 
     def test_initialize_and_tool_list_are_stable(self) -> None:
         server = StdioMcpServer(FakeRunner([]))

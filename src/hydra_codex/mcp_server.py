@@ -82,19 +82,6 @@ class SubprocessRunner:
             pass
 
     @staticmethod
-    def _force_close(stream) -> None:
-        if stream is None:
-            return
-        try:
-            descriptor = stream.fileno()
-        except (OSError, ValueError):
-            return
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-
-    @staticmethod
     def _reap(process: subprocess.Popen[bytes]) -> None:
         try:
             process.wait()
@@ -124,8 +111,22 @@ class SubprocessRunner:
             thread.join(max(0.0, deadline - time.monotonic()))
         return not thread.is_alive()
 
+    @classmethod
+    def _join_all_until(
+        cls,
+        workers: tuple[threading.Thread, ...],
+        deadline: float,
+    ) -> bool:
+        joined = True
+        for worker in workers:
+            if not cls._join_until(worker, deadline):
+                joined = False
+        return joined
+
     def run(self, command: tuple[str, ...], stdin_text: str | None = None) -> ProcessResult:
         deadline = time.monotonic() + self._timeout_seconds
+        cleanup_budget = min(0.1, self._timeout_seconds * 0.5)
+        operation_deadline = deadline - cleanup_budget
         input_bytes = None if stdin_text is None else stdin_text.encode("utf-8")
         if input_bytes is not None and len(input_bytes) > _SUBPROCESS_INPUT_MAX_BYTES:
             return ProcessResult(1, "", "")
@@ -149,8 +150,18 @@ class SubprocessRunner:
         stdout = bytearray()
         stderr = bytearray()
         readers = (
-            threading.Thread(target=self._drain, args=(process.stdout, stdout), daemon=True),
-            threading.Thread(target=self._drain, args=(process.stderr, stderr), daemon=True),
+            threading.Thread(
+                target=self._drain,
+                args=(process.stdout, stdout),
+                name="hydra-codex-pipe-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._drain,
+                args=(process.stderr, stderr),
+                name="hydra-codex-pipe-stderr",
+                daemon=True,
+            ),
         )
         for reader in readers:
             reader.start()
@@ -160,6 +171,7 @@ class SubprocessRunner:
             writer = threading.Thread(
                 target=self._write,
                 args=(process.stdin, input_bytes),
+                name="hydra-codex-pipe-stdin",
                 daemon=True,
             )
             writer.start()
@@ -167,24 +179,24 @@ class SubprocessRunner:
         timed_out = False
         try:
             returncode = process.wait(
-                timeout=max(0.0, deadline - time.monotonic()),
+                timeout=max(0.0, operation_deadline - time.monotonic()),
             )
         except subprocess.TimeoutExpired:
             timed_out = True
             returncode = 1
         if not timed_out:
-            timed_out = not all(
-                self._join_until(worker, deadline) for worker in workers
+            timed_out = not self._join_all_until(
+                workers,
+                operation_deadline,
             )
         if timed_out:
             self._terminate(process, process_group=use_process_group)
-            self._force_close(process.stdin)
-            self._force_close(process.stdout)
-            self._force_close(process.stderr)
+            self._join_all_until(workers, deadline)
             if process.poll() is None:
                 threading.Thread(
                     target=self._reap,
                     args=(process,),
+                    name="hydra-codex-process-reaper",
                     daemon=True,
                 ).start()
             return ProcessResult(1, "", "")

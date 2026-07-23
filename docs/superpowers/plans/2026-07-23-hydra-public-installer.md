@@ -1077,10 +1077,15 @@ Use PyInstaller's documented one-folder and frozen-runtime mechanisms:
 Run:
 
 ```bash
-python3.12 -m PyInstaller --noconfirm --clean packaging/hydra-codex.spec
 python3.12 packaging/build_standalone.py --output "$PWD/release"
 sh packaging/accept_standalone.sh "$PWD"/release/hydra-codex-*.tar.gz
 ```
+
+`build_standalone.py` is the supported entry point. It copies only tracked
+source into a temporary staging tree, creates the exact versioned distribution
+metadata required by the spec, and invokes PyInstaller there. Running the spec
+directly from the checkout must fail closed because that checkout intentionally
+does not contain staged distribution metadata.
 
 The acceptance script must create a fresh HOME and foreign Git repository, unset `PYTHONPATH`/`PYTHONHOME`, prepend failing `python`, `python3`, `python3.12`, `pip`, and `uv` shims returning 97, install from a local fake release server, and verify:
 
@@ -1282,7 +1287,6 @@ Run sequentially:
 ```bash
 env PYTHONPATH="$PWD/src" python3.12 -m unittest discover -s tests -t .
 python3.12 -m build --no-isolation
-python3.12 -m PyInstaller --noconfirm --clean packaging/hydra-codex.spec
 python3.12 packaging/build_standalone.py --output "$PWD/release"
 sh packaging/accept_standalone.sh "$PWD"/release/hydra-codex-*.tar.gz
 git diff --check
@@ -1290,6 +1294,9 @@ git status --short
 ```
 
 Expected: all gates PASS, no test is skipped because of product behavior, and the worktree is clean except the deliberate local `release/` output ignored by Git.
+The standalone builder is also the PyInstaller gate: it creates the exact
+staged metadata and invokes the pinned PyInstaller runtime internally. A
+direct spec invocation from the checkout is expected to fail closed.
 
 - [ ] **Step 2: Obtain an independent exact-HEAD review**
 

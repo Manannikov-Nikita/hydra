@@ -48,6 +48,7 @@ class PluginDistributionContentTests(unittest.TestCase):
 
     def test_wheel_and_sdist_ship_the_complete_canonical_plugin_bundle(self) -> None:
         expected = _inventory(PLUGIN_ROOT)
+        license_text = (ROOT / "LICENSE").read_bytes()
         self.assertIn(".codex-plugin/plugin.json", expected)
         self.assertIn(".mcp.json", expected)
         self.assertIn("hooks/hooks.json", expected)
@@ -82,6 +83,14 @@ class PluginDistributionContentTests(unittest.TestCase):
 
             wheel = next(output.glob("*.whl"))
             with zipfile.ZipFile(wheel) as archive:
+                wheel_licenses = [
+                    name
+                    for name in archive.namelist()
+                    if name.endswith(".dist-info/licenses/LICENSE")
+                ]
+                self.assertTrue(wheel_licenses, "wheel does not contain LICENSE")
+                wheel_license = wheel_licenses[0]
+                self.assertEqual(archive.read(wheel_license), license_text)
                 wheel_members = {
                     name: archive.read(name)
                     for name in archive.namelist()
@@ -95,6 +104,14 @@ class PluginDistributionContentTests(unittest.TestCase):
 
             sdist = next(output.glob("*.tar.gz"))
             with tarfile.open(sdist, "r:gz") as archive:
+                sdist_licenses = [
+                    member
+                    for member in archive.getmembers()
+                    if member.isfile() and member.name.endswith("/LICENSE")
+                ]
+                self.assertTrue(sdist_licenses, "sdist does not contain LICENSE")
+                sdist_license = sdist_licenses[0]
+                self.assertEqual(archive.extractfile(sdist_license).read(), license_text)
                 sdist_members = {
                     member.name: archive.extractfile(member).read()
                     for member in archive.getmembers()

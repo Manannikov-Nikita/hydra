@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 import tomllib
 import unittest
@@ -18,6 +19,15 @@ def load_pyproject() -> dict[str, object]:
 
 
 class ReleaseMetadataTests(unittest.TestCase):
+    def test_plugin_manifest_version_matches_canonical_package_version(self) -> None:
+        manifest = json.loads(
+            (_ROOT / "plugins" / "hydra-codex" / ".codex-plugin" / "plugin.json").read_text(
+                encoding="utf-8",
+            ),
+        )
+
+        self.assertEqual(manifest["version"], __version__)
+
     def test_cli_and_mcp_use_package_version(self) -> None:
         stdout = io.StringIO()
 

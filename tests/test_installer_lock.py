@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
-from unittest.mock import patch
 
 from hydra_codex.installer_lock import (
     InstallerLockError,
@@ -14,284 +14,164 @@ from hydra_codex.installer_lock import (
 )
 
 
+LOCK_RECORD = b"hydra-installer-lock/v2\n"
+CAPABILITY_RECORD = b"hydra-installer-capability/v1\n"
+
+
 class InstallerLockTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)
         self.lock = self.home / ".hydra-installer-lock"
-        self.current_start = "darwin:Wed Jul 23 12:34:56 2026"
 
-    def process_query(self, pid: int) -> str | None:
-        return self.current_start if pid == os.getpid() else None
+    def publish_lock(self, content: bytes = LOCK_RECORD, mode: int = 0o600) -> None:
+        self.lock.write_bytes(content)
+        self.lock.chmod(mode)
 
-    def write_lock(
-        self,
-        *,
-        pid: int,
-        start: str,
-        nonce: str = "c" * 64,
-        directory_mode: int = 0o700,
-        owner_mode: int = 0o600,
-    ) -> Path:
-        self.lock.mkdir(mode=directory_mode)
-        owner = self.lock / "owner-v1"
-        owner.write_text(
-            "hydra-installer-lock/v1\n"
-            f"pid={pid}\n"
-            f"start={start}\n"
-            f"nonce={nonce}\n",
-            encoding="ascii",
+    def test_crash_before_owner_receipt_leaves_reusable_canonical_lock(self) -> None:
+        # The immutable canonical file is the complete atomic publication. A
+        # crash before any acquisition-specific state must not poison it.
+        self.publish_lock()
+
+        try:
+            held = acquire_installer_lock(self.lock, nonce="a" * 64)
+        except InstallerLockError as error:
+            self.fail(f"complete canonical publication was poisoned: {error}")
+        capability = self.home / (
+            ".hydra-installer-capability." + "a" * 64
         )
-        owner.chmod(owner_mode)
-        return owner
-
-    def test_acquire_writes_exact_private_nonce_bound_receipt_and_releases(
-        self,
-    ) -> None:
-        nonce = "a" * 64
-        held = acquire_installer_lock(
-            self.lock,
-            nonce=nonce,
-            process_query=self.process_query,
-        )
-
-        owner = self.lock / "owner-v1"
-        self.assertEqual(self.lock.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(owner.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(
-            owner.read_text(encoding="ascii"),
-            "hydra-installer-lock/v1\n"
-            f"pid={os.getpid()}\n"
-            f"start={self.current_start}\n"
-            f"nonce={nonce}\n",
-        )
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
+        self.assertEqual(self.lock.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(capability.read_bytes(), CAPABILITY_RECORD)
+        self.assertEqual(capability.stat().st_mode & 0o777, 0o600)
 
         release_installer_lock(held)
-        self.assertFalse(self.lock.exists())
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
+        self.assertFalse(capability.exists())
 
-    def test_dead_owner_is_reclaimed_but_live_reuse_and_unavailable_fail_closed(
+    def test_crash_before_canonical_link_leaves_only_an_inert_private_temp(
         self,
     ) -> None:
-        self.write_lock(pid=999_999_999, start="darwin:dead-owner")
-        held = acquire_installer_lock(
-            self.lock,
-            nonce="a" * 64,
-            process_query=self.process_query,
-        )
+        abandoned = self.home / "..hydra-installer-lock.create.abandoned"
+        abandoned.write_bytes(LOCK_RECORD)
+        abandoned.chmod(0o600)
+
+        held = acquire_installer_lock(self.lock, nonce="a" * 64)
         release_installer_lock(held)
-        self.assertFalse(self.lock.exists())
 
-        self.write_lock(pid=os.getpid(), start=self.current_start)
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=self.process_query,
-            )
-        self.assertTrue(self.lock.exists())
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
+        self.assertEqual(abandoned.read_bytes(), LOCK_RECORD)
 
-        (self.lock / "owner-v1").write_text(
-            "hydra-installer-lock/v1\n"
-            f"pid={os.getpid()}\n"
-            "start=darwin:wrong-start\n"
-            f"nonce={'d' * 64}\n",
-            encoding="ascii",
-        )
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=self.process_query,
-            )
-        self.assertTrue(self.lock.exists())
-
-        def unavailable(_pid: int) -> str | None:
-            raise InstallerLockError("process identity unavailable")
-
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=unavailable,
-            )
-        self.assertTrue(self.lock.exists())
-
-    def test_unsafe_or_ambiguous_lock_state_is_preserved(self) -> None:
-        owner = self.write_lock(
-            pid=999_999_999,
-            start="darwin:dead-owner",
-            owner_mode=0o644,
-        )
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=self.process_query,
-            )
-        self.assertEqual(owner.stat().st_mode & 0o777, 0o644)
-        owner.unlink()
-        self.lock.rmdir()
-
-        owner = self.write_lock(
-            pid=999_999_999,
-            start="darwin:dead-owner",
-            directory_mode=0o755,
-        )
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=self.process_query,
-            )
-        self.assertEqual(self.lock.stat().st_mode & 0o777, 0o755)
-        self.lock.chmod(0o700)
-        owner.unlink()
-        self.lock.rmdir()
-
-        target = self.home / "foreign"
-        target.write_text("foreign\n", encoding="utf-8")
-        self.lock.mkdir(mode=0o700)
-        (self.lock / "owner-v1").symlink_to(target)
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=self.process_query,
-            )
-        self.assertTrue((self.lock / "owner-v1").is_symlink())
-        (self.lock / "owner-v1").unlink()
-        self.lock.rmdir()
-
-        self.write_lock(pid=999_999_999, start="darwin:dead-owner")
-        extra = self.lock / "unexpected"
-        extra.write_text("preserve\n", encoding="utf-8")
-        with self.assertRaises(InstallerLockError):
-            acquire_installer_lock(
-                self.lock,
-                nonce="a" * 64,
-                process_query=self.process_query,
-            )
-        self.assertTrue(extra.exists())
-
-    def test_release_preserves_changed_owner_and_directory_identity(self) -> None:
-        held = acquire_installer_lock(
-            self.lock,
-            nonce="a" * 64,
-            process_query=self.process_query,
-        )
-        owner = self.lock / "owner-v1"
-        owner.write_text(
-            "hydra-installer-lock/v1\n"
-            f"pid={os.getpid()}\n"
-            f"start={self.current_start}\n"
-            f"nonce={'e' * 64}\n",
-            encoding="ascii",
-        )
-
-        with self.assertRaises(InstallerLockError):
-            release_installer_lock(held)
-        self.assertTrue(self.lock.is_dir())
-        self.assertIn("nonce=" + "e" * 64, owner.read_text(encoding="ascii"))
-
-    def test_release_crashes_leave_only_inert_private_retirements(self) -> None:
-        real_unlink = os.unlink
-
-        held = acquire_installer_lock(
-            self.lock,
-            nonce="a" * 64,
-            process_query=self.process_query,
-        )
-
-        def crash_before_owner_unlink(path, *args, **options):
-            if path == "owner-v1" and options.get("dir_fd") is not None:
-                raise OSError("injected crash after retirement")
-            return real_unlink(path, *args, **options)
-
-        with patch(
-            "hydra_codex.installer_lock.os.unlink",
-            side_effect=crash_before_owner_unlink,
-        ):
-            with self.assertRaises(InstallerLockError):
-                release_installer_lock(held)
-        self.assertFalse(self.lock.exists())
-        retirements = list(self.home.glob(".hydra-installer-lock.retired.*"))
-        self.assertEqual(len(retirements), 1)
-        self.assertTrue((retirements[0] / "owner-v1").is_file())
-
-        replacement = acquire_installer_lock(
-            self.lock,
-            nonce="b" * 64,
-            process_query=self.process_query,
-        )
-        release_installer_lock(replacement)
-
-        held = acquire_installer_lock(
-            self.lock,
-            nonce="c" * 64,
-            process_query=self.process_query,
-        )
-        real_rmdir = os.rmdir
-
-        def crash_after_owner_unlink(path, *args, **options):
-            if ".hydra-installer-lock.retired." in os.fspath(path):
-                raise OSError("injected crash before retirement removal")
-            return real_rmdir(path, *args, **options)
-
-        with patch(
-            "hydra_codex.installer_lock.os.rmdir",
-            side_effect=crash_after_owner_unlink,
-        ):
-            with self.assertRaises(InstallerLockError):
-                release_installer_lock(held)
-        self.assertFalse(self.lock.exists())
-        retirements = list(self.home.glob(".hydra-installer-lock.retired.*"))
-        self.assertEqual(len(retirements), 2)
-        self.assertEqual(
-            sum((retirement / "owner-v1").exists() for retirement in retirements),
-            1,
-        )
-
-        replacement = acquire_installer_lock(
-            self.lock,
-            nonce="d" * 64,
-            process_query=self.process_query,
-        )
-        release_installer_lock(replacement)
-
-    def test_concurrent_dead_reclaim_has_exactly_one_owner(self) -> None:
-        self.write_lock(pid=999_999_999, start="darwin:dead-owner")
-        entered = threading.Event()
+    def test_exact_three_contenders_have_only_one_kernel_lock_owner(self) -> None:
+        barrier = threading.Barrier(3)
         release = threading.Event()
+        condition = threading.Condition()
         outcomes: list[str] = []
 
-        def worker() -> None:
+        def worker(index: int) -> None:
+            barrier.wait()
             try:
                 held = acquire_installer_lock(
                     self.lock,
-                    nonce="a" * 64,
-                    process_query=self.process_query,
+                    nonce=f"{index + 1:064x}",
                 )
             except InstallerLockError:
-                outcomes.append("busy")
+                with condition:
+                    outcomes.append("busy")
+                    condition.notify_all()
                 return
-            outcomes.append("success")
-            entered.set()
+            with condition:
+                outcomes.append("success")
+                condition.notify_all()
             release.wait(2)
             release_installer_lock(held)
 
-        first = threading.Thread(target=worker)
-        second = threading.Thread(target=worker)
-        first.start()
-        self.assertTrue(entered.wait(1))
-        second.start()
-        second.join(1)
-        release.set()
-        first.join(2)
-        second.join(2)
+        workers = [
+            threading.Thread(target=worker, args=(index,))
+            for index in range(3)
+        ]
+        for worker_thread in workers:
+            worker_thread.start()
+        deadline = time.monotonic() + 2
+        with condition:
+            while len(outcomes) < 3 and time.monotonic() < deadline:
+                condition.wait(deadline - time.monotonic())
 
-        self.assertEqual(sorted(outcomes), ["busy", "success"])
-        self.assertFalse(self.lock.exists())
+        self.assertEqual(sorted(outcomes), ["busy", "busy", "success"])
+        release.set()
+        for worker_thread in workers:
+            worker_thread.join(2)
+        self.assertTrue(all(not worker_thread.is_alive() for worker_thread in workers))
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
+
+    def test_lock_has_no_pid_identity_and_repeated_acquisition_cannot_pid_block(
+        self,
+    ) -> None:
+        try:
+            held = acquire_installer_lock(self.lock, nonce="a" * 64)
+        except InstallerLockError as error:
+            self.fail(f"process identity still controls the lock: {error}")
+        try:
+            self.assertTrue(self.lock.is_file())
+            self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
+            self.assertNotIn(b"pid=", self.lock.read_bytes())
+            self.assertNotIn(b"start=", self.lock.read_bytes())
+        finally:
+            release_installer_lock(held)
+
+        for value in ("b", "c", "d"):
+            held = acquire_installer_lock(self.lock, nonce=value * 64)
+            release_installer_lock(held)
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
+
+    def test_malformed_foreign_or_symlinked_canonical_files_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            ("empty", b"", 0o600),
+            ("foreign", b"not-hydra\n", 0o600),
+            ("public-mode", LOCK_RECORD, 0o644),
+        )
+        for label, content, mode in cases:
+            with self.subTest(label=label):
+                selected = self.home / label
+                selected.write_bytes(content)
+                selected.chmod(mode)
+                with self.assertRaises(InstallerLockError):
+                    acquire_installer_lock(selected, nonce="a" * 64)
+                self.assertEqual(selected.read_bytes(), content)
+
+        target = self.home / "target"
+        target.write_bytes(LOCK_RECORD)
+        target.chmod(0o600)
+        linked = self.home / "linked"
+        linked.symlink_to(target)
+        with self.assertRaises(InstallerLockError):
+            acquire_installer_lock(linked, nonce="a" * 64)
+        self.assertTrue(linked.is_symlink())
+
+        directory = self.home / "directory"
+        directory.mkdir(mode=0o700)
+        with self.assertRaises(InstallerLockError):
+            acquire_installer_lock(directory, nonce="a" * 64)
+        self.assertTrue(directory.is_dir())
+
+    def test_stale_capabilities_are_inert_and_exact_collisions_fail_closed(
+        self,
+    ) -> None:
+        stale = self.home / (".hydra-installer-capability." + "a" * 64)
+        stale.write_bytes(CAPABILITY_RECORD)
+        stale.chmod(0o600)
+
+        with self.assertRaises(InstallerLockError):
+            acquire_installer_lock(self.lock, nonce="a" * 64)
+        self.assertEqual(stale.read_bytes(), CAPABILITY_RECORD)
+
+        held = acquire_installer_lock(self.lock, nonce="b" * 64)
+        release_installer_lock(held)
+        self.assertEqual(stale.read_bytes(), CAPABILITY_RECORD)
+        self.assertEqual(self.lock.read_bytes(), LOCK_RECORD)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -8,7 +7,6 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
 
 from hydra_codex.install_layout import validate_bundle
 from hydra_codex.release_management import (
@@ -33,16 +31,16 @@ class ReleaseAcquisitionTests(unittest.TestCase):
         installer.chmod(0o700)
         activate_version(first, roots=self.roots, environ=self.environ)
         self.active = self.roots.current.resolve()
-        process_start = patch(
-            "hydra_codex.installer_lock._process_start_query",
-            side_effect=lambda pid: (
-                "darwin:Wed Jul 23 12:34:56 2026"
-                if pid == os.getpid()
-                else None
-            ),
+
+    def assert_installer_lock_is_idle(self) -> None:
+        lock = self.home / ".hydra-installer-lock"
+        self.assertTrue(lock.is_file())
+        self.assertEqual(lock.read_bytes(), b"hydra-installer-lock/v2\n")
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            list(self.home.glob(".hydra-installer-capability.*")),
+            [],
         )
-        process_start.start()
-        self.addCleanup(process_start.stop)
 
     def acquisition_api(self):
         try:
@@ -74,25 +72,19 @@ class ReleaseAcquisitionTests(unittest.TestCase):
             candidate = self.staged_candidate()
             observed.update(command=command, **options)
             lock = self.home / ".hydra-installer-lock"
-            self.assertTrue(lock.is_dir())
-            owner = lock / "owner-v1"
-            self.assertEqual(owner.stat().st_mode & 0o777, 0o600)
-            self.assertRegex(
-                owner.read_text(encoding="ascii"),
-                (
-                    r"\Ahydra-installer-lock/v1\n"
-                    r"pid=[1-9][0-9]*\n"
-                    r"start=[^\n]{1,80}\n"
-                    r"nonce=[0-9a-f]{64}\n\Z"
-                ),
-            )
+            self.assertTrue(lock.is_file())
+            self.assertEqual(lock.read_bytes(), b"hydra-installer-lock/v2\n")
             capability = options["env"][
                 "HYDRA_INTERNAL_RELEASE_ACQUISITION"
             ]
-            self.assertIn(
-                f"nonce={capability}\n",
-                owner.read_text(encoding="ascii"),
+            capability_file = self.home / (
+                ".hydra-installer-capability." + capability
             )
+            self.assertEqual(
+                capability_file.read_bytes(),
+                b"hydra-installer-capability/v1\n",
+            )
+            self.assertEqual(capability_file.stat().st_mode & 0o777, 0o600)
             return subprocess.CompletedProcess(command, 0, str(candidate) + "\n", "")
 
         with acquire(
@@ -146,7 +138,7 @@ class ReleaseAcquisitionTests(unittest.TestCase):
         self.assertIsNotNone(re.fullmatch(r"[0-9a-f]{64}", capability))
         assert candidate is not None
         self.assertFalse(candidate.parent.exists())
-        self.assertFalse((self.home / ".hydra-installer-lock").exists())
+        self.assert_installer_lock_is_idle()
 
     def test_acquisition_failures_are_path_private_and_release_all_owned_state(
         self,
@@ -165,7 +157,7 @@ class ReleaseAcquisitionTests(unittest.TestCase):
             ):
                 self.fail("failed acquisition yielded a candidate")
         self.assertNotIn(private, str(failure.exception))
-        self.assertFalse((self.home / ".hydra-installer-lock").exists())
+        self.assert_installer_lock_is_idle()
 
         def timed_out(command, **options):
             raise subprocess.TimeoutExpired(
@@ -183,7 +175,7 @@ class ReleaseAcquisitionTests(unittest.TestCase):
             ):
                 self.fail("timed-out acquisition yielded a candidate")
         self.assertNotIn(private, str(timeout.exception))
-        self.assertFalse((self.home / ".hydra-installer-lock").exists())
+        self.assert_installer_lock_is_idle()
 
     def test_acquisition_rejects_oversized_or_out_of_root_output_without_deleting_it(
         self,
@@ -206,7 +198,7 @@ class ReleaseAcquisitionTests(unittest.TestCase):
                     ):
                         self.fail("unsafe acquisition output was accepted")
                 self.assertTrue(outside.exists())
-                self.assertFalse((self.home / ".hydra-installer-lock").exists())
+                self.assert_installer_lock_is_idle()
 
     def test_acquisition_recovers_only_a_bounded_number_of_owned_staging_roots(
         self,

@@ -254,6 +254,9 @@ class InstallerTests(unittest.TestCase):
             "candidate = Path(sys.argv[1])\n"
             "layout = validate_bundle(candidate)\n"
             "roots = default_install_roots(Path(os.environ['HOME']))\n"
+            "if os.environ.get('HYDRA_EXPECT_NO_PRELOCK_HOME') == '1' "
+            "and roots.home.exists():\n"
+            " raise SystemExit(73)\n"
             "activate_version(layout, roots=roots, environ=os.environ)\n",
             encoding="utf-8",
         )
@@ -328,60 +331,18 @@ class InstallerTests(unittest.TestCase):
     def launcher(self) -> Path:
         return self.home / ".local" / "bin" / "hydra-codex"
 
-    def write_installer_lock(
-        self,
-        *,
-        pid: int,
-        start: str,
-        nonce: str = "c" * 64,
-        owner_mode: int = 0o600,
-    ) -> Path:
-        lock = self.home / ".hydra-installer-lock"
-        lock.mkdir(mode=0o700)
-        owner = lock / "owner-v1"
-        owner.write_text(
-            "hydra-installer-lock/v1\n"
-            f"pid={pid}\n"
-            f"start={start}\n"
-            f"nonce={nonce}\n",
-            encoding="ascii",
-        )
-        owner.chmod(owner_mode)
-        return lock
-
-    @staticmethod
-    def process_start(pid: int) -> str:
-        result = subprocess.run(
-            ("ps", "-o", "lstart=", "-p", str(pid)),
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-            text=True,
-            capture_output=True,
-            timeout=2,
-            check=True,
-        )
-        return "darwin:" + result.stdout.strip()
-
-    @staticmethod
-    def dead_pid() -> int:
-        for pid in range(99_999, 99_899, -1):
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-                text=True,
-                capture_output=True,
-                timeout=2,
-                check=False,
-            )
-            if result.returncode == 1 and not result.stdout and not result.stderr:
-                return pid
-        raise AssertionError("no definitively dead test PID is available")
-
     def test_script_is_posix_private_and_has_no_python_or_jq_bootstrap(self) -> None:
         source = INSTALLER.read_text(encoding="utf-8")
         self.assertTrue(source.startswith("#!/bin/sh\nset -eu\n"))
         self.assertIn("umask 077", source)
         self.assertNotIn("python", source.lower())
         self.assertNotIn("jq", source.lower())
+        self.assertNotIn("LOCK_", source)
+        self.assertNotIn("owner-v1", source)
+        self.assertNotIn("process_start_identity", source)
+        self.assertNotIn("reclaim_dead_installer_lock", source)
+        self.assertNotIn("cleanup_installer_lock", source)
+        self.assertNotIn(".hydra-installer-lock", source)
 
     def test_private_acquisition_requires_capability_and_preserves_parent_lock(
         self,
@@ -394,11 +355,14 @@ class InstallerTests(unittest.TestCase):
         self.run_installer("--version", "1.0.0")
         self.publish("1.0.1")
         capability = "a" * 64
-        lock = self.write_installer_lock(
-            pid=os.getpid(),
-            start=self.process_start(os.getpid()),
-            nonce=capability,
+        capability_file = self.home / (
+            ".hydra-installer-capability." + capability
         )
+        capability_file.write_text(
+            "hydra-installer-capability/v1\n",
+            encoding="ascii",
+        )
+        capability_file.chmod(0o600)
         acquired = self.run_installer(
             "--acquire",
             environment={
@@ -413,7 +377,52 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(candidate.parent.parent, self.home / ".hydra")
         self.assertTrue(candidate.parent.name.startswith(".acquire."))
         self.assertEqual(validate_bundle(candidate).version, "1.0.1")
-        self.assertTrue(lock.is_dir())
+        self.assertEqual(
+            capability_file.read_text(encoding="ascii"),
+            "hydra-installer-capability/v1\n",
+        )
+
+        capability_file.write_text(
+            "hydra-installer-capability/v1\ntrailing\n",
+            encoding="ascii",
+        )
+        trailing = self.run_installer(
+            "--acquire",
+            environment={
+                "HYDRA_INTERNAL_RELEASE_ACQUISITION": capability,
+            },
+        )
+        self.assertNotEqual(trailing.returncode, 0)
+
+        capability_file.write_text(
+            "hydra-installer-capability/v1\n",
+            encoding="ascii",
+        )
+        capability_file.chmod(0o644)
+        public = self.run_installer(
+            "--acquire",
+            environment={
+                "HYDRA_INTERNAL_RELEASE_ACQUISITION": capability,
+            },
+        )
+        self.assertNotEqual(public.returncode, 0)
+
+        capability_file.unlink()
+        foreign = self.root / "foreign-capability"
+        foreign.write_text(
+            "hydra-installer-capability/v1\n",
+            encoding="ascii",
+        )
+        foreign.chmod(0o600)
+        capability_file.symlink_to(foreign)
+        linked = self.run_installer(
+            "--acquire",
+            environment={
+                "HYDRA_INTERNAL_RELEASE_ACQUISITION": capability,
+            },
+        )
+        self.assertNotEqual(linked.returncode, 0)
+        self.assertTrue(capability_file.is_symlink())
 
     def test_private_resolution_is_capability_gated_machine_readable_and_read_only(
         self,
@@ -489,6 +498,16 @@ class InstallerTests(unittest.TestCase):
             2,
         )
         self.assertNotIn("/releases/latest", self.state.requests)
+
+    def test_initial_bootstrap_defers_shared_hydra_home_to_activation(self) -> None:
+        result = self.run_installer(
+            "--version",
+            "1.0.0",
+            environment={"HYDRA_EXPECT_NO_PRELOCK_HOME": "1"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue(self.current.is_symlink())
 
     def test_activation_is_delegated_to_task5_runtime_helper(self) -> None:
         result = self.run_installer("--version", "1.0.0")
@@ -657,6 +676,53 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(activated.name, "1.0.0")
         self.assertTrue(self.current.is_symlink())
+
+    def test_staged_runtime_activation_holds_the_kernel_installer_lock(
+        self,
+    ) -> None:
+        from hydra_codex.installation_cli import activate_staged_runtime
+
+        archive = self.root / "locked-activation-candidate.tar.gz"
+        make_archive(archive, "1.0.0", "darwin-arm64")
+        extract = self.root / "locked-activation-extract"
+        extract.mkdir()
+        with tarfile.open(archive, "r:gz") as bundle:
+            bundle.extractall(extract, filter="data")
+        candidate = extract / "hydra-codex-1.0.0"
+        held = object()
+        activated = self.home / ".hydra" / "versions" / "1.0.0"
+
+        with (
+            patch(
+                "hydra_codex.installation_cli.acquire_installer_lock",
+                return_value=held,
+                create=True,
+            ) as acquire,
+            patch(
+                "hydra_codex.installation_cli.release_installer_lock",
+                create=True,
+            ) as release,
+            patch(
+                "hydra_codex.installation_cli.activate_version",
+                return_value=activated,
+            ) as activate,
+        ):
+            result = activate_staged_runtime(
+                candidate,
+                environ={"HOME": str(self.home)},
+                executable=candidate / "bin" / "hydra-codex",
+            )
+
+        self.assertEqual(result, activated)
+        lock_path = self.home / ".hydra-installer-lock"
+        acquire.assert_called_once()
+        self.assertEqual(acquire.call_args.args, (lock_path,))
+        self.assertRegex(
+            acquire.call_args.kwargs["nonce"],
+            r"\A[0-9a-f]{64}\Z",
+        )
+        release.assert_called_once_with(held)
+        activate.assert_called_once()
 
     def test_invalid_release_override_is_rejected_before_curl(self) -> None:
         marker = self.root / "curl-called"
@@ -996,7 +1062,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((self.home / ".hydra").exists())
 
-    def test_concurrent_installs_share_one_private_lock_domain(self) -> None:
+    def test_concurrent_bootstraps_converge_at_runtime_activation(self) -> None:
         self.state.delay_archive = 0.4
         values = {
             "HOME": str(self.home),
@@ -1028,274 +1094,12 @@ class InstallerTests(unittest.TestCase):
         first_stdout, first_stderr = first.communicate(timeout=15)
 
         returncodes = (first.returncode, second.returncode)
-        self.assertEqual(sum(code == 0 for code in returncodes), 1)
-        self.assertEqual(sum(code != 0 for code in returncodes), 1)
+        self.assertGreaterEqual(sum(code == 0 for code in returncodes), 1)
+        self.assertTrue(all(code in {0, 1} for code in returncodes))
         self.assertTrue(self.launcher.is_symlink())
+        self.assertEqual(self.current.resolve().name, "1.0.0")
         self.assertNotIn(str(self.home), second.stderr + first_stderr)
         self.assertNotIn(str(self.home), first_stdout)
-
-    def test_preexisting_lock_is_never_removed_by_a_nonowner(self) -> None:
-        lock = self.home / ".hydra-installer-lock"
-        lock.mkdir(mode=0o700)
-
-        result = self.run_installer("--version", "1.0.0")
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(lock.is_dir())
-
-    def test_dead_installer_lock_is_reclaimed_but_live_and_pid_reuse_are_not(
-        self,
-    ) -> None:
-        dead = self.write_installer_lock(
-            pid=self.dead_pid(),
-            start="darwin:dead-owner",
-        )
-        installed = self.run_installer("--version", "1.0.0")
-        self.assertEqual(installed.returncode, 0, installed.stderr)
-        self.assertFalse(dead.exists())
-
-        self.run_installer("--uninstall")
-        live = self.write_installer_lock(
-            pid=os.getpid(),
-            start=self.process_start(os.getpid()),
-        )
-        rejected = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertTrue(live.is_dir())
-
-        (live / "owner-v1").write_text(
-            "hydra-installer-lock/v1\n"
-            f"pid={os.getpid()}\n"
-            "start=darwin:wrong-start-identity\n"
-            f"nonce={'d' * 64}\n",
-            encoding="ascii",
-        )
-        reused = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(reused.returncode, 0)
-        self.assertTrue(live.is_dir())
-
-    def test_unsafe_installer_lock_owner_is_fail_closed(self) -> None:
-        lock = self.write_installer_lock(
-            pid=999_999_999,
-            start="darwin:dead-owner",
-            owner_mode=0o644,
-        )
-        mode = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(mode.returncode, 0)
-        self.assertTrue(lock.is_dir())
-        (lock / "owner-v1").unlink()
-        lock.rmdir()
-
-        lock = self.write_installer_lock(
-            pid=999_999_999,
-            start="darwin:dead-owner",
-        )
-        lock.chmod(0o755)
-        directory_mode = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(directory_mode.returncode, 0)
-        self.assertEqual(lock.stat().st_mode & 0o777, 0o755)
-        lock.chmod(0o700)
-        (lock / "owner-v1").unlink()
-        lock.rmdir()
-
-        foreign = self.root / "foreign-owner"
-        foreign.write_text("foreign\n", encoding="utf-8")
-        lock.mkdir(mode=0o700)
-        (lock / "owner-v1").symlink_to(foreign)
-        linked = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(linked.returncode, 0)
-        self.assertTrue((lock / "owner-v1").is_symlink())
-        (lock / "owner-v1").unlink()
-        lock.rmdir()
-
-        lock = self.write_installer_lock(
-            pid=999_999_999,
-            start="darwin:dead-owner",
-        )
-        (lock / "unexpected").write_text("preserve\n", encoding="utf-8")
-        extra = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(extra.returncode, 0)
-        self.assertTrue((lock / "unexpected").is_file())
-        (lock / "unexpected").unlink()
-        (lock / "owner-v1").unlink()
-        lock.rmdir()
-
-        lock = self.write_installer_lock(
-            pid=999_999_999,
-            start="darwin:dead-owner",
-        )
-        ps = self.shims / "ps"
-        ps.write_text("#!/bin/sh\nexit 77\n", encoding="utf-8")
-        ps.chmod(0o700)
-        unavailable = self.run_installer("--version", "1.0.0")
-        self.assertNotEqual(unavailable.returncode, 0)
-        self.assertTrue(lock.is_dir())
-
-    def test_cleanup_preserves_a_lock_whose_owner_changed(self) -> None:
-        self.state.delay_archive = 0.4
-        values = {
-            "HOME": str(self.home),
-            "PATH": f"{self.shims}:/usr/bin:/bin:/usr/sbin:/sbin",
-            "HYDRA_INSTALLER_RELEASE_BASE_URL": self.release_base,
-            "HYDRA_TEST_ACTIVATOR": str(self.activator),
-            "PYTHONPATH": str(ROOT / "src"),
-            "LC_ALL": "C",
-        }
-        process = subprocess.Popen(
-            ("sh", str(INSTALLER), "--version", "1.0.0"),
-            cwd=ROOT,
-            env=values,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        owner = self.home / ".hydra-installer-lock" / "owner-v1"
-        archive_request = (
-            "/releases/download/v1.0.0/"
-            "hydra-codex-1.0.0-darwin-arm64.tar.gz"
-        )
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and (
-            not owner.exists() or archive_request not in self.state.requests
-        ):
-            time.sleep(0.01)
-        self.assertTrue(owner.exists())
-        self.assertIn(archive_request, self.state.requests)
-        owner.write_text(
-            "hydra-installer-lock/v1\n"
-            f"pid={os.getpid()}\n"
-            f"start={self.process_start(os.getpid())}\n"
-            f"nonce={'e' * 64}\n",
-            encoding="ascii",
-        )
-        stdout, stderr = process.communicate(timeout=15)
-
-        self.assertEqual(process.returncode, 0, stderr + stdout)
-        self.assertTrue(owner.exists())
-        self.assertIn("nonce=" + "e" * 64, owner.read_text(encoding="ascii"))
-
-    def test_cleanup_crashes_leave_only_inert_private_retirements(self) -> None:
-        marker = self.root / "cleanup-crash"
-        rm = self.shims / "rm"
-        rm.write_text(
-            "#!/bin/sh\n"
-            "case \"${1-}\" in\n"
-            "  \"$HOME\"/.hydra-installer-lock.retired.*/owner-v1)\n"
-            "    : > \"$TEST_CRASH_MARKER\"\n"
-            "    kill -KILL \"$PPID\"\n"
-            "    sleep 1\n"
-            "    exit 99\n"
-            "    ;;\n"
-            "esac\n"
-            "exec /bin/rm \"$@\"\n",
-            encoding="utf-8",
-        )
-        rm.chmod(0o700)
-
-        crashed = self.run_installer(
-            "--version",
-            "1.0.0",
-            environment={"TEST_CRASH_MARKER": str(marker)},
-        )
-        self.assertNotEqual(crashed.returncode, 0)
-        self.assertTrue(marker.is_file())
-        self.assertFalse((self.home / ".hydra-installer-lock").exists())
-        retirements = list(
-            self.home.glob(".hydra-installer-lock.retired.*"),
-        )
-        self.assertEqual(len(retirements), 1)
-        self.assertTrue((retirements[0] / "owner-v1").is_file())
-
-        rm.unlink()
-        recovered = self.run_installer("--version", "1.0.0")
-        self.assertEqual(
-            recovered.returncode,
-            0,
-            recovered.stderr + recovered.stdout,
-        )
-
-        marker.unlink()
-        rmdir = self.shims / "rmdir"
-        rmdir.write_text(
-            "#!/bin/sh\n"
-            "case \"${1-}\" in\n"
-            "  \"$HOME\"/.hydra-installer-lock.retired.*)\n"
-            "    : > \"$TEST_CRASH_MARKER\"\n"
-            "    kill -KILL \"$PPID\"\n"
-            "    sleep 1\n"
-            "    exit 99\n"
-            "    ;;\n"
-            "esac\n"
-            "exec /bin/rmdir \"$@\"\n",
-            encoding="utf-8",
-        )
-        rmdir.chmod(0o700)
-
-        crashed = self.run_installer(
-            "--version",
-            "1.0.0",
-            environment={"TEST_CRASH_MARKER": str(marker)},
-        )
-        self.assertNotEqual(crashed.returncode, 0)
-        self.assertTrue(marker.is_file())
-        self.assertFalse((self.home / ".hydra-installer-lock").exists())
-        retirements = list(
-            self.home.glob(".hydra-installer-lock.retired.*"),
-        )
-        self.assertEqual(len(retirements), 2)
-        self.assertEqual(
-            sum((retirement / "owner-v1").exists() for retirement in retirements),
-            1,
-        )
-
-        rmdir.unlink()
-        recovered = self.run_installer("--version", "1.0.0")
-        self.assertEqual(
-            recovered.returncode,
-            0,
-            recovered.stderr + recovered.stdout,
-        )
-
-    def test_concurrent_stale_lock_reclaim_has_one_winner(self) -> None:
-        self.write_installer_lock(
-            pid=self.dead_pid(),
-            start="darwin:dead-owner",
-        )
-        self.state.delay_archive = 0.4
-        values = {
-            "HOME": str(self.home),
-            "PATH": f"{self.shims}:/usr/bin:/bin:/usr/sbin:/sbin",
-            "HYDRA_INSTALLER_RELEASE_BASE_URL": self.release_base,
-            "HYDRA_TEST_ACTIVATOR": str(self.activator),
-            "PYTHONPATH": str(ROOT / "src"),
-            "LC_ALL": "C",
-        }
-        command = ("sh", str(INSTALLER), "--version", "1.0.0")
-        first = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            env=values,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        second = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            env=values,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        first_output = first.communicate(timeout=15)
-        second_output = second.communicate(timeout=15)
-
-        self.assertEqual(
-            sum(code == 0 for code in (first.returncode, second.returncode)),
-            1,
-            first_output + second_output,
-        )
-        self.assertFalse((self.home / ".hydra-installer-lock").exists())
 
 
 if __name__ == "__main__":

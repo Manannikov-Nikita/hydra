@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import secrets
 from typing import Mapping, TextIO
 
 from . import __version__
@@ -17,6 +18,7 @@ from .codex_integration import (
 from .platform_paths import default_data_directory
 from .plugin_bundle import marketplace_root_path
 from .project_lifecycle import initialize_project, uninitialize_project
+from .installer_lock import acquire_installer_lock, release_installer_lock
 from .release_management import (
     activate_version,
     check_upgrade,
@@ -50,7 +52,14 @@ def activate_staged_runtime(
         raise ValueError("staged activation identity is invalid")
     layout = validate_bundle(selected)
     roots = default_install_roots(_home(environ))
-    return activate_version(layout, roots=roots, environ=environ)
+    held_lock = acquire_installer_lock(
+        roots.home.parent / ".hydra-installer-lock",
+        nonce=secrets.token_hex(32),
+    )
+    try:
+        return activate_version(layout, roots=roots, environ=environ)
+    finally:
+        release_installer_lock(held_lock)
 
 
 def _write_json(stdout: TextIO, value: Mapping[str, object]) -> None:

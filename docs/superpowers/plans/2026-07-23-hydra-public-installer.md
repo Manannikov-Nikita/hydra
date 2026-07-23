@@ -118,7 +118,7 @@ class ReleaseMetadataTests(unittest.TestCase):
 
     def test_public_metadata_and_license_are_shipped(self) -> None:
         metadata = load_pyproject()
-        self.assertEqual(metadata["license"]["text"], "MIT")
+        self.assertEqual(metadata["license"], "MIT")
         self.assertEqual(
             metadata["urls"]["Repository"],
             "https://github.com/Manannikov-Nikita/hydra",

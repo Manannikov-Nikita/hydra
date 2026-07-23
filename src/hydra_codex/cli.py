@@ -133,6 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    commands.add_parser("hook")
+    commands.add_parser("mcp")
+
     ingest = commands.add_parser("ingest")
     _common_options(ingest)
     ingest.add_argument("--source", action="append", default=[])
@@ -497,6 +500,27 @@ def main(
                 stdout=output_stream,
             )
             return 0
+        if arguments.command in {"hook", "mcp"}:
+            from .runtime_entrypoint import runtime_command_prefix
+
+            command_prefix = runtime_command_prefix()
+            if arguments.command == "hook":
+                from .hook_runtime import run as run_hook
+
+                return run_hook(
+                    stdin=input_stream,
+                    stdout=output_stream,
+                    stderr=error_stream,
+                    environ=environment,
+                    command_prefix=command_prefix,
+                )
+            from .mcp_server import main as run_mcp
+
+            return run_mcp(
+                input_stream=input_stream,
+                output_stream=output_stream,
+                command_prefix=command_prefix,
+            )
         if arguments.command == "dashboard":
             from .dashboard_launch import run_dashboard
 

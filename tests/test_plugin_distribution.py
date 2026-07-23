@@ -15,6 +15,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins" / "hydra-codex"
 INSTALLED_PREFIX = "share/hydra-codex/plugins/hydra-codex"
+MARKETPLACE_MANIFEST = ROOT / ".agents" / "plugins" / "marketplace.json"
+INSTALLED_MARKETPLACE = "share/hydra-codex/.agents/plugins/marketplace.json"
 
 
 def _inventory(root: Path) -> dict[str, bytes]:
@@ -45,6 +47,16 @@ class PluginDistributionContentTests(unittest.TestCase):
                         )
         self.assertEqual(set(mapped), expected)
         self.assertEqual(len(mapped), len(expected))
+
+        marketplace_sources = [
+            source
+            for destination, patterns in data_files.items()
+            if destination == "share/hydra-codex/.agents/plugins"
+            for pattern in patterns
+            for source in sorted(ROOT.glob(pattern))
+            if source.is_file()
+        ]
+        self.assertEqual(marketplace_sources, [MARKETPLACE_MANIFEST])
 
     def test_wheel_and_sdist_ship_the_complete_canonical_plugin_bundle(self) -> None:
         expected = _inventory(PLUGIN_ROOT)
@@ -96,6 +108,17 @@ class PluginDistributionContentTests(unittest.TestCase):
                     for name in archive.namelist()
                     if f"/{INSTALLED_PREFIX}/" in f"/{name}"
                 }
+                marketplace_members = [
+                    name
+                    for name in archive.namelist()
+                    if name.endswith("/" + INSTALLED_MARKETPLACE)
+                    or name == INSTALLED_MARKETPLACE
+                ]
+                self.assertEqual(len(marketplace_members), 1)
+                self.assertEqual(
+                    archive.read(marketplace_members[0]),
+                    MARKETPLACE_MANIFEST.read_bytes(),
+                )
             wheel_bundle = {
                 name.split(f"{INSTALLED_PREFIX}/", 1)[1]: content
                 for name, content in wheel_members.items()
@@ -117,6 +140,17 @@ class PluginDistributionContentTests(unittest.TestCase):
                     for member in archive.getmembers()
                     if member.isfile() and "/plugins/hydra-codex/" in member.name
                 }
+                marketplace_members = [
+                    member
+                    for member in archive.getmembers()
+                    if member.isfile()
+                    and member.name.endswith("/.agents/plugins/marketplace.json")
+                ]
+                self.assertEqual(len(marketplace_members), 1)
+                self.assertEqual(
+                    archive.extractfile(marketplace_members[0]).read(),
+                    MARKETPLACE_MANIFEST.read_bytes(),
+                )
             sdist_bundle = {
                 name.split("/plugins/hydra-codex/", 1)[1]: content
                 for name, content in sdist_members.items()
@@ -136,6 +170,7 @@ class PluginBundleApiTests(unittest.TestCase):
         plugin_bundle = self._api()
 
         self.assertEqual(plugin_bundle.plugin_bundle_path(), PLUGIN_ROOT.resolve())
+        self.assertEqual(plugin_bundle.marketplace_root_path(), ROOT.resolve())
 
     def test_api_materializes_the_complete_bundle_without_overwriting(self) -> None:
         plugin_bundle = self._api()

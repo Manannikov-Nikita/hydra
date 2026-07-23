@@ -48,6 +48,9 @@ hydra_codex = [
 ]
 
 [tool.setuptools.data-files]
+"share/hydra-codex/.agents/plugins" = [
+    ".agents/plugins/marketplace.json",
+]
 "share/hydra-codex/plugins/hydra-codex" = [
     "plugins/hydra-codex/.mcp.json",
     "plugins/hydra-codex/README.md",

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -118,8 +119,13 @@ class PackagedHookEntrypointTests(unittest.TestCase):
         context = self.assert_prompt_shape(self.invoke(
             command, self.prompt(session="plugin-session", turn="plugin-turn"),
         ))
-        self.assertIn("hydra-codex annotate --kind phase", context)
-        self.assertIn("hydra-codex annotate --kind finish", context)
+        safe_runtime = shlex.join((
+            os.path.abspath(sys.executable),
+            "-m",
+            "hydra_codex",
+        ))
+        self.assertIn(f"{safe_runtime} annotate --kind phase", context)
+        self.assertIn(f"{safe_runtime} annotate --kind finish", context)
         self.assertIn("`HYDRA_TURN_CAPABILITY=hcap_v1_", context)
         self.assertNotIn("PYTHONPATH", context)
         self.assert_stop_shape(self.invoke(
@@ -131,10 +137,7 @@ class PackagedHookEntrypointTests(unittest.TestCase):
         context = self.assert_prompt_shape(self.invoke(
             command, self.prompt(session="lifecycle-session", turn="lifecycle-turn"),
         ))
-        match = re.search(
-            r"HYDRA_TURN_CAPABILITY=([A-Za-z0-9_-]+) hydra-codex annotate",
-            context,
-        )
+        match = re.search(r"HYDRA_TURN_CAPABILITY=([A-Za-z0-9_-]+)", context)
         self.assertIsNotNone(match)
         environment = {**self.environment, "HYDRA_TURN_CAPABILITY": match.group(1)}
 
@@ -196,6 +199,33 @@ class PackagedHookEntrypointTests(unittest.TestCase):
         self.assert_stop_shape(local_stop)
         self.assertEqual(plugin_stop, {})
 
+    def test_command_containing_hook_path_as_text_does_not_shadow_plugin(self) -> None:
+        (self.root / ".codex").mkdir()
+        hooks = {
+            "hooks": {
+                event: [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "echo integrations/codex/hook.py",
+                        "timeout": 10,
+                    }],
+                }]
+                for event in ("UserPromptSubmit", "PostToolUse", "Stop")
+            },
+        }
+        (self.root / ".codex" / "hooks.json").write_text(
+            json.dumps(hooks),
+            encoding="utf-8",
+        )
+        self.environment["HYDRA_CODEX_HOOK_SOURCE"] = "plugin"
+
+        response = self.invoke(
+            [sys.executable, "-m", "hydra_codex.hook_runtime"],
+            self.prompt(session="adversarial-session", turn="adversarial-turn"),
+        )
+
+        self.assert_prompt_shape(response)
+
 
 class PluginHookContractTests(unittest.TestCase):
     def test_console_script_and_plugin_hook_manifest_are_consistent(self) -> None:
@@ -231,9 +261,15 @@ class PluginHookContractTests(unittest.TestCase):
             self.assertEqual(command["type"], "command")
             self.assertEqual(
                 command["command"],
-                "env HYDRA_CODEX_HOOK_SOURCE=plugin hydra-codex-hook",
+                "env HYDRA_CODEX_HOOK_SOURCE=plugin hydra-codex hook",
             )
             self.assertLessEqual(command["timeout"], 10)
+
+        mcp = json.loads((plugin_root / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            mcp["mcpServers"]["hydra"],
+            {"command": "hydra-codex", "args": ["mcp"]},
+        )
 
         project_hooks = json.loads(
             (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8"),
@@ -241,6 +277,27 @@ class PluginHookContractTests(unittest.TestCase):
         self.assertEqual(
             set(project_hooks["hooks"]), {"UserPromptSubmit", "PostToolUse", "Stop"},
         )
+
+    def test_bundled_marketplace_contains_only_the_canonical_plugin(self) -> None:
+        marketplace = json.loads(
+            (ROOT / ".agents" / "plugins" / "marketplace.json").read_text(
+                encoding="utf-8",
+            ),
+        )
+        self.assertEqual(marketplace["name"], "hydra")
+        self.assertEqual(marketplace["interface"], {"displayName": "Hydra"})
+        self.assertEqual(marketplace["plugins"], [{
+            "name": "hydra-codex",
+            "source": {
+                "source": "local",
+                "path": "./plugins/hydra-codex",
+            },
+            "policy": {
+                "installation": "AVAILABLE",
+                "authentication": "ON_INSTALL",
+            },
+            "category": "Developer Tools",
+        }])
 
     def test_plugin_documents_post_pilot_installation_precondition(self) -> None:
         plugin_readme = (

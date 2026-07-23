@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 from typing import Any, TextIO
 
@@ -24,6 +25,7 @@ from .project import ProjectResolution, resolve_project
 from .rollout_identity import Pseudonymizer
 from .platform_paths import default_installation_key_path
 from .storage import HydraStore, StorageUnavailable
+from .runtime_entrypoint import runtime_command_prefix
 
 
 Clock = Callable[[], datetime]
@@ -33,10 +35,11 @@ ProjectResolver = Callable[[Path | str], ProjectResolution]
 
 _INITIAL_REQUEST_DOMAIN = "codex-hook-initial-understand-v1"
 _CAPABILITY_LIFETIME = timedelta(hours=24)
-_INSTALLED_ANNOTATION_COMMAND = (
-    "HYDRA_TURN_CAPABILITY={capability} hydra-codex annotate"
-)
 _PLUGIN_SOURCE = "plugin"
+_PROJECT_HOOK_COMMANDS = frozenset({
+    'python3.12 "$(git rev-parse --show-toplevel)/integrations/codex/hook.py"',
+    "hydra-codex-hook",
+})
 
 
 def _required_text(payload: Mapping[str, Any], field: str) -> str:
@@ -121,12 +124,25 @@ def _project_hook_owns_event(
             if not isinstance(hook, Mapping):
                 continue
             command = hook.get("command")
-            if isinstance(command, str) and (
-                "integrations/codex/hook.py" in command
-                or command.strip() == "hydra-codex-hook"
+            if (
+                hook.get("type") == "command"
+                and isinstance(command, str)
+                and command.strip() in _PROJECT_HOOK_COMMANDS
             ):
                 return True
     return False
+
+
+def _annotation_command(command_prefix: tuple[str, ...]) -> str:
+    if (
+        not command_prefix
+        or any(not isinstance(part, str) or not part for part in command_prefix)
+    ):
+        raise ValueError("invalid Hydra runtime command")
+    return (
+        "HYDRA_TURN_CAPABILITY={capability} "
+        + shlex.join((*command_prefix, "annotate"))
+    )
 
 
 def _instruction(capability: str, annotation_command: str) -> dict[str, object]:
@@ -228,7 +244,8 @@ def handle_event(
     store_factory: StoreFactory = HydraStore,
     key_loader: KeyLoader = Pseudonymizer.installation_key,
     project_resolver: ProjectResolver = resolve_project,
-    annotation_command: str = _INSTALLED_ANNOTATION_COMMAND,
+    annotation_command: str | None = None,
+    command_prefix: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     """Handle one configured Codex hook envelope; every error fails open.
 
@@ -246,10 +263,19 @@ def handle_event(
         _required_text(payload, "turn_id")
         if event == "Stop" and not isinstance(payload.get("stop_hook_active"), bool):
             return {}
+        if annotation_command is not None and command_prefix is not None:
+            return {}
+        selected_command = (
+            _annotation_command(
+                runtime_command_prefix() if command_prefix is None else command_prefix,
+            )
+            if annotation_command is None
+            else annotation_command
+        )
         if (
-            not annotation_command.strip()
-            or len(annotation_command) > 512
-            or annotation_command.count("{capability}") != 1
+            not selected_command.strip()
+            or len(selected_command) > 512
+            or selected_command.count("{capability}") != 1
         ):
             return {}
         environment = os.environ if environ is None else environ
@@ -276,10 +302,10 @@ def handle_event(
                 return {}
             if event == "UserPromptSubmit":
                 return _handle_prompt(
-                    payload, project, store, keys, now, observed_at, annotation_command,
+                    payload, project, store, keys, now, observed_at, selected_command,
                 )
             return _handle_stop(
-                payload, project, store, keys, now, observed_at, annotation_command,
+                payload, project, store, keys, now, observed_at, selected_command,
             )
         finally:
             store.close()
@@ -294,7 +320,8 @@ def run(
     stderr: TextIO | None = None,
     environ: Mapping[str, str] | None = None,
     clock: Clock | None = None,
-    annotation_command: str = _INSTALLED_ANNOTATION_COMMAND,
+    annotation_command: str | None = None,
+    command_prefix: tuple[str, ...] | None = None,
 ) -> int:
     """Read one hook JSON envelope and always emit one private JSON response."""
     input_stream = sys.stdin if stdin is None else stdin
@@ -309,6 +336,7 @@ def run(
         environ=environ,
         clock=clock,
         annotation_command=annotation_command,
+        command_prefix=command_prefix,
     )
     output_stream.write(json.dumps(response, sort_keys=True, separators=(",", ":")) + "\n")
     return 0

@@ -3,9 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import io
 import json
+import sys
 import unittest
+from unittest.mock import patch
 
-from hydra_codex.mcp_server import ProcessResult, StdioMcpServer, serve
+from hydra_codex.mcp_server import (
+    ProcessResult,
+    StdioMcpServer,
+    SubprocessRunner,
+    serve,
+)
 
 
 @dataclass
@@ -28,6 +35,61 @@ def request(identifier: int, method: str, params: object | None = None) -> dict[
 
 
 class StdioMcpServerTests(unittest.TestCase):
+    def test_injected_runtime_prefix_is_used_for_every_internal_command(self) -> None:
+        runner = FakeRunner([
+            ProcessResult(0, '{"command":"ingest","status":"ok"}\n', ""),
+            ProcessResult(0, '{"status":"ok"}\n', ""),
+            ProcessResult(0, "{}\n", ""),
+        ])
+        prefix = ("/trusted/python", "-m", "hydra_codex")
+        server = StdioMcpServer(runner, command_prefix=prefix)
+
+        response = server.handle(request(30, "tools/call", {
+            "name": "hydra.report",
+            "arguments": {"last": 1, "format": "json"},
+        }))
+
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(
+            [call[0][:3] for call in runner.calls],
+            [prefix, prefix, prefix],
+        )
+        self.assertEqual(
+            [call[0][3] for call in runner.calls],
+            ["ingest", "reconcile", "report"],
+        )
+
+    def test_subprocess_runner_is_shell_free_bounded_and_times_out(self) -> None:
+        runner = SubprocessRunner(
+            timeout_seconds=1,
+            output_max_bytes=1_024,
+        )
+        command = (
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.stdout.write('x' * 200000); "
+            "sys.stderr.write('y' * 200000)",
+        )
+        from hydra_codex import mcp_server
+
+        with patch(
+            "hydra_codex.mcp_server.subprocess.Popen",
+            wraps=mcp_server.subprocess.Popen,
+        ) as popen:
+            result = runner.run(command)
+
+        self.assertEqual(len(result.stdout.encode("utf-8")), 1_024)
+        self.assertEqual(len(result.stderr.encode("utf-8")), 1_024)
+        self.assertFalse(popen.call_args.kwargs["shell"])
+
+        timed_out = SubprocessRunner(timeout_seconds=0.05).run((
+            sys.executable,
+            "-c",
+            "import time; time.sleep(2)",
+        ))
+        self.assertEqual(timed_out, ProcessResult(1, "", ""))
+
     def test_initialize_and_tool_list_are_stable(self) -> None:
         server = StdioMcpServer(FakeRunner([]))
         initialized = server.handle(request(1, "initialize", {"protocolVersion": "2025-06-18"}))

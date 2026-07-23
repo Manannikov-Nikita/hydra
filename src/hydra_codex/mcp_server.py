@@ -12,14 +12,19 @@ import json
 import re
 import subprocess
 import sys
-from typing import Any, Mapping, Protocol, TextIO
+import threading
+from typing import Any, Mapping, Protocol, Sequence, TextIO
 
 from . import __version__
 from .contracts import ModelAnnotationInput
+from .runtime_entrypoint import runtime_command_prefix
 
 
 MCP_PROTOCOL = "2025-06-18"
 _PILOT_ID = re.compile(r"hpilot_v1_[0-9a-f]{32}\Z")
+_SUBPROCESS_TIMEOUT_SECONDS = 10
+_SUBPROCESS_OUTPUT_MAX_BYTES = 65_536
+_SUBPROCESS_INPUT_MAX_BYTES = 65_536
 
 
 @dataclass(frozen=True)
@@ -34,15 +39,90 @@ class CommandRunner(Protocol):
 
 
 class SubprocessRunner:
-    def run(self, command: tuple[str, ...], stdin_text: str | None = None) -> ProcessResult:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = _SUBPROCESS_TIMEOUT_SECONDS,
+        output_max_bytes: int = _SUBPROCESS_OUTPUT_MAX_BYTES,
+    ) -> None:
+        if timeout_seconds <= 0 or output_max_bytes <= 0:
+            raise ValueError("invalid subprocess limits")
+        self._timeout_seconds = timeout_seconds
+        self._output_max_bytes = output_max_bytes
+
+    def _drain(self, stream, output: bytearray) -> None:
         try:
-            completed = subprocess.run(
-                command, input=stdin_text, text=True, capture_output=True,
-                check=False, shell=False,
+            while chunk := stream.read(8192):
+                remaining = self._output_max_bytes - len(output)
+                if remaining > 0:
+                    output.extend(chunk[:remaining])
+        except OSError:
+            pass
+        finally:
+            stream.close()
+
+    @staticmethod
+    def _write(stream, content: bytes) -> None:
+        try:
+            stream.write(content)
+            stream.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            stream.close()
+
+    def run(self, command: tuple[str, ...], stdin_text: str | None = None) -> ProcessResult:
+        input_bytes = None if stdin_text is None else stdin_text.encode("utf-8")
+        if input_bytes is not None and len(input_bytes) > _SUBPROCESS_INPUT_MAX_BYTES:
+            return ProcessResult(1, "", "")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL if input_bytes is None else subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
             )
         except OSError:
             return ProcessResult(1, "", "")
-        return ProcessResult(completed.returncode, completed.stdout, completed.stderr)
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout = bytearray()
+        stderr = bytearray()
+        readers = (
+            threading.Thread(target=self._drain, args=(process.stdout, stdout), daemon=True),
+            threading.Thread(target=self._drain, args=(process.stderr, stderr), daemon=True),
+        )
+        for reader in readers:
+            reader.start()
+        writer = None
+        if input_bytes is not None:
+            assert process.stdin is not None
+            writer = threading.Thread(
+                target=self._write,
+                args=(process.stdin, input_bytes),
+                daemon=True,
+            )
+            writer.start()
+        try:
+            returncode = process.wait(timeout=self._timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            if writer is not None:
+                writer.join()
+            for reader in readers:
+                reader.join()
+            return ProcessResult(1, "", "")
+        if writer is not None:
+            writer.join()
+        for reader in readers:
+            reader.join()
+        return ProcessResult(
+            returncode,
+            stdout.decode("utf-8", errors="ignore"),
+            stderr.decode("utf-8", errors="ignore"),
+        )
 
 
 _ANNOTATION_PROPERTIES: dict[str, dict[str, object]] = {
@@ -134,12 +214,31 @@ class StdioMcpServer:
         self,
         runner: CommandRunner | None = None,
         *,
-        executable: str = "hydra-codex",
+        command_prefix: Sequence[str] | None = None,
+        executable: str | None = None,
         annotation_enabled: bool = False,
     ) -> None:
         self._runner = SubprocessRunner() if runner is None else runner
-        self._executable = executable
+        if command_prefix is not None and executable is not None:
+            raise ValueError("choose one Hydra command prefix")
+        selected = (
+            (executable,)
+            if executable is not None
+            else (
+                runtime_command_prefix()
+                if command_prefix is None
+                else tuple(command_prefix)
+            )
+        )
+        if not selected or any(
+            not isinstance(part, str) or not part for part in selected
+        ):
+            raise ValueError("invalid Hydra command prefix")
+        self._command_prefix = tuple(selected)
         self._annotation_enabled = annotation_enabled
+
+    def _command(self, *arguments: str) -> tuple[str, ...]:
+        return (*self._command_prefix, *arguments)
 
     def _annotate(self, arguments: object) -> dict[str, object]:
         if not isinstance(arguments, Mapping):
@@ -157,7 +256,7 @@ class StdioMcpServer:
         if model.outcome is not None:
             payload["outcome"] = model.outcome.value
         result = self._runner.run(
-            (self._executable, "annotate"),
+            self._command("annotate"),
             json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
         )
         if result.returncode != 0:
@@ -178,8 +277,7 @@ class StdioMcpServer:
             pilot_id = arguments.get("pilot")
             if not isinstance(pilot_id, str) or _PILOT_ID.fullmatch(pilot_id) is None:
                 raise ValueError("invalid pilot")
-            rendered = self._runner.run((
-                self._executable,
+            rendered = self._runner.run(self._command(
                 "audit",
                 "--pilot",
                 pilot_id,
@@ -192,14 +290,14 @@ class StdioMcpServer:
         count = arguments.get("last")
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
             raise ValueError("invalid last")
-        ingested = self._runner.run((self._executable, "ingest"))
+        ingested = self._runner.run(self._command("ingest"))
         if ingested.returncode != 0:
             return _result_text("Hydra command failed.", error=True)
-        reconciled = self._runner.run((self._executable, "reconcile"))
+        reconciled = self._runner.run(self._command("reconcile"))
         if reconciled.returncode != 0:
             return _result_text("Hydra command failed.", error=True)
-        rendered = self._runner.run((
-            self._executable, "report", "--last", str(count), "--format", str(output_format),
+        rendered = self._runner.run(self._command(
+            "report", "--last", str(count), "--format", str(output_format),
         ))
         if rendered.returncode != 0:
             return _result_text("Hydra command failed.", error=True)
@@ -265,8 +363,17 @@ def serve(input_stream: TextIO, output_stream: TextIO, server: StdioMcpServer) -
             output_stream.flush()
 
 
-def main() -> int:
-    serve(sys.stdin, sys.stdout, StdioMcpServer())
+def main(
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+    command_prefix: Sequence[str] | None = None,
+) -> int:
+    serve(
+        sys.stdin if input_stream is None else input_stream,
+        sys.stdout if output_stream is None else output_stream,
+        StdioMcpServer(command_prefix=command_prefix),
+    )
     return 0
 
 

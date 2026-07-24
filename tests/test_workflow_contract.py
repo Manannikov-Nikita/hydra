@@ -357,8 +357,18 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("gh release create", reconcile["run"])
         self.assertIn("--draft", reconcile["run"])
         self.assertIn("--verify-tag", reconcile["run"])
-        self.assertIn("gh release upload", reconcile["run"])
-        self.assertIn("draft release is required", reconcile["run"])
+        self.assertNotIn("gh release upload", reconcile["run"])
+        self.assertNotIn("gh release download", reconcile["run"])
+        self.assertIn("releases/assets/$asset_id", reconcile["run"])
+        self.assertIn("https://uploads.github.com/", reconcile["run"])
+        self.assertIn("curl --fail-with-body", reconcile["run"])
+        self.assertIn("releases/{release_id}/assets", reconcile["run"])
+        self.assertIn(
+            "release must be a draft or an immutable published release",
+            reconcile["run"],
+        )
+        self.assertIn("published release asset inventory is incomplete", reconcile["run"])
+        self.assertIn('"$release_state")" = "published"', reconcile["run"])
         self.assertIn("remote asset checksum mismatch", reconcile["run"])
         self.assertIn("prerelease", reconcile["run"])
         self.assertIn("gh api --include", reconcile["run"])
@@ -380,19 +390,22 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("git/tags/", verify["run"])
         self.assertIn("releases/latest", verify["run"])
         self.assertIn("current_version <= latest_version", verify["run"])
-        self.assertIn("gh release download", verify["run"])
+        self.assertNotIn("gh release download", verify["run"])
+        self.assertNotIn("gh release upload", verify["run"])
+        self.assertNotIn("gh release edit", verify["run"])
+        self.assertIn("releases/assets/$asset_id", verify["run"])
+        self.assertIn("--method PATCH", verify["run"])
+        self.assertIn("releases/$release_id", verify["run"])
+        self.assertIn("published release state is invalid", verify["run"])
         self.assertIn("draft release is required", verify["run"])
         self.assertIn("prerelease", verify["run"])
         self.assertIn("remote asset checksum mismatch", verify["run"])
-        self.assertIn("gh release edit", verify["run"])
-        self.assertIn("--draft=false", verify["run"])
-        self.assertIn("--latest", verify["run"])
         self.assertGreater(
-            verify["run"].index("gh release edit"),
+            verify["run"].index("--method PATCH"),
             verify["run"].index("remote asset checksum mismatch"),
         )
         self.assertGreater(
-            verify["run"].index("gh release edit"),
+            verify["run"].index("--method PATCH"),
             verify["run"].rindex("current_version <= latest_version"),
         )
         self.assertGreater(

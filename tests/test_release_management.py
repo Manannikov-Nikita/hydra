@@ -115,6 +115,50 @@ class ReleaseManagementTests(unittest.TestCase):
             self.user_home / ".local" / "bin" / "hydra-codex",
         )
 
+    def test_activation_accepts_standard_public_launcher_directories(self) -> None:
+        local = self.user_home / ".local"
+        launcher_directory = local / "bin"
+        launcher_directory.mkdir(parents=True)
+        local.chmod(0o755)
+        launcher_directory.chmod(0o755)
+
+        installed = self.activate("0.1.0")
+
+        self.assertEqual(self.roots.current.resolve(), installed.resolve())
+        self.assertEqual(
+            os.readlink(self.roots.launcher),
+            str(self.roots.current / "bin" / "hydra-codex"),
+        )
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE(launcher_directory.stat().st_mode),
+            0o755,
+        )
+
+    def test_activation_rejects_writable_public_launcher_directories(self) -> None:
+        for mode in (0o775, 0o777):
+            with self.subTest(mode=oct(mode)):
+                selected_home = self.base / f"user-{mode:o}"
+                launcher_directory = selected_home / ".local" / "bin"
+                launcher_directory.mkdir(parents=True)
+                launcher_directory.chmod(mode)
+                roots = default_install_roots(selected_home)
+                candidate = _bundle(
+                    self.base,
+                    "0.1.0",
+                    marker=f"mode-{mode:o}",
+                )
+
+                with self.assertRaises(InstallOwnershipError):
+                    activate_version(
+                        candidate,
+                        roots=roots,
+                        environ={"HOME": str(selected_home)},
+                    )
+
+                self.assertFalse(roots.home.exists())
+                self.assertFalse(roots.launcher.exists())
+
     def test_parser_accepts_upgrade_check_and_uninstall_keep_cli(self) -> None:
         upgrade_args = build_parser().parse_args(["upgrade", "--check"])
         uninstall_args = build_parser().parse_args(["uninstall", "--keep-cli"])
@@ -522,12 +566,21 @@ class ReleaseManagementTests(unittest.TestCase):
         real_link = release_management._atomic_symlink
         calls = 0
 
-        def crash_on_launcher(link: Path, target: Path) -> None:
+        def crash_on_launcher(
+            link: Path,
+            target: Path,
+            *,
+            private_parent: bool = True,
+        ) -> None:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise SimulatedCrash
-            real_link(link, target)
+            real_link(
+                link,
+                target,
+                private_parent=private_parent,
+            )
 
         with patch(
             "hydra_codex.release_management._atomic_symlink",

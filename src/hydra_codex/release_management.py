@@ -109,7 +109,12 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _ensure_directory(path: Path, *, mode: int) -> None:
+def _ensure_directory(
+    path: Path,
+    *,
+    mode: int,
+    private: bool = True,
+) -> None:
     try:
         current_mode = path.lstat().st_mode
     except FileNotFoundError:
@@ -119,11 +124,12 @@ def _ensure_directory(path: Path, *, mode: int) -> None:
         except OSError:
             pass
         return
+    unsafe_permissions = 0o077 if private else 0o022
     if (
         not stat.S_ISDIR(current_mode)
         or stat.S_ISLNK(current_mode)
         or path.stat().st_uid != os.getuid()
-        or stat.S_IMODE(current_mode) & 0o077
+        or stat.S_IMODE(current_mode) & unsafe_permissions
     ):
         raise InstallOwnershipError("invalid release directory")
 
@@ -291,8 +297,17 @@ def _lifecycle_lock(roots: InstallRoots) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _atomic_symlink(link: Path, target: Path) -> None:
-    _ensure_directory(link.parent, mode=0o700)
+def _atomic_symlink(
+    link: Path,
+    target: Path,
+    *,
+    private_parent: bool = True,
+) -> None:
+    _ensure_directory(
+        link.parent,
+        mode=0o700 if private_parent else 0o755,
+        private=private_parent,
+    )
     temporary = link.parent / f".{link.name}.tmp-{secrets.token_hex(8)}"
     os.symlink(str(target), temporary)
     try:
@@ -428,6 +443,7 @@ def _restore_previous_links(
         _atomic_symlink(
             roots.launcher,
             roots.current / "bin" / "hydra-codex",
+            private_parent=False,
         )
     if clear:
         _clear_journal(roots)
@@ -460,6 +476,7 @@ def _recover_pending(
         _atomic_symlink(
             roots.launcher,
             roots.current / "bin" / "hydra-codex",
+            private_parent=False,
         )
         _write_journal(
             roots,
@@ -478,6 +495,7 @@ def _recover_pending(
         _atomic_symlink(
             roots.launcher,
             roots.current / "bin" / "hydra-codex",
+            private_parent=False,
         )
         _clear_journal(roots)
         return journal.new_version
@@ -535,6 +553,7 @@ def _activate_locked(
         _atomic_symlink(
             roots.launcher,
             roots.current / "bin" / "hydra-codex",
+            private_parent=False,
         )
         _write_journal(
             roots,

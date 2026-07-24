@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from hydra_codex import __version__
 from hydra_codex.platform_paths import (
     default_database_path,
     default_installation_key_path,
@@ -43,7 +44,7 @@ class StatusTests(unittest.TestCase):
         self.marketplace = self.root / "marketplace"
         self.marketplace.mkdir()
         self.client = StatefulCodexClient()
-        self.client.available_versions[self.marketplace.resolve()] = "0.1.0"
+        self.client.available_versions[self.marketplace.resolve()] = __version__
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -238,7 +239,7 @@ class StatusTests(unittest.TestCase):
 
     def test_codex_status_reports_exact_version_parity_and_new_task_action(self) -> None:
         self.client.marketplaces["hydra"] = self.marketplace.resolve()
-        self.client.installed_version = "0.1.0"
+        self.client.installed_version = __version__
 
         result = self.status()
 
@@ -249,7 +250,7 @@ class StatusTests(unittest.TestCase):
                 "compatible": True,
                 "marketplace_installed": True,
                 "plugin_installed": True,
-                "plugin_version": "0.1.0",
+                "plugin_version": __version__,
                 "version_matches": True,
                 "new_task_required": True,
                 "next_actions": ["Start a new Codex task to load Hydra."],

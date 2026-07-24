@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from hydra_codex import __version__
 from hydra_codex.cli import atomic_write, main
 
 
@@ -156,7 +157,7 @@ class CodexInstallationCliTests(unittest.TestCase):
         self.marketplace.mkdir()
         self.receipt = self.root / "private" / "codex-integration.json"
         self.client = StatefulCodexClient()
-        self.client.available_versions[self.marketplace.resolve()] = "0.1.0"
+        self.client.available_versions[self.marketplace.resolve()] = __version__
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -328,10 +329,10 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         )
 
         roots = default_install_roots(self.home)
-        first = _bundle(self.root, "0.1.0")
+        first = _bundle(self.root, __version__)
         activate_version(first, roots=roots, environ=self.environ)
         active_marketplace = roots.current.resolve() / "marketplace"
-        self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
+        self.client.available_versions[active_marketplace.resolve()] = __version__
         installed = invoke(
             ["install", "-y"],
             environ=self.environ,
@@ -347,7 +348,7 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
 
         with mock.patch(
             "hydra_codex.installation_cli.acquire_release_candidate",
-            return_value=nullcontext(AcquiredRelease(candidate, "0.1.0")),
+            return_value=nullcontext(AcquiredRelease(candidate, __version__)),
         ):
             code, stdout, stderr = invoke(
                 ["upgrade"],
@@ -407,10 +408,10 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         )
 
         roots = default_install_roots(self.home)
-        first = _bundle(self.root, "0.1.0")
+        first = _bundle(self.root, __version__)
         activate_version(first, roots=roots, environ=self.environ)
         active_marketplace = roots.current.resolve() / "marketplace"
-        self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
+        self.client.available_versions[active_marketplace.resolve()] = __version__
         self.assertEqual(
             invoke(
                 ["install", "-y"],
@@ -428,7 +429,7 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         self.client.fail_on = ("add_plugin", "hydra-codex@hydra")
         with mock.patch(
             "hydra_codex.installation_cli.acquire_release_candidate",
-            return_value=nullcontext(AcquiredRelease(candidate, "0.1.0")),
+            return_value=nullcontext(AcquiredRelease(candidate, __version__)),
         ):
             failed = invoke(
                 ["upgrade"],
@@ -441,13 +442,13 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
             failed,
             (1, "", "hydra-codex: command failed\n"),
         )
-        self.assertEqual(roots.current.resolve().name, "0.1.0")
-        self.assertEqual(self.client.installed_version, "0.1.0")
+        self.assertEqual(roots.current.resolve().name, __version__)
+        self.assertEqual(self.client.installed_version, __version__)
         self.assertEqual(
             json.loads(self.receipt.read_text(encoding="utf-8"))[
                 "runtime_version"
             ],
-            "0.1.0",
+            __version__,
         )
         release_journal = roots.home / "release-journal.json"
         self.assertEqual(
@@ -458,7 +459,7 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         retry = _bundle(self.root, "0.2.0", marker="retry")
         with mock.patch(
             "hydra_codex.installation_cli.acquire_release_candidate",
-            return_value=nullcontext(AcquiredRelease(retry, "0.1.0")),
+            return_value=nullcontext(AcquiredRelease(retry, __version__)),
         ):
             code, stdout, stderr = invoke(
                 ["upgrade"],
@@ -487,10 +488,10 @@ class ReleaseLifecycleCliTests(unittest.TestCase):
         )
 
         roots = default_install_roots(self.home)
-        first = _bundle(self.root, "0.1.0")
+        first = _bundle(self.root, __version__)
         activate_version(first, roots=roots, environ=self.environ)
         active_marketplace = roots.current.resolve() / "marketplace"
-        self.client.available_versions[active_marketplace.resolve()] = "0.1.0"
+        self.client.available_versions[active_marketplace.resolve()] = __version__
         installed = invoke(
             ["install", "-y"],
             environ=self.environ,

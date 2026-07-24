@@ -346,6 +346,8 @@ RELEASE_BASE=http://127.0.0.1:$SERVER_PORT/releases
 HYDRA_INSTALLER_RELEASE_BASE_URL=$RELEASE_BASE
 export HYDRA_INSTALLER_RELEASE_BASE_URL
 
+mkdir -p "$HOME/.local/bin"
+chmod 755 "$HOME/.local" "$HOME/.local/bin"
 sh "$SOURCE_ROOT/install.sh" --version "$BASE_VERSION" >/dev/null
 HYDRA=$HOME/.local/bin/hydra-codex
 [ -x "$HYDRA" ] && [ ! -L "$HOME/.hydra/current/bin/hydra-codex" ] ||

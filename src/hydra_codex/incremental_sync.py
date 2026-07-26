@@ -27,9 +27,12 @@ from .rollout import ingest_rollouts
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .rollout_observations import safe_int, usage as parse_usage
 from .rollout_privacy import canonical_timestamp, nonempty_string
+from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
 from .rollout_sources import SourceChanged, SourceStat, line_fingerprint, open_source, scan_source, source_stat
 from .storage import HydraStore
 from .sync_state import QueueItem, SourceCheckpoint, SyncStateRepository, validate_root_relative_locator
+from .test_evidence import reconcile_test_evidence
+from .token_selection import refresh_token_source_selection
 
 
 _PREFIX_BYTES = 256
@@ -454,6 +457,15 @@ class IncrementalSyncWorker:
             if owned is None:
                 raise RepairRequired("queue claim expired")
             result = self.materialize(item, tail, connection)
+            if result.project_id is not None:
+                # Keep incremental facts in the same derived-state shape as a
+                # legacy ingest batch before exposing the project as dirty.
+                reconcile_test_evidence(connection)
+                refresh_token_source_selection(connection, result.project_id)
+                diagnose = lambda _source, _ordinal, _kind: None
+                reconcile_token_epochs(connection, result.project_id, diagnose)
+                reconcile_fork_baselines(connection, result.project_id)
+                reconcile_turn_attempts(connection, diagnose)
             checkpoint = tail.checkpoint
             connection.execute(
                 """INSERT INTO sync_source_checkpoints(

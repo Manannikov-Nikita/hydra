@@ -167,9 +167,13 @@ class DurableSyncStateTests(unittest.TestCase):
         self.assertTrue(first_repository.acquire_lease(
             "worker-a", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
         ))
-        claimed = first_repository.claim_next("worker-a", "2026-07-26T00:00:01Z")
+        claimed = first_repository.claim_next(
+            "worker-a", "2026-07-26T00:00:01Z", "2026-07-26T00:01:00Z",
+        )
         self.assertEqual((claimed.root_kind, claimed.source_locator), ("sessions", locator))
-        self.assertIsNone(second_repository.claim_next("worker-b", "2026-07-26T00:00:01Z"))
+        self.assertIsNone(second_repository.claim_next(
+            "worker-b", "2026-07-26T00:00:01Z", "2026-07-26T00:01:00Z",
+        ))
 
         self.store.connection.execute("BEGIN IMMEDIATE")
         second.connection.execute("PRAGMA busy_timeout=25")
@@ -194,7 +198,7 @@ class DurableSyncStateTests(unittest.TestCase):
         self.assertTrue(repository.acquire_lease(
             "worker", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
         ))
-        item = repository.claim_next("worker", "2026-07-26T00:00:01Z")
+        item = repository.claim_next("worker", "2026-07-26T00:00:01Z", "2026-07-26T00:01:00Z")
         self.assertEqual((item.root_kind, item.project_id, item.logical_source_key),
                          ("sessions", "hprj_safe", "logical-safe"))
         self.assertTrue(repository.retry_claim(
@@ -202,12 +206,16 @@ class DurableSyncStateTests(unittest.TestCase):
             available_at="2026-07-26T00:00:02Z", observed_at="2026-07-26T00:00:01Z",
         ))
         self.assertEqual(repository.list_queue()[0].attempts, 1)
-        item = repository.claim_next("worker", "2026-07-26T00:00:02Z")
+        item = repository.claim_next("worker", "2026-07-26T00:00:02Z", "2026-07-26T00:01:00Z")
         self.assertTrue(repository.acknowledge_claim("worker", item.root_kind, item.source_locator,
                                                       "2026-07-26T00:00:03Z"))
 
         repository.mark_dirty("hprj_safe", "task-safe", "task", "2026-07-26T00:00:00Z")
-        self.assertEqual([root.root_key for root in repository.consume_dirty_roots(10)], ["task-safe"])
+        dirty = repository.claim_dirty_roots(
+            "worker", "2026-07-26T00:00:03Z", "2026-07-26T00:01:00Z", 10,
+        )
+        self.assertEqual([root.root_key for root in dirty], ["task-safe"])
+        self.assertEqual(repository.acknowledge_dirty_roots("worker", dirty, "2026-07-26T00:00:04Z"), 1)
         self.assertEqual(repository.list_dirty_roots(), ())
         job_id = repository.create_job("backfill", "2026-07-26T00:00:00Z")
         repository.save_frontier(
@@ -224,6 +232,51 @@ class DurableSyncStateTests(unittest.TestCase):
         self.assertEqual(repository.get_job(other_job).job_id, other_job)
         self.assertEqual(repository.list_frontier(other_job)[0].state, "scanned")
         self.assertEqual({job.job_id for job in repository.list_jobs()}, {job_id, other_job})
+
+    def test_crashed_queue_and_dirty_claims_are_reclaimed_after_restart(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/crash.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        repository.mark_dirty("hprj_safe", "task-safe", "task", "2026-07-26T00:00:00Z")
+        self.assertTrue(repository.acquire_lease(
+            "crashed", "2026-07-26T00:00:00Z", "2026-07-26T00:00:10Z",
+        ))
+        self.assertEqual(
+            repository.claim_next("crashed", "2026-07-26T00:00:01Z", "2026-07-26T00:00:10Z").source_locator,
+            locator,
+        )
+        claimed_dirty = repository.claim_dirty_roots(
+            "crashed", "2026-07-26T00:00:01Z", "2026-07-26T00:00:10Z", 10,
+        )
+        self.assertEqual([root.root_key for root in claimed_dirty], ["task-safe"])
+        self.store.close()  # Simulate the owning MCP/dashboard process crashing before acknowledgements.
+
+        restarted = HydraStore(self.database)
+        self.addCleanup(restarted.close)
+        from hydra_codex.sync_state import SyncStateRepository
+        recovered = SyncStateRepository(restarted)
+        self.assertTrue(recovered.acquire_lease(
+            "recovered", "2026-07-26T00:00:10Z", "2026-07-26T00:00:20Z",
+        ))
+        queue_item = recovered.claim_next(
+            "recovered", "2026-07-26T00:00:10Z", "2026-07-26T00:00:20Z",
+        )
+        self.assertEqual(queue_item.source_locator, locator)
+        self.assertTrue(recovered.acknowledge_claim(
+            "recovered", "sessions", locator, "2026-07-26T00:00:11Z",
+        ))
+        self.assertEqual([root.root_key for root in recovered.list_dirty_roots()], ["task-safe"])
+        recovered_dirty = recovered.claim_dirty_roots(
+            "recovered", "2026-07-26T00:00:10Z", "2026-07-26T00:00:20Z", 10,
+        )
+        self.assertEqual([root.root_key for root in recovered_dirty], ["task-safe"])
+        self.assertEqual(recovered.acknowledge_dirty_roots(
+            "recovered", recovered_dirty, "2026-07-26T00:00:11Z",
+        ), 1)
+        self.assertEqual(recovered.list_dirty_roots(), ())
 
     def test_dirty_roots_jobs_frontier_and_revision_survive_store_reopen(self) -> None:
         repository = self._repository()

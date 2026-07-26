@@ -44,6 +44,7 @@ class QueueItem(SourceRecord):
     queue_state: str
     attempts: int
     available_at: str
+    claim_expires_at: str | None
     reason_code: str | None
 
 
@@ -53,6 +54,8 @@ class DirtyRoot:
     root_key: str
     root_kind: str
     observed_at: str
+    claim_owner: str | None
+    claim_expires_at: str | None
 
 
 @dataclass(frozen=True)
@@ -145,7 +148,8 @@ class SyncStateRepository:
         return QueueItem(
             root_kind=values[0], source_locator=values[1], source_state=values[2],
             project_id=values[3], logical_source_key=values[4], session_key=values[5],
-            queue_state=values[6], attempts=int(values[7]), available_at=values[8], reason_code=values[9],
+            queue_state=values[6], attempts=int(values[7]), available_at=values[8],
+            claim_expires_at=values[9], reason_code=values[10],
         )
 
     def data_revision(self) -> int:
@@ -204,8 +208,8 @@ class SyncStateRepository:
             )
             result = connection.execute(
                 """INSERT INTO sync_ingest_queue(
-                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,attempts,reason_code)
-                   VALUES (?,?,'queued',?,?,NULL,NULL,0,NULL)
+                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,attempts,reason_code)
+                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,NULL)
                    ON CONFLICT(root_kind,source_locator) DO NOTHING""",
                 (root, locator, now, now),
             )
@@ -220,8 +224,8 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             result = connection.execute(
                 """INSERT INTO sync_ingest_queue(
-                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,attempts,reason_code)
-                   VALUES (?,?,'queued',?,?,NULL,NULL,0,NULL)
+                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,attempts,reason_code)
+                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,NULL)
                    ON CONFLICT(root_kind,source_locator) DO NOTHING""",
                 (root, locator, now, now),
             )
@@ -250,41 +254,49 @@ class SyncStateRepository:
             raise ValueError("queue limit must be between 1 and 1000")
         return tuple(self._queue_from_row(row) for row in self._store.connection.execute(
             """SELECT q.root_kind,q.source_locator,s.source_state,s.project_id,s.logical_source_key,s.session_key,
-                      q.queue_state,q.attempts,q.available_at,q.reason_code
+                      q.queue_state,q.attempts,q.available_at,q.claim_expires_at,q.reason_code
                  FROM sync_ingest_queue q JOIN sync_source_registry s
                    ON s.root_kind=q.root_kind AND s.source_locator=q.source_locator
                 ORDER BY q.available_at,q.enqueued_at,q.root_kind,q.source_locator LIMIT ?""", (limit,),
         ))
 
-    def claim_next(self, owner_key: str, observed_at: str) -> QueueItem | None:
+    def claim_next(self, owner_key: str, observed_at: str, claim_expires_at: str) -> QueueItem | None:
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
+        if claim_expires_at <= observed_at:
+            raise ValueError("queue claim expiry must follow claim time")
         with self._store.rollout_transaction() as connection:
             lease = connection.execute(
-                "SELECT 1 FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+                "SELECT expires_at FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
                 (owner_key, observed_at),
             ).fetchone()
             if lease is None:
                 return None
+            if claim_expires_at > str(lease[0]):
+                raise ValueError("queue claim cannot outlive worker lease")
             selected = connection.execute(
                 """SELECT root_kind,source_locator FROM sync_ingest_queue
-                     WHERE queue_state='queued' AND available_at<=?
-                     ORDER BY available_at,enqueued_at,root_kind,source_locator LIMIT 1""", (observed_at,),
+                     WHERE (queue_state='queued' AND available_at<=?)
+                        OR (queue_state='claimed' AND claim_expires_at<=?)
+                     ORDER BY available_at,enqueued_at,root_kind,source_locator LIMIT 1""", (observed_at, observed_at),
             ).fetchone()
             if selected is None:
                 return None
             root, locator = str(selected[0]), str(selected[1])
             changed = connection.execute(
-                """UPDATE sync_ingest_queue SET queue_state='claimed',claimed_by=?,claimed_at=?
-                     WHERE root_kind=? AND source_locator=? AND queue_state='queued' AND available_at<=?""",
-                (owner_key, observed_at, root, locator, observed_at),
+                """UPDATE sync_ingest_queue SET queue_state='claimed',claimed_by=?,claimed_at=?,claim_expires_at=?
+                     WHERE root_kind=? AND source_locator=? AND (
+                         (queue_state='queued' AND available_at<=?)
+                         OR (queue_state='claimed' AND claim_expires_at<=?)
+                     )""",
+                (owner_key, observed_at, claim_expires_at, root, locator, observed_at, observed_at),
             ).rowcount
             if changed != 1:
                 return None
             self._bump_revision(connection, observed_at)
             row = connection.execute(
                 """SELECT q.root_kind,q.source_locator,s.source_state,s.project_id,s.logical_source_key,s.session_key,
-                          q.queue_state,q.attempts,q.available_at,q.reason_code
+                          q.queue_state,q.attempts,q.available_at,q.claim_expires_at,q.reason_code
                      FROM sync_ingest_queue q JOIN sync_source_registry s
                        ON s.root_kind=q.root_kind AND s.source_locator=q.source_locator
                     WHERE q.root_kind=? AND q.source_locator=?""", (root, locator),
@@ -302,7 +314,7 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
-                       claimed_at=NULL,attempts=attempts+1,reason_code=?
+                       claimed_at=NULL,claim_expires_at=NULL,attempts=attempts+1,reason_code=?
                      WHERE root_kind=? AND source_locator=? AND queue_state='claimed' AND claimed_by=?""",
                 (available_at, reason_code, root, locator, owner_key),
             ).rowcount == 1
@@ -316,7 +328,8 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 """DELETE FROM sync_ingest_queue WHERE root_kind=? AND source_locator=?
-                     AND queue_state='claimed' AND claimed_by=?""", (root, locator, owner_key),
+                     AND queue_state='claimed' AND claimed_by=? AND claim_expires_at>?""",
+                (root, locator, owner_key, observed_at),
             ).rowcount == 1
             if changed:
                 self._bump_revision(connection, observed_at)
@@ -410,8 +423,11 @@ class SyncStateRepository:
         now = _timestamp(observed_at)
         with self._store.rollout_transaction() as connection:
             connection.execute(
-                """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at) VALUES (?,?,?,?)
-                   ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET observed_at=excluded.observed_at""",
+                """INSERT INTO sync_dirty_roots(
+                       project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at)
+                   VALUES (?,?,?,?,NULL,NULL)
+                   ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
+                       observed_at=excluded.observed_at,claim_owner=NULL,claim_expires_at=NULL""",
                 (project_id, root_key, root_kind, now),
             )
             return self._bump_revision(connection, now)
@@ -419,25 +435,67 @@ class SyncStateRepository:
     def list_dirty_roots(self, limit: int = 100) -> tuple[DirtyRoot, ...]:
         if not 1 <= limit <= 1000:
             raise ValueError("dirty root limit must be between 1 and 1000")
-        return tuple(DirtyRoot(*(str(value) for value in row)) for row in self._store.connection.execute(
-            """SELECT project_id,root_key,root_kind,observed_at FROM sync_dirty_roots
-                 ORDER BY observed_at,project_id,root_kind,root_key LIMIT ?""", (limit,),
+        return tuple(DirtyRoot(
+            str(row[0]), str(row[1]), str(row[2]), str(row[3]),
+            None if row[4] is None else str(row[4]), None if row[5] is None else str(row[5]),
+        ) for row in self._store.connection.execute(
+            """SELECT project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at
+                 FROM sync_dirty_roots ORDER BY observed_at,project_id,root_kind,root_key LIMIT ?""", (limit,),
         ))
 
-    def consume_dirty_roots(self, limit: int = 100) -> tuple[DirtyRoot, ...]:
+    def claim_dirty_roots(
+        self, owner_key: str, observed_at: str, claim_expires_at: str, limit: int = 100,
+    ) -> tuple[DirtyRoot, ...]:
+        if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
+            raise ValueError("worker owner key is invalid")
+        if claim_expires_at <= observed_at:
+            raise ValueError("dirty claim expiry must follow claim time")
+        if not 1 <= limit <= 1000:
+            raise ValueError("dirty root limit must be between 1 and 1000")
         with self._store.rollout_transaction() as connection:
+            lease = connection.execute(
+                "SELECT expires_at FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+                (owner_key, observed_at),
+            ).fetchone()
+            if lease is None:
+                return ()
+            if claim_expires_at > str(lease[0]):
+                raise ValueError("dirty claim cannot outlive worker lease")
             rows = tuple(connection.execute(
                 """SELECT project_id,root_key,root_kind,observed_at FROM sync_dirty_roots
-                     ORDER BY observed_at,project_id,root_kind,root_key LIMIT ?""", (limit,),
+                     WHERE claim_owner IS NULL OR claim_expires_at<=?
+                     ORDER BY observed_at,project_id,root_kind,root_key LIMIT ?""", (observed_at, limit),
             ))
             if not rows:
                 return ()
             connection.executemany(
-                "DELETE FROM sync_dirty_roots WHERE project_id=? AND root_key=? AND root_kind=?",
-                ((row[0], row[1], row[2]) for row in rows),
+                """UPDATE sync_dirty_roots SET claim_owner=?,claim_expires_at=?
+                     WHERE project_id=? AND root_key=? AND root_kind=?
+                       AND (claim_owner IS NULL OR claim_expires_at<=?)""",
+                ((owner_key, claim_expires_at, row[0], row[1], row[2], observed_at) for row in rows),
             )
-            self._bump_revision(connection, str(rows[-1][3]))
-            return tuple(DirtyRoot(*(str(value) for value in row)) for row in rows)
+            self._bump_revision(connection, observed_at)
+            return tuple(
+                DirtyRoot(str(row[0]), str(row[1]), str(row[2]), str(row[3]), owner_key, claim_expires_at)
+                for row in rows
+            )
+
+    def acknowledge_dirty_roots(
+        self, owner_key: str, roots: tuple[DirtyRoot, ...] | list[DirtyRoot], observed_at: str,
+    ) -> int:
+        if not roots:
+            return 0
+        with self._store.rollout_transaction() as connection:
+            deleted = 0
+            for root in roots:
+                deleted += connection.execute(
+                    """DELETE FROM sync_dirty_roots WHERE project_id=? AND root_key=? AND root_kind=?
+                         AND claim_owner=? AND claim_expires_at>?""",
+                    (root.project_id, root.root_key, root.root_kind, owner_key, observed_at),
+                ).rowcount
+            if deleted:
+                self._bump_revision(connection, observed_at)
+            return deleted
 
     def create_job(self, job_kind: str, created_at: str, job_id: str | None = None) -> str:
         if job_kind not in _JOB_KINDS:

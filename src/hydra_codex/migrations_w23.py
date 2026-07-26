@@ -46,13 +46,15 @@ W23_SYNC_INGEST_QUEUE_TABLE_SQL = """CREATE TABLE sync_ingest_queue (
     available_at TEXT NOT NULL,
     claimed_by TEXT,
     claimed_at TEXT,
+    claim_expires_at TEXT,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     reason_code TEXT,
     PRIMARY KEY(root_kind,source_locator),
     FOREIGN KEY(root_kind,source_locator)
         REFERENCES sync_source_registry(root_kind,source_locator) ON DELETE CASCADE,
-    CHECK((queue_state='queued' AND claimed_by IS NULL AND claimed_at IS NULL)
-          OR (queue_state='claimed' AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL)),
+    CHECK((queue_state='queued' AND claimed_by IS NULL AND claimed_at IS NULL AND claim_expires_at IS NULL)
+          OR (queue_state='claimed' AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL
+              AND claim_expires_at IS NOT NULL AND claim_expires_at > claimed_at)),
     CHECK(claimed_by IS NULL OR length(claimed_by) BETWEEN 1 AND 128),
     CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 64)
 ) WITHOUT ROWID"""
@@ -70,9 +72,14 @@ W23_SYNC_DIRTY_ROOTS_TABLE_SQL = """CREATE TABLE sync_dirty_roots (
     root_key TEXT NOT NULL,
     root_kind TEXT NOT NULL CHECK(root_kind IN ('project','task')),
     observed_at TEXT NOT NULL,
+    claim_owner TEXT,
+    claim_expires_at TEXT,
     PRIMARY KEY(project_id,root_key,root_kind),
     CHECK(length(project_id) BETWEEN 1 AND 160),
-    CHECK(length(root_key) BETWEEN 1 AND 160)
+    CHECK(length(root_key) BETWEEN 1 AND 160),
+    CHECK((claim_owner IS NULL AND claim_expires_at IS NULL)
+          OR (claim_owner IS NOT NULL AND claim_expires_at IS NOT NULL)),
+    CHECK(claim_owner IS NULL OR length(claim_owner) BETWEEN 1 AND 128)
 ) WITHOUT ROWID"""
 
 W23_SYNC_JOBS_TABLE_SQL = """CREATE TABLE sync_jobs (
@@ -152,6 +159,7 @@ W23_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "INSERT INTO sync_data_revision(singleton,revision,updated_at) VALUES (1,0,datetime('now'))",
         "CREATE INDEX sync_ingest_queue_available ON sync_ingest_queue(queue_state,available_at,enqueued_at)",
         "CREATE INDEX sync_dirty_roots_project ON sync_dirty_roots(project_id,root_kind,observed_at)",
+        "CREATE INDEX sync_dirty_roots_claim ON sync_dirty_roots(claim_expires_at,observed_at)",
         "CREATE INDEX sync_jobs_kind_updated ON sync_jobs(job_kind,updated_at DESC)",
         "CREATE INDEX sync_frontier_resume ON sync_backfill_frontier(job_id,state,updated_at)",
     )),
@@ -169,10 +177,12 @@ W23_REQUIRED_SCHEMA: dict[str, set[str]] = {
     },
     "sync_ingest_queue": {
         "root_kind", "source_locator", "queue_state", "enqueued_at", "available_at",
-        "claimed_by", "claimed_at", "attempts", "reason_code",
+        "claimed_by", "claimed_at", "claim_expires_at", "attempts", "reason_code",
     },
     "sync_worker_leases": {"lease_name", "owner_key", "acquired_at", "expires_at"},
-    "sync_dirty_roots": {"project_id", "root_key", "root_kind", "observed_at"},
+    "sync_dirty_roots": {
+        "project_id", "root_key", "root_kind", "observed_at", "claim_owner", "claim_expires_at",
+    },
     "sync_jobs": {
         "job_id", "job_kind", "state", "sources_discovered", "sources_completed",
         "bytes_processed", "created_at", "updated_at", "completed_at",

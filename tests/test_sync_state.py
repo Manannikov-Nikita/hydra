@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -49,7 +50,10 @@ class DurableSyncStateTests(unittest.TestCase):
             root_kind="sessions", source_locator="2026/07/26/rollout.jsonl",
         )
 
-        for invalid in ("/Users/alice/private.jsonl", "../private.jsonl", "a/../../b", "a\\b"):
+        for invalid in (
+            "/Users/alice/private.jsonl", "../private.jsonl", "a/../../b", "a\\b",
+            "./rollout.jsonl", "a//b", "a/./b", "a/../b", "a/\nrollout.jsonl",
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     repository.register_source(root_kind="sessions", source_locator=invalid)
@@ -60,17 +64,57 @@ class DurableSyncStateTests(unittest.TestCase):
             [("2026/07/26/rollout.jsonl",)],
         )
 
+    def test_database_rejects_noncanonical_locators_even_when_python_validation_is_bypassed(self) -> None:
+        now = "2026-07-26T00:00:00Z"
+        for invalid in ("/absolute", "a\\b", "../escape", "a//b", "a/./b", "a/../b", "a/\x01b"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.store.connection.execute(
+                        """INSERT INTO sync_source_registry(
+                               root_kind,source_locator,source_state,first_seen_at,last_seen_at)
+                           VALUES ('sessions',?,'ready',?,?)""",
+                        (invalid, now, now),
+                    )
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM sync_source_registry"
+        ).fetchone()[0], 0)
+
+    def test_same_relative_source_can_exist_in_active_and_archived_roots(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/rollout.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, project_id="hprj_active",
+            logical_source_key="source-active", session_key="session-active",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        repository.register_and_enqueue(
+            root_kind="archived_sessions", source_locator=locator, project_id="hprj_archive",
+            logical_source_key="source-archive", session_key="session-archive",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+
+        self.assertEqual(
+            [(item.root_kind, item.source_locator, item.project_id, item.session_key)
+             for item in repository.list_sources()],
+            [
+                ("archived_sessions", locator, "hprj_archive", "session-archive"),
+                ("sessions", locator, "hprj_active", "session-active"),
+            ],
+        )
+        self.assertEqual(len(repository.list_queue()), 2)
+
     def test_queue_and_checkpoint_are_idempotent_and_keep_only_append_state(self) -> None:
         repository = self._repository()
         locator = "2026/07/26/rollout.jsonl"
-        repository.register_source(root_kind="sessions", source_locator=locator)
-        self.assertTrue(repository.enqueue(locator, "2026-07-26T00:00:00Z"))
-        self.assertFalse(repository.enqueue(locator, "2026-07-26T00:00:01Z"))
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertFalse(repository.enqueue("sessions", locator, "2026-07-26T00:00:01Z"))
         repository.save_checkpoint(
-            locator, byte_offset=128, line_number=4,
+            "sessions", locator, byte_offset=128, file_size=128, line_number=4,
             prefix_anchor="a" * 64, revision_anchor="b" * 64,
         )
-        checkpoint = repository.checkpoint_for(locator)
+        checkpoint = repository.checkpoint_for("sessions", locator)
 
         self.assertEqual(checkpoint.byte_offset, 128)
         self.assertEqual(checkpoint.line_number, 4)
@@ -79,6 +123,26 @@ class DurableSyncStateTests(unittest.TestCase):
         self.assertEqual(
             self.store.connection.execute("SELECT COUNT(*) FROM sync_ingest_queue").fetchone()[0], 1,
         )
+
+    def test_checkpoint_cannot_exceed_file_size_and_failed_write_is_atomic(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/rollout.jsonl"
+        repository.register_source(root_kind="sessions", source_locator=locator)
+        before = repository.data_revision()
+        with self.assertRaises(ValueError):
+            repository.save_checkpoint(
+                "sessions", locator, byte_offset=9, file_size=8, line_number=1,
+                prefix_anchor=None, revision_anchor=None,
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                """INSERT INTO sync_source_checkpoints(
+                       root_kind,source_locator,file_size,byte_offset,line_number,updated_at)
+                   VALUES ('sessions',?,8,9,1,'2026-07-26T00:00:00Z')""",
+                (locator,),
+            )
+        self.assertEqual(repository.data_revision(), before)
+        self.assertEqual(repository.checkpoint_for("sessions", locator).byte_offset, 0)
 
     def test_only_one_worker_holds_the_expiring_lease(self) -> None:
         repository = self._repository()
@@ -90,6 +154,77 @@ class DurableSyncStateTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(lease), ("worker-b", "2026-07-26T00:00:20Z"))
 
+    def test_two_connections_claim_once_and_busy_failure_leaves_no_partial_state(self) -> None:
+        second = HydraStore(self.database)
+        self.addCleanup(second.close)
+        first_repository = self._repository()
+        from hydra_codex.sync_state import SyncStateRepository
+        second_repository = SyncStateRepository(second)
+        locator = "2026/07/26/rollout.jsonl"
+        first_repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(first_repository.acquire_lease(
+            "worker-a", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
+        ))
+        claimed = first_repository.claim_next("worker-a", "2026-07-26T00:00:01Z")
+        self.assertEqual((claimed.root_kind, claimed.source_locator), ("sessions", locator))
+        self.assertIsNone(second_repository.claim_next("worker-b", "2026-07-26T00:00:01Z"))
+
+        self.store.connection.execute("BEGIN IMMEDIATE")
+        second.connection.execute("PRAGMA busy_timeout=25")
+        started = time.monotonic()
+        with self.assertRaises(sqlite3.OperationalError):
+            second_repository.register_and_enqueue(
+                root_kind="sessions", source_locator="2026/07/26/blocked.jsonl",
+                observed_at="2026-07-26T00:00:02Z",
+            )
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.store.connection.rollback()
+        self.assertIsNone(second_repository.source_for("sessions", "2026/07/26/blocked.jsonl"))
+
+    def test_worker_ready_queue_dirty_job_and_frontier_operations(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/rollout.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, project_id="hprj_safe",
+            logical_source_key="logical-safe", session_key="session-safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
+        ))
+        item = repository.claim_next("worker", "2026-07-26T00:00:01Z")
+        self.assertEqual((item.root_kind, item.project_id, item.logical_source_key),
+                         ("sessions", "hprj_safe", "logical-safe"))
+        self.assertTrue(repository.retry_claim(
+            "worker", item.root_kind, item.source_locator, reason_code="partial_line",
+            available_at="2026-07-26T00:00:02Z", observed_at="2026-07-26T00:00:01Z",
+        ))
+        self.assertEqual(repository.list_queue()[0].attempts, 1)
+        item = repository.claim_next("worker", "2026-07-26T00:00:02Z")
+        self.assertTrue(repository.acknowledge_claim("worker", item.root_kind, item.source_locator,
+                                                      "2026-07-26T00:00:03Z"))
+
+        repository.mark_dirty("hprj_safe", "task-safe", "task", "2026-07-26T00:00:00Z")
+        self.assertEqual([root.root_key for root in repository.consume_dirty_roots(10)], ["task-safe"])
+        self.assertEqual(repository.list_dirty_roots(), ())
+        job_id = repository.create_job("backfill", "2026-07-26T00:00:00Z")
+        repository.save_frontier(
+            job_id=job_id, root_kind="sessions", directory_locator="2026/07/26", state="pending",
+            discovered_count=1, updated_at="2026-07-26T00:00:01Z",
+        )
+        other_job = repository.create_job("backfill", "2026-07-26T00:00:02Z")
+        repository.save_frontier(
+            job_id=other_job, root_kind="sessions", directory_locator="2026/07/26", state="scanned",
+            discovered_count=2, updated_at="2026-07-26T00:00:03Z",
+        )
+        self.assertEqual(repository.current_job("backfill").job_id, other_job)
+        self.assertEqual(repository.resume_frontier(job_id)[0].directory_locator, "2026/07/26")
+        self.assertEqual(repository.get_job(other_job).job_id, other_job)
+        self.assertEqual(repository.list_frontier(other_job)[0].state, "scanned")
+        self.assertEqual({job.job_id for job in repository.list_jobs()}, {job_id, other_job})
+
     def test_dirty_roots_jobs_frontier_and_revision_survive_store_reopen(self) -> None:
         repository = self._repository()
         revision = repository.mark_dirty("hprj_safe", "task-safe", "task", "2026-07-26T00:00:00Z")
@@ -99,7 +234,7 @@ class DurableSyncStateTests(unittest.TestCase):
             bytes_processed=1024, updated_at="2026-07-26T00:00:01Z",
         )
         repository.save_frontier(
-            root_kind="sessions", directory_locator="2026/07/26", state="pending",
+            job_id=job_id, root_kind="sessions", directory_locator="2026/07/26", state="pending",
             discovered_count=10, updated_at="2026-07-26T00:00:01Z",
         )
         self.assertGreaterEqual(revision, 1)

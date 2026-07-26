@@ -4,38 +4,57 @@ from __future__ import annotations
 
 
 W23_SYNC_SOURCE_REGISTRY_TABLE_SQL = """CREATE TABLE sync_source_registry (
-    source_locator TEXT PRIMARY KEY,
     root_kind TEXT NOT NULL CHECK(root_kind IN ('sessions','archived_sessions')),
+    source_locator TEXT NOT NULL,
     source_state TEXT NOT NULL DEFAULT 'ready'
         CHECK(source_state IN ('ready','repair_required','missing')),
+    project_id TEXT,
+    logical_source_key TEXT,
+    session_key TEXT,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(root_kind,source_locator),
     CHECK(length(source_locator) BETWEEN 1 AND 512),
-    CHECK(source_locator NOT LIKE '/%'),
-    CHECK(instr(source_locator, char(92)) = 0),
-    CHECK(instr(source_locator, '..') = 0)
+    CHECK(length(project_id) <= 160),
+    CHECK(length(logical_source_key) <= 160),
+    CHECK(length(session_key) <= 160)
 ) WITHOUT ROWID"""
 
 W23_SYNC_SOURCE_CHECKPOINTS_TABLE_SQL = """CREATE TABLE sync_source_checkpoints (
-    source_locator TEXT PRIMARY KEY REFERENCES sync_source_registry(source_locator)
-        ON DELETE CASCADE,
+    root_kind TEXT NOT NULL,
+    source_locator TEXT NOT NULL,
     device_id INTEGER,
     inode INTEGER,
     file_size INTEGER NOT NULL DEFAULT 0 CHECK(file_size >= 0),
-    byte_offset INTEGER NOT NULL DEFAULT 0 CHECK(byte_offset >= 0),
+    byte_offset INTEGER NOT NULL DEFAULT 0 CHECK(byte_offset >= 0 AND byte_offset <= file_size),
     line_number INTEGER NOT NULL DEFAULT 0 CHECK(line_number >= 0),
     prefix_anchor TEXT,
     revision_anchor TEXT,
     updated_at TEXT NOT NULL,
+    PRIMARY KEY(root_kind,source_locator),
+    FOREIGN KEY(root_kind,source_locator)
+        REFERENCES sync_source_registry(root_kind,source_locator) ON DELETE CASCADE,
     CHECK(prefix_anchor IS NULL OR length(prefix_anchor) = 64),
     CHECK(revision_anchor IS NULL OR length(revision_anchor) = 64)
 ) WITHOUT ROWID"""
 
 W23_SYNC_INGEST_QUEUE_TABLE_SQL = """CREATE TABLE sync_ingest_queue (
-    source_locator TEXT PRIMARY KEY REFERENCES sync_source_registry(source_locator)
-        ON DELETE CASCADE,
+    root_kind TEXT NOT NULL,
+    source_locator TEXT NOT NULL,
+    queue_state TEXT NOT NULL DEFAULT 'queued' CHECK(queue_state IN ('queued','claimed')),
     enqueued_at TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
+    available_at TEXT NOT NULL,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    reason_code TEXT,
+    PRIMARY KEY(root_kind,source_locator),
+    FOREIGN KEY(root_kind,source_locator)
+        REFERENCES sync_source_registry(root_kind,source_locator) ON DELETE CASCADE,
+    CHECK((queue_state='queued' AND claimed_by IS NULL AND claimed_at IS NULL)
+          OR (queue_state='claimed' AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL)),
+    CHECK(claimed_by IS NULL OR length(claimed_by) BETWEEN 1 AND 128),
+    CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 64)
 ) WITHOUT ROWID"""
 
 W23_SYNC_WORKER_LEASES_TABLE_SQL = """CREATE TABLE sync_worker_leases (
@@ -71,16 +90,14 @@ W23_SYNC_JOBS_TABLE_SQL = """CREATE TABLE sync_jobs (
 ) WITHOUT ROWID"""
 
 W23_SYNC_BACKFILL_FRONTIER_TABLE_SQL = """CREATE TABLE sync_backfill_frontier (
+    job_id TEXT NOT NULL REFERENCES sync_jobs(job_id) ON DELETE CASCADE,
     root_kind TEXT NOT NULL CHECK(root_kind IN ('sessions','archived_sessions')),
     directory_locator TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending','scanned','repair_required')),
     discovered_count INTEGER NOT NULL DEFAULT 0 CHECK(discovered_count >= 0),
     updated_at TEXT NOT NULL,
-    PRIMARY KEY(root_kind,directory_locator),
-    CHECK(length(directory_locator) BETWEEN 1 AND 512),
-    CHECK(directory_locator NOT LIKE '/%'),
-    CHECK(instr(directory_locator, char(92)) = 0),
-    CHECK(instr(directory_locator, '..') = 0)
+    PRIMARY KEY(job_id,root_kind,directory_locator),
+    CHECK(length(directory_locator) BETWEEN 1 AND 512)
 ) WITHOUT ROWID"""
 
 W23_SYNC_DATA_REVISION_TABLE_SQL = """CREATE TABLE sync_data_revision (
@@ -88,6 +105,37 @@ W23_SYNC_DATA_REVISION_TABLE_SQL = """CREATE TABLE sync_data_revision (
     revision INTEGER NOT NULL CHECK(revision >= 0),
     updated_at TEXT NOT NULL
 ) WITHOUT ROWID"""
+
+
+def _locator_trigger(table: str, column: str, action: str) -> str:
+    return f"""CREATE TRIGGER {table}_canonical_locator_{action.lower()}
+        BEFORE {action} ON {table}
+        WHEN NOT (
+            typeof(NEW.{column})='text'
+            AND length(NEW.{column}) BETWEEN 1 AND 512
+            AND length(CAST(NEW.{column} AS BLOB))=length(NEW.{column})
+            AND NEW.{column} NOT GLOB '*[^ -~]*'
+            AND NEW.{column} NOT LIKE '/%'
+            AND instr(NEW.{column},char(92))=0
+            AND instr(NEW.{column},'//')=0
+            AND NEW.{column} NOT IN ('.','..')
+            AND NEW.{column} NOT LIKE './%'
+            AND NEW.{column} NOT LIKE '../%'
+            AND NEW.{column} NOT LIKE '%/./%'
+            AND NEW.{column} NOT LIKE '%/../%'
+            AND NEW.{column} NOT LIKE '%/.'
+            AND NEW.{column} NOT LIKE '%/..'
+        ) BEGIN SELECT RAISE(ABORT,'noncanonical private source locator'); END"""
+
+
+W23_LOCATOR_TRIGGER_STATEMENTS: tuple[str, ...] = tuple(
+    _locator_trigger(table, column, action)
+    for table, column in (
+        ("sync_source_registry", "source_locator"),
+        ("sync_backfill_frontier", "directory_locator"),
+    )
+    for action in ("INSERT", "UPDATE")
+)
 
 
 W23_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -100,23 +148,29 @@ W23_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         W23_SYNC_JOBS_TABLE_SQL,
         W23_SYNC_BACKFILL_FRONTIER_TABLE_SQL,
         W23_SYNC_DATA_REVISION_TABLE_SQL,
+        *W23_LOCATOR_TRIGGER_STATEMENTS,
         "INSERT INTO sync_data_revision(singleton,revision,updated_at) VALUES (1,0,datetime('now'))",
-        "CREATE INDEX sync_ingest_queue_enqueued ON sync_ingest_queue(enqueued_at,source_locator)",
+        "CREATE INDEX sync_ingest_queue_available ON sync_ingest_queue(queue_state,available_at,enqueued_at)",
         "CREATE INDEX sync_dirty_roots_project ON sync_dirty_roots(project_id,root_kind,observed_at)",
         "CREATE INDEX sync_jobs_kind_updated ON sync_jobs(job_kind,updated_at DESC)",
+        "CREATE INDEX sync_frontier_resume ON sync_backfill_frontier(job_id,state,updated_at)",
     )),
 )
 
 
 W23_REQUIRED_SCHEMA: dict[str, set[str]] = {
     "sync_source_registry": {
-        "source_locator", "root_kind", "source_state", "first_seen_at", "last_seen_at",
+        "root_kind", "source_locator", "source_state", "project_id", "logical_source_key",
+        "session_key", "first_seen_at", "last_seen_at",
     },
     "sync_source_checkpoints": {
-        "source_locator", "device_id", "inode", "file_size", "byte_offset", "line_number",
-        "prefix_anchor", "revision_anchor", "updated_at",
+        "root_kind", "source_locator", "device_id", "inode", "file_size", "byte_offset",
+        "line_number", "prefix_anchor", "revision_anchor", "updated_at",
     },
-    "sync_ingest_queue": {"source_locator", "enqueued_at", "attempts"},
+    "sync_ingest_queue": {
+        "root_kind", "source_locator", "queue_state", "enqueued_at", "available_at",
+        "claimed_by", "claimed_at", "attempts", "reason_code",
+    },
     "sync_worker_leases": {"lease_name", "owner_key", "acquired_at", "expires_at"},
     "sync_dirty_roots": {"project_id", "root_key", "root_kind", "observed_at"},
     "sync_jobs": {
@@ -124,7 +178,7 @@ W23_REQUIRED_SCHEMA: dict[str, set[str]] = {
         "bytes_processed", "created_at", "updated_at", "completed_at",
     },
     "sync_backfill_frontier": {
-        "root_kind", "directory_locator", "state", "discovered_count", "updated_at",
+        "job_id", "root_kind", "directory_locator", "state", "discovered_count", "updated_at",
     },
     "sync_data_revision": {"singleton", "revision", "updated_at"},
 }

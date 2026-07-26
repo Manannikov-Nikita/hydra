@@ -712,6 +712,7 @@ class ResumableRepair:
         pending_after = self.repository.resume_frontier(job_id)
         complete = not pending_after
         partial = bool(self.repository.list_frontier(job_id, "repair_required"))
+        reconciliation_settled = False
         if complete:
             owner = f"repair-{job_id[:80]}"
             expiry = (datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
@@ -723,14 +724,16 @@ class ResumableRepair:
                     reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
                     self.repository.acknowledge_dirty_roots(owner, group, observed_at)
                 self.repository.release_lease(owner, observed_at)
+                reconciliation_settled = not self.repository.list_dirty_roots()
+        finished = complete and reconciliation_settled
         latest = self.repository.get_job(job_id)
         assert latest is not None
         self.repository.update_job(
-            job_id, state="partial" if complete and partial else "succeeded" if complete else "running",
+            job_id, state="partial" if finished and partial else "succeeded" if finished else "running",
             sources_discovered=latest.sources_discovered + discovered,
             sources_completed=latest.sources_completed + completed_sources,
             bytes_processed=latest.bytes_processed + processed_bytes,
             updated_at=observed_at,
-            completed_at=observed_at if complete else None,
+            completed_at=observed_at if finished else None,
         )
-        return RepairRun(discovered, directories, complete)
+        return RepairRun(discovered, directories, finished)

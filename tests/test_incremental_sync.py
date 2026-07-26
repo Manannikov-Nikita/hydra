@@ -257,6 +257,29 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.repository.list_dirty_roots(), ())
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM reconciliation_runs WHERE project_id='hprj_backfill'").fetchone()[0], 1)
 
+    def test_backfill_waits_for_reconciliation_lease_before_succeeding(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "leased-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text('project_id = "hprj_leased"\ntelemetry = "hybrid"\n')
+        self.path.write_text(
+            '{"type":"session_meta","payload":{"id":"leased-session","session_id":"leased-session",'
+            f'"cwd":"{project}"}}}}\n'
+        )
+        repair = ResumableRepair(self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"))
+        job_id = repair.start_backfill("2026-07-26T00:00:00Z")
+        repair.run_batch(job_id, "2026-07-26T00:00:01Z", directory_limit=1)
+        self.assertTrue(self.repository.acquire_lease("other", "2026-07-26T00:00:01Z", "2026-07-26T00:10:00Z"))
+        blocked = repair.run_batch(job_id, "2026-07-26T00:00:02Z", directory_limit=1)
+        self.assertFalse(blocked.completed)
+        self.assertEqual(self.repository.get_job(job_id).state, "running")
+        self.assertNotEqual(self.repository.list_dirty_roots(), ())
+        resumed = repair.run_batch(job_id, "2026-07-26T00:10:00Z", directory_limit=1)
+        self.assertTrue(resumed.completed)
+        self.assertEqual(self.repository.get_job(job_id).state, "succeeded")
+        self.assertEqual(self.repository.list_dirty_roots(), ())
+
     def test_rewrite_repair_remains_quarantined_without_advancing_checkpoint(self) -> None:
         from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
 

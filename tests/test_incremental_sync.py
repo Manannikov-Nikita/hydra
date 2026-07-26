@@ -383,6 +383,37 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(worker.sync_once("worker", "2026-07-26T00:01:00Z", "2026-07-26T00:02:00Z").completed, 1)
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").line_number, 2)
 
+    def test_repair_leaves_unterminated_record_for_one_reconstructed_append(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "partial-repair-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text('project_id = "hprj_partial"\ntelemetry = "hybrid"\n')
+        prefix = (
+            '{"type":"session_meta","payload":{"id":"partial-session","session_id":"partial-session",'
+            f'"cwd":"{project}"}}}}\n'
+        ).encode()
+        unfinished = b'{"type":"event_msg","payload":{"type":"task_complete"'
+        self.path.write_bytes(prefix + unfinished)
+        roots = TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive")
+        repair = ResumableRepair(self.store, roots)
+        self.assertTrue(repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:00:00Z"))
+        checkpoint = self.repository.checkpoint_for("sessions", "rollout.jsonl")
+        self.assertEqual((checkpoint.byte_offset, checkpoint.line_number), (len(prefix), 1))
+
+        suffix = b'}}\n'
+        self.path.write_bytes(prefix + unfinished + suffix)
+        self.repository.enqueue("sessions", "rollout.jsonl", "2026-07-26T00:01:00Z")
+        seen: list[bytes] = []
+
+        def materialize(_item, tail, _connection):
+            seen.extend(line.value for line in tail.lines)
+            return MaterializedSource(project_id="hprj_partial")
+
+        worker = IncrementalSyncWorker(self.store, roots, materialize=materialize)
+        self.assertEqual(worker.sync_once("worker", "2026-07-26T00:01:00Z", "2026-07-26T00:02:00Z").completed, 1)
+        self.assertEqual(seen, [unfinished + suffix])
+
     def test_large_repair_checkpoint_is_at_eof_then_append_reads_only_new_bytes(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, ResumableRepair, TrustedSourceRoots
 

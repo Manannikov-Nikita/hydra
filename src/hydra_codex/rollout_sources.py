@@ -49,6 +49,12 @@ class SourceScan:
     segment_marker: str
     source_stat: SourceStat
     path: Path = field(repr=False)
+    # Legacy ingest intentionally retains counts for every physical record,
+    # including a final unterminated fragment. Incremental repair needs the
+    # durable newline-complete prefix separately so that fragment can be
+    # reconstructed when its writer appends the suffix.
+    complete_line_count: int | None = None
+    complete_byte_count: int | None = None
 
 
 def _regular_source_stat(details: os.stat_result) -> SourceStat:
@@ -127,11 +133,16 @@ def scan_source(
     first_meta: tuple[str, str | None, str | None, str | None, str] | None = None
     matched_meta: tuple[int, tuple[str, str | None, str | None, str | None, str]] | None = None
     byte_count = 0
+    complete_byte_count = 0
+    complete_line_count = 0
     with source_context as handle:
         if opener is not None:
             before_stat = _regular_source_stat(os.fstat(handle.fileno()))
         for raw_line in handle:
             byte_count += len(raw_line)
+            if raw_line.endswith(b"\n"):
+                complete_byte_count += len(raw_line)
+                complete_line_count += 1
             revision.update(raw_line)
             decoded = raw_line.decode("utf-8", errors="replace")
             fingerprint = line_fingerprint(raw_line, key)
@@ -173,7 +184,7 @@ def scan_source(
     return SourceScan(
         revision.hexdigest(), tuple(fingerprints), len(fingerprints), byte_count,
         chain.hexdigest(), identity, conversation, cwd, meta_timestamp, marker,
-        before_stat, canonical_path,
+        before_stat, canonical_path, complete_line_count, complete_byte_count,
     )
 
 

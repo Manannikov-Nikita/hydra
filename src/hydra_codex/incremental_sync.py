@@ -220,7 +220,12 @@ def _full_scan_checkpoint(
     with roots.open_held(root_kind, locator) as (handle, details):
         if details != scan.source_stat or details.size != scan.byte_count:
             raise RepairRequired("source changed during full repair")
-        return _checkpoint_for(handle, details, scan.byte_count, scan.line_count)
+        # Old callers can still construct SourceScan positionally; their
+        # legacy counts remain the safest available fallback. New scans retain
+        # a final unterminated fragment for the incremental append reader.
+        complete_bytes = scan.byte_count if scan.complete_byte_count is None else scan.complete_byte_count
+        complete_lines = scan.line_count if scan.complete_line_count is None else scan.complete_line_count
+        return _checkpoint_for(handle, details, complete_bytes, complete_lines)
 
 
 def read_incremental_source(

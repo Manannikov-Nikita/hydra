@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -21,6 +21,7 @@ import stat
 from typing import BinaryIO
 
 from .project import ProjectNotFound, resolve_project
+from .reconcile_engine import reconcile_project
 from .rollout import ingest_rollouts
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .rollout_observations import safe_int, usage as parse_usage
@@ -502,6 +503,7 @@ class ResumableRepair:
     """Explicit bounded repair/backfill; this is the only directory walker."""
 
     _ROOT_MARKER = "@root"
+    _FILE_PREFIX = "@file/"
 
     def __init__(self, store: HydraStore, roots: TrustedSourceRoots) -> None:
         self.store = store
@@ -559,6 +561,21 @@ class ResumableRepair:
             self.store, (RolloutRoot(canonical_path, label),), project.project_root, project.project_id,
             hash_key=hasher.key, prepared_scans={canonical_path: scan},
         )
+        current_digest = hasher.digest("source", f"revision/{project.project_id}/{scan.revision_digest}")
+        current = self.store.connection.execute(
+            """SELECT r.materialized,l.lineage_state,l.canonical_revision_digest
+                 FROM rollout_sources AS r JOIN rollout_logical_sources AS l
+                   ON l.logical_source_key=r.logical_source_key
+                WHERE r.source_digest=? AND l.project_id=?""",
+            (current_digest, project.project_id),
+        ).fetchone()
+        if current is None or not int(current[0]) or current[1] != "clean" or current[2] != current_digest:
+            self.repository.register_source(
+                root_kind=root_kind, source_locator=locator, project_id=project.project_id,
+                observed_at=observed_at,
+            )
+            self.repository.mark_repair_required(root_kind, locator, observed_at)
+            return False
         location_key = hasher.digest("source", str(canonical_path))
         row = self.store.connection.execute(
             """SELECT l.logical_source_key,l.session_key FROM rollout_source_locations AS x
@@ -599,6 +616,7 @@ class ResumableRepair:
                  checkpoint.revision_anchor, observed_at),
             )
             self.repository._bump_revision(connection, observed_at)
+        self.repository.mark_dirty(project.project_id, project.project_id, "project", observed_at)
         return True
 
     def repair_source(self, root_kind: str, source_locator: str, observed_at: str) -> bool:
@@ -633,6 +651,31 @@ class ResumableRepair:
         pending = self.repository.resume_frontier(job_id)[:directory_limit]
         discovered = directories = completed_sources = processed_bytes = 0
         for frontier in pending:
+            if frontier.directory_locator.startswith(self._FILE_PREFIX):
+                locator = frontier.directory_locator.removeprefix(self._FILE_PREFIX)
+                try:
+                    if self._full_materialize(frontier.root_kind, locator, observed_at):
+                        details = source_stat(self.roots.resolve(frontier.root_kind, locator))
+                        self.repository.save_frontier(
+                            job_id=job_id, root_kind=frontier.root_kind,
+                            directory_locator=frontier.directory_locator, state="scanned",
+                            discovered_count=1, updated_at=observed_at,
+                        )
+                        completed_sources += 1
+                        processed_bytes += details.size
+                    else:
+                        self.repository.save_frontier(
+                            job_id=job_id, root_kind=frontier.root_kind,
+                            directory_locator=frontier.directory_locator, state="repair_required",
+                            discovered_count=1, updated_at=observed_at,
+                        )
+                except (OSError, RepairRequired, SourceChanged):
+                    self.repository.save_frontier(
+                        job_id=job_id, root_kind=frontier.root_kind,
+                        directory_locator=frontier.directory_locator, state="repair_required",
+                        discovered_count=1, updated_at=observed_at,
+                    )
+                continue
             try:
                 directory = self._directory(frontier.root_kind, frontier.directory_locator)
                 with os.scandir(directory) as entries:
@@ -650,9 +693,11 @@ class ResumableRepair:
                                 state="pending", discovered_count=0, updated_at=observed_at,
                             )
                         elif stat.S_ISREG(details.st_mode) and entry.name.endswith(".jsonl"):
-                            if self._full_materialize(frontier.root_kind, relative, observed_at):
-                                completed_sources += 1
-                                processed_bytes += int(details.st_size)
+                            self.repository.save_frontier(
+                                job_id=job_id, root_kind=frontier.root_kind,
+                                directory_locator=self._FILE_PREFIX + relative, state="pending",
+                                discovered_count=1, updated_at=observed_at,
+                            )
                             discovered += 1
                 self.repository.save_frontier(
                     job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
@@ -664,11 +709,24 @@ class ResumableRepair:
                     job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
                     state="repair_required", discovered_count=0, updated_at=observed_at,
                 )
-        complete = not self.repository.resume_frontier(job_id)
+        pending_after = self.repository.resume_frontier(job_id)
+        complete = not pending_after
+        partial = bool(self.repository.list_frontier(job_id, "repair_required"))
+        if complete:
+            owner = f"repair-{job_id[:80]}"
+            expiry = (datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                      + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+            if self.repository.acquire_lease(owner, observed_at, expiry):
+                dirty = self.repository.claim_dirty_roots(owner, observed_at, expiry)
+                for project_id in sorted({root.project_id for root in dirty}):
+                    group = tuple(root for root in dirty if root.project_id == project_id)
+                    reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
+                    self.repository.acknowledge_dirty_roots(owner, group, observed_at)
+                self.repository.release_lease(owner, observed_at)
         latest = self.repository.get_job(job_id)
         assert latest is not None
         self.repository.update_job(
-            job_id, state="succeeded" if complete else "running",
+            job_id, state="partial" if complete and partial else "succeeded" if complete else "running",
             sources_discovered=latest.sources_discovered + discovered,
             sources_completed=latest.sources_completed + completed_sources,
             bytes_processed=latest.bytes_processed + processed_bytes,

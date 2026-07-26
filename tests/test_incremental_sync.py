@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from hydra_codex.storage import HydraStore
 from hydra_codex.sync_state import SyncStateRepository
@@ -149,7 +150,8 @@ class IncrementalWorkerTests(unittest.TestCase):
             path.write_bytes(b'{"unread":true}\n')
             self.repository.register_source(root_kind="sessions", source_locator=f"known/{index}.jsonl", observed_at="2026-07-26T00:00:00Z")
         worker = IncrementalSyncWorker(self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"))
-        report = worker.sync_once("worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z")
+        with mock.patch("hydra_codex.incremental_sync.read_incremental_source", side_effect=AssertionError("must not read")):
+            report = worker.sync_once("worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z")
         self.assertEqual((report.claimed, report.completed, report.repair_required), (0, 0, 0))
 
     def test_default_materializer_persists_appended_token_and_lifecycle_facts(self) -> None:
@@ -206,6 +208,7 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(first.discovered, 1)
         second = repair.run_batch(job, "2026-07-26T00:00:02Z", directory_limit=2)
         self.assertEqual(second.discovered, 1)
+        repair.run_batch(job, "2026-07-26T00:00:03Z", directory_limit=2)
         self.assertEqual(
             [source.source_locator for source in self.repository.list_sources()],
             ["nested/one.jsonl", "rollout.jsonl"],
@@ -233,3 +236,38 @@ class IncrementalWorkerTests(unittest.TestCase):
         worker = IncrementalSyncWorker(self.store, roots)
         self.assertEqual(worker.sync_once("worker", "2026-07-26T00:01:00Z", "2026-07-26T00:02:00Z").completed, 1)
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").line_number, 2)
+
+    def test_backfill_reconciles_dirty_project_before_job_succeeds(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "backfill-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text('project_id = "hprj_backfill"\ntelemetry = "hybrid"\n')
+        self.path.write_text(
+            '{"type":"session_meta","payload":{"id":"backfill-session","session_id":"backfill-session",'
+            f'"cwd":"{project}"}}}}\n'
+        )
+        repair = ResumableRepair(self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"))
+        job_id = repair.start_backfill("2026-07-26T00:00:00Z")
+        repair.run_batch(job_id, "2026-07-26T00:00:01Z", directory_limit=1)
+        repair.run_batch(job_id, "2026-07-26T00:00:02Z", directory_limit=1)
+        job = self.repository.get_job(job_id)
+        self.assertEqual(job.state, "succeeded")
+        self.assertEqual(job.sources_completed, 1)
+        self.assertEqual(self.repository.list_dirty_roots(), ())
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM reconciliation_runs WHERE project_id='hprj_backfill'").fetchone()[0], 1)
+
+    def test_rewrite_repair_remains_quarantined_without_advancing_checkpoint(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "rewrite-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text('project_id = "hprj_rewrite"\ntelemetry = "hybrid"\n')
+        self.path.write_text('{"type":"session_meta","payload":{"id":"s","cwd":"' + str(project) + '"}}\n')
+        repair = ResumableRepair(self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"))
+        self.assertTrue(repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:00:00Z"))
+        before = self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset
+        self.path.write_text('{"type":"session_meta","payload":{"id":"s","cwd":"' + str(project) + '","changed":true}}\n')
+        self.assertFalse(repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:01:00Z"))
+        self.assertEqual(self.repository.source_for("sessions", "rollout.jsonl").source_state, "repair_required")
+        self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, before)

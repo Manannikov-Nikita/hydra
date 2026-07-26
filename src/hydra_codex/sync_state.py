@@ -612,7 +612,10 @@ class SyncStateRepository:
                       discovered_count: int, updated_at: str) -> int:
         updated_at = _timestamp(updated_at)
         root = self._validate_root(root_kind)
-        locator = validate_root_relative_locator(directory_locator)
+        # ``@root`` is a private frontier sentinel, never a source locator or
+        # public payload.  It lets a repair job persist that it has scanned the
+        # root directory even when it contained no descendants.
+        locator = directory_locator if directory_locator == "@root" else validate_root_relative_locator(directory_locator)
         if state not in _FRONTIER_STATES or discovered_count < 0:
             raise ValueError("backfill frontier is invalid")
         with self._store.rollout_transaction() as connection:

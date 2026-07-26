@@ -181,7 +181,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     )
                 }
 
-                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(store.schema_version(), 39)
                 self.assertIsNotNone(index)
                 self.assertIn(
                     "ON token_snapshots(project_id,session_key)",
@@ -247,7 +247,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                            AND name='token_snapshots_project_session_valid'""",
                 ).fetchone()
 
-                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(store.schema_version(), 39)
                 self.assertEqual(tuple(preserved), (10, 2, 3))
                 self.assertIsNotNone(index)
             finally:
@@ -266,7 +266,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     columns,
                     {"project_id", "display_name", "first_seen_at", "last_seen_at"},
                 )
-                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(store.schema_version(), 39)
             finally:
                 store.close()
 

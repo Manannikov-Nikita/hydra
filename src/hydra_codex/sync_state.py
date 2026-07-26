@@ -348,6 +348,34 @@ class SyncStateRepository:
                 self._bump_revision(connection, observed_at)
             return changed
 
+    def renew_claim(
+        self, owner_key: str, root_kind: str, source_locator: str,
+        observed_at: str, lease_expires_at: str,
+    ) -> bool:
+        """Atomically heartbeat the singleton lease and one owned queue claim."""
+        observed_at = _timestamp(observed_at)
+        lease_expires_at = _timestamp(lease_expires_at)
+        root = self._validate_root(root_kind)
+        locator = validate_root_relative_locator(source_locator)
+        if lease_expires_at <= observed_at:
+            raise ValueError("renewal expiry must follow observation")
+        with self._store.rollout_transaction() as connection:
+            held = connection.execute(
+                """UPDATE sync_worker_leases SET acquired_at=?,expires_at=?
+                     WHERE lease_name='ingest' AND owner_key=?""",
+                (observed_at, lease_expires_at, owner_key),
+            ).rowcount == 1
+            if not held:
+                return False
+            renewed = connection.execute(
+                """UPDATE sync_ingest_queue SET claim_expires_at=? WHERE root_kind=? AND source_locator=?
+                     AND queue_state='claimed' AND claimed_by=?""",
+                (lease_expires_at, root, locator, owner_key),
+            ).rowcount == 1
+            if renewed:
+                self._bump_revision(connection, observed_at)
+            return renewed
+
     def acknowledge_claim(self, owner_key: str, root_kind: str, source_locator: str, observed_at: str) -> bool:
         observed_at = _timestamp(observed_at)
         root = self._validate_root(root_kind)

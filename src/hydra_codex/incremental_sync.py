@@ -545,6 +545,12 @@ class IncrementalSyncWorker:
                     reason_code="unattributed", available_at=lease_expires_at, observed_at=now,
                 )
                 continue
+            if not self.repository.renew_claim(
+                owner_key, item.root_kind, item.source_locator, now, lease_expires_at,
+            ):
+                # A competing owner or expired lease won before materialization;
+                # leave the queue item for normal expiry/reclaim semantics.
+                continue
             if crash_after_materialize:
                 # Test-only fault point: the queue claim survives and its
                 # expiry causes an idempotent replay after a process restart.

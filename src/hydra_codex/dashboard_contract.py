@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .contracts import AnnotationCause, AnnotationKind, Outcome, ScopeChange
+from .contracts import AnnotationCause, AnnotationKind, Outcome, ScopeChange, normalize_task_label
 from .diagnostics import DOCTOR_SCHEMA
 from .redaction import redact_note
 from .report_semantics import (
@@ -198,7 +198,7 @@ def _validate_annotations(value: object) -> None:
 
 def validate_task_report(value: object) -> None:
     report = _object(value, {
-        "schema_version", "task_ref", "status", "last_activity_at", "task_family",
+        "schema_version", "task_ref", "status", "last_activity_at", "task_family", "display_name",
         "recorded_tokens", "deduplicated_tokens", "timing", "counts", "semantic",
         "instrumentation_overhead", "pilot_health", "trend",
     }, "task report")
@@ -209,6 +209,8 @@ def validate_task_report(value: object) -> None:
         raise ValueError("task report status is invalid")
     _timestamp(report["last_activity_at"], "task report last_activity_at")
     _task_family(report["task_family"], "task family")
+    if normalize_task_label(report["display_name"]) != report["display_name"]:
+        raise ValueError("task display name is invalid")
     _validate_fact_group(
         report["recorded_tokens"], TOKEN_KEYS, "tokens",
         integer=True, nonnegative=True,

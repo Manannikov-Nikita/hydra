@@ -23,6 +23,7 @@ def report_from_task_tree(
     semantic_conflicts: NumericFact | None = None,
     schema_diagnostics: NumericFact | None = None,
     instrumentation_overhead: NumericFact | None = None,
+    display_name: str | None = None,
 ) -> TaskReport:
     """Adapt trusted task-tree facts without retaining its private root or session list."""
     from .reporting import (
@@ -80,7 +81,7 @@ def report_from_task_tree(
         _from_scalar(metrics.test_runs, "count"), _from_scalar(metrics.targeted_test_runs, "count"),
         _from_scalar(metrics.full_test_runs, "count"), _from_scalar(metrics.test_retries, "count"),
         semantic_coverage, breakdown, conflicts, diagnostics, overhead, pilot, trend,
-        TrendAssessment.unavailable(),
+        TrendAssessment.unavailable(), display_name,
     )
 
 

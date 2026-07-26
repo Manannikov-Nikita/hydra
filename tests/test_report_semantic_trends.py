@@ -304,7 +304,7 @@ class SemanticReportIntegrationTests(StoredReportScenario):
         payload = json.loads(render_json(report))
         annotations = payload["semantic"]["annotations"]
 
-        self.assertEqual(payload["schema_version"], "hydra.report/v3")
+        self.assertEqual(payload["schema_version"], "hydra.report/v4")
         self.assertEqual(annotations["kind_counts"]["phase"]["value"], 1)
         self.assertEqual(annotations["kind_counts"]["finish"]["value"], 1)
         self.assertEqual(annotations["cause_counts"]["plan"]["value"], 1)

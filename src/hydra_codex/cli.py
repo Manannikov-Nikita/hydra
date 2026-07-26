@@ -28,6 +28,10 @@ class CommandServices(Protocol):
 
     def reconcile(self, database_path: Path | None, cwd: Path) -> object: ...
 
+    def sync(self, database_path: Path | None, cwd: Path) -> object: ...
+
+    def repair(self, database_path: Path | None, cwd: Path) -> object: ...
+
     def report(
         self, last: int, output_format: str, database_path: Path | None, cwd: Path,
     ) -> str: ...
@@ -155,12 +159,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     annotate = commands.add_parser("annotate")
     _common_options(annotate)
-    for field in ("kind", "phase", "cause", "outcome", "scope-change", "task-family", "note"):
+    for field in ("kind", "phase", "cause", "outcome", "scope-change", "task-family", "task-label", "note"):
         annotate.add_argument("--" + field)
     annotate.add_argument("--confidence", type=float)
 
     reconcile = commands.add_parser("reconcile")
     _common_options(reconcile)
+
+    sync = commands.add_parser("sync")
+    _common_options(sync)
+
+    repair = commands.add_parser("repair")
+    _common_options(repair)
+    repair.add_argument("--all", action="store_true", required=True)
 
     dashboard = commands.add_parser("dashboard")
     _common_options(dashboard)
@@ -370,6 +381,7 @@ def _annotation(arguments: argparse.Namespace, stdin: TextIO) -> ModelAnnotation
         "outcome": arguments.outcome,
         "scope_change": arguments.scope_change,
         "task_family": arguments.task_family,
+        "task_label": arguments.task_label,
         "confidence": arguments.confidence,
         "note": arguments.note,
     }
@@ -635,6 +647,18 @@ def main(
             database, cwd = _paths(arguments)
             command_services.reconcile(database, cwd)
             _write_json(output_stream, {"command": "reconcile", "status": "ok"})
+        elif arguments.command == "sync":
+            database, cwd = _paths(arguments)
+            result = command_services.sync(database, cwd)
+            if not isinstance(result, Mapping):
+                raise RuntimeError("sync service returned invalid content")
+            _write_json(output_stream, result)
+        elif arguments.command == "repair":
+            database, cwd = _paths(arguments)
+            result = command_services.repair(database, cwd)
+            if not isinstance(result, Mapping):
+                raise RuntimeError("repair service returned invalid content")
+            _write_json(output_stream, result)
         elif arguments.command == "pilot":
             _pilot(arguments, output_stream, command_services)
         else:

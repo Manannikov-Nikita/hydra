@@ -228,6 +228,7 @@ _ANNOTATION_PROPERTIES: dict[str, dict[str, object]] = {
         "type": "string", "minLength": 1, "maxLength": 80,
         "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+){0,7}$",
     },
+    "task_label": {"type": "string", "minLength": 1, "maxLength": 80},
     "note": {"type": "string", "maxLength": 240},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
 }
@@ -254,8 +255,8 @@ def _tool_definitions(*, annotation_enabled: bool) -> list[dict[str, object]]:
     tools.append({
         "name": "hydra.report",
         "description": (
-            "Reconcile local telemetry and render either recent privacy-safe task reports "
-            "or one canonical pilot audit."
+            "Read materialized local telemetry and render recent privacy-safe task reports "
+            "or one canonical pilot audit. This tool does not ingest, sync, or reconcile."
         ),
         "inputSchema": {
             "type": "object",
@@ -335,6 +336,8 @@ class StdioMcpServer:
             "confidence": model.confidence,
             "note": model.note,
         }
+        if model.task_label is not None:
+            payload["task_label"] = model.task_label
         if model.outcome is not None:
             payload["outcome"] = model.outcome.value
         result = self._runner.run(
@@ -372,12 +375,6 @@ class StdioMcpServer:
         count = arguments.get("last")
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
             raise ValueError("invalid last")
-        ingested = self._runner.run(self._command("ingest"))
-        if ingested.returncode != 0:
-            return _result_text("Hydra command failed.", error=True)
-        reconciled = self._runner.run(self._command("reconcile"))
-        if reconciled.returncode != 0:
-            return _result_text("Hydra command failed.", error=True)
         rendered = self._runner.run(self._command(
             "report", "--last", str(count), "--format", str(output_format),
         ))

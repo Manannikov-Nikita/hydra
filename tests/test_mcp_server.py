@@ -38,11 +38,7 @@ def request(identifier: int, method: str, params: object | None = None) -> dict[
 
 class StdioMcpServerTests(unittest.TestCase):
     def test_injected_runtime_prefix_is_used_for_every_internal_command(self) -> None:
-        runner = FakeRunner([
-            ProcessResult(0, '{"command":"ingest","status":"ok"}\n', ""),
-            ProcessResult(0, '{"status":"ok"}\n', ""),
-            ProcessResult(0, "{}\n", ""),
-        ])
+        runner = FakeRunner([ProcessResult(0, "{}\n", "")])
         prefix = ("/trusted/python", "-m", "hydra_codex")
         server = StdioMcpServer(runner, command_prefix=prefix)
 
@@ -52,14 +48,8 @@ class StdioMcpServerTests(unittest.TestCase):
         }))
 
         self.assertFalse(response["result"]["isError"])
-        self.assertEqual(
-            [call[0][:3] for call in runner.calls],
-            [prefix, prefix, prefix],
-        )
-        self.assertEqual(
-            [call[0][3] for call in runner.calls],
-            ["ingest", "reconcile", "report"],
-        )
+        self.assertEqual([call[0][:3] for call in runner.calls], [prefix])
+        self.assertEqual([call[0][3] for call in runner.calls], ["report"])
 
     def test_subprocess_runner_is_shell_free_bounded_and_times_out(self) -> None:
         runner = SubprocessRunner(
@@ -292,19 +282,13 @@ class StdioMcpServerTests(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(runner.calls, [])
 
-    def test_report_ingests_reconciles_then_renders_and_never_accepts_paths(self) -> None:
-        runner = FakeRunner([
-            ProcessResult(0, '{"command":"ingest","status":"ok"}\n', ""),
-            ProcessResult(0, '{"status":"ok"}\n', ""),
-            ProcessResult(0, "# Hydra task report\n", ""),
-        ])
+    def test_report_reads_materialized_state_only_and_never_accepts_paths(self) -> None:
+        runner = FakeRunner([ProcessResult(0, "# Hydra task report\n", "")])
         server = StdioMcpServer(runner, executable="hydra-test")
         response = server.handle(request(5, "tools/call", {
             "name": "hydra.report", "arguments": {"last": 5, "format": "markdown"},
         }))
         self.assertEqual(runner.calls, [
-            (("hydra-test", "ingest"), None),
-            (("hydra-test", "reconcile"), None),
             (("hydra-test", "report", "--last", "5", "--format", "markdown"), None),
         ])
         self.assertEqual(response["result"]["content"][0]["text"], "# Hydra task report\n")
@@ -313,8 +297,8 @@ class StdioMcpServerTests(unittest.TestCase):
         }))
         self.assertTrue(invalid["result"]["isError"])
 
-    def test_report_fails_closed_when_fresh_ingest_fails(self) -> None:
-        runner = FakeRunner([ProcessResult(1, "", "private ingest failure")])
+    def test_report_fails_closed_when_materialized_read_fails(self) -> None:
+        runner = FakeRunner([ProcessResult(1, "", "private report failure")])
 
         response = StdioMcpServer(runner, executable="hydra-test").handle(request(
             15, "tools/call", {
@@ -323,7 +307,7 @@ class StdioMcpServerTests(unittest.TestCase):
         ))
 
         self.assertTrue(response["result"]["isError"])
-        self.assertEqual(runner.calls, [(("hydra-test", "ingest"), None)])
+        self.assertEqual(runner.calls, [(("hydra-test", "report", "--last", "1", "--format", "json"), None)])
         self.assertNotIn("private", response["result"]["content"][0]["text"])
 
     def test_report_audit_mode_delegates_to_one_shot_audit_command(self) -> None:

@@ -27,6 +27,7 @@ from .reconcile_types import (
     TaskPlan,
 )
 from .storage import HydraStore
+from .contracts import normalize_task_label
 from .rollout_reconcile import reconcile_turn_attempts
 from .task_tree_storage import (
     StoredProjectObservationIndex,
@@ -212,14 +213,24 @@ def _persist_task(
     connection: sqlite3.Connection, project_id: str, public_ref: str,
     plan: TaskPlan, input_digest: str, deltas: Iterable[DeltaFact], semantic: SemanticAssembly,
 ) -> None:
+    placeholders = ",".join("?" for _ in plan.session_ids)
+    label_row = connection.execute(
+        f"""SELECT task_label FROM annotations
+              WHERE project_id=? AND session_id IN ({placeholders})
+                AND provenance='model_reported' AND task_label IS NOT NULL
+                AND observed_at<=?
+              ORDER BY observed_at DESC,sequence DESC,annotation_id DESC LIMIT 1""",
+        (project_id, *plan.session_ids, _plan_instant(plan).canonical),
+    ).fetchone()
+    display_name = None if label_row is None else normalize_task_label(label_row[0])
     connection.execute(
         """INSERT INTO reconciled_tasks(
                project_id,root_key,public_ref,status,cutoff_at,last_activity_at,task_family,
-               reconciliation_version,input_digest) VALUES (?,?,?,?,?,?,?,?,?)""",
+               reconciliation_version,input_digest,display_name) VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (
             project_id, plan.root_key, public_ref, plan.status,
             _plan_instant(plan).canonical, _plan_instant(plan).canonical,
-            semantic.task_family, RECONCILIATION_VERSION, input_digest,
+            semantic.task_family, RECONCILIATION_VERSION, input_digest, display_name,
         ),
     )
     connection.executemany(
@@ -467,7 +478,7 @@ def list_reconciled_tasks(
             tasks.append(ReconciledTask(
                 str(row["public_ref"]), str(row["status"]), cutoff,
                 replace(metrics, semantic_coverage=semantic.coverage), semantic,
-                cutoff_instant,
+                cutoff_instant, row["display_name"],
             ))
         return tuple(tasks)
 

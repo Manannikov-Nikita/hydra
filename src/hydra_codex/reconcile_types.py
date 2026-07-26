@@ -9,6 +9,7 @@ from typing import Mapping
 
 from .exact_time import ExactInstant, instant_from_datetime
 from .reconcile_annotations import AnnotationFacts
+from .contracts import normalize_task_label
 from .task_tree_types import Provenance, ScalarFact, TaskTreeMetrics, validate_provenance
 
 
@@ -96,6 +97,7 @@ class ReconciledTask:
     last_activity_instant: ExactInstant | None = field(
         default=None, compare=False, repr=False,
     )
+    display_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.public_ref.startswith("task_"):
@@ -111,6 +113,7 @@ class ReconciledTask:
         object.__setattr__(self, "last_activity_instant", instant)
         if self.last_activity_at != self.metrics.cutoff_at:
             raise ValueError("task activity and metric cutoff must match")
+        object.__setattr__(self, "display_name", normalize_task_label(self.display_name))
 
     def __repr__(self) -> str:
         return f"ReconciledTask(public_ref={self.public_ref!r}, status={self.status!r})"

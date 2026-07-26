@@ -26,7 +26,7 @@ class DurableSyncStateTests(unittest.TestCase):
             self.fail(f"durable sync state module is missing: {error}")
         return SyncStateRepository(self.store)
 
-    def test_schema_39_creates_private_durable_sync_tables(self) -> None:
+    def test_schema_40_creates_private_durable_sync_tables(self) -> None:
         tables = {
             str(row[0])
             for row in self.store.connection.execute(
@@ -34,7 +34,7 @@ class DurableSyncStateTests(unittest.TestCase):
             )
         }
 
-        self.assertEqual(self.store.schema_version(), 39)
+        self.assertEqual(self.store.schema_version(), 40)
         self.assertTrue({
             "sync_source_registry", "sync_source_checkpoints", "sync_ingest_queue",
             "sync_worker_leases", "sync_dirty_roots", "sync_jobs",
@@ -386,7 +386,7 @@ class DurableSyncStateTests(unittest.TestCase):
 
         upgraded = HydraStore(legacy_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.schema_version(), 39)
+        self.assertEqual(upgraded.schema_version(), 40)
         self.assertEqual(
             upgraded.connection.execute(
                 "SELECT display_name FROM dashboard_projects WHERE project_id='hprj_preserved'"

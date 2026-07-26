@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import uuid
 
 from .annotation_spool import stage_annotation
 from .contracts import ModelAnnotationInput
@@ -19,6 +20,7 @@ from .report_renderers import (
 from .rollout_identity import Pseudonymizer
 from .platform_paths import default_installation_key_path
 from .storage import HydraStore
+from .sync_state import SyncStateRepository
 
 
 Clock = Callable[[], datetime]
@@ -70,6 +72,7 @@ def _payload(annotation: ModelAnnotationInput) -> dict[str, object]:
         "task_family": annotation.task_family,
         "confidence": annotation.confidence,
         "note": annotation.note,
+        **({"task_label": annotation.task_label} if annotation.task_label is not None else {}),
         **(
             {"outcome": annotation.outcome.value}
             if annotation.outcome is not None
@@ -139,6 +142,61 @@ class LocalCommandServices:
         finally:
             store.close()
 
+    def _sync_roots(self) -> object:
+        from .incremental_sync import TrustedSourceRoots
+
+        home = Path(self._environ.get("HOME", str(Path.home()))).expanduser()
+        return TrustedSourceRoots(
+            sessions=home / ".codex" / "sessions",
+            archived_sessions=home / ".codex" / "archived_sessions",
+        )
+
+    def sync(self, database_path: Path | None, cwd: Path) -> dict[str, object]:
+        """Process only queued source locators; directory discovery is never reachable here."""
+        _ = cwd
+        from .incremental_sync import IncrementalSyncWorker
+
+        now = _utc_now(self._clock)
+        expiry = (datetime.fromisoformat(now.replace("Z", "+00:00"))
+                  + timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
+        store = HydraStore(self._database_path(database_path))
+        try:
+            result = IncrementalSyncWorker(
+                store, self._sync_roots(),
+                reconcile=lambda project_id: self._reconcile_store(store, project_id),
+            ).sync_once("cli-" + uuid.uuid4().hex, now, expiry)
+            return {
+                "command": "sync", "status": "ok", "claimed": result.claimed,
+                "completed": result.completed, "repair_required": result.repair_required,
+                "bytes_processed": result.bytes_processed,
+            }
+        finally:
+            store.close()
+
+    def _reconcile_store(self, store: HydraStore, project_id: str) -> object:
+        from .reconcile_engine import reconcile_project
+
+        return reconcile_project(store, project_id, self._keys().key)
+
+    def repair(self, database_path: Path | None, cwd: Path) -> dict[str, object]:
+        """Start or resume the explicit bounded history repair operation."""
+        _ = cwd
+        from .incremental_sync import ResumableRepair
+
+        now = _utc_now(self._clock)
+        store = HydraStore(self._database_path(database_path))
+        try:
+            repair = ResumableRepair(store, self._sync_roots())
+            job_id = repair.start_backfill(now, job_kind="repair")
+            result = repair.run_batch(job_id, now)
+            return {
+                "command": "repair", "status": "complete" if result.completed else "running",
+                "directories_scanned": result.directories_scanned,
+                "sources_discovered": result.discovered,
+            }
+        finally:
+            store.close()
+
     def report(
         self,
         last: int,
@@ -154,9 +212,28 @@ class LocalCommandServices:
             reports = list_reconciled_reports(
                 store, project.project_id, limit=last,
             )
-            return render_report_collection(reports, output_format)
+            return render_report_collection(
+                reports, output_format, sync_freshness=self._sync_freshness(store),
+            )
         finally:
             store.close()
+
+    @staticmethod
+    def _sync_freshness(store: HydraStore) -> dict[str, object]:
+        repository = SyncStateRepository(store)
+        queued = repository.list_queue(limit=1)
+        repair = any(item.source_state == "repair_required" for item in queued)
+        job = repository.current_job("repair") or repository.current_job("backfill")
+        state = (
+            "repair_required" if repair else "repairing"
+            if job is not None and job.state in {"queued", "running"}
+            else "queued" if queued else "idle"
+        )
+        return {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": state,
+            "data_revision": repository.data_revision(),
+        }
 
     def compare(
         self,

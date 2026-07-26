@@ -10,12 +10,13 @@ from types import MappingProxyType
 from typing import Mapping
 
 from .public_refs import PublicReferenceProjection, project_public_references
+from .contracts import normalize_task_label
 from .redaction import project_task_family
 from .report_semantics import SemanticBreakdown, TrendAssessment
 from .task_tree_types import ScalarFact, TokenVectorFact, validate_provenance
 
 
-REPORT_SCHEMA = "hydra.report/v3"
+REPORT_SCHEMA = "hydra.report/v4"
 COMPARISON_SCHEMA = "hydra.comparison/v2"
 _PUBLIC_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z")
@@ -246,12 +247,14 @@ class TaskReport:
     pilot_health: PilotHealth
     trend_input: TrendInput
     trend_result: TrendAssessment
+    display_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != REPORT_SCHEMA:
             raise ValueError("unsupported report schema")
         if _PUBLIC_REF.fullmatch(self.task_ref) is None:
             raise ValueError("task_ref must be an opaque public reference")
+        object.__setattr__(self, "display_name", normalize_task_label(self.display_name))
         if self.status not in {"complete", "incomplete"}:
             raise ValueError("invalid task status")
         try:
@@ -363,6 +366,7 @@ class TaskReport:
             "status": self.status,
             "last_activity_at": self.last_activity_at,
             "task_family": self.task_family,
+            "display_name": self.display_name,
             "recorded_tokens": self.recorded_tokens.as_dict(),
             "deduplicated_tokens": self.deduplicated_tokens.as_dict(),
             "timing": {

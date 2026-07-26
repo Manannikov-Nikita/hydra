@@ -10,7 +10,7 @@ from .reporting import ComparisonReport, NumericFact, TaskReport
 
 
 Renderable = TaskReport | ComparisonReport
-REPORT_LIST_SCHEMA = "hydra.report-list/v1"
+REPORT_LIST_SCHEMA = "hydra.report-list/v2"
 
 
 def _number(value: int | float | None) -> str:
@@ -98,10 +98,12 @@ def _semantic_markdown(report: TaskReport) -> list[str]:
 
 def _report_markdown(report: TaskReport) -> str:
     family = report.task_family if report.task_family is not None else "unavailable"
+    display_name = report.display_name if report.display_name is not None else "unavailable"
     lines = [
         "# Hydra task report",
         "",
         f"- Task: `{_md(report.task_ref)}`",
+        f"- Display name: {_md(display_name)}",
         f"- Status: {_md(report.status)}",
         f"- Last activity: {_md(report.last_activity_at)}",
         f"- Task family: {_md(family)}",
@@ -251,7 +253,10 @@ def render_html(value: Renderable) -> str:
     return _report_html(value) if isinstance(value, TaskReport) else _comparison_html(value)
 
 
-def render_report_collection(reports: tuple[TaskReport, ...], output_format: str) -> str:
+def render_report_collection(
+    reports: tuple[TaskReport, ...], output_format: str, *,
+    sync_freshness: dict[str, object] | None = None,
+) -> str:
     """Render recent reports in caller-supplied deterministic order."""
     if not isinstance(reports, tuple) or any(not isinstance(item, TaskReport) for item in reports):
         raise ValueError("reports must be a tuple of TaskReport values")
@@ -260,6 +265,9 @@ def render_report_collection(reports: tuple[TaskReport, ...], output_format: str
             {
                 "schema_version": REPORT_LIST_SCHEMA,
                 "reports": [item.as_dict() for item in reports],
+                "sync_freshness": sync_freshness or {
+                    "schema_version": "hydra.sync-freshness/v1", "state": "unknown",
+                },
             },
             ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
         ) + "\n"

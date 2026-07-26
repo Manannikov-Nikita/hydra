@@ -52,6 +52,7 @@ from .migrations_w23 import (
     W23_REQUIRED_TABLE_SQL,
     W23_REQUIRED_TRIGGER_SQL,
 )
+from .migrations_x24 import X24_MIGRATIONS, X24_REQUIRED_SCHEMA
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -287,7 +288,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -525,6 +526,7 @@ class HydraStore:
         required.update(T20_REQUIRED_SCHEMA)
         required.update(U21_REQUIRED_SCHEMA)
         required.update(W23_REQUIRED_SCHEMA)
+        required.update(X24_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -708,7 +710,7 @@ class HydraStore:
             record.sequence, record.observed_at, record.kind.value, record.phase.value,
             record.cause.value, record.scope_change.value, record.task_family, record.confidence,
             None if record.outcome is None else record.outcome.value, record.provenance.value,
-            redact_note(record.note), hashlib.sha256(record.note.encode("utf-8")).hexdigest(), len(record.note),
+            redact_note(record.note), hashlib.sha256(record.note.encode("utf-8")).hexdigest(), len(record.note), record.task_label,
         )
 
     def write_annotation(self, record: AnnotationRecord) -> WriteResult:
@@ -722,15 +724,15 @@ class HydraStore:
                     """INSERT INTO annotations(
                         annotation_id, project_id, session_id, turn_id, sequence, observed_at, kind,
                         phase, cause, scope_change, task_family, confidence, outcome, provenance, note_redacted,
-                        note_hash, note_length
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        note_hash, note_length, task_label
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     values,
                 )
                 return WriteResult(inserted=True, conflicted=False)
             persisted = tuple(existing[column] for column in (
                 "annotation_id", "project_id", "session_id", "turn_id", "sequence", "observed_at", "kind",
                 "phase", "cause", "scope_change", "task_family", "confidence", "outcome", "provenance", "note_redacted",
-                "note_hash", "note_length",
+                "note_hash", "note_length", "task_label",
             ))
             if persisted == values:
                 return WriteResult(inserted=False, conflicted=False)
@@ -757,7 +759,7 @@ class HydraStore:
                 turn_id=row["turn_id"], sequence=row["sequence"], observed_at=row["observed_at"],
                 kind=row["kind"], phase=row["phase"], cause=row["cause"], scope_change=row["scope_change"],
                 task_family=row["task_family"], confidence=row["confidence"], outcome=row["outcome"], note=row["note_redacted"],
-                provenance=row["provenance"],
+                provenance=row["provenance"], task_label=row["task_label"],
             )
             for row in rows
         ]

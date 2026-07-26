@@ -25,6 +25,8 @@ from .project import ProjectResolution, resolve_project
 from .rollout_identity import Pseudonymizer
 from .platform_paths import default_installation_key_path
 from .storage import HydraStore, StorageUnavailable
+from .incremental_sync import RepairRequired, TrustedSourceRoots
+from .sync_state import SyncStateRepository, validate_root_relative_locator
 from .runtime_entrypoint import runtime_command_prefix
 
 
@@ -69,6 +71,61 @@ def _key_path(environ: Mapping[str, str]) -> Path:
     home_value = environ.get("HOME")
     home = Path(home_value).expanduser() if isinstance(home_value, str) and home_value else Path.home()
     return default_installation_key_path(home, environ=environ)
+
+
+def _trusted_source_roots(environ: Mapping[str, str]) -> TrustedSourceRoots:
+    home_value = environ.get("HOME")
+    home = Path(home_value).expanduser() if isinstance(home_value, str) and home_value else Path.home()
+    return TrustedSourceRoots(
+        sessions=home / ".codex" / "sessions",
+        archived_sessions=home / ".codex" / "archived_sessions",
+    )
+
+
+def _trusted_transcript_locator(
+    payload: Mapping[str, Any], roots: TrustedSourceRoots,
+) -> tuple[str, str] | None:
+    """Convert only a verified trusted-root transcript path to a private locator."""
+    raw = payload.get("transcript_path")
+    if not isinstance(raw, str) or not raw or len(raw) > 4096:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        return None
+    for root_kind in ("sessions", "archived_sessions"):
+        try:
+            root = roots.root_for(root_kind)
+            locator = validate_root_relative_locator(candidate.relative_to(root).as_posix())
+            roots.resolve(root_kind, locator)
+            return root_kind, locator
+        except (ValueError, OSError, RepairRequired):
+            continue
+    return None
+
+
+def _enqueue_hook_source(
+    payload: Mapping[str, Any], project: ProjectResolution, store: HydraStore,
+    keys: Pseudonymizer, environ: Mapping[str, str], observed_at: str,
+) -> None:
+    """Queue one trusted transcript, never persisting a caller-controlled path."""
+    repository = SyncStateRepository(store)
+    session_key = keys.digest("identity", _required_text(payload, "session_id"))
+    roots = _trusted_source_roots(environ)
+    located = _trusted_transcript_locator(payload, roots)
+    if located is not None:
+        root_kind, locator = located
+        repository.register_and_enqueue(
+            root_kind=root_kind, source_locator=locator, project_id=project.project_id,
+            session_key=session_key, observed_at=observed_at,
+        )
+        return
+    # Some hook envelopes omit a path.  A prior repair/tail registration can
+    # still bind the private session digest to exactly one trusted locator.
+    matches = [
+        source for source in repository.list_sources() if source.session_key == session_key
+    ]
+    if len(matches) == 1:
+        repository.enqueue(matches[0].root_kind, matches[0].source_locator, observed_at)
 
 
 def _open_store(factory: StoreFactory, path: Path | None) -> HydraStore:
@@ -298,6 +355,7 @@ def handle_event(
                 observed_at=observed_at,
                 allow_session_turns=event == "UserPromptSubmit",
             )
+            _enqueue_hook_source(payload, project, store, keys, environment, observed_at)
             if event == "PostToolUse":
                 return {}
             if event == "UserPromptSubmit":

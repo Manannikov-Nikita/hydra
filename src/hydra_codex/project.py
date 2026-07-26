@@ -19,6 +19,7 @@ class ProjectResolution:
     project_root: Path
     worktree_path: Path
     display_name: str | None = None
+    display_name_provenance: str | None = None
 
 
 def normalize_project_display_name(value: object) -> str | None:
@@ -47,6 +48,14 @@ def _trusted_display_name(value: object, config_path: Path) -> str | None:
         return normalize_project_display_name(value)
     except ValueError as error:
         raise ValueError(f"{config_path} {error}") from error
+
+
+def _basename_display_name(directory: Path) -> str | None:
+    """Use a validated basename only for legacy projects with no configured name."""
+    try:
+        return normalize_project_display_name(directory.name)
+    except ValueError:
+        return None
 
 
 def resolve_project(cwd: Path | str) -> ProjectResolution:
@@ -102,10 +111,12 @@ def resolve_project(cwd: Path | str) -> ProjectResolution:
                 )
             except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
                 raise strict_error from None
+        display_name = config.display_name or _basename_display_name(directory)
         return ProjectResolution(
             config.project_id,
             directory,
             current.relative_to(directory),
-            config.display_name,
+            display_name,
+            "config" if config.display_name is not None else "repo_basename" if display_name else None,
         )
     raise ProjectNotFound(f"no .hydra/project.toml found from {cwd}")

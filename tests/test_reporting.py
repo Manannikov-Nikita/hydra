@@ -109,7 +109,7 @@ class PublicReportContractTests(unittest.TestCase):
         )
         payload = json.loads(render_json(report))
 
-        self.assertEqual(REPORT_SCHEMA, "hydra.report/v3")
+        self.assertEqual(REPORT_SCHEMA, "hydra.report/v4")
         self.assertEqual(payload["schema_version"], REPORT_SCHEMA)
         self.assertEqual(payload["task_ref"], public_ref)
         self.assertEqual(payload["status"], "complete")
@@ -380,7 +380,8 @@ class CompareAndRendererTests(unittest.TestCase):
         }
 
         payload = json.loads(rendered["json"])
-        self.assertEqual(payload["schema_version"], "hydra.report-list/v1")
+        self.assertEqual(payload["schema_version"], "hydra.report-list/v2")
+        self.assertEqual(payload["sync_freshness"]["state"], "unknown")
         self.assertEqual(
             [item["task_ref"] for item in payload["reports"]],
             [item.task_ref for item in reports],
@@ -394,7 +395,12 @@ class CompareAndRendererTests(unittest.TestCase):
     def test_empty_report_collection_is_valid_in_all_formats(self) -> None:
         self.assertEqual(
             json.loads(render_report_collection((), "json")),
-            {"reports": [], "schema_version": "hydra.report-list/v1"},
+            {
+                "reports": [], "schema_version": "hydra.report-list/v2",
+                "sync_freshness": {
+                    "schema_version": "hydra.sync-freshness/v1", "state": "unknown",
+                },
+            },
         )
         self.assertIn("No reconciled tasks", render_report_collection((), "markdown"))
         self.assertIn("0 reconciled tasks", render_report_collection((), "html"))

@@ -238,6 +238,31 @@ class ReconcileEngineTests(unittest.TestCase):
             "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?", (PROJECT,),
         ).fetchone()[0], 2)
 
+    def test_reconcile_uses_the_latest_trusted_task_label_at_the_cutoff(self) -> None:
+        self.session("label-root", 0)
+        self.token("label-root", 1, 2, 10, 1, 1, 0)
+        self.semantic_interval(
+            "label-root", start=1, end=None, phase="implement", cause="plan",
+            family="telemetry", sequence=1,
+        )
+        self.complete("label-root", 5)
+        self.connection.execute(
+            "UPDATE annotations SET task_label='Initial label' WHERE annotation_id='annotation-label-root-1'"
+        )
+        self.connection.execute(
+            """INSERT INTO annotations(annotation_id,project_id,session_id,turn_id,sequence,observed_at,
+                  kind,phase,cause,scope_change,task_family,confidence,outcome,provenance,note_redacted,
+                  note_hash,note_length,task_label)
+                 VALUES ('later-label',?,'label-root','turn-label-root',9,?,'phase','review','plan',
+                         'none','telemetry',1,NULL,'model_reported','safe','later',4,'Too late')""",
+            (PROJECT, stamp(6)),
+        )
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"l" * 32)
+        report = list_reconciled_reports(self.store, PROJECT)[0]
+        self.assertEqual(report.display_name, "Initial label")
+        self.assertNotIn("Too late", render_json(report))
+
     def test_reconcile_deduplicates_fork_replay_then_attributes_exact_deltas_to_intervals(self) -> None:
         self.session("root", 0)
         self.session("child", 2, parent="root")
@@ -317,7 +342,7 @@ class ReconcileEngineTests(unittest.TestCase):
             self.store, project_id=PROJECT, public_ref=task.public_ref,
         )
         self.assertEqual(report.semantic_coverage.value, 1.0)
-        self.assertEqual(report.schema_version, "hydra.report/v3")
+        self.assertEqual(report.schema_version, "hydra.report/v4")
         self.assertEqual(report.semantic_breakdown.phases["understand"].working.value, 90)
         self.assertEqual(report.semantic_breakdown.phases["understand"].full_context.value, 110)
         self.assertEqual(report.semantic_breakdown.phases["understand"].reasoning.value, 5)

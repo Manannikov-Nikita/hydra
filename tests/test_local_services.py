@@ -16,6 +16,7 @@ from hydra_codex.contracts import ModelAnnotationInput
 from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.services import LocalCommandServices
 from hydra_codex.storage import HydraStore
+from hydra_codex.sync_state import SyncStateRepository
 from integrations.codex.hook import handle_event
 
 
@@ -73,6 +74,57 @@ class LocalCommandServiceTests(unittest.TestCase):
         match = re.search(r"hcap_v1_[A-Za-z0-9_-]{43}", instruction)
         self.assertIsNotNone(match)
         return match.group(0)
+
+    def test_hook_enqueues_only_a_trusted_root_relative_transcript_once(self) -> None:
+        source = self.root / ".codex" / "sessions" / "2026" / "rollout.jsonl"
+        source.parent.mkdir(parents=True)
+        source.write_text("{}\n", encoding="utf-8")
+        payload = {
+            "hook_event_name": "UserPromptSubmit", "session_id": "private-session",
+            "turn_id": "private-turn", "cwd": str(self.project),
+            "transcript_path": str(source), "prompt": "must not be stored",
+        }
+        handle_event(payload, environ=self.environ, clock=lambda: NOW)
+        handle_event(payload, environ=self.environ, clock=lambda: NOW)
+        store = HydraStore(self.database)
+        try:
+            queue = SyncStateRepository(store).list_queue()
+            self.assertEqual([(item.root_kind, item.source_locator) for item in queue], [
+                ("sessions", "2026/rollout.jsonl"),
+            ])
+            self.assertNotIn("must not be stored", repr(queue))
+        finally:
+            store.close()
+
+    def test_hook_does_not_enqueue_an_untrusted_transcript_path(self) -> None:
+        payload = {
+            "hook_event_name": "UserPromptSubmit", "session_id": "private-session",
+            "turn_id": "private-turn", "cwd": str(self.project),
+            "transcript_path": "/private/untrusted.jsonl",
+        }
+        handle_event(payload, environ=self.environ, clock=lambda: NOW)
+        store = HydraStore(self.database)
+        try:
+            self.assertEqual(SyncStateRepository(store).list_queue(), ())
+        finally:
+            store.close()
+
+    def test_sync_and_explicit_repair_are_private_bounded_commands(self) -> None:
+        sync = invoke(
+            ["sync", "--db", str(self.database), "--cwd", str(self.project)],
+            environ=self.environ,
+        )
+        repair = invoke(
+            ["repair", "--all", "--db", str(self.database), "--cwd", str(self.project)],
+            environ=self.environ,
+        )
+        self.assertEqual(sync[0], 0, sync[2])
+        self.assertEqual(repair[0], 0, repair[2])
+        sync_payload = json.loads(sync[1])
+        repair_payload = json.loads(repair[1])
+        self.assertEqual(sync_payload["command"], "sync")
+        self.assertEqual(repair_payload["command"], "repair")
+        self.assertNotIn(str(self.root), sync[1] + repair[1])
 
     def _annotate(self, capability: str, *, finish: bool = False):
         payload = {
@@ -413,11 +465,12 @@ class LocalCommandServiceTests(unittest.TestCase):
         ))
         self.assertEqual(rendered[0], 0, rendered[2])
         payload = json.loads(rendered[1])
-        self.assertEqual(payload["schema_version"], "hydra.report-list/v1")
+        self.assertEqual(payload["schema_version"], "hydra.report-list/v2")
+        self.assertEqual(payload["sync_freshness"]["schema_version"], "hydra.sync-freshness/v1")
         self.assertEqual(len(payload["reports"]), 2)
         self.assertEqual(
             {item["schema_version"] for item in payload["reports"]},
-            {"hydra.report/v3"},
+            {"hydra.report/v4"},
         )
         refs = [item["task_ref"] for item in payload["reports"]]
         self.assertTrue(all(re.fullmatch(r"task_[0-9a-f]+", item) for item in refs))

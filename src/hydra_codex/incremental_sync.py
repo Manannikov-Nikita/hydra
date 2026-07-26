@@ -113,13 +113,15 @@ class TrustedSourceRoots:
             if directory is not None:
                 os.close(directory)
 
-    def source_opener(self, root_kind: str, locator: str):
+    def source_opener(self, root_kind: str, locator: str, *, byte_limit: int | None = None):
         """Build a fd-relative opener for legacy scan/parser seams.
 
         The passed path is intentionally ignored.  It is a private lexical
         label only; every actual open starts at a fresh trusted root descriptor.
         """
         validate_root_relative_locator(locator)
+        if byte_limit is not None and byte_limit < 0:
+            raise ValueError("source read limit is invalid")
 
         @contextmanager
         def opener(_path: Path, expected: SourceStat | None = None) -> Iterator[BinaryIO]:
@@ -127,7 +129,7 @@ class TrustedSourceRoots:
                 with self.open_held(root_kind, locator) as (handle, actual):
                     if expected is not None and actual != expected:
                         raise SourceChanged(SOURCE_CHANGED_MESSAGE)
-                    yield handle
+                    yield handle if byte_limit is None else _BoundedSourceRead(handle, byte_limit)
             except RepairRequired as error:
                 raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
 
@@ -160,6 +162,47 @@ class TrustedSourceRoots:
 class TailLine:
     ordinal: int
     value: bytes
+
+
+class _BoundedSourceRead:
+    """A non-owning byte cap over a held trusted descriptor.
+
+    It deliberately exposes only the binary reads/iteration used by legacy
+    scan and parser code plus ``fileno`` for fstat verification.  No temporary
+    transcript copy or pathname re-open is involved.
+    """
+
+    def __init__(self, handle: BinaryIO, byte_limit: int) -> None:
+        self._handle = handle
+        self._remaining = byte_limit
+
+    def fileno(self) -> int:
+        return self._handle.fileno()
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        requested = self._remaining if size < 0 else min(size, self._remaining)
+        value = self._handle.read(requested)
+        self._remaining -= len(value)
+        return value
+
+    def readline(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        requested = self._remaining if size < 0 else min(size, self._remaining)
+        value = self._handle.readline(requested)
+        self._remaining -= len(value)
+        return value
+
+    def __iter__(self) -> "_BoundedSourceRead":
+        return self
+
+    def __next__(self) -> bytes:
+        value = self.readline()
+        if not value:
+            raise StopIteration
+        return value
 
 
 @dataclass(frozen=True)
@@ -834,13 +877,14 @@ class ResumableRepair:
         opener = self.roots.source_opener(root_kind, locator)
         hasher = Pseudonymizer.installation(self.store.database_path.parent)
         scan = scan_source(path, hasher.key, hasher.digest, opener=opener)
-        if scan.identity is None or scan.cwd is None:
+        materialized_scan = scan.complete_prefix()
+        if materialized_scan.identity is None or materialized_scan.cwd is None:
             self.repository.register_and_enqueue(
                 root_kind=root_kind, source_locator=locator, observed_at=observed_at,
             )
             return False
         try:
-            project = resolve_project(scan.cwd)
+            project = resolve_project(materialized_scan.cwd)
         except (ProjectNotFound, OSError, TypeError, ValueError):
             self.repository.register_and_enqueue(
                 root_kind=root_kind, source_locator=locator, observed_at=observed_at,
@@ -848,12 +892,19 @@ class ResumableRepair:
             return False
         label = "active" if root_kind == "sessions" else "archived"
         # ``prepared_scans`` makes legacy ingest use exactly this validated
-        # source; no directory discovery or global walk is reachable here.
+        # source prefix; no directory discovery, raw transcript copy or global
+        # walk is reachable here. The opener authenticates the full descriptor
+        # but caps parser bytes at the newline-complete scan boundary.
         ingest_rollouts(
             self.store, (RolloutRoot(path, label),), project.project_root, project.project_id,
-            hash_key=hasher.key, prepared_scans={path: scan}, source_opener=opener,
+            hash_key=hasher.key, prepared_scans={path: materialized_scan},
+            source_opener=self.roots.source_opener(
+                root_kind, locator, byte_limit=materialized_scan.byte_count,
+            ),
         )
-        current_digest = hasher.digest("source", f"revision/{project.project_id}/{scan.revision_digest}")
+        current_digest = hasher.digest(
+            "source", f"revision/{project.project_id}/{materialized_scan.revision_digest}",
+        )
         current = self.store.connection.execute(
             """SELECT r.materialized,l.lineage_state,l.canonical_revision_digest
                  FROM rollout_sources AS r JOIN rollout_logical_sources AS l

@@ -799,3 +799,49 @@ class IncrementalParityTests(unittest.TestCase):
             )
         finally:
             incremental.close()
+
+    def test_repair_prefix_and_reconstructed_partial_match_canonical_report_without_diagnostics(self) -> None:
+        """The legacy repair parser must never diagnose an in-progress JSONL line."""
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, ResumableRepair, TrustedSourceRoots
+        from hydra_codex.reconcile_engine import reconcile_project
+        from hydra_codex.rollout import RolloutRoot, ingest_rollouts
+        from hydra_codex.sync_state import SyncStateRepository
+
+        self._write_prefix()
+        completion = self._record("event_msg", {
+            "type": "task_complete", "turn_id": "parity-turn", "duration_ms": 5000,
+        }, 5)
+        unfinished = completion[:-2]
+        self.source.write_text(self.source.read_text(encoding="utf-8") + unfinished, encoding="utf-8")
+        roots = TrustedSourceRoots(sessions=self.sessions, archived_sessions=self.root / "archived")
+        incremental = HydraStore(self.root / "partial-incremental.sqlite3")
+        try:
+            repair = ResumableRepair(incremental, roots)
+            self.assertTrue(repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:00:00Z"))
+            self.source.write_text(self.source.read_text(encoding="utf-8") + "}\n", encoding="utf-8")
+            SyncStateRepository(incremental).enqueue("sessions", "rollout.jsonl", "2026-07-26T00:00:10Z")
+            worker = IncrementalSyncWorker(
+                incremental, roots,
+                reconcile=lambda project_id: reconcile_project(incremental, project_id, self.key),
+            )
+            self.assertEqual(worker.sync_once(
+                "partial-worker", "2026-07-26T00:00:10Z", "2026-07-26T00:01:10Z",
+            ).completed, 1)
+
+            legacy = HydraStore(self.root / "partial-legacy.sqlite3")
+            try:
+                ingest_rollouts(legacy, (RolloutRoot(self.source, "active"),), self.project, self.project_id, hash_key=self.key)
+                reconcile_project(legacy, self.project_id, self.key)
+                self.assertEqual(self._snapshot(incremental), self._snapshot(legacy))
+                self.assertEqual(
+                    tuple(incremental.connection.execute(
+                        "SELECT envelope_kind FROM rollout_diagnostics ORDER BY source_digest,line_number,envelope_kind"
+                    )),
+                    tuple(legacy.connection.execute(
+                        "SELECT envelope_kind FROM rollout_diagnostics ORDER BY source_digest,line_number,envelope_kind"
+                    )),
+                )
+            finally:
+                legacy.close()
+        finally:
+            incremental.close()

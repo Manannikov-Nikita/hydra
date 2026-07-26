@@ -46,6 +46,17 @@ class IncrementalSourceReaderTests(unittest.TestCase):
         self.assertEqual(appended.checkpoint.byte_offset, len(self.path.read_bytes()) - len(b'{"partial"'))
         self.assertNotIn(b'{"type":"session_meta"}', b''.join(line.value for line in appended.lines))
 
+    def test_tail_claim_is_bounded_by_complete_line_count(self) -> None:
+        from hydra_codex.incremental_sync import read_incremental_source
+
+        roots = self._reader()
+        first = read_incremental_source(roots, "sessions", "2026/07/rollout.jsonl", max_lines=1)
+        self.assertEqual([line.ordinal for line in first.lines], [1])
+        self.assertLess(first.checkpoint.byte_offset, self.path.stat().st_size)
+        second = read_incremental_source(roots, "sessions", "2026/07/rollout.jsonl", first.checkpoint, max_lines=1)
+        self.assertEqual([line.ordinal for line in second.lines], [2])
+        self.assertEqual(second.checkpoint.byte_offset, self.path.stat().st_size)
+
     def test_rewrite_truncate_inode_and_symlink_are_source_local_repair(self) -> None:
         from hydra_codex.incremental_sync import RepairRequired, read_incremental_source
 
@@ -274,7 +285,7 @@ class IncrementalWorkerTests(unittest.TestCase):
         blocked = repair.run_batch(job_id, "2026-07-26T00:00:02Z", directory_limit=1)
         self.assertFalse(blocked.completed)
         self.assertEqual(self.repository.get_job(job_id).state, "running")
-        self.assertNotEqual(self.repository.list_dirty_roots(), ())
+        self.assertEqual(self.repository.get_job(job_id).sources_completed, 0)
         resumed = repair.run_batch(job_id, "2026-07-26T00:10:00Z", directory_limit=1)
         self.assertTrue(resumed.completed)
         self.assertEqual(self.repository.get_job(job_id).state, "succeeded")

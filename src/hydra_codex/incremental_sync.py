@@ -10,6 +10,7 @@ without reintroducing a full-file scan.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -18,7 +19,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
 from .project import ProjectNotFound, resolve_project
 from .reconcile_engine import reconcile_project
@@ -56,6 +57,56 @@ class TrustedSourceRoots:
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
             raise RepairRequired("trusted source root is unavailable")
         return value
+
+    @contextmanager
+    def open_held(self, root_kind: str, locator: str) -> Iterator[tuple[BinaryIO, SourceStat]]:
+        """Open a regular source by descriptor-relative traversal, fail closed.
+
+        Each component is opened from the directory descriptor that named it;
+        a parent swap to a symlink after validation therefore cannot redirect
+        the final open. The returned descriptor remains held while its caller
+        validates anchors and reads the append.
+        """
+        relative = validate_root_relative_locator(locator)
+        root = self.root_for(root_kind)
+        directory: int | None = None
+        source: int | None = None
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            directory = os.open(root, flags)
+            if not stat.S_ISDIR(os.fstat(directory).st_mode):
+                raise RepairRequired("trusted source root is unavailable")
+            parts = relative.split("/")
+            for component in parts[:-1]:
+                child = os.open(component, flags, dir_fd=directory)
+                if not stat.S_ISDIR(os.fstat(child).st_mode):
+                    os.close(child)
+                    raise RepairRequired("source locator is unavailable")
+                os.close(directory)
+                directory = child
+            source = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory)
+            details = os.fstat(source)
+            if not stat.S_ISREG(details.st_mode):
+                raise RepairRequired("source locator is not a regular file")
+            stat_value = SourceStat(int(details.st_dev), int(details.st_ino), int(details.st_size),
+                                    int(details.st_mtime_ns), int(details.st_ctime_ns))
+            with os.fdopen(source, "rb", closefd=True) as handle:
+                source = None
+                yield handle, stat_value
+                after = os.fstat(handle.fileno())
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                    stat_value.dev, stat_value.ino, stat_value.size, stat_value.mtime_ns, stat_value.ctime_ns,
+                ):
+                    raise RepairRequired("source changed while tailing")
+        except RepairRequired:
+            raise
+        except OSError as error:
+            raise RepairRequired("source locator is unavailable") from error
+        finally:
+            if source is not None:
+                os.close(source)
+            if directory is not None:
+                os.close(directory)
 
     def resolve(self, root_kind: str, locator: str) -> Path:
         """Resolve a private locator without accepting symlinks or escapes."""
@@ -128,7 +179,8 @@ def _checkpoint_for(
 
 def read_incremental_source(
     roots: TrustedSourceRoots, root_kind: str, source_locator: str,
-    checkpoint: SourceCheckpoint | None = None,
+    checkpoint: SourceCheckpoint | None = None, *, max_bytes: int = 1024 * 1024,
+    max_lines: int = 10_000,
 ) -> TailRead:
     """Read only new, newline-complete bytes from one trusted source.
 
@@ -136,30 +188,41 @@ def read_incremental_source(
     boundary before the durable offset is a repair condition for *this source*
     only.  A partial final line is deliberately not included in the checkpoint.
     """
-    path = roots.resolve(root_kind, source_locator)
+    if not 1 <= max_bytes <= 16 * 1024 * 1024 or not 1 <= max_lines <= 100_000:
+        raise ValueError("tail claim limits are invalid")
     prior = checkpoint or SourceCheckpoint(0, 0, None, None, 0, None, None)
     try:
-        before = source_stat(path)
-        if prior.byte_offset > before.size:
-            raise RepairRequired("source was truncated")
-        if prior.device_id is not None and (prior.device_id, prior.inode) != (before.dev, before.ino):
-            raise RepairRequired("source inode changed")
-        with open_source(path, before) as handle:
+        with roots.open_held(root_kind, source_locator) as (handle, before):
+            if prior.byte_offset > before.size:
+                raise RepairRequired("source was truncated")
+            if prior.device_id is not None and (prior.device_id, prior.inode) != (before.dev, before.ino):
+                raise RepairRequired("source inode changed")
             if prior.prefix_anchor is not None and _prefix_anchor(handle, before.size) != prior.prefix_anchor:
                 raise RepairRequired("source prefix changed")
             if prior.revision_anchor is not None and _boundary_anchor(handle, prior.byte_offset) != prior.revision_anchor:
                 raise RepairRequired("source boundary changed")
             handle.seek(prior.byte_offset)
-            appended = handle.read()
-            last_newline = appended.rfind(b"\n")
-            complete = b"" if last_newline < 0 else appended[:last_newline + 1]
-            lines = tuple(
-                TailLine(prior.line_number + index, raw)
-                for index, raw in enumerate(complete.splitlines(keepends=True), start=1)
-            )
-            offset = prior.byte_offset + len(complete)
+            lines: list[TailLine] = []
+            buffered = b""
+            consumed = 0
+            read_total = 0
+            while read_total < max_bytes and len(lines) < max_lines:
+                chunk = handle.read(min(64 * 1024, max_bytes - read_total))
+                if not chunk:
+                    break
+                read_total += len(chunk)
+                buffered += chunk
+                while len(lines) < max_lines:
+                    ending = buffered.find(b"\n")
+                    if ending < 0:
+                        break
+                    raw = buffered[:ending + 1]
+                    buffered = buffered[ending + 1:]
+                    lines.append(TailLine(prior.line_number + len(lines) + 1, raw))
+                    consumed += len(raw)
+            offset = prior.byte_offset + consumed
             next_checkpoint = _checkpoint_for(handle, before, offset, prior.line_number + len(lines))
-        return TailRead(lines, next_checkpoint, len(complete))
+        return TailRead(tuple(lines), next_checkpoint, consumed)
     except RepairRequired:
         raise
     except SourceChanged as error:
@@ -648,6 +711,13 @@ class ResumableRepair:
         job = self.repository.get_job(job_id)
         if job is None or job.job_kind not in {"repair", "backfill"}:
             raise KeyError("repair job is unknown")
+        owner = f"repair-{job_id[:80]}"
+        expiry = (datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                  + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        # Directory and file frontiers share the singleton ingest lease: a
+        # second dashboard/MCP worker observes progress but does no I/O.
+        if not self.repository.acquire_lease(owner, observed_at, expiry):
+            return RepairRun(0, 0, False)
         pending = self.repository.resume_frontier(job_id)[:directory_limit]
         discovered = directories = completed_sources = processed_bytes = 0
         for frontier in pending:
@@ -714,17 +784,12 @@ class ResumableRepair:
         partial = bool(self.repository.list_frontier(job_id, "repair_required"))
         reconciliation_settled = False
         if complete:
-            owner = f"repair-{job_id[:80]}"
-            expiry = (datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-                      + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
-            if self.repository.acquire_lease(owner, observed_at, expiry):
-                dirty = self.repository.claim_dirty_roots(owner, observed_at, expiry)
-                for project_id in sorted({root.project_id for root in dirty}):
-                    group = tuple(root for root in dirty if root.project_id == project_id)
-                    reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
-                    self.repository.acknowledge_dirty_roots(owner, group, observed_at)
-                self.repository.release_lease(owner, observed_at)
-                reconciliation_settled = not self.repository.list_dirty_roots()
+            dirty = self.repository.claim_dirty_roots(owner, observed_at, expiry)
+            for project_id in sorted({root.project_id for root in dirty}):
+                group = tuple(root for root in dirty if root.project_id == project_id)
+                reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
+                self.repository.acknowledge_dirty_roots(owner, group, observed_at)
+            reconciliation_settled = not self.repository.list_dirty_roots()
         finished = complete and reconciliation_settled
         latest = self.repository.get_job(job_id)
         assert latest is not None
@@ -736,4 +801,5 @@ class ResumableRepair:
             updated_at=observed_at,
             completed_at=observed_at if finished else None,
         )
+        self.repository.release_lease(owner, observed_at)
         return RepairRun(discovered, directories, finished)

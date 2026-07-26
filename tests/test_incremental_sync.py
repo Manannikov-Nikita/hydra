@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -10,6 +11,7 @@ from unittest import mock
 
 from hydra_codex.storage import HydraStore
 from hydra_codex.sync_state import SyncStateRepository
+from hydra_codex.rollout_identity import Pseudonymizer
 
 
 def _anchor(value: bytes) -> str:
@@ -423,3 +425,156 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertFalse(repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:01:00Z"))
         self.assertEqual(self.repository.source_for("sessions", "rollout.jsonl").source_state, "repair_required")
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, before)
+
+
+class IncrementalParityTests(unittest.TestCase):
+    """Production acceptance parity between full ingest and append tailing."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.project_id = "hprj_parity"
+        self.project = self.root / "project"
+        (self.project / ".hydra").mkdir(parents=True)
+        (self.project / ".hydra" / "project.toml").write_text(
+            f'project_id = "{self.project_id}"\ntelemetry = "hybrid"\n',
+            encoding="utf-8",
+        )
+        self.sessions = self.root / "sessions"
+        self.sessions.mkdir()
+        self.source = self.sessions / "rollout.jsonl"
+        self.key = Pseudonymizer.installation(self.root).key
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _record(self, kind: str, payload: dict[str, object], second: int) -> str:
+        return json.dumps({
+            "timestamp": f"2026-07-26T00:00:{second:02d}Z",
+            "type": kind,
+            "payload": payload,
+        }, sort_keys=True) + "\n"
+
+    def _write_prefix(self) -> None:
+        self.source.write_text("".join((
+            self._record("session_meta", {
+                "id": "parity-session", "session_id": "parity-session",
+                "cwd": str(self.project),
+            }, 0),
+            self._record("turn_context", {"turn_id": "parity-turn"}, 1),
+            self._record("event_msg", {
+                "type": "task_started", "turn_id": "parity-turn", "duration_ms": 1,
+            }, 2),
+            self._record("event_msg", {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": 100, "cached_input_tokens": 20,
+                    "output_tokens": 10, "reasoning_output_tokens": 3,
+                    "total_tokens": 110,
+                }, "model_context_window": 1000},
+            }, 3),
+        )), encoding="utf-8")
+
+    def _append_completion(self) -> None:
+        with self.source.open("a", encoding="utf-8") as handle:
+            handle.write(self._record("event_msg", {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": 150, "cached_input_tokens": 30,
+                    "output_tokens": 20, "reasoning_output_tokens": 5,
+                    "total_tokens": 170,
+                }, "model_context_window": 1000},
+            }, 4))
+            handle.write(self._record("event_msg", {
+                "type": "task_complete", "turn_id": "parity-turn", "duration_ms": 5000,
+            }, 5))
+
+    def _snapshot(self, store: HydraStore) -> tuple[object, object, object]:
+        from hydra_codex.reconcile_engine import list_reconciled_reports
+
+        reports = tuple(report.as_dict() for report in list_reconciled_reports(
+            store, project_id=self.project_id,
+        ))
+        tokens = tuple(store.connection.execute(
+            """SELECT line_number,source_family,input_tokens,cached_input_tokens,
+                      output_tokens,reasoning_tokens,contributes_total,
+                      selection_provenance,selection_caveat
+                 FROM token_snapshots WHERE project_id=? ORDER BY line_number""",
+            (self.project_id,),
+        ))
+        selected = tuple(store.connection.execute(
+            """SELECT line_number,source_family,contributes_total,
+                      selection_provenance,selection_caveat
+                 FROM token_snapshots WHERE project_id=? ORDER BY line_number""",
+            (self.project_id,),
+        ))
+        return reports, tokens, selected
+
+    def test_append_sync_and_source_repair_match_canonical_full_ingest_without_duplicate_tokens(self) -> None:
+        """A tail must preserve legacy task totals; repair must not double them."""
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, ResumableRepair, TrustedSourceRoots
+        from hydra_codex.reconcile_engine import reconcile_project
+        from hydra_codex.rollout import RolloutRoot, ingest_rollouts
+        from hydra_codex.sync_state import SyncStateRepository
+
+        # This fails if the tail uses a different legacy identity/selection
+        # contract, or if an explicit repair leaves two token contributions.
+        self._write_prefix()
+        incremental = HydraStore(self.root / "incremental.sqlite3")
+        roots = TrustedSourceRoots(
+            sessions=self.sessions, archived_sessions=self.root / "archived",
+        )
+        try:
+            repair = ResumableRepair(incremental, roots)
+            self.assertTrue(repair.repair_source(
+                "sessions", "rollout.jsonl", "2026-07-26T00:00:00Z",
+            ))
+            self._append_completion()
+            SyncStateRepository(incremental).enqueue(
+                "sessions", "rollout.jsonl", "2026-07-26T00:00:10Z",
+            )
+            worker = IncrementalSyncWorker(
+                incremental, roots,
+                reconcile=lambda project_id: reconcile_project(
+                    incremental, project_id, self.key,
+                ),
+            )
+            self.assertEqual(worker.sync_once(
+                "parity-worker", "2026-07-26T00:00:10Z", "2026-07-26T00:01:10Z",
+            ).completed, 1)
+            incremental_before_repair = self._snapshot(incremental)
+
+            legacy = HydraStore(self.root / "legacy.sqlite3")
+            try:
+                ingest_rollouts(
+                    legacy, (RolloutRoot(self.source, "active"),), self.project,
+                    self.project_id, hash_key=self.key,
+                )
+                reconcile_project(legacy, self.project_id, self.key)
+                canonical = self._snapshot(legacy)
+            finally:
+                legacy.close()
+
+            self.assertEqual(incremental_before_repair, canonical)
+            self.assertEqual(len(canonical[0]), 1)
+            self.assertEqual(canonical[0][0]["status"], "complete")
+            self.assertEqual(tuple(incremental.connection.execute(
+                    "SELECT COUNT(*),COUNT(DISTINCT source_digest || ':' || line_number) "
+                    "FROM token_snapshots WHERE project_id=?", (self.project_id,),
+                ).fetchone()),
+                (2, 2),
+            )
+
+            self.assertTrue(repair.repair_source(
+                "sessions", "rollout.jsonl", "2026-07-26T00:02:00Z",
+            ))
+            reconcile_project(incremental, self.project_id, self.key)
+            self.assertEqual(self._snapshot(incremental), canonical)
+            self.assertEqual(tuple(incremental.connection.execute(
+                    "SELECT COUNT(*),COUNT(DISTINCT source_digest || ':' || line_number) "
+                    "FROM token_snapshots WHERE project_id=?", (self.project_id,),
+                ).fetchone()),
+                (2, 2),
+            )
+        finally:
+            incremental.close()

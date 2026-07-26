@@ -106,26 +106,35 @@ def _trusted_transcript_locator(
 def _enqueue_hook_source(
     payload: Mapping[str, Any], project: ProjectResolution, store: HydraStore,
     keys: Pseudonymizer, environ: Mapping[str, str], observed_at: str,
-) -> None:
-    """Queue one trusted transcript, never persisting a caller-controlled path."""
+) -> tuple[str, str] | None:
+    """Find one trusted transcript, never retaining a caller-controlled path."""
     repository = SyncStateRepository(store)
     session_key = keys.digest("identity", _required_text(payload, "session_id"))
     roots = _trusted_source_roots(environ)
     located = _trusted_transcript_locator(payload, roots)
     if located is not None:
-        root_kind, locator = located
-        repository.register_and_enqueue(
-            root_kind=root_kind, source_locator=locator, project_id=project.project_id,
-            session_key=session_key, observed_at=observed_at,
-        )
-        return
+        return located
     # Some hook envelopes omit a path.  A prior repair/tail registration can
     # still bind the private session digest to exactly one trusted locator.
     matches = [
         source for source in repository.list_sources() if source.session_key == session_key
     ]
     if len(matches) == 1:
-        repository.enqueue(matches[0].root_kind, matches[0].source_locator, observed_at)
+        return matches[0].root_kind, matches[0].source_locator
+    return None
+
+
+def _hook_safe_fact(payload: Mapping[str, Any], event: str) -> tuple[str, str | None, str | None, int | None]:
+    event_kind = {"UserPromptSubmit": "prompt", "PostToolUse": "post_tool", "Stop": "stop"}[event]
+    if event != "PostToolUse":
+        return event_kind, None, None, None
+    raw_category = payload.get("tool_category")
+    category = raw_category if raw_category in {"shell", "read", "write", "search", "browser"} else "other"
+    raw_status = payload.get("tool_status")
+    status = raw_status if raw_status in {"success", "failure"} else "unknown"
+    duration = payload.get("duration_ms")
+    safe_duration = duration if isinstance(duration, int) and not isinstance(duration, bool) and 0 <= duration <= 86_400_000 else None
+    return event_kind, category, status, safe_duration
 
 
 def _open_store(factory: StoreFactory, path: Path | None) -> HydraStore:
@@ -355,7 +364,16 @@ def handle_event(
                 observed_at=observed_at,
                 allow_session_turns=event == "UserPromptSubmit",
             )
-            _enqueue_hook_source(payload, project, store, keys, environment, observed_at)
+            source = _enqueue_hook_source(payload, project, store, keys, environment, observed_at)
+            event_kind, category, status, duration = _hook_safe_fact(payload, event)
+            session_key = keys.digest("identity", _required_text(payload, "session_id"))
+            turn_key = keys.digest("turn", _required_text(payload, "turn_id"))
+            event_key = keys.digest("event", f"hook-outbox/v1/{event_kind}/{session_key}/{turn_key}")
+            SyncStateRepository(store).record_hook_event_and_enqueue(
+                event_key=event_key, project_id=project.project_id, session_key=session_key,
+                turn_key=turn_key, event_kind=event_kind, observed_at=observed_at,
+                tool_category=category, tool_status=status, duration_ms=duration, source=source,
+            )
             if event == "PostToolUse":
                 return {}
             if event == "UserPromptSubmit":

@@ -106,7 +106,10 @@ class DashboardQueryTests(unittest.TestCase):
             row[1] for row in connection.execute("PRAGMA table_info(dashboard_projects)")
         }
         self.assertEqual(
-            columns, {"project_id", "display_name", "first_seen_at", "last_seen_at"},
+            columns, {
+                "project_id", "display_name", "first_seen_at", "last_seen_at",
+                "display_name_provenance",
+            },
         )
         self.assertEqual(
             [tuple(row) for row in connection.execute(
@@ -126,7 +129,7 @@ class DashboardQueryTests(unittest.TestCase):
         observe_resolved_project(
             self.store,
             ProjectResolution(
-                "project-a", Path("/private/project"), Path("nested"), "Hydra Core",
+                "project-a", Path("/private/project"), Path("nested"), "Hydra Core", "config",
             ),
             "2026-07-20T12:00:00Z",
         )
@@ -135,7 +138,9 @@ class DashboardQueryTests(unittest.TestCase):
             "SELECT * FROM dashboard_projects",
         ).fetchone()
         self.assertEqual(
-            tuple(row), ("project-a", "Hydra Core", "2026-07-20T12:00:00Z", "2026-07-20T12:00:00Z"),
+            tuple(row), (
+                "project-a", "Hydra Core", "2026-07-20T12:00:00Z", "2026-07-20T12:00:00Z", "config",
+            ),
         )
         self.assertNotIn("/private/project", "\n".join(self.store.connection.iterdump()))
 

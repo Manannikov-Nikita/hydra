@@ -109,6 +109,25 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_post_tool_hook_durably_records_only_safe_fact_and_is_idempotent(self) -> None:
+        payload = {
+            "hook_event_name": "PostToolUse", "session_id": "private-session",
+            "turn_id": "private-turn", "cwd": str(self.project),
+            "tool_name": "Bash", "duration_ms": 12, "tool_input": "secret=input",
+            "tool_response": "secret=output",
+        }
+        handle_event(payload, environ=self.environ, clock=lambda: NOW)
+        handle_event(payload, environ=self.environ, clock=lambda: NOW)
+        store = HydraStore(self.database)
+        try:
+            rows = store.connection.execute(
+                "SELECT event_kind,tool_category,duration_ms FROM hook_event_outbox"
+            ).fetchall()
+            self.assertEqual([tuple(row) for row in rows], [("post_tool", "other", 12)])
+            self.assertNotIn("secret", repr(rows))
+        finally:
+            store.close()
+
     def test_sync_and_explicit_repair_are_private_bounded_commands(self) -> None:
         sync = invoke(
             ["sync", "--db", str(self.database), "--cwd", str(self.project)],

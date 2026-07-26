@@ -297,6 +297,7 @@ def materialize_annotation(model: ModelAnnotationInput, context: AnnotationConte
         confidence=model.confidence,
         outcome=model.outcome,
         note=model.note,
+        task_label=model.task_label,
     )
 
 

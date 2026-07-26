@@ -26,7 +26,7 @@ class DurableSyncStateTests(unittest.TestCase):
             self.fail(f"durable sync state module is missing: {error}")
         return SyncStateRepository(self.store)
 
-    def test_schema_40_creates_private_durable_sync_tables(self) -> None:
+    def test_schema_41_creates_private_durable_sync_tables(self) -> None:
         tables = {
             str(row[0])
             for row in self.store.connection.execute(
@@ -34,11 +34,11 @@ class DurableSyncStateTests(unittest.TestCase):
             )
         }
 
-        self.assertEqual(self.store.schema_version(), 40)
+        self.assertEqual(self.store.schema_version(), 41)
         self.assertTrue({
             "sync_source_registry", "sync_source_checkpoints", "sync_ingest_queue",
             "sync_worker_leases", "sync_dirty_roots", "sync_jobs",
-            "sync_backfill_frontier", "sync_data_revision",
+            "sync_backfill_frontier", "sync_data_revision", "hook_event_outbox",
         }.issubset(tables))
         self.assertEqual(
             self.store.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000,
@@ -143,6 +143,25 @@ class DurableSyncStateTests(unittest.TestCase):
             )
         self.assertEqual(repository.data_revision(), before)
         self.assertEqual(repository.checkpoint_for("sessions", locator).byte_offset, 0)
+
+    def test_hook_fact_and_source_wakeup_share_one_transaction(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/atomic.jsonl"
+        self.store.connection.execute(
+            """CREATE TRIGGER reject_hook_queue BEFORE INSERT ON sync_ingest_queue
+                 BEGIN SELECT RAISE(ABORT, 'forced queue failure'); END""",
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "forced queue failure"):
+            repository.record_hook_event_and_enqueue(
+                event_key="event-safe", project_id="hprj_safe", session_key="session-safe",
+                turn_key="turn-safe", event_kind="post_tool", tool_category="shell",
+                tool_status="success", duration_ms=1, observed_at="2026-07-26T00:00:00Z",
+                source=("sessions", locator),
+            )
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM hook_event_outbox",
+        ).fetchone()[0], 0)
+        self.assertIsNone(repository.source_for("sessions", locator))
 
     def test_only_one_worker_holds_the_expiring_lease(self) -> None:
         repository = self._repository()
@@ -386,7 +405,7 @@ class DurableSyncStateTests(unittest.TestCase):
 
         upgraded = HydraStore(legacy_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.schema_version(), 40)
+        self.assertEqual(upgraded.schema_version(), 41)
         self.assertEqual(
             upgraded.connection.execute(
                 "SELECT display_name FROM dashboard_projects WHERE project_id='hprj_preserved'"

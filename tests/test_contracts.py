@@ -171,6 +171,7 @@ class AnnotationContractTests(unittest.TestCase):
             confidence=0.9,
             outcome=Outcome.SUCCESS,
             note="completed",
+            task_label="Finish verification",
         )
         annotation = materialize_annotation(
             model_input,
@@ -188,6 +189,7 @@ class AnnotationContractTests(unittest.TestCase):
         self.assertEqual(annotation.session_id, "session-1")
         self.assertEqual(annotation.task_family, "foundation")
         self.assertEqual(annotation.provenance, Provenance.MODEL_REPORTED)
+        self.assertEqual(annotation.task_label, "Finish verification")
 
     def test_counts_reject_bool_string_and_float_values(self) -> None:
         for value in (True, "1", 1.0):

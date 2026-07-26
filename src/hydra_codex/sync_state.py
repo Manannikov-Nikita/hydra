@@ -233,6 +233,61 @@ class SyncStateRepository:
             self._bump_revision(connection, now)
             return inserted
 
+    def record_hook_event_and_enqueue(
+        self, *, event_key: str, project_id: str, session_key: str, turn_key: str,
+        event_kind: str, observed_at: str, tool_category: str | None = None,
+        tool_status: str | None = None, duration_ms: int | None = None,
+        source: tuple[str, str] | None = None,
+    ) -> bool:
+        """Atomically save one safe hook fact and its optional source wakeup."""
+        now = _timestamp(observed_at)
+        if event_kind not in {"prompt", "post_tool", "stop"}:
+            raise ValueError("hook event kind is invalid")
+        if tool_category not in {None, "shell", "read", "write", "search", "browser", "other"}:
+            raise ValueError("hook tool category is invalid")
+        if tool_status not in {None, "success", "failure", "unknown"}:
+            raise ValueError("hook tool status is invalid")
+        if duration_ms is not None and (
+            isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or not 0 <= duration_ms <= 86_400_000
+        ):
+            raise ValueError("hook duration is invalid")
+        event = _identity(event_key, "hook event identity")
+        project = _identity(project_id, "project identity")
+        session = _identity(session_key, "session identity")
+        turn = _identity(turn_key, "turn identity")
+        prepared: tuple[str, str] | None = None
+        if source is not None:
+            prepared = (self._validate_root(source[0]), validate_root_relative_locator(source[1]))
+        with self._store.rollout_transaction() as connection:
+            connection.execute(
+                """INSERT INTO hook_event_outbox(
+                       event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING""",
+                (event, project, session, turn, event_kind, tool_category, tool_status, duration_ms, now),
+            )
+            inserted = False
+            if prepared is not None:
+                root, locator = prepared
+                self._register(
+                    connection, root_kind=root, source_locator=locator, project_id=project,
+                    logical_source_key=None, session_key=session, observed_at=now,
+                )
+                result = connection.execute(
+                    """INSERT INTO sync_ingest_queue(
+                           root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code)
+                       VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL)
+                       ON CONFLICT(root_kind,source_locator) DO NOTHING""",
+                    (root, locator, now, now),
+                )
+                inserted = result.rowcount == 1
+                if not inserted:
+                    connection.execute(
+                        """UPDATE sync_ingest_queue SET requeue_pending=1 WHERE root_kind=? AND source_locator=?
+                             AND queue_state='claimed'""", (root, locator),
+                    )
+            self._bump_revision(connection, now)
+            return inserted
+
     def enqueue(self, root_kind: str, source_locator: str, observed_at: str | None = None) -> bool:
         root = self._validate_root(root_kind)
         locator = validate_root_relative_locator(source_locator)

@@ -235,7 +235,7 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertNotIn("Infinity", payload)
 
     def test_markdown_and_standalone_html_escape_all_dynamic_text(self) -> None:
-        report = self.report("escape", 10, task_family="quiz_report")
+        report = replace(self.report("escape", 10, task_family="quiz_report"), display_name="Label <safe>")
         malicious = self.report(
             "malicious", 10, task_family="[click](https://example.invalid) `code`",
         )
@@ -246,6 +246,8 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertIn(r"quiz\_report", markdown)
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn("<style>", html)
+        self.assertIn("Label &lt;safe&gt;", html)
+        self.assertIn(f"<code>{report.task_ref}</code>", html)
         self.assertNotIn("https://", html)
         self.assertNotIn("file://", html)
         self.assertIsNone(malicious.task_family)
@@ -372,7 +374,10 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_recent_report_collection_is_versioned_deterministic_and_safe_in_all_formats(self) -> None:
-        reports = (self.report("latest-private-root", 20), self.report("older-private-root", 10))
+        reports = (
+            replace(self.report("latest-private-root", 20), display_name="Latest label"),
+            replace(self.report("older-private-root", 10), display_name="Older label"),
+        )
 
         rendered = {
             output_format: render_report_collection(reports, output_format)
@@ -387,6 +392,8 @@ class CompareAndRendererTests(unittest.TestCase):
             [item.task_ref for item in reports],
         )
         self.assertEqual(rendered["html"].count("<!doctype html>"), 1)
+        self.assertIn("Latest label", rendered["html"])
+        self.assertIn(f"<code>{reports[0].task_ref}</code>", rendered["html"])
         self.assertIn("Hydra task reports", rendered["markdown"])
         for artifact in rendered.values():
             self.assertNotIn("latest-private-root", artifact)

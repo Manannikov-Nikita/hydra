@@ -212,8 +212,9 @@ def _semantic_html(report: TaskReport) -> str:
 
 def _report_html(report: TaskReport) -> str:
     family = report.task_family if report.task_family is not None else "unavailable"
+    display_name = report.display_name if report.display_name is not None else "unavailable"
     summary = (
-        f"<p>Task <code>{escape(report.task_ref)}</code>; status {escape(report.status)}; "
+        f"<p>Task {escape(display_name)} <code>{escape(report.task_ref)}</code>; status {escape(report.status)}; "
         f"last activity {escape(report.last_activity_at)}; family {escape(family)}.</p>"
         f"<p>{escape(_trend_text(report))}</p>"
         f"<p>{escape(_pilot_text(report))}</p>{_semantic_html(report)}"
@@ -281,7 +282,7 @@ def render_report_collection(
     if output_format == "html":
         rows = [
             (
-                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                f"{escape(report.display_name or 'unavailable')} <code>{escape(report.task_ref)}</code>", escape(report.status),
                 escape(name), _html_fact(fact),
             )
             for report in reports

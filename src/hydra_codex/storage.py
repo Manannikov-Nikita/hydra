@@ -52,7 +52,11 @@ from .migrations_w23 import (
     W23_REQUIRED_TABLE_SQL,
     W23_REQUIRED_TRIGGER_SQL,
 )
-from .migrations_x24 import X24_MIGRATIONS, X24_REQUIRED_SCHEMA
+from .migrations_x24 import (
+    X24_DASHBOARD_PROJECTS_TABLE_SQL,
+    X24_MIGRATIONS,
+    X24_REQUIRED_SCHEMA,
+)
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -547,7 +551,7 @@ class HydraStore:
             )
         if (
             _table_schema_sql(self.connection, "dashboard_projects")
-            != _normalized_schema_sql(U21_DASHBOARD_PROJECTS_TABLE_SQL)
+            != _normalized_schema_sql(X24_DASHBOARD_PROJECTS_TABLE_SQL)
         ):
             raise StorageUnavailable(
                 "Hydra schema has altered dashboard project catalog trust constraints"

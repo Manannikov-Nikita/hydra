@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from hydra_codex.contracts import AnnotationContext, ModelAnnotationInput, materialize_annotation
 from hydra_codex.reconcile_engine import (
     ReconciliationStale,
     get_reconciled_task,
@@ -246,9 +247,18 @@ class ReconcileEngineTests(unittest.TestCase):
             family="telemetry", sequence=1,
         )
         self.complete("label-root", 5)
-        self.connection.execute(
-            "UPDATE annotations SET task_label='Initial label' WHERE annotation_id='annotation-label-root-1'"
+        label = materialize_annotation(
+            ModelAnnotationInput.from_mapping({
+                "kind": "phase", "phase": "implement", "cause": "plan", "scope_change": "none",
+                "task_family": "telemetry", "confidence": 1.0, "note": "", "task_label": "Initial label",
+            }),
+            AnnotationContext(
+                annotation_id="materialized-label", project_id=PROJECT, session_id="label-root",
+                turn_id="turn-label-root", sequence=2, observed_at=stamp(2),
+            ),
         )
+        self.connection.commit()
+        self.assertTrue(self.store.write_annotation(label).inserted)
         self.connection.execute(
             """INSERT INTO annotations(annotation_id,project_id,session_id,turn_id,sequence,observed_at,
                   kind,phase,cause,scope_change,task_family,confidence,outcome,provenance,note_redacted,

@@ -40,6 +40,7 @@ class CatalogProject:
     display_name: str | None
     first_seen_at: str
     last_seen_at: str
+    display_name_provenance: str | None = None
 
 
 def _catalog_rows(connection: sqlite3.Connection) -> tuple[CatalogProject, ...]:
@@ -48,9 +49,10 @@ def _catalog_rows(connection: sqlite3.Connection) -> tuple[CatalogProject, ...]:
             str(row["project_id"]),
             None if row["display_name"] is None else str(row["display_name"]),
             str(row["first_seen_at"]), str(row["last_seen_at"]),
+            None if row["display_name_provenance"] is None else str(row["display_name_provenance"]),
         )
         for row in connection.execute(
-            """SELECT project_id,display_name,first_seen_at,last_seen_at
+            """SELECT project_id,display_name,first_seen_at,last_seen_at,display_name_provenance
                  FROM dashboard_projects ORDER BY project_id""",
         )
     )
@@ -78,8 +80,8 @@ def sync_project_catalog(
         for project_id, first_seen, last_seen in rows:
             connection.execute(
                 """INSERT INTO dashboard_projects(
-                       project_id,display_name,first_seen_at,last_seen_at)
-                   VALUES (?,NULL,?,?)
+                       project_id,display_name,first_seen_at,last_seen_at,display_name_provenance)
+                   VALUES (?,NULL,?,?,NULL)
                    ON CONFLICT(project_id) DO UPDATE SET
                      first_seen_at=MIN(first_seen_at,excluded.first_seen_at),
                      last_seen_at=MAX(last_seen_at,excluded.last_seen_at)""",
@@ -95,13 +97,17 @@ def observe_resolved_project(
     with store.rollout_transaction() as connection:
         connection.execute(
             """INSERT INTO dashboard_projects(
-                   project_id,display_name,first_seen_at,last_seen_at)
-               VALUES (?,?,?,?)
+                   project_id,display_name,first_seen_at,last_seen_at,display_name_provenance)
+               VALUES (?,?,?,?,?)
                ON CONFLICT(project_id) DO UPDATE SET
-                 display_name=COALESCE(excluded.display_name,display_name),
+                 display_name=CASE WHEN excluded.display_name_provenance='config'
+                     THEN excluded.display_name ELSE COALESCE(display_name,excluded.display_name) END,
+                 display_name_provenance=CASE WHEN excluded.display_name_provenance='config'
+                     THEN 'config' ELSE COALESCE(display_name_provenance,excluded.display_name_provenance) END,
                  last_seen_at=MAX(last_seen_at,excluded.last_seen_at)""",
             (
                 resolution.project_id, resolution.display_name, observed_at, observed_at,
+                resolution.display_name_provenance,
             ),
         )
 

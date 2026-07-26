@@ -82,7 +82,10 @@ class IncrementalWorkerTests(unittest.TestCase):
     def test_crash_after_materialization_replays_idempotently_then_acks_and_marks_only_dirty_project(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
 
-        self.repository.register_and_enqueue(root_kind="sessions", source_locator="rollout.jsonl", observed_at="2026-07-26T00:00:00Z")
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl", project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
         seen: set[int] = set()
 
         def materialize(item, tail, connection):
@@ -103,10 +106,47 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.repository.list_queue(), ())
         self.assertEqual([(root.project_id, root.root_kind) for root in self.repository.list_dirty_roots()], [("hprj_safe", "project")])
 
+    def test_unattributed_source_is_requeued_without_a_checkpoint(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl", observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
+        )
+        worker.sync_once("worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z")
+        self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, 0)
+        self.assertEqual(self.repository.list_queue()[0].queue_state, "queued")
+        self.assertEqual(self.repository.list_queue()[0].reason_code, "unattributed")
+
+    def test_materializer_failure_requeues_without_checkpoint_loss(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl", project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+
+        def fail(*_args):
+            raise RuntimeError("temporary parser failure")
+
+        worker = IncrementalSyncWorker(
+            self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
+            materialize=fail,
+        )
+        report = worker.sync_once("worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z")
+        self.assertEqual(report.completed, 0)
+        self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, 0)
+        self.assertEqual(self.repository.list_queue()[0].reason_code, "transient_failure")
+
     def test_normal_sync_never_discovers_or_reads_unqueued_registered_sources(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
 
         for index in range(1500):
+            path = self.root / "known" / f"{index}.jsonl"
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b'{"unread":true}\n')
             self.repository.register_source(root_kind="sessions", source_locator=f"known/{index}.jsonl", observed_at="2026-07-26T00:00:00Z")
         worker = IncrementalSyncWorker(self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"))
         report = worker.sync_once("worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z")
@@ -170,3 +210,26 @@ class IncrementalWorkerTests(unittest.TestCase):
             [source.source_locator for source in self.repository.list_sources()],
             ["nested/one.jsonl", "rollout.jsonl"],
         )
+
+    def test_repair_full_materializes_attributed_source_then_append_can_tail(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text('project_id = "hprj_safe"\ntelemetry = "hybrid"\n')
+        self.path.write_text(
+            '{"type":"session_meta","payload":{"id":"session-1","session_id":"session-1",'
+            f'"cwd":"{project}"}}}}\n'
+        )
+        roots = TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive")
+        repair = ResumableRepair(self.store, roots)
+        repaired = repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:00:00Z")
+        self.assertTrue(repaired)
+        checkpoint = self.repository.checkpoint_for("sessions", "rollout.jsonl")
+        self.assertGreater(checkpoint.byte_offset, 0)
+        self.assertEqual(self.repository.source_for("sessions", "rollout.jsonl").project_id, "hprj_safe")
+        self.path.write_bytes(self.path.read_bytes() + b'{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t"}}\n')
+        self.repository.enqueue("sessions", "rollout.jsonl", "2026-07-26T00:01:00Z")
+        worker = IncrementalSyncWorker(self.store, roots)
+        self.assertEqual(worker.sync_once("worker", "2026-07-26T00:01:00Z", "2026-07-26T00:02:00Z").completed, 1)
+        self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").line_number, 2)

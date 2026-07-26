@@ -16,13 +16,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 from typing import BinaryIO
 
-from .rollout_identity import Pseudonymizer
+from .project import ProjectNotFound, resolve_project
+from .rollout import ingest_rollouts
+from .rollout_identity import Pseudonymizer, RolloutRoot
 from .rollout_observations import safe_int, usage as parse_usage
 from .rollout_privacy import canonical_timestamp, nonempty_string
-from .rollout_sources import SourceChanged, SourceStat, open_source, source_stat
+from .rollout_sources import SourceChanged, SourceStat, line_fingerprint, open_source, scan_source, source_stat
 from .storage import HydraStore
 from .sync_state import QueueItem, SourceCheckpoint, SyncStateRepository, validate_root_relative_locator
 
@@ -214,8 +217,16 @@ def rollout_tail_materializer(store: HydraStore) -> Materializer:
             # A hook/backfill may discover a source before it knows a project.
             # Keep its safe checkpoint, but never guess a project from raw cwd.
             return MaterializedSource()
-        source_digest = hasher.digest("source", f"incremental/{item.root_kind}/{item.source_locator}")
-        logical = item.logical_source_key or hasher.digest("source", f"logical/{item.root_kind}/{item.source_locator}")
+        # Backfill/repair records the legacy logical key. For a hook-created
+        # source without one, retain a stable opaque placeholder until a full
+        # repair has established the canonical legacy lineage.
+        logical = item.logical_source_key or hasher.digest("source", f"pending/{item.root_kind}/{item.source_locator}")
+        canonical = connection.execute(
+            "SELECT canonical_revision_digest FROM rollout_logical_sources WHERE logical_source_key=?", (logical,),
+        ).fetchone()
+        source_digest = str(canonical[0]) if canonical is not None and canonical[0] is not None else hasher.digest(
+            "source", f"incremental/{item.root_kind}/{item.source_locator}",
+        )
         session_key = item.session_key
         row = connection.execute(
             "SELECT session_key FROM rollout_logical_sources WHERE logical_source_key=?", (logical,),
@@ -257,8 +268,10 @@ def rollout_tail_materializer(store: HydraStore) -> Materializer:
             kind = envelope.get("type")
             payload = envelope["payload"]
             observed = canonical_timestamp(envelope.get("timestamp"))
-            fingerprint = hasher.digest("event", f"{logical}/{line.ordinal}")
-            event_key = hasher.digest("event", f"incremental/{logical}/{line.ordinal}")
+            source_fingerprint = line_fingerprint(line.value, hasher.key)
+            fingerprint = source_fingerprint
+            # This is byte-for-byte the legacy _parse_source event-key recipe.
+            event_key = hasher.digest("event", f"{logical}/{line.ordinal}/{source_fingerprint}")
             if kind == "session_meta":
                 identity = nonempty_string(payload.get("id"), payload.get("session_id"))
                 if identity is not None:
@@ -448,13 +461,30 @@ class IncrementalSyncWorker:
                 self.repository.acknowledge_claim(owner_key, item.root_kind, item.source_locator, now)
                 repairs += 1
                 continue
+            if item.project_id is None:
+                # Without a trusted project binding, advancing the durable
+                # offset would irreversibly discard facts we cannot attribute.
+                self.repository.retry_claim(
+                    owner_key, item.root_kind, item.source_locator,
+                    reason_code="unattributed", available_at=lease_expires_at, observed_at=now,
+                )
+                continue
             if crash_after_materialize:
                 # Test-only fault point: the queue claim survives and its
                 # expiry causes an idempotent replay after a process restart.
                 with self.store.rollout_transaction() as connection:
                     self.materialize(item, tail, connection)
                 raise RuntimeError("injected crash after materialize")
-            self._commit(item, tail, MaterializedSource(), owner_key, now)
+            try:
+                self._commit(item, tail, MaterializedSource(), owner_key, now)
+            except (OSError, sqlite3.OperationalError, SourceChanged, RuntimeError):
+                # The materializer transaction rolled back; release this claim
+                # for a bounded retry rather than relying on process death.
+                self.repository.retry_claim(
+                    owner_key, item.root_kind, item.source_locator,
+                    reason_code="transient_failure", available_at=lease_expires_at, observed_at=now,
+                )
+                continue
             completed += 1
             processed += tail.bytes_read
         self.reconcile_dirty(owner_key, now, lease_expires_at)
@@ -478,11 +508,14 @@ class ResumableRepair:
         self.roots = roots
         self.repository = SyncStateRepository(store)
 
-    def start(self, observed_at: str) -> str:
-        job = self.repository.current_job("repair")
+    def start_backfill(self, observed_at: str, *, job_kind: str = "backfill") -> str:
+        """Start or resume the explicit full-history path, never normal sync."""
+        if job_kind not in {"backfill", "repair"}:
+            raise ValueError("backfill job kind is invalid")
+        job = self.repository.current_job(job_kind)
         if job is not None:
             return job.job_id
-        job_id = self.repository.create_job("repair", observed_at)
+        job_id = self.repository.create_job(job_kind, observed_at)
         for root_kind in ("sessions", "archived_sessions"):
             try:
                 self.roots.root_for(root_kind)
@@ -493,6 +526,84 @@ class ResumableRepair:
                 state="pending", discovered_count=0, updated_at=observed_at,
             )
         return job_id
+
+    def start(self, observed_at: str) -> str:
+        """Compatibility spelling for an explicit repair-history operation."""
+        return self.start_backfill(observed_at, job_kind="repair")
+
+    def _full_materialize(self, root_kind: str, locator: str, observed_at: str) -> bool:
+        """Legacy-equivalent full ingest for one explicit repair/backfill file."""
+        path = self.roots.resolve(root_kind, locator)
+        try:
+            canonical_path = path.resolve(strict=True)
+        except OSError as error:
+            raise RepairRequired("source changed before full repair") from error
+        hasher = Pseudonymizer.installation(self.store.database_path.parent)
+        scan = scan_source(canonical_path, hasher.key, hasher.digest)
+        if scan.identity is None or scan.cwd is None:
+            self.repository.register_and_enqueue(
+                root_kind=root_kind, source_locator=locator, observed_at=observed_at,
+            )
+            return False
+        try:
+            project = resolve_project(scan.cwd)
+        except (ProjectNotFound, OSError, TypeError, ValueError):
+            self.repository.register_and_enqueue(
+                root_kind=root_kind, source_locator=locator, observed_at=observed_at,
+            )
+            return False
+        label = "active" if root_kind == "sessions" else "archived"
+        # ``prepared_scans`` makes legacy ingest use exactly this validated
+        # source; no directory discovery or global walk is reachable here.
+        ingest_rollouts(
+            self.store, (RolloutRoot(canonical_path, label),), project.project_root, project.project_id,
+            hash_key=hasher.key, prepared_scans={canonical_path: scan},
+        )
+        location_key = hasher.digest("source", str(canonical_path))
+        row = self.store.connection.execute(
+            """SELECT l.logical_source_key,l.session_key FROM rollout_source_locations AS x
+                 JOIN rollout_logical_sources AS l ON l.logical_source_key=x.logical_source_key
+                WHERE x.location_key=? AND l.project_id=?""",
+            (location_key, project.project_id),
+        ).fetchone()
+        if row is None or row[1] is None:
+            # Preserve the full ingest's unresolved/quarantine behavior, and
+            # never checkpoint it as though attribution were complete.
+            self.repository.register_and_enqueue(
+                root_kind=root_kind, source_locator=locator, project_id=project.project_id,
+                observed_at=observed_at,
+            )
+            return False
+        checkpoint = read_incremental_source(self.roots, root_kind, locator).checkpoint
+        with self.store.rollout_transaction() as connection:
+            self.repository._register(
+                connection, root_kind=root_kind, source_locator=locator, project_id=project.project_id,
+                logical_source_key=str(row[0]), session_key=str(row[1]), observed_at=observed_at,
+            )
+            connection.execute(
+                """UPDATE sync_source_registry SET source_state='ready' WHERE root_kind=? AND source_locator=?""",
+                (root_kind, locator),
+            )
+            connection.execute(
+                """INSERT INTO sync_source_checkpoints(
+                       root_kind,source_locator,device_id,inode,file_size,byte_offset,line_number,
+                       prefix_anchor,revision_anchor,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(root_kind,source_locator) DO UPDATE SET
+                     device_id=excluded.device_id,inode=excluded.inode,file_size=excluded.file_size,
+                     byte_offset=excluded.byte_offset,line_number=excluded.line_number,
+                     prefix_anchor=excluded.prefix_anchor,revision_anchor=excluded.revision_anchor,
+                     updated_at=excluded.updated_at""",
+                (root_kind, locator, checkpoint.device_id, checkpoint.inode, checkpoint.file_size,
+                 checkpoint.byte_offset, checkpoint.line_number, checkpoint.prefix_anchor,
+                 checkpoint.revision_anchor, observed_at),
+            )
+            self.repository._bump_revision(connection, observed_at)
+        return True
+
+    def repair_source(self, root_kind: str, source_locator: str, observed_at: str) -> bool:
+        """Repair exactly one known source; no root scan is performed."""
+        return self._full_materialize(root_kind, source_locator, observed_at)
 
     def _directory(self, root_kind: str, locator: str) -> Path:
         root = self.roots.root_for(root_kind)
@@ -520,7 +631,7 @@ class ResumableRepair:
         if job is None or job.job_kind not in {"repair", "backfill"}:
             raise KeyError("repair job is unknown")
         pending = self.repository.resume_frontier(job_id)[:directory_limit]
-        discovered = directories = 0
+        discovered = directories = completed_sources = processed_bytes = 0
         for frontier in pending:
             try:
                 directory = self._directory(frontier.root_kind, frontier.directory_locator)
@@ -539,9 +650,9 @@ class ResumableRepair:
                                 state="pending", discovered_count=0, updated_at=observed_at,
                             )
                         elif stat.S_ISREG(details.st_mode) and entry.name.endswith(".jsonl"):
-                            self.repository.register_and_enqueue(
-                                root_kind=frontier.root_kind, source_locator=relative, observed_at=observed_at,
-                            )
+                            if self._full_materialize(frontier.root_kind, relative, observed_at):
+                                completed_sources += 1
+                                processed_bytes += int(details.st_size)
                             discovered += 1
                 self.repository.save_frontier(
                     job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
@@ -559,8 +670,8 @@ class ResumableRepair:
         self.repository.update_job(
             job_id, state="succeeded" if complete else "running",
             sources_discovered=latest.sources_discovered + discovered,
-            sources_completed=latest.sources_completed,
-            bytes_processed=latest.bytes_processed,
+            sources_completed=latest.sources_completed + completed_sources,
+            bytes_processed=latest.bytes_processed + processed_bytes,
             updated_at=observed_at,
             completed_at=observed_at if complete else None,
         )

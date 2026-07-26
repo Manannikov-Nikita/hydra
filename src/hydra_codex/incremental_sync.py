@@ -20,6 +20,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import threading
+import uuid
 from typing import BinaryIO, Iterator
 
 from .project import ProjectNotFound, resolve_project
@@ -166,6 +167,11 @@ class TailRead:
     lines: tuple[TailLine, ...]
     checkpoint: SourceCheckpoint
     bytes_read: int
+    # ``has_complete_work`` deliberately excludes an EOF partial line.  The
+    # worker can immediately requeue a bounded complete suffix, while an
+    # incomplete final record waits for its producer instead of hot-looping.
+    has_complete_work: bool = False
+    partial_line: bool = False
 
 
 def _digest(value: bytes) -> str:
@@ -199,6 +205,22 @@ def _checkpoint_for(
         device_id=details.dev,
         inode=details.ino,
     )
+
+
+def _full_scan_checkpoint(
+    roots: TrustedSourceRoots, root_kind: str, locator: str, scan,
+) -> SourceCheckpoint:
+    """Checkpoint a completed legacy scan without applying tail claim limits.
+
+    ``scan_source`` already streamed every record for the explicit repair.
+    Re-reading it through the bounded live-tail reader would silently leave a
+    large repair at 1 MiB/10k lines.  Re-open the same descriptor-relative
+    source only to verify the scan's exact stat and hash the small anchors.
+    """
+    with roots.open_held(root_kind, locator) as (handle, details):
+        if details != scan.source_stat or details.size != scan.byte_count:
+            raise RepairRequired("source changed during full repair")
+        return _checkpoint_for(handle, details, scan.byte_count, scan.line_count)
 
 
 def read_incremental_source(
@@ -249,7 +271,28 @@ def read_incremental_source(
                     consumed += len(raw)
             offset = prior.byte_offset + consumed
             next_checkpoint = _checkpoint_for(handle, before, offset, prior.line_number + len(lines))
-        return TailRead(tuple(lines), next_checkpoint, consumed)
+            unread_after_buffer = before.size - (prior.byte_offset + read_total)
+            has_complete_work = False
+            partial_line = False
+            if len(lines) == max_lines:
+                # The line cap leaves a complete suffix when it is already in
+                # the bounded buffer or when bytes remain unread.  If the
+                # buffer is the true EOF suffix without a newline, it is only
+                # a partial producer record and must not be requeued hot.
+                has_complete_work = b"\n" in buffered or unread_after_buffer > 0
+                partial_line = not has_complete_work and bool(buffered)
+            elif read_total == max_bytes:
+                if buffered:
+                    if unread_after_buffer > 0:
+                        # No newline fitted into a whole claim and the record
+                        # still continues.  Retrying would make zero progress.
+                        raise RepairRequired("source line exceeds bounded tail limit")
+                    partial_line = True
+                else:
+                    has_complete_work = unread_after_buffer > 0
+            else:
+                partial_line = bool(buffered)
+        return TailRead(tuple(lines), next_checkpoint, consumed, has_complete_work, partial_line)
     except RepairRequired:
         raise
     except SourceChanged as error:
@@ -291,6 +334,13 @@ def _utc(value: str) -> str:
     if value:
         return value
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _precise_utc(value: datetime) -> str:
+    """Render a canonical UTC timestamp without discarding a short lease."""
+    value = value.astimezone(timezone.utc)
+    fraction = f"{value.microsecond:06d}".rstrip("0")
+    return value.strftime("%Y-%m-%dT%H:%M:%S") + (f".{fraction}" if fraction else "") + "Z"
 
 
 def rollout_tail_materializer(store: HydraStore) -> Materializer:
@@ -470,45 +520,50 @@ class IncrementalSyncWorker:
         stop = threading.Event()
         lost = threading.Event()
         interval = max(0.01, interval_seconds if interval_seconds is not None else remaining / 3)
-        auxiliary = HydraStore(self.store.database_path)
-        # A materializer may hold SQLite's single writer lock.  A heartbeat
-        # must retry on the next cadence, not sleep for the normal five-second
-        # contention timeout and accidentally outlive its owner.
-        auxiliary.connection.execute("PRAGMA busy_timeout = 25")
-        repository = SyncStateRepository(auxiliary)
-
         def beat() -> None:
-            while not stop.wait(interval):
-                observed = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                renewed_expiry = (
-                    datetime.now(timezone.utc) + timedelta(seconds=remaining)
-                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                try:
-                    if item is None:
-                        held = repository.acquire_lease(owner_key, observed, renewed_expiry)
-                    else:
-                        held = repository.renew_claim(
-                            owner_key, item.root_kind, item.source_locator,
-                            observed, renewed_expiry,
-                        )
-                except (OSError, sqlite3.Error):
-                    # Busy means our own in-flight atomic materialization owns
-                    # the writer lock.  Its pre-extended claim remains valid;
-                    # retry at the next heartbeat rather than declaring loss.
-                    continue
-                except ValueError:
-                    held = False
-                if not held:
-                    # A false claim renewal can race the successful queue ack
-                    # at the end of this worker's transaction.  Only a
-                    # read-confirmed change of lease ownership is terminal.
+            # SQLite connections are thread-affine.  Construct this auxiliary
+            # store inside the heartbeat thread, rather than accidentally
+            # catching ProgrammingError forever on a connection opened by the
+            # invoking MCP/dashboard thread.
+            auxiliary = HydraStore(self.store.database_path)
+            try:
+                # A materializer may hold SQLite's single writer lock.  A
+                # heartbeat must retry on the next cadence, not wait through
+                # the normal five-second contention timeout.
+                auxiliary.connection.execute("PRAGMA busy_timeout = 25")
+                repository = SyncStateRepository(auxiliary)
+                while not stop.wait(interval):
+                    observed_now = datetime.now(timezone.utc)
+                    observed = _precise_utc(observed_now)
+                    renewed_expiry = _precise_utc(
+                        observed_now + timedelta(seconds=remaining),
+                    )
                     try:
-                        still_owned = repository.lease_owned(owner_key, observed)
-                    except sqlite3.Error:
+                        if item is None:
+                            held = repository.acquire_lease(owner_key, observed, renewed_expiry)
+                        else:
+                            held = repository.renew_claim(
+                                owner_key, item.root_kind, item.source_locator,
+                                observed, renewed_expiry,
+                            )
+                    except (OSError, sqlite3.Error):
+                        # Busy means our own in-flight atomic materialization
+                        # owns the writer lock; retry on the next heartbeat.
                         continue
-                    if not still_owned:
-                        lost.set()
-                        return
+                    except ValueError:
+                        held = False
+                    if not held:
+                        # A false claim renewal can race the successful queue
+                        # ack. Only a read-confirmed owner change is terminal.
+                        try:
+                            still_owned = repository.lease_owned(owner_key, observed)
+                        except sqlite3.Error:
+                            continue
+                        if not still_owned:
+                            lost.set()
+                            return
+            finally:
+                auxiliary.close()
 
         thread = threading.Thread(target=beat, name="hydra-sync-lease", daemon=True)
         thread.start()
@@ -517,7 +572,6 @@ class IncrementalSyncWorker:
         finally:
             stop.set()
             thread.join(timeout=max(1.0, interval * 2))
-            auxiliary.close()
 
     def reconcile_dirty(self, owner_key: str, observed_at: str, lease_expires_at: str) -> int:
         """Reconcile only roots claimed by this worker, never the full catalog.
@@ -604,10 +658,10 @@ class IncrementalSyncWorker:
                          observed_at=excluded.observed_at,claim_owner=NULL,claim_expires_at=NULL""",
                     (result.project_id, root_key, result.dirty_root_kind, observed_at),
                 )
-            if int(owned[0]):
+            if tail.has_complete_work or int(owned[0]):
                 connection.execute(
                     """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
-                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0
+                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,reason_code=NULL
                          WHERE root_kind=? AND source_locator=?""",
                     (observed_at, item.root_kind, item.source_locator),
                 )
@@ -723,10 +777,25 @@ class ResumableRepair:
     _ROOT_MARKER = "@root"
     _FILE_PREFIX = "@file/"
 
-    def __init__(self, store: HydraStore, roots: TrustedSourceRoots) -> None:
+    def __init__(self, store: HydraStore, roots: TrustedSourceRoots, *, lease_ttl_seconds: int = 300) -> None:
+        if not 1 <= lease_ttl_seconds <= 3600:
+            raise ValueError("repair lease TTL must be between 1 and 3600 seconds")
         self.store = store
         self.roots = roots
         self.repository = SyncStateRepository(store)
+        self.lease_ttl_seconds = lease_ttl_seconds
+
+    @contextmanager
+    def _lease_heartbeat(self, owner_key: str, lease_expires_at: str) -> Iterator[threading.Event]:
+        """Use the generic separate-connection heartbeat for repair I/O.
+
+        Repair does directory enumeration, full legacy materialization and
+        reconciliation outside one SQLite transaction.  Reusing the no-queue
+        heartbeat keeps the singleton owner alive through each slow phase.
+        """
+        worker = IncrementalSyncWorker(self.store, self.roots)
+        with worker._lease_heartbeat(owner_key, lease_expires_at) as lost:
+            yield lost
 
     def start_backfill(self, observed_at: str, *, job_kind: str = "backfill") -> str:
         """Start or resume the explicit full-history path, never normal sync."""
@@ -809,7 +878,7 @@ class ResumableRepair:
                 observed_at=observed_at,
             )
             return False
-        checkpoint = read_incremental_source(self.roots, root_kind, locator).checkpoint
+        checkpoint = _full_scan_checkpoint(self.roots, root_kind, locator, scan)
         with self.store.rollout_transaction() as connection:
             self.repository._register(
                 connection, root_kind=root_kind, source_locator=locator, project_id=project.project_id,
@@ -866,23 +935,40 @@ class ResumableRepair:
         job = self.repository.get_job(job_id)
         if job is None or job.job_kind not in {"repair", "backfill"}:
             raise KeyError("repair job is unknown")
-        owner = f"repair-{job_id[:80]}"
-        expiry = (datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-                  + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        # A job identifies durable work, not a process.  An invocation needs a
+        # fresh lease identity so a second dashboard/MCP call cannot renew the
+        # first call's singleton lease merely by knowing the job id.
+        owner = f"repair-{uuid.uuid4().hex}"
+        expiry = _precise_utc(
+            datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+            + timedelta(seconds=self.lease_ttl_seconds),
+        )
         # Directory and file frontiers share the singleton ingest lease: a
         # second dashboard/MCP worker observes progress but does no I/O.
         if not self.repository.acquire_lease(owner, observed_at, expiry):
             return RepairRun(0, 0, False)
         pending = self.repository.resume_frontier(job_id)[:directory_limit]
         discovered = directories = completed_sources = processed_bytes = 0
-        for frontier in pending:
-            if frontier.directory_locator.startswith(self._FILE_PREFIX):
-                locator = frontier.directory_locator.removeprefix(self._FILE_PREFIX)
-                try:
-                    if self._full_materialize(frontier.root_kind, locator, observed_at):
-                        details = read_incremental_source(
-                            self.roots, frontier.root_kind, locator,
-                        ).checkpoint
+        try:
+            for frontier in pending:
+                if frontier.directory_locator.startswith(self._FILE_PREFIX):
+                    locator = frontier.directory_locator.removeprefix(self._FILE_PREFIX)
+                    try:
+                        with self._lease_heartbeat(owner, expiry) as lost:
+                            materialized = self._full_materialize(frontier.root_kind, locator, observed_at)
+                        if lost.is_set():
+                            # The durable frontier remains pending; a later
+                            # owner may safely retry the idempotent full scan.
+                            continue
+                    except (OSError, RepairRequired, SourceChanged):
+                        self.repository.save_frontier(
+                            job_id=job_id, root_kind=frontier.root_kind,
+                            directory_locator=frontier.directory_locator, state="repair_required",
+                            discovered_count=1, updated_at=observed_at,
+                        )
+                        continue
+                    if materialized:
+                        details = self.repository.checkpoint_for(frontier.root_kind, locator)
                         self.repository.save_frontier(
                             job_id=job_id, root_kind=frontier.root_kind,
                             directory_locator=frontier.directory_locator, state="scanned",
@@ -896,67 +982,68 @@ class ResumableRepair:
                             directory_locator=frontier.directory_locator, state="repair_required",
                             discovered_count=1, updated_at=observed_at,
                         )
-                except (OSError, RepairRequired, SourceChanged):
+                    continue
+                try:
+                    with self._lease_heartbeat(owner, expiry) as lost:
+                        directory = self._directory(frontier.root_kind, frontier.directory_locator)
+                        with os.scandir(directory) as entries:
+                            for entry in entries:
+                                try:
+                                    details = entry.stat(follow_symlinks=False)
+                                except OSError:
+                                    continue
+                                if stat.S_ISLNK(details.st_mode):
+                                    continue
+                                relative = entry.name if frontier.directory_locator == self._ROOT_MARKER else f"{frontier.directory_locator}/{entry.name}"
+                                if stat.S_ISDIR(details.st_mode):
+                                    self.repository.save_frontier(
+                                        job_id=job_id, root_kind=frontier.root_kind, directory_locator=relative,
+                                        state="pending", discovered_count=0, updated_at=observed_at,
+                                    )
+                                elif stat.S_ISREG(details.st_mode) and entry.name.endswith(".jsonl"):
+                                    self.repository.save_frontier(
+                                        job_id=job_id, root_kind=frontier.root_kind,
+                                        directory_locator=self._FILE_PREFIX + relative, state="pending",
+                                        discovered_count=1, updated_at=observed_at,
+                                    )
+                                    discovered += 1
+                    if lost.is_set():
+                        continue
                     self.repository.save_frontier(
-                        job_id=job_id, root_kind=frontier.root_kind,
-                        directory_locator=frontier.directory_locator, state="repair_required",
-                        discovered_count=1, updated_at=observed_at,
+                        job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
+                        state="scanned", discovered_count=discovered, updated_at=observed_at,
                     )
-                continue
-            try:
-                directory = self._directory(frontier.root_kind, frontier.directory_locator)
-                with os.scandir(directory) as entries:
-                    for entry in entries:
-                        try:
-                            details = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        if stat.S_ISLNK(details.st_mode):
-                            continue
-                        relative = entry.name if frontier.directory_locator == self._ROOT_MARKER else f"{frontier.directory_locator}/{entry.name}"
-                        if stat.S_ISDIR(details.st_mode):
-                            self.repository.save_frontier(
-                                job_id=job_id, root_kind=frontier.root_kind, directory_locator=relative,
-                                state="pending", discovered_count=0, updated_at=observed_at,
-                            )
-                        elif stat.S_ISREG(details.st_mode) and entry.name.endswith(".jsonl"):
-                            self.repository.save_frontier(
-                                job_id=job_id, root_kind=frontier.root_kind,
-                                directory_locator=self._FILE_PREFIX + relative, state="pending",
-                                discovered_count=1, updated_at=observed_at,
-                            )
-                            discovered += 1
-                self.repository.save_frontier(
-                    job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
-                    state="scanned", discovered_count=discovered, updated_at=observed_at,
-                )
-                directories += 1
-            except RepairRequired:
-                self.repository.save_frontier(
-                    job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
-                    state="repair_required", discovered_count=0, updated_at=observed_at,
-                )
-        pending_after = self.repository.resume_frontier(job_id)
-        complete = not pending_after
-        partial = bool(self.repository.list_frontier(job_id, "repair_required"))
-        reconciliation_settled = False
-        if complete:
-            dirty = self.repository.claim_dirty_roots(owner, observed_at, expiry)
-            for project_id in sorted({root.project_id for root in dirty}):
-                group = tuple(root for root in dirty if root.project_id == project_id)
-                reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
-                self.repository.acknowledge_dirty_roots(owner, group, observed_at)
-            reconciliation_settled = not self.repository.list_dirty_roots()
-        finished = complete and reconciliation_settled
-        latest = self.repository.get_job(job_id)
-        assert latest is not None
-        self.repository.update_job(
-            job_id, state="partial" if finished and partial else "succeeded" if finished else "running",
-            sources_discovered=latest.sources_discovered + discovered,
-            sources_completed=latest.sources_completed + completed_sources,
-            bytes_processed=latest.bytes_processed + processed_bytes,
-            updated_at=observed_at,
-            completed_at=observed_at if finished else None,
-        )
-        self.repository.release_lease(owner, observed_at)
-        return RepairRun(discovered, directories, finished)
+                    directories += 1
+                except RepairRequired:
+                    self.repository.save_frontier(
+                        job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
+                        state="repair_required", discovered_count=0, updated_at=observed_at,
+                    )
+            pending_after = self.repository.resume_frontier(job_id)
+            complete = not pending_after
+            partial = bool(self.repository.list_frontier(job_id, "repair_required"))
+            reconciliation_settled = False
+            if complete:
+                dirty = self.repository.claim_dirty_roots(owner, observed_at, expiry)
+                for project_id in sorted({root.project_id for root in dirty}):
+                    group = tuple(root for root in dirty if root.project_id == project_id)
+                    with self._lease_heartbeat(owner, expiry) as lost:
+                        reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
+                    if lost.is_set():
+                        break
+                    self.repository.acknowledge_dirty_roots(owner, group, observed_at)
+                reconciliation_settled = not self.repository.list_dirty_roots()
+            finished = complete and reconciliation_settled
+            latest = self.repository.get_job(job_id)
+            assert latest is not None
+            self.repository.update_job(
+                job_id, state="partial" if finished and partial else "succeeded" if finished else "running",
+                sources_discovered=latest.sources_discovered + discovered,
+                sources_completed=latest.sources_completed + completed_sources,
+                bytes_processed=latest.bytes_processed + processed_bytes,
+                updated_at=observed_at,
+                completed_at=observed_at if finished else None,
+            )
+            return RepairRun(discovered, directories, finished)
+        finally:
+            self.repository.release_lease(owner, observed_at)

@@ -46,7 +46,12 @@ from .migrations_u21 import (
     U21_REQUIRED_SCHEMA,
 )
 from .migrations_v22 import V22_MIGRATIONS
-from .migrations_w23 import W23_MIGRATIONS, W23_REQUIRED_SCHEMA
+from .migrations_w23 import (
+    W23_MIGRATIONS,
+    W23_REQUIRED_SCHEMA,
+    W23_REQUIRED_TABLE_SQL,
+    W23_REQUIRED_TRIGGER_SQL,
+)
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -545,6 +550,11 @@ class HydraStore:
             raise StorageUnavailable(
                 "Hydra schema has altered dashboard project catalog trust constraints"
             )
+        for table, expected_sql in W23_REQUIRED_TABLE_SQL.items():
+            if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
+                raise StorageUnavailable(
+                    "Hydra schema has altered incremental sync trust constraints"
+                )
         tool_role_foreign_key = (
             (
                 "tool_spans", "session_key", "session_key", "NO ACTION", "CASCADE",
@@ -617,6 +627,15 @@ class HydraStore:
             ):
                 raise StorageUnavailable(
                     f"Hydra schema has missing or altered immutable candidate trigger: {name}"
+                )
+        for name, expected_sql in W23_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql) != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has altered incremental sync trust constraints"
                 )
         if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise StorageUnavailable("Hydra schema has foreign-key violations")

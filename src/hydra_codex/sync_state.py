@@ -16,6 +16,7 @@ _JOB_STATES = frozenset({"queued", "running", "succeeded", "partial", "failed"})
 _FRONTIER_STATES = frozenset({"pending", "scanned", "repair_required"})
 _HEX_ANCHOR = re.compile(r"[0-9a-f]{64}")
 _SAFE_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_CANONICAL_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 
 
 @dataclass(frozen=True)
@@ -96,7 +97,16 @@ def validate_root_relative_locator(locator: str) -> str:
 
 
 def _timestamp(value: str | None) -> str:
-    return value or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    candidate = value or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if not isinstance(candidate, str) or not _CANONICAL_UTC.fullmatch(candidate):
+        raise ValueError("timestamp must be canonical UTC RFC3339")
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("timestamp must be canonical UTC RFC3339") from error
+    if parsed.tzinfo != timezone.utc or ("." in candidate and candidate[:-1].endswith("0")):
+        raise ValueError("timestamp must be canonical UTC RFC3339")
+    return candidate
 
 
 def _anchor(value: str | None, field: str) -> str | None:
@@ -208,12 +218,18 @@ class SyncStateRepository:
             )
             result = connection.execute(
                 """INSERT INTO sync_ingest_queue(
-                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,attempts,reason_code)
-                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,NULL)
+                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code)
+                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL)
                    ON CONFLICT(root_kind,source_locator) DO NOTHING""",
                 (root, locator, now, now),
             )
             inserted = result.rowcount == 1
+            if not inserted:
+                connection.execute(
+                    """UPDATE sync_ingest_queue SET requeue_pending=1
+                         WHERE root_kind=? AND source_locator=? AND queue_state='claimed'""",
+                    (root, locator),
+                )
             self._bump_revision(connection, now)
             return inserted
 
@@ -224,14 +240,19 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             result = connection.execute(
                 """INSERT INTO sync_ingest_queue(
-                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,attempts,reason_code)
-                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,NULL)
+                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code)
+                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL)
                    ON CONFLICT(root_kind,source_locator) DO NOTHING""",
                 (root, locator, now, now),
             )
             inserted = result.rowcount == 1
-            if inserted:
-                self._bump_revision(connection, now)
+            if not inserted:
+                connection.execute(
+                    """UPDATE sync_ingest_queue SET requeue_pending=1
+                         WHERE root_kind=? AND source_locator=? AND queue_state='claimed'""",
+                    (root, locator),
+                )
+            self._bump_revision(connection, now)
             return inserted
 
     def source_for(self, root_kind: str, source_locator: str) -> SourceRecord | None:
@@ -261,6 +282,8 @@ class SyncStateRepository:
         ))
 
     def claim_next(self, owner_key: str, observed_at: str, claim_expires_at: str) -> QueueItem | None:
+        observed_at = _timestamp(observed_at)
+        claim_expires_at = _timestamp(claim_expires_at)
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
         if claim_expires_at <= observed_at:
@@ -284,7 +307,8 @@ class SyncStateRepository:
                 return None
             root, locator = str(selected[0]), str(selected[1])
             changed = connection.execute(
-                """UPDATE sync_ingest_queue SET queue_state='claimed',claimed_by=?,claimed_at=?,claim_expires_at=?
+                """UPDATE sync_ingest_queue SET queue_state='claimed',claimed_by=?,claimed_at=?,claim_expires_at=?,
+                       requeue_pending=0
                      WHERE root_kind=? AND source_locator=? AND (
                          (queue_state='queued' AND available_at<=?)
                          OR (queue_state='claimed' AND claim_expires_at<=?)
@@ -307,6 +331,8 @@ class SyncStateRepository:
         self, owner_key: str, root_kind: str, source_locator: str, *, reason_code: str,
         available_at: str, observed_at: str,
     ) -> bool:
+        available_at = _timestamp(available_at)
+        observed_at = _timestamp(observed_at)
         if not _SAFE_REASON.fullmatch(reason_code):
             raise ValueError("retry reason must be a safe code")
         root = self._validate_root(root_kind)
@@ -314,7 +340,7 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
-                       claimed_at=NULL,claim_expires_at=NULL,attempts=attempts+1,reason_code=?
+                       claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,attempts=attempts+1,reason_code=?
                      WHERE root_kind=? AND source_locator=? AND queue_state='claimed' AND claimed_by=?""",
                 (available_at, reason_code, root, locator, owner_key),
             ).rowcount == 1
@@ -323,17 +349,28 @@ class SyncStateRepository:
             return changed
 
     def acknowledge_claim(self, owner_key: str, root_kind: str, source_locator: str, observed_at: str) -> bool:
+        observed_at = _timestamp(observed_at)
         root = self._validate_root(root_kind)
         locator = validate_root_relative_locator(source_locator)
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 """DELETE FROM sync_ingest_queue WHERE root_kind=? AND source_locator=?
-                     AND queue_state='claimed' AND claimed_by=? AND claim_expires_at>?""",
+                     AND queue_state='claimed' AND claimed_by=? AND claim_expires_at>?
+                     AND requeue_pending=0""",
                 (root, locator, owner_key, observed_at),
             ).rowcount == 1
-            if changed:
+            requeued = False
+            if not changed:
+                requeued = connection.execute(
+                    """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
+                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0
+                         WHERE root_kind=? AND source_locator=? AND queue_state='claimed'
+                           AND claimed_by=? AND claim_expires_at>? AND requeue_pending=1""",
+                    (observed_at, root, locator, owner_key, observed_at),
+                ).rowcount == 1
+            if changed or requeued:
                 self._bump_revision(connection, observed_at)
-            return changed
+            return changed or requeued
 
     def save_checkpoint(
         self, root_kind: str, source_locator: str, *, byte_offset: int, line_number: int,
@@ -390,6 +427,8 @@ class SyncStateRepository:
             return self._bump_revision(connection, now)
 
     def acquire_lease(self, owner_key: str, acquired_at: str, expires_at: str) -> bool:
+        acquired_at = _timestamp(acquired_at)
+        expires_at = _timestamp(expires_at)
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
         if expires_at <= acquired_at:
@@ -446,6 +485,8 @@ class SyncStateRepository:
     def claim_dirty_roots(
         self, owner_key: str, observed_at: str, claim_expires_at: str, limit: int = 100,
     ) -> tuple[DirtyRoot, ...]:
+        observed_at = _timestamp(observed_at)
+        claim_expires_at = _timestamp(claim_expires_at)
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
         if claim_expires_at <= observed_at:
@@ -483,6 +524,7 @@ class SyncStateRepository:
     def acknowledge_dirty_roots(
         self, owner_key: str, roots: tuple[DirtyRoot, ...] | list[DirtyRoot], observed_at: str,
     ) -> int:
+        observed_at = _timestamp(observed_at)
         if not roots:
             return 0
         with self._store.rollout_transaction() as connection:
@@ -498,6 +540,7 @@ class SyncStateRepository:
             return deleted
 
     def create_job(self, job_kind: str, created_at: str, job_id: str | None = None) -> str:
+        created_at = _timestamp(created_at)
         if job_kind not in _JOB_KINDS:
             raise ValueError("sync job kind is invalid")
         identifier = job_id or f"sync_{uuid.uuid4().hex}"
@@ -544,6 +587,8 @@ class SyncStateRepository:
 
     def update_job(self, job_id: str, *, state: str, sources_discovered: int, sources_completed: int,
                    bytes_processed: int, updated_at: str, completed_at: str | None = None) -> int:
+        updated_at = _timestamp(updated_at)
+        completed_at = None if completed_at is None else _timestamp(completed_at)
         if state not in _JOB_STATES or min(sources_discovered, sources_completed, bytes_processed) < 0:
             raise ValueError("sync job progress is invalid")
         if sources_completed > sources_discovered:
@@ -565,6 +610,7 @@ class SyncStateRepository:
 
     def save_frontier(self, *, job_id: str, root_kind: str, directory_locator: str, state: str,
                       discovered_count: int, updated_at: str) -> int:
+        updated_at = _timestamp(updated_at)
         root = self._validate_root(root_kind)
         locator = validate_root_relative_locator(directory_locator)
         if state not in _FRONTIER_STATES or discovered_count < 0:

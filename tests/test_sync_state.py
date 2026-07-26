@@ -233,6 +233,50 @@ class DurableSyncStateTests(unittest.TestCase):
         self.assertEqual(repository.list_frontier(other_job)[0].state, "scanned")
         self.assertEqual({job.job_id for job in repository.list_jobs()}, {job_id, other_job})
 
+    def test_enqueue_during_claim_is_requeued_after_acknowledgement(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/race.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
+        ))
+        first = repository.claim_next("worker", "2026-07-26T00:00:01Z", "2026-07-26T00:01:00Z")
+        self.assertEqual(first.source_locator, locator)
+        self.assertFalse(repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator, observed_at="2026-07-26T00:00:02Z",
+        ))
+        self.assertTrue(repository.acknowledge_claim(
+            "worker", "sessions", locator, "2026-07-26T00:00:03Z",
+        ))
+        second = repository.claim_next("worker", "2026-07-26T00:00:04Z", "2026-07-26T00:01:00Z")
+        self.assertEqual(second.source_locator, locator)
+
+    def test_sync_timestamps_are_canonical_utc_rfc3339(self) -> None:
+        repository = self._repository()
+        invalid = ("2026-07-26T00:00:00z", "2026-07-26T00:00:00+00:00", "zz")
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    repository.register_source(
+                        root_kind="sessions", source_locator="2026/07/26/time.jsonl", observed_at=value,
+                    )
+                with self.assertRaises(ValueError):
+                    repository.acquire_lease("worker", value, "2026-07-26T00:01:00Z")
+                with self.assertRaises(ValueError):
+                    repository.create_job("sync", value)
+
+    def test_tampered_w23_locator_trigger_fails_closed_on_reopen(self) -> None:
+        self.store.close()
+        altered = sqlite3.connect(self.database)
+        altered.execute("DROP TRIGGER sync_source_registry_canonical_locator_insert")
+        altered.commit()
+        altered.close()
+        from hydra_codex.storage import StorageUnavailable
+        with self.assertRaisesRegex(StorageUnavailable, "incremental sync trust constraints"):
+            HydraStore(self.database)
+
     def test_crashed_queue_and_dirty_claims_are_reclaimed_after_restart(self) -> None:
         repository = self._repository()
         locator = "2026/07/26/crash.jsonl"

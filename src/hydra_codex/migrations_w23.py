@@ -47,6 +47,7 @@ W23_SYNC_INGEST_QUEUE_TABLE_SQL = """CREATE TABLE sync_ingest_queue (
     claimed_by TEXT,
     claimed_at TEXT,
     claim_expires_at TEXT,
+    requeue_pending INTEGER NOT NULL DEFAULT 0 CHECK(requeue_pending IN (0,1)),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     reason_code TEXT,
     PRIMARY KEY(root_kind,source_locator),
@@ -177,7 +178,7 @@ W23_REQUIRED_SCHEMA: dict[str, set[str]] = {
     },
     "sync_ingest_queue": {
         "root_kind", "source_locator", "queue_state", "enqueued_at", "available_at",
-        "claimed_by", "claimed_at", "claim_expires_at", "attempts", "reason_code",
+        "claimed_by", "claimed_at", "claim_expires_at", "requeue_pending", "attempts", "reason_code",
     },
     "sync_worker_leases": {"lease_name", "owner_key", "acquired_at", "expires_at"},
     "sync_dirty_roots": {
@@ -191,4 +192,21 @@ W23_REQUIRED_SCHEMA: dict[str, set[str]] = {
         "job_id", "root_kind", "directory_locator", "state", "discovered_count", "updated_at",
     },
     "sync_data_revision": {"singleton", "revision", "updated_at"},
+}
+
+
+W23_REQUIRED_TABLE_SQL: dict[str, str] = {
+    "sync_source_registry": W23_SYNC_SOURCE_REGISTRY_TABLE_SQL,
+    "sync_source_checkpoints": W23_SYNC_SOURCE_CHECKPOINTS_TABLE_SQL,
+    "sync_ingest_queue": W23_SYNC_INGEST_QUEUE_TABLE_SQL,
+    "sync_worker_leases": W23_SYNC_WORKER_LEASES_TABLE_SQL,
+    "sync_dirty_roots": W23_SYNC_DIRTY_ROOTS_TABLE_SQL,
+    "sync_jobs": W23_SYNC_JOBS_TABLE_SQL,
+    "sync_backfill_frontier": W23_SYNC_BACKFILL_FRONTIER_TABLE_SQL,
+    "sync_data_revision": W23_SYNC_DATA_REVISION_TABLE_SQL,
+}
+
+
+W23_REQUIRED_TRIGGER_SQL: dict[str, str] = {
+    statement.split()[2]: statement for statement in W23_LOCATOR_TRIGGER_STATEMENTS
 }

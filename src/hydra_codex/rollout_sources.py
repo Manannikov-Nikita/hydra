@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import BinaryIO, Callable, Iterator
+from typing import BinaryIO, Callable, ContextManager, Iterator
 
 from .rollout_privacy import canonical_timestamp, nonempty_string
 
@@ -21,6 +21,9 @@ SOURCE_CHANGED_MESSAGE = "rollout source changed during ingest"
 
 class SourceChanged(RuntimeError):
     """The source stopped matching the exact regular file being ingested."""
+
+
+SourceOpener = Callable[[Path, "SourceStat | None"], ContextManager[BinaryIO]]
 
 
 @dataclass(frozen=True)
@@ -100,20 +103,33 @@ def line_fingerprint(value: bytes, key: bytes) -> str:
     return hmac.new(key, b"hydra/source-line/" + value, hashlib.sha256).hexdigest()
 
 
-def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str]) -> SourceScan:
+def scan_source(
+    path: Path, key: bytes, pseudonymize: Callable[[str, str], str], *,
+    opener: SourceOpener | None = None,
+) -> SourceScan:
     """Read a rollout incrementally, retaining only keyed hashes and safe header fields."""
-    before_stat = source_stat(path)
-    try:
-        canonical_path = path.resolve(strict=True)
-    except OSError as error:
-        raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+    if opener is None:
+        before_stat = source_stat(path)
+        try:
+            canonical_path = path.resolve(strict=True)
+        except OSError as error:
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+        source_context = open_source(path, before_stat)
+    else:
+        # A descriptor-relative opener owns all containment checks.  The path
+        # is deliberately lexical here: resolving it would reintroduce the
+        # parent-directory TOCTOU that the trusted opener prevents.
+        canonical_path = path
+        source_context = opener(path, None)
     revision = hmac.new(key, b"hydra/source-revision/", hashlib.sha256)
     chain = hmac.new(key, b"hydra/source-chain/", hashlib.sha256)
     fingerprints: list[str] = []
     first_meta: tuple[str, str | None, str | None, str | None, str] | None = None
     matched_meta: tuple[int, tuple[str, str | None, str | None, str | None, str]] | None = None
     byte_count = 0
-    with open_source(path, before_stat) as handle:
+    with source_context as handle:
+        if opener is not None:
+            before_stat = _regular_source_stat(os.fstat(handle.fileno()))
         for raw_line in handle:
             byte_count += len(raw_line)
             revision.update(raw_line)

@@ -10,7 +10,7 @@ without reintroducing a full-file scan.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
 from typing import BinaryIO, Iterator
 
 from .project import ProjectNotFound, resolve_project
@@ -28,7 +29,7 @@ from .rollout_identity import Pseudonymizer, RolloutRoot
 from .rollout_observations import safe_int, usage as parse_usage
 from .rollout_privacy import canonical_timestamp, nonempty_string
 from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
-from .rollout_sources import SourceChanged, SourceStat, line_fingerprint, open_source, scan_source, source_stat
+from .rollout_sources import SOURCE_CHANGED_MESSAGE, SourceChanged, SourceStat, line_fingerprint, open_source, scan_source, source_stat
 from .storage import HydraStore
 from .sync_state import QueueItem, SourceCheckpoint, SyncStateRepository, validate_root_relative_locator
 from .test_evidence import reconcile_test_evidence
@@ -111,6 +112,26 @@ class TrustedSourceRoots:
             if directory is not None:
                 os.close(directory)
 
+    def source_opener(self, root_kind: str, locator: str):
+        """Build a fd-relative opener for legacy scan/parser seams.
+
+        The passed path is intentionally ignored.  It is a private lexical
+        label only; every actual open starts at a fresh trusted root descriptor.
+        """
+        validate_root_relative_locator(locator)
+
+        @contextmanager
+        def opener(_path: Path, expected: SourceStat | None = None) -> Iterator[BinaryIO]:
+            try:
+                with self.open_held(root_kind, locator) as (handle, actual):
+                    if expected is not None and actual != expected:
+                        raise SourceChanged(SOURCE_CHANGED_MESSAGE)
+                    yield handle
+            except RepairRequired as error:
+                raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+
+        return opener
+
     def resolve(self, root_kind: str, locator: str) -> Path:
         """Resolve a private locator without accepting symlinks or escapes."""
         relative = validate_root_relative_locator(locator)
@@ -190,6 +211,9 @@ def read_incremental_source(
     A changed inode, a smaller size, a changed stable prefix, or a changed
     boundary before the durable offset is a repair condition for *this source*
     only.  A partial final line is deliberately not included in the checkpoint.
+    An unchanged-size rewrite strictly in the unchecked middle of an already
+    consumed prefix is intentionally not reread: it is outside the bounded
+    tailing contract and requires explicit repair history.
     """
     if not 1 <= max_bytes <= 16 * 1024 * 1024 or not 1 <= max_lines <= 100_000:
         raise ValueError("tail claim limits are invalid")
@@ -422,6 +446,79 @@ class IncrementalSyncWorker:
         self.materialize = materialize or rollout_tail_materializer(store)
         self.reconcile = reconcile
 
+    @contextmanager
+    def _lease_heartbeat(
+        self, owner_key: str, lease_expires_at: str, item: QueueItem | None = None,
+        *, interval_seconds: float | None = None,
+    ) -> Iterator[threading.Event]:
+        """Renew a held lease while arbitrary parser/reconciler code runs.
+
+        The heartbeat owns a separate SQLite connection so a slow materializer
+        cannot starve the renewal behind its transaction.  A failed renewal is
+        sticky: callers must not acknowledge/commit derived state afterwards.
+        """
+        try:
+            deadline = datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
+            remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            remaining = 0
+        # Historical callers supply logical timestamps.  They still retain the
+        # old boundary semantics; real short leases get a genuine heartbeat.
+        if remaining <= 0:
+            yield threading.Event()
+            return
+        stop = threading.Event()
+        lost = threading.Event()
+        interval = max(0.01, interval_seconds if interval_seconds is not None else remaining / 3)
+        auxiliary = HydraStore(self.store.database_path)
+        # A materializer may hold SQLite's single writer lock.  A heartbeat
+        # must retry on the next cadence, not sleep for the normal five-second
+        # contention timeout and accidentally outlive its owner.
+        auxiliary.connection.execute("PRAGMA busy_timeout = 25")
+        repository = SyncStateRepository(auxiliary)
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                observed = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                renewed_expiry = (
+                    datetime.now(timezone.utc) + timedelta(seconds=remaining)
+                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                try:
+                    if item is None:
+                        held = repository.acquire_lease(owner_key, observed, renewed_expiry)
+                    else:
+                        held = repository.renew_claim(
+                            owner_key, item.root_kind, item.source_locator,
+                            observed, renewed_expiry,
+                        )
+                except (OSError, sqlite3.Error):
+                    # Busy means our own in-flight atomic materialization owns
+                    # the writer lock.  Its pre-extended claim remains valid;
+                    # retry at the next heartbeat rather than declaring loss.
+                    continue
+                except ValueError:
+                    held = False
+                if not held:
+                    # A false claim renewal can race the successful queue ack
+                    # at the end of this worker's transaction.  Only a
+                    # read-confirmed change of lease ownership is terminal.
+                    try:
+                        still_owned = repository.lease_owned(owner_key, observed)
+                    except sqlite3.Error:
+                        continue
+                    if not still_owned:
+                        lost.set()
+                        return
+
+        thread = threading.Thread(target=beat, name="hydra-sync-lease", daemon=True)
+        thread.start()
+        try:
+            yield lost
+        finally:
+            stop.set()
+            thread.join(timeout=max(1.0, interval * 2))
+            auxiliary.close()
+
     def reconcile_dirty(self, owner_key: str, observed_at: str, lease_expires_at: str) -> int:
         """Reconcile only roots claimed by this worker, never the full catalog.
 
@@ -438,13 +535,16 @@ class IncrementalSyncWorker:
         completed = 0
         for project_id in sorted({root.project_id for root in roots}):
             project_roots = tuple(root for root in roots if root.project_id == project_id)
-            self.reconcile(project_id)
+            with self._lease_heartbeat(owner_key, lease_expires_at) as lost:
+                self.reconcile(project_id)
+            if lost.is_set():
+                continue
             completed += self.repository.acknowledge_dirty_roots(owner_key, project_roots, observed_at)
         return completed
 
     def _commit(
         self, item: QueueItem, tail: TailRead, result: MaterializedSource,
-        owner_key: str, observed_at: str,
+        owner_key: str, observed_at: str, ownership_lost: threading.Event | None = None,
     ) -> None:
         """Commit parser facts, checkpoint, dirty marker and queue ack together."""
         with self.store.rollout_transaction() as connection:
@@ -457,6 +557,11 @@ class IncrementalSyncWorker:
             if owned is None:
                 raise RepairRequired("queue claim expired")
             result = self.materialize(item, tail, connection)
+            if ownership_lost is not None and ownership_lost.is_set():
+                # The materializer's writes are still inside this transaction;
+                # raising here rolls them back before a successor can observe
+                # any facts or a durable checkpoint.
+                raise RepairRequired("worker lease lost")
             if result.project_id is not None:
                 # Keep incremental facts in the same derived-state shape as a
                 # legacy ingest batch before exposing the project as dirty.
@@ -466,6 +571,8 @@ class IncrementalSyncWorker:
                 reconcile_token_epochs(connection, result.project_id, diagnose)
                 reconcile_fork_baselines(connection, result.project_id)
                 reconcile_turn_attempts(connection, diagnose)
+            if ownership_lost is not None and ownership_lost.is_set():
+                raise RepairRequired("worker lease lost")
             checkpoint = tail.checkpoint
             connection.execute(
                 """INSERT INTO sync_source_checkpoints(
@@ -545,8 +652,22 @@ class IncrementalSyncWorker:
                     reason_code="unattributed", available_at=lease_expires_at, observed_at=now,
                 )
                 continue
+            # SQLite permits only one writer.  Give a materialization
+            # transaction a conservative initial lease window, then keep
+            # heartbeating from a separate connection whenever the write lock
+            # is free.  Without this extension an otherwise healthy, slow
+            # parser could block the heartbeat behind its own transaction.
+            requested_deadline = datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
+            live_lease = requested_deadline > datetime.now(timezone.utc)
+            protected_expiry = (
+                max(
+                    lease_expires_at,
+                    (datetime.now(timezone.utc) + timedelta(seconds=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                )
+                if live_lease else lease_expires_at
+            )
             if not self.repository.renew_claim(
-                owner_key, item.root_kind, item.source_locator, now, lease_expires_at,
+                owner_key, item.root_kind, item.source_locator, now, protected_expiry,
             ):
                 # A competing owner or expired lease won before materialization;
                 # leave the queue item for normal expiry/reclaim semantics.
@@ -558,7 +679,23 @@ class IncrementalSyncWorker:
                     self.materialize(item, tail, connection)
                 raise RuntimeError("injected crash after materialize")
             try:
-                self._commit(item, tail, MaterializedSource(), owner_key, now)
+                requested_seconds = max(0.01, (requested_deadline - datetime.now(timezone.utc)).total_seconds())
+                heartbeat = (
+                    self._lease_heartbeat(
+                        owner_key, protected_expiry, item,
+                        interval_seconds=requested_seconds / 3,
+                    ) if live_lease else nullcontext(threading.Event())
+                )
+                with heartbeat as lost:
+                    if lost.is_set():
+                        raise RepairRequired("worker lease lost")
+                    self._commit(item, tail, MaterializedSource(), owner_key, now, lost)
+            except RepairRequired:
+                self.repository.retry_claim(
+                    owner_key, item.root_kind, item.source_locator,
+                    reason_code="lease_lost", available_at=lease_expires_at, observed_at=now,
+                )
+                continue
             except (OSError, sqlite3.OperationalError, SourceChanged, RuntimeError):
                 # The materializer transaction rolled back; release this claim
                 # for a bounded retry rather than relying on process death.
@@ -616,13 +753,13 @@ class ResumableRepair:
 
     def _full_materialize(self, root_kind: str, locator: str, observed_at: str) -> bool:
         """Legacy-equivalent full ingest for one explicit repair/backfill file."""
-        path = self.roots.resolve(root_kind, locator)
-        try:
-            canonical_path = path.resolve(strict=True)
-        except OSError as error:
-            raise RepairRequired("source changed before full repair") from error
+        validate_root_relative_locator(locator)
+        # This path is an opaque, root-relative label passed through legacy
+        # APIs.  All byte access below goes via ``source_opener``.
+        path = self.roots.root_for(root_kind) / locator
+        opener = self.roots.source_opener(root_kind, locator)
         hasher = Pseudonymizer.installation(self.store.database_path.parent)
-        scan = scan_source(canonical_path, hasher.key, hasher.digest)
+        scan = scan_source(path, hasher.key, hasher.digest, opener=opener)
         if scan.identity is None or scan.cwd is None:
             self.repository.register_and_enqueue(
                 root_kind=root_kind, source_locator=locator, observed_at=observed_at,
@@ -639,8 +776,8 @@ class ResumableRepair:
         # ``prepared_scans`` makes legacy ingest use exactly this validated
         # source; no directory discovery or global walk is reachable here.
         ingest_rollouts(
-            self.store, (RolloutRoot(canonical_path, label),), project.project_root, project.project_id,
-            hash_key=hasher.key, prepared_scans={canonical_path: scan},
+            self.store, (RolloutRoot(path, label),), project.project_root, project.project_id,
+            hash_key=hasher.key, prepared_scans={path: scan}, source_opener=opener,
         )
         current_digest = hasher.digest("source", f"revision/{project.project_id}/{scan.revision_digest}")
         current = self.store.connection.execute(
@@ -657,7 +794,7 @@ class ResumableRepair:
             )
             self.repository.mark_repair_required(root_kind, locator, observed_at)
             return False
-        location_key = hasher.digest("source", str(canonical_path))
+        location_key = hasher.digest("source", str(path))
         row = self.store.connection.execute(
             """SELECT l.logical_source_key,l.session_key FROM rollout_source_locations AS x
                  JOIN rollout_logical_sources AS l ON l.logical_source_key=x.logical_source_key
@@ -743,14 +880,16 @@ class ResumableRepair:
                 locator = frontier.directory_locator.removeprefix(self._FILE_PREFIX)
                 try:
                     if self._full_materialize(frontier.root_kind, locator, observed_at):
-                        details = source_stat(self.roots.resolve(frontier.root_kind, locator))
+                        details = read_incremental_source(
+                            self.roots, frontier.root_kind, locator,
+                        ).checkpoint
                         self.repository.save_frontier(
                             job_id=job_id, root_kind=frontier.root_kind,
                             directory_locator=frontier.directory_locator, state="scanned",
                             discovered_count=1, updated_at=observed_at,
                         )
                         completed_sources += 1
-                        processed_bytes += details.size
+                        processed_bytes += details.file_size
                     else:
                         self.repository.save_frontier(
                             job_id=job_id, root_kind=frontier.root_kind,

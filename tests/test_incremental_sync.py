@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -152,6 +153,84 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, 0)
         self.assertEqual(self.repository.list_queue()[0].reason_code, "transient_failure")
 
+    def test_heartbeat_keeps_short_lease_during_slow_materializer(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        observed = now.isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl", project_id="hprj_safe", observed_at=observed,
+        )
+        contender: list[bool] = []
+
+        def materialize(*_args):
+            time.sleep(0.45)
+            other = HydraStore(self.database)
+            try:
+                other.connection.execute("PRAGMA busy_timeout = 0")
+                contender_now = datetime.now(timezone.utc).replace(microsecond=0)
+                try:
+                    contender.append(SyncStateRepository(other).acquire_lease(
+                        "other", contender_now.isoformat().replace("+00:00", "Z"),
+                        (contender_now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    ))
+                except Exception:  # SQLite's held writer lock is also a failed acquisition.
+                    contender.append(False)
+            finally:
+                other.close()
+            time.sleep(0.45)
+            return MaterializedSource(project_id="hprj_safe")
+
+        worker = IncrementalSyncWorker(
+            self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
+            materialize=materialize,
+        )
+        self.assertEqual(worker.sync_once("worker", observed, expires).completed, 1)
+        self.assertEqual(contender, [False])
+
+    def test_heartbeat_loss_rolls_back_slow_materializer_and_requeues(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        observed = now.isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl", project_id="hprj_safe", observed_at=observed,
+        )
+        calls = 0
+        original = SyncStateRepository.renew_claim
+
+        def lose_on_heartbeat(repository, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                return False
+            return original(repository, *args, **kwargs)
+
+        def materialize(_item, _tail, connection):
+            connection.execute("CREATE TABLE IF NOT EXISTS heartbeat_rollback (value INTEGER)")
+            connection.execute("INSERT INTO heartbeat_rollback(value) VALUES (1)")
+            time.sleep(0.7)
+            return MaterializedSource(project_id="hprj_safe")
+
+        worker = IncrementalSyncWorker(
+            self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
+            materialize=materialize,
+        )
+        with (
+            mock.patch.object(SyncStateRepository, "renew_claim", new=lose_on_heartbeat),
+            mock.patch.object(SyncStateRepository, "lease_owned", return_value=False),
+        ):
+            self.assertEqual(worker.sync_once("worker", observed, expires).completed, 0)
+        self.assertGreaterEqual(calls, 2)
+        self.assertEqual(self.repository.list_queue()[0].reason_code, "lease_lost")
+        self.assertIsNone(self.store.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='heartbeat_rollback'"
+        ).fetchone())
+
     def test_normal_sync_never_discovers_or_reads_unqueued_registered_sources(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
 
@@ -247,6 +326,45 @@ class IncrementalWorkerTests(unittest.TestCase):
         worker = IncrementalSyncWorker(self.store, roots)
         self.assertEqual(worker.sync_once("worker", "2026-07-26T00:01:00Z", "2026-07-26T00:02:00Z").completed, 1)
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").line_number, 2)
+
+    def test_repair_holds_descriptor_when_parent_is_swapped_before_parse(self) -> None:
+        """A repair scan must not re-open through a newly symlinked parent."""
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "held-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text(
+            'project_id = "hprj_held"\ntelemetry = "hybrid"\n'
+        )
+        nested = self.root / "safe"
+        nested.mkdir()
+        source = nested / "rollout.jsonl"
+        source.write_text(
+            '{"type":"session_meta","payload":{"id":"held-session","session_id":"held-session",'
+            f'"cwd":"{project}"}}}}\n'
+        )
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (outside / "rollout.jsonl").write_text('{"type":"session_meta","payload":{"id":"escape"}}\n')
+        roots = TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive")
+        repair = ResumableRepair(self.store, roots)
+
+        original_scan = __import__("hydra_codex.incremental_sync", fromlist=["scan_source"]).scan_source
+        swapped = False
+
+        def swap_after_scan(*args, **kwargs):
+            nonlocal swapped
+            result = original_scan(*args, **kwargs)
+            if not swapped:
+                nested.rename(self.root / "safe-original")
+                nested.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return result
+
+        with mock.patch("hydra_codex.incremental_sync.scan_source", side_effect=swap_after_scan):
+            with self.assertRaisesRegex(Exception, "rollout source changed"):
+                repair.repair_source("sessions", "safe/rollout.jsonl", "2026-07-26T00:00:00Z")
+        self.assertIsNone(self.repository.source_for("sessions", "safe/rollout.jsonl"))
 
     def test_backfill_reconciles_dirty_project_before_job_succeeds(self) -> None:
         from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots

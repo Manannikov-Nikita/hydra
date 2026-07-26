@@ -474,6 +474,15 @@ class SyncStateRepository:
                 self._bump_revision(connection, acquired_at)
             return acquired
 
+    def lease_owned(self, owner_key: str, observed_at: str) -> bool:
+        """Read the singleton lease without taking a writer transaction."""
+        observed_at = _timestamp(observed_at)
+        row = self._store.connection.execute(
+            "SELECT 1 FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+            (owner_key, observed_at),
+        ).fetchone()
+        return row is not None
+
     def release_lease(self, owner_key: str, observed_at: str | None = None) -> bool:
         now = _timestamp(observed_at)
         with self._store.rollout_transaction() as connection:

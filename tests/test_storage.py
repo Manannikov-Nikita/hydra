@@ -116,6 +116,84 @@ class SQLiteStorageTests(unittest.TestCase):
         first.close()
         second.close()
 
+    def test_bounded_writer_open_checks_schema_without_scanning_database(self) -> None:
+        with patch.object(
+            HydraStore,
+            "_validate_database_integrity",
+            side_effect=AssertionError(
+                "bounded writer open scanned the whole database",
+            ),
+        ):
+            store = HydraStore.open_bounded_writer(self.database)
+        store.close()
+
+        self.store.connection.execute(
+            "DROP TRIGGER sync_queue_eligibility_insert",
+        )
+        self.store.connection.commit()
+        with self.assertRaisesRegex(
+            StorageUnavailable, "bounded sync-work trigger",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_schema_change_before_first_write(self) -> None:
+        bounded = HydraStore.open_bounded_writer(self.database)
+        self.addCleanup(bounded.close)
+        other = sqlite3.connect(self.database)
+        try:
+            other.execute(
+                "DROP TRIGGER sync_queue_eligibility_insert",
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "after bounded writer validation",
+        ):
+            with bounded.rollout_transaction() as connection:
+                connection.execute(
+                    """INSERT INTO sync_worker_leases(
+                           lease_name,owner_key,acquired_at,expires_at
+                       ) VALUES (
+                           'ingest','unsafe',
+                           '2026-07-27T00:00:00Z',
+                           '2026-07-27T00:01:00Z'
+                       )""",
+                )
+        self.assertIsNone(
+            bounded.connection.execute(
+                """SELECT owner_key FROM sync_worker_leases
+                    WHERE lease_name='ingest'""",
+            ).fetchone(),
+        )
+
+    def test_bounded_writer_rejects_schema_change_during_validation(self) -> None:
+        validate = HydraStore._validate_schema
+
+        def tamper_after_validation(store, latest, *, full_validation=True):
+            validate(store, latest, full_validation=full_validation)
+            other = sqlite3.connect(self.database)
+            try:
+                other.execute(
+                    "DROP TRIGGER sync_queue_eligibility_insert",
+                )
+                other.commit()
+            finally:
+                other.close()
+
+        with (
+            patch.object(
+                HydraStore, "_validate_schema",
+                new=tamper_after_validation,
+            ),
+            self.assertRaisesRegex(
+                StorageUnavailable,
+                "changed during bounded writer validation",
+            ),
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
     def test_constructor_closes_connection_when_storage_validation_fails(self) -> None:
         database = Path(self.temporary_directory.name) / "failed-open.sqlite3"
         failed = HydraStore.__new__(HydraStore)

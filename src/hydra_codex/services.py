@@ -174,7 +174,9 @@ class LocalCommandServices:
         now = _utc_now(self._clock)
         expiry = (datetime.fromisoformat(now.replace("Z", "+00:00"))
                   + timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
-        store = HydraStore(self._database_path(database_path))
+        store = HydraStore.open_bounded_writer(
+            self._database_path(database_path),
+        )
         try:
             result = IncrementalSyncWorker(
                 store, self._sync_roots(),

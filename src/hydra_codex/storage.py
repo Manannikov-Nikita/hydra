@@ -585,6 +585,60 @@ class HydraStore:
             raise
 
     @classmethod
+    def open_bounded_writer(
+        cls, path: Path | str | None = None,
+    ) -> HydraStore:
+        """Open a hot writer after exact schema checks, without a data scan.
+
+        Normal sync is frequent and mutating: it must verify every trusted
+        table/trigger contract, but repeating ``PRAGMA integrity_check`` over
+        a multi-gigabyte database would turn an empty queue poll into a global
+        read. Fresh or stale databases still use :meth:`open_current`'s safe
+        creation/migration boundary before this bounded validation.
+        """
+        store = cls.open_current(path)
+        try:
+            identity_before = os.stat(store.database_path)
+            schema_before = int(
+                store.connection.execute(
+                    "PRAGMA schema_version",
+                ).fetchone()[0],
+            )
+            store._validate_schema(
+                MIGRATIONS[-1][0], full_validation=False,
+            )
+            schema_after = int(
+                store.connection.execute(
+                    "PRAGMA schema_version",
+                ).fetchone()[0],
+            )
+            identity_after = os.stat(store.database_path)
+            if (
+                schema_before != schema_after
+                or (
+                    identity_before.st_dev, identity_before.st_ino
+                ) != (
+                    identity_after.st_dev, identity_after.st_ino
+                )
+            ):
+                raise StorageUnavailable(
+                    "Hydra database changed during bounded writer validation",
+                )
+            store._bounded_writer_schema_version = schema_after
+            store._bounded_writer_identity = (
+                identity_after.st_dev, identity_after.st_ino,
+            )
+            return store
+        except (OSError, sqlite3.Error) as error:
+            store.close()
+            raise StorageUnavailable(
+                f"cannot validate bounded Hydra writer: {store.database_path}",
+            ) from error
+        except BaseException:
+            store.close()
+            raise
+
+    @classmethod
     def _open_validated(
         cls,
         path: Path,
@@ -656,10 +710,45 @@ class HydraStore:
             connection.close()
             self.connection = None
 
+    def _assert_bounded_writer_schema(self) -> None:
+        expected_schema = getattr(
+            self, "_bounded_writer_schema_version", None,
+        )
+        expected_identity = getattr(
+            self, "_bounded_writer_identity", None,
+        )
+        if expected_schema is None or expected_identity is None:
+            return
+        try:
+            current_schema = int(
+                self.connection.execute(
+                    "PRAGMA schema_version",
+                ).fetchone()[0],
+            )
+            current_version = int(
+                self.connection.execute(
+                    "PRAGMA user_version",
+                ).fetchone()[0],
+            )
+            identity = os.stat(self.database_path)
+        except (OSError, sqlite3.Error) as error:
+            raise StorageUnavailable(
+                "cannot verify bounded Hydra writer",
+            ) from error
+        if (
+            current_schema != expected_schema
+            or current_version != MIGRATIONS[-1][0]
+            or (identity.st_dev, identity.st_ino) != expected_identity
+        ):
+            raise StorageUnavailable(
+                "Hydra database changed after bounded writer validation",
+            )
+
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
+            self._assert_bounded_writer_schema()
             yield self.connection
             self.connection.commit()
         except BaseException:

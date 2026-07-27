@@ -209,6 +209,46 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertEqual(repair_payload["command"], "repair")
         self.assertNotIn(str(self.root), sync[1] + repair[1])
 
+    def test_warm_sync_skips_repeat_whole_database_validation(self) -> None:
+        store = HydraStore(self.database)
+        store.close()
+
+        with mock.patch.object(
+            HydraStore,
+            "_validate_database_integrity",
+            side_effect=AssertionError(
+                "warm sync repeated the whole-database integrity scan",
+            ),
+        ):
+            sync = invoke(
+                [
+                    "sync", "--db", str(self.database),
+                    "--cwd", str(self.project),
+                ],
+                environ=self.environ,
+            )
+
+        self.assertEqual(sync[0], 0, sync[2])
+
+    def test_warm_sync_rejects_a_missing_trusted_schema_trigger(self) -> None:
+        store = HydraStore(self.database)
+        store.connection.execute(
+            "DROP TRIGGER sync_queue_eligibility_insert",
+        )
+        store.connection.commit()
+        store.close()
+
+        sync = invoke(
+            [
+                "sync", "--db", str(self.database),
+                "--cwd", str(self.project),
+            ],
+            environ=self.environ,
+        )
+
+        self.assertEqual(sync[0], 1)
+        self.assertEqual(sync[2], "hydra-codex: storage unavailable\n")
+
     def test_cli_repair_all_runs_every_bounded_batch_to_completion(self) -> None:
         sessions = self.root / ".codex" / "sessions"
         for index in range(101):

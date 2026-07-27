@@ -8,14 +8,17 @@ import {renderCompare} from "./views/compare.js";
 import {renderHealth} from "./views/health.js";
 import {renderEvidence} from "./views/evidence.js";
 
-const REFRESH_STAGES = Object.freeze(["discover", "inspect", "scan", "reconcile"]);
+const REFRESH_STAGES = Object.freeze(["queued", "running", "succeeded", "partial", "failed"]);
 const TERMINAL_REFRESH = new Set(["succeeded", "partial", "failed"]);
 const FOCUSABLE = "button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])";
 const routeView = document.getElementById("route-view");
 const routeStatus = document.getElementById("route-status");
 const asyncStatus = document.getElementById("async-status");
 const liveRegion = document.getElementById("global-live-region");
-const refreshButton = document.getElementById("refresh-button");
+const refreshButton = document.getElementById("sync-button");
+const repairButton = document.getElementById("repair-button");
+const repairConfirmation = document.getElementById("repair-confirmation");
+const repairConfirmButton = document.getElementById("repair-confirm-button");
 const freshnessLabel = document.getElementById("freshness-label");
 let state = initialState();
 let api = null;
@@ -23,6 +26,8 @@ let activeRequest = null;
 let routeWorkGeneration = 0;
 let lastAnnouncement = null;
 let lastRefreshProgress = null;
+let dataRevision = 0;
+let changePoll = null;
 
 function dispatch(action) {
   state = reduce(state, action);
@@ -95,12 +100,13 @@ function refreshRequiredRoute(route) {
     ? "Refresh Hydra before comparing task evidence."
     : "Refresh Hydra before browsing task evidence.";
   return el("div", {class: "route-stack"}, [
-    pageHeader(title, "Validated task evidence is unavailable until Refresh completes."),
-    emptyState("Refresh required", detail),
+    pageHeader(title, "Validated task evidence is unavailable until Sync now completes."),
+    emptyState("Sync required", detail.replaceAll("Refresh", "Sync")),
   ]);
 }
 
 function refreshProgressCount(fact) {
+  if (Number.isFinite(fact) && fact >= 0) return formatNumber(fact);
   if (!fact || fact.value === null) {
     return fact && Number.isFinite(fact.lower_bound) && fact.lower_bound > 0
       ? `≥ ${formatNumber(fact.lower_bound)}`
@@ -116,19 +122,9 @@ function refreshProgressCount(fact) {
 
 function refreshProgressDetail(current) {
   const progress = current && current.progress ? current.progress : {};
-  const facts = [
-    progress.sources_scanned, progress.sources_discovered,
-    progress.projects_completed, progress.projects_total,
-    progress.projects_refreshed,
-  ];
-  const provenance = [...new Set(facts.map(fact =>
-    fact && fact.provenance ? fact.provenance : "provenance unavailable"))];
-  const metadata = `provenance: ${provenance.join(", ")}`;
-  return `Sources scanned ${refreshProgressCount(progress.sources_scanned)}`
-    + `/${refreshProgressCount(progress.sources_discovered)}; `
-    + `Projects completed ${refreshProgressCount(progress.projects_completed)}`
-    + `/${refreshProgressCount(progress.projects_total)}; `
-    + `refreshed ${refreshProgressCount(progress.projects_refreshed)} · ${metadata}`;
+  return `Queued ${refreshProgressCount(progress.sources_queued)}; `
+    + `processed ${refreshProgressCount(progress.sources_processed)}; `
+    + `new bytes ${refreshProgressCount(progress.new_bytes)}`;
 }
 
 function refreshDiagnosticDetail(current) {
@@ -136,18 +132,18 @@ function refreshDiagnosticDetail(current) {
     ? current.diagnostic_codes : []);
   if (codes.has("source_changed")) {
     return "A live task changed during refresh. Stable evidence remains visible. "
-      + "Wait for the active task to finish writing, then refresh again.";
+      + "Wait for the active task to finish writing, then sync again.";
   }
   if (codes.has("database_busy")) {
-    return "Hydra is finishing another write. Stable evidence remains visible. Refresh again shortly.";
+    return "Hydra is finishing another write. Stable evidence remains visible. Sync again shortly.";
   }
   if (codes.has("reconciliation_stale")) {
-    return "New observations arrived before reconciliation finished. Stable evidence remains visible. Refresh again.";
+    return "New observations arrived before reconciliation finished. Stable evidence remains visible. Sync again.";
   }
   if (current && current.state === "partial") {
-    return "Some sources could not be refreshed. Stable evidence remains visible. Refresh again when the source is ready.";
+    return "Some sources could not be synced. Stable evidence remains visible. Sync again when the source is ready.";
   }
-  return "The refresh could not finish. Stable evidence remains visible. Try again.";
+  return "The sync could not finish. Stable evidence remains visible. Try again.";
 }
 
 function errorMessage(code) {
@@ -258,6 +254,7 @@ async function loadSnapshot(projectRef = state.projectRef, context) {
   const snapshot = await api.snapshot(projectRef, null, abortPrevious());
   if (!isCurrentRouteWork(context)) return null;
   dispatch({type: "snapshot", snapshot});
+  dataRevision = Number.isInteger(snapshot.data_revision) && snapshot.data_revision >= 0 ? snapshot.data_revision : dataRevision;
   context.projectRef = state.projectRef;
   renderRoute();
   return snapshot;
@@ -319,7 +316,7 @@ async function loadRoute() {
     }
     if (routeNeedsRefresh()) {
       clearAsyncState();
-      announce(`${state.route} requires Refresh`);
+      announce(`${state.route} requires Sync`);
       return;
     }
     if (needsTasks && state.tasks.length === 0) {
@@ -366,14 +363,14 @@ function announceRefresh(current) {
   const progressKey = `${current.state}:${stage}`;
   if (progressKey === lastRefreshProgress) return;
   lastRefreshProgress = progressKey;
-  if (!TERMINAL_REFRESH.has(current.state)) announce(`Refresh ${stage}`);
+  if (!TERMINAL_REFRESH.has(current.state)) announce(`Sync ${stage}`);
 }
 
 async function pollRefresh(refreshRef) {
   for (;;) {
-    await new Promise(resolve => window.setTimeout(resolve, 350));
-    const current = await api.refreshStatus(refreshRef);
-    showAsyncState("loading", "Refreshing evidence", refreshProgressDetail(current));
+    await new Promise(resolve => window.setTimeout(resolve, 1000));
+    const current = await api.syncStatus(refreshRef);
+    showAsyncState("loading", "Syncing evidence", refreshProgressDetail(current));
     announceRefresh(current);
     if (!TERMINAL_REFRESH.has(current.state)) continue;
 
@@ -381,21 +378,21 @@ async function pollRefresh(refreshRef) {
     refreshButton.disabled = false;
     refreshButton.removeAttribute("aria-busy");
     refreshButton.textContent = current.state === "partial"
-      ? "Refresh again" : current.state === "failed" ? "Retry" : "Refresh";
+      ? "Sync again" : current.state === "failed" ? "Retry" : "Sync now";
     if (!reloaded) return;
     if (current.state === "partial" || current.state === "failed") {
       const partial = current.state === "partial";
-      const title = partial ? "Refresh needs another pass" : "Refresh failed";
+      const title = partial ? "Sync needs another pass" : "Sync failed";
       const detail = refreshDiagnosticDetail(current);
       showAsyncState(
         partial ? "notice" : "error", title, detail, startRefresh,
-        partial ? "Refresh again" : "Retry",
+        partial ? "Sync again" : "Retry",
       );
       routeStatus.textContent = "";
       announceRefreshOutcome(`${title}. ${detail}`);
     } else {
       clearAsyncState();
-      announce("Refresh complete");
+      announce("Sync complete");
     }
     return;
   }
@@ -412,23 +409,55 @@ async function startRefresh() {
   refreshButton.disabled = true;
   refreshButton.setAttribute("aria-busy", "true");
   lastRefreshProgress = null;
-  showAsyncState("loading", "Refreshing evidence", "Current evidence stays visible until refreshed facts are reconciled.");
+  showAsyncState("loading", "Syncing evidence", "Current evidence stays visible while new queued telemetry is reconciled.");
   try {
-    const started = await api.startRefresh();
-    announce(started.reused ? "Existing refresh reused" : "Refresh started");
-    await pollRefresh(started.refresh_ref);
+    const started = await api.startSync();
+    announce(started.reused ? "Existing sync reused" : "Sync started");
+    await pollRefresh(started.sync_ref);
   } catch (error) {
     refreshButton.disabled = false;
     refreshButton.removeAttribute("aria-busy");
-    refreshButton.textContent = "Retry";
+    refreshButton.textContent = "Retry sync";
     const code = error instanceof ApiError ? error.code : "internal_failure";
-    showAsyncState("error", "Refresh failed", errorMessage(code), startRefresh);
+    showAsyncState("error", "Sync failed", errorMessage(code), startRefresh);
     routeStatus.textContent = "";
-    announceRefreshOutcome("Refresh failed");
+    announceRefreshOutcome("Sync failed");
   }
 }
 
 refreshButton.addEventListener("click", startRefresh);
+repairButton.addEventListener("click", () => {
+  const visible = repairConfirmation.hidden;
+  repairConfirmation.hidden = !visible;
+  repairButton.setAttribute("aria-expanded", String(visible));
+  if (visible) repairConfirmButton.focus({preventScroll: true});
+});
+repairConfirmButton.addEventListener("click", async () => {
+  repairConfirmButton.disabled = true;
+  showAsyncState("loading", "Repairing history", "Repair history is walking all trusted telemetry files; existing evidence remains visible.");
+  try {
+    const started = await api.startRepair();
+    repairConfirmation.hidden = true;
+    repairButton.setAttribute("aria-expanded", "false");
+    await pollRefresh(started.sync_ref);
+  } catch (error) {
+    showAsyncState("error", "Repair history failed", errorMessage(error instanceof ApiError ? error.code : "internal_failure"));
+  } finally { repairConfirmButton.disabled = false; }
+});
+
+async function pollChanges() {
+  if (!api) return;
+  try {
+    const changes = await api.changes(dataRevision);
+    if (Number.isInteger(changes.data_revision) && changes.data_revision > dataRevision) dataRevision = changes.data_revision;
+    if (changes.changed && !refreshButton.disabled) await reloadAfterRefresh();
+  } catch (_) { /* A later one-second poll retries without exposing transport details. */ }
+}
+
+function startChangePolling() {
+  if (changePoll !== null) window.clearInterval(changePoll);
+  changePoll = window.setInterval(pollChanges, 1000);
+}
 window.addEventListener("popstate", () => {
   dispatch({type: "route", route: routeFromLocation()});
   loadRoute();
@@ -443,4 +472,8 @@ window.addEventListener("hydra-dashboard-ready", event => {
   initializeShell(actions());
   dispatch({type: "route", route: routeFromLocation()});
   loadRoute();
+  startChangePolling();
+  api.sync().then(current => {
+    if (current && (current.state === "queued" || current.state === "running")) pollRefresh(current.sync_ref);
+  }).catch(() => undefined);
 }, {once: true});

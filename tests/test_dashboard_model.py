@@ -144,7 +144,7 @@ class DashboardModelTests(unittest.TestCase):
     def test_snapshot_is_immutable_and_canonical(self) -> None:
         snapshot = self.snapshot()
 
-        self.assertEqual(snapshot.as_dict()["schema_version"], "hydra.dashboard/v1")
+        self.assertEqual(snapshot.as_dict()["schema_version"], "hydra.dashboard/v2")
         self.assertEqual(snapshot.as_dict()["project"]["display_name"], "Hydra <Core>")
         with self.assertRaises(FrozenInstanceError):
             snapshot.generated_at = "changed"  # type: ignore[misc]

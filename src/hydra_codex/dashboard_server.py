@@ -2,14 +2,12 @@
 from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import json
-import re
-import secrets
-import sqlite3
+import json, re, secrets, sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType
 from typing import Any
 from .dashboard_model import DashboardRefreshView
+from .dashboard_sync_api import dashboard_payload, dispatch as dispatch_sync
 from .public_payload import reject_private_fields
 from .storage import StorageUnavailable
 
@@ -38,21 +36,19 @@ _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
 _AUTHORITY = re.compile(r"127\.0\.0\.1:([1-9][0-9]{0,4})\Z")
 _PROJECT_REF, _TASK_REF = re.compile(r"project_[0-9a-f]{12,64}\Z"), re.compile(r"task_[0-9a-f]{1,64}\Z")
 _REFRESH_REF, _EVIDENCE_REF = re.compile(r"refresh_[0-9a-f]{12,64}\Z"), re.compile(r"ev_[0-9a-f]{16}\Z")
+_SYNC_REF = re.compile(r"sync_[0-9a-f]{12,64}\Z")
 _MAX_HEADERS, _MAX_HEADER_VALUE, _MAX_HEADER_BYTES, _MAX_TARGET_BYTES = 64, 8192, 32768, 2048
-
 @dataclass(frozen=True)
 class DashboardRequest:
     method: str
     target: str
     headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     body: bytes = field(default=b"", repr=False)
-
 @dataclass(frozen=True)
 class DashboardResponse:
     status: int
     headers: tuple[tuple[str, str], ...]
     body: bytes
-
 @dataclass(frozen=True)
 class DashboardAsset:
     content_type: str
@@ -67,7 +63,6 @@ class DashboardAsset:
             raise ValueError("asset content type must be safe text")
         if not isinstance(self.body, bytes):
             raise TypeError("asset body must be bytes")
-
 class _HttpError(Exception):
     def __init__(self, code: str) -> None:
         if code not in _ERROR_STATUS:
@@ -90,6 +85,7 @@ def _as_dict(value: object) -> dict[str, object]:
 class DashboardApplication:
     def __init__(
         self, *, token: str, query_service: object, refresh_controller: object,
+        sync_controller: object | None = None,
         snapshot_cache: object, assets: Mapping[str, DashboardAsset],
         fallback_snapshot: object | None = None, fallback_error: str | None = None,
         _authority: str | None = None,
@@ -119,6 +115,7 @@ class DashboardApplication:
             self._validate_authority(_authority)
         if fallback_error not in {None, "storage_unavailable"}: raise ValueError("dashboard fallback error is invalid")
         self._token, self._query, self._controller = token, query_service, refresh_controller
+        self._sync_controller = sync_controller
         self._cache, self._fallback_snapshot, self._fallback_error = snapshot_cache, fallback_snapshot, fallback_error
         self._assets, self._authority = MappingProxyType(dict(sorted(copied.items()))), _authority
     @staticmethod
@@ -130,7 +127,7 @@ class DashboardApplication:
         self._validate_authority(authority)
         return DashboardApplication(
             token=self._token, query_service=self._query,
-            refresh_controller=self._controller, snapshot_cache=self._cache,
+            refresh_controller=self._controller, sync_controller=self._sync_controller, snapshot_cache=self._cache,
             assets=self._assets, fallback_snapshot=self._fallback_snapshot,
             fallback_error=self._fallback_error, _authority=authority,
         )
@@ -334,12 +331,12 @@ class DashboardApplication:
                         raise _HttpError("refresh_unavailable")
                     payload = _as_dict(self._fallback_snapshot)
                     payload["refresh"] = _as_dict(self._current_refresh())
-                    return self._json(200, payload, method)
+                    return self._json(200, dashboard_payload(self, payload), method)
                 cached = self._controller.snapshot(selected)
                 if cached is None:
                     raise KeyError("unknown public reference")
                 payload = _as_dict(cached)
-            return self._json(200, payload, method)
+            return self._json(200, dashboard_payload(self, payload), method)
         if path == "/api/v1/tasks":
             values = self._parse_query_fields(
                 raw_query, allowed=("project", "cursor", "limit"),
@@ -383,6 +380,9 @@ class DashboardApplication:
             return self._json(
                 200, _as_dict(self._query.evidence(project, evidence)), method,
             )
+        sync_response = dispatch_sync(self, method, path, raw_query)
+        if sync_response is not None:
+            return sync_response
         if path == "/api/v1/refresh":
             self._parse_query_fields(raw_query, allowed=())
             if method != "POST":

@@ -1,4 +1,4 @@
-import {dataTable, el, factText, pageHeader} from "../dom.js";
+import {dataTable, el, factText, pageHeader, taskDisplay} from "../dom.js";
 
 export function renderCompare(state, actions) {
   const comparison = state.comparison;
@@ -10,7 +10,8 @@ export function renderCompare(state, actions) {
   for (const taskRef of [baselineRef, currentRef]) {
     if (taskRef && !taskRefs.includes(taskRef)) taskRefs.push(taskRef);
   }
-  const options = taskRefs.map(taskRef => el("option", {value: taskRef, text: taskRef}));
+  const taskByRef = new Map(state.tasks.map(task => [task.task_ref, task]));
+  const options = taskRefs.map(taskRef => el("option", {value: taskRef, text: taskDisplay(taskByRef.get(taskRef) || {task_ref: taskRef})}));
   const left = el("select", {id: "compare-left", name: "left"}, options.map(option => option.cloneNode(true)));
   const right = el("select", {id: "compare-right", name: "right"}, options.map(option => option.cloneNode(true)));
   if (baselineRef) left.value = baselineRef;

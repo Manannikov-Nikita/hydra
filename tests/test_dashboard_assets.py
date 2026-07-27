@@ -324,8 +324,8 @@ class DashboardAssetContractTests(unittest.TestCase):
             "Recent tasks", "Pilot", "System health", "dataTable(",
         ):
             self.assertIn(marker, source)
-        self.assertIn("Latest validated task unavailable — Refresh required", source)
-        self.assertIn("Recent task evidence requires Refresh.", source)
+        self.assertIn("Latest validated task unavailable — Sync required", source)
+        self.assertIn("Recent task evidence requires Sync.", source)
         self.assertNotIn("Basis: no reconciled task", source)
 
     def test_overview_distinguishes_unknown_false_and_true_readiness(self) -> None:
@@ -342,7 +342,7 @@ class DashboardAssetContractTests(unittest.TestCase):
 
         for marker in (
             "function absentPilotText", 'project.freshness_state === "stale"',
-            "Unavailable until Refresh", "Not started", "const absentPilot",
+            "Unavailable until Sync", "Not started", "const absentPilot",
             "pilot ? readinessText(pilot.transport_verified) : absentPilot",
             "pilot ? readinessText(pilot.trend_ready) : absentPilot",
         ):
@@ -409,10 +409,10 @@ class DashboardAssetContractTests(unittest.TestCase):
     def test_refresh_and_navigation_keep_prior_content_during_progress(self) -> None:
         app = self.asset("app.js")
         state = self.asset("state.js")
-        for stage in ("discover", "inspect", "scan", "reconcile"):
+        for stage in ("queued", "running", "succeeded", "partial", "failed"):
             self.assertIn(stage, app)
         for marker in (
-            "AbortController", "refresh_ref", "reused", "partial", "failed",
+            "AbortController", "sync_ref", "reused", "partial", "failed",
             "succeeded", "Retry", "aria-busy", "focus", "lastRefreshProgress",
             "reset_after_refresh", "reloadAfterRefresh",
         ):
@@ -429,7 +429,7 @@ class DashboardAssetContractTests(unittest.TestCase):
 
         for marker in (
             "Stable evidence remains visible",
-            "Refresh again",
+            "Sync again",
             "A live task changed during refresh",
             "Wait for the active task to finish writing",
         ):
@@ -447,10 +447,9 @@ class DashboardAssetContractTests(unittest.TestCase):
         app = self.asset("app.js")
 
         for marker in (
-            "function refreshProgressDetail", "sources_scanned",
-            "sources_discovered", "projects_completed", "projects_total",
-            "projects_refreshed", "Sources scanned", "Projects completed",
-            "refreshed", "provenance unavailable", "fact.value === 0",
+            "function refreshProgressDetail", "sources_queued",
+            "sources_processed", "new_bytes", "Queued", "processed",
+            "new bytes", "fact.value === 0",
         ):
             self.assertIn(marker, app)
         progress = app.split("function refreshProgressDetail", 1)[-1].split(
@@ -462,12 +461,28 @@ class DashboardAssetContractTests(unittest.TestCase):
             "async function startRefresh", 1,
         )[0]
         visible_progress = (
-            'showAsyncState("loading", "Refreshing evidence", '
+            'showAsyncState("loading", "Syncing evidence", '
             "refreshProgressDetail(current))"
         )
         self.assertIn(visible_progress, poll)
         self.assertLess(poll.index(visible_progress), poll.index("announceRefresh(current)"))
-        self.assertIn("announce(`Refresh ${stage}`)", app)
+        self.assertIn("announce(`Sync ${stage}`)", app)
+
+    def test_sync_repair_polling_and_task_names_are_explicit_and_safe(self) -> None:
+        app = self.asset("app.js")
+        api = self.asset("api.js")
+        html = self.asset("index.html")
+        dom = self.asset("dom.js")
+        tasks = self.asset("views/tasks.js")
+
+        for marker in ("Sync now", "Repair history", "Start full repair", "startChangePolling", "window.setInterval(pollChanges, 1000)"):
+            self.assertIn(marker, html + app)
+        self.assertIn("/api/v1/changes?after=", api)
+        self.assertIn("startSync", api)
+        self.assertIn("startRepair", api)
+        self.assertIn("export function taskDisplay", dom)
+        self.assertIn("taskDisplay(task)", tasks)
+        self.assertNotIn("sources_scanned", app)
 
     def test_task_loading_uses_the_canonical_nested_page_cursor(self) -> None:
         app = self.asset("app.js")

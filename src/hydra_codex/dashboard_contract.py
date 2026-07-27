@@ -430,8 +430,10 @@ def validate_project_payload(value: object) -> None:
     if len(recent_tasks) > 10:
         raise ValueError("dashboard recent tasks are not bounded")
     for item in recent_tasks:
-        recent = _object(item, {"task_ref", "status", "last_activity_at", "task_family", "headline"}, "recent task")
+        recent = _object(item, {"task_ref", "display_name", "status", "last_activity_at", "task_family", "headline"}, "recent task")
         _task_ref(recent["task_ref"], "recent task task_ref")
+        if normalize_task_label(recent["display_name"]) != recent["display_name"]:
+            raise ValueError("recent task display name is invalid")
         if recent["status"] not in {"complete", "incomplete"}:
             raise ValueError("recent task status is invalid")
         _timestamp(recent["last_activity_at"], "recent task last_activity_at")

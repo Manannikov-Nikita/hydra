@@ -771,6 +771,28 @@ class SyncStateRepository:
             self._bump_revision(connection, created_at)
         return identifier
 
+    def get_or_create_active_job(self, job_kind: str, created_at: str) -> tuple[str, bool]:
+        """Return one durable queued/running job, creating it atomically if absent."""
+        created_at = _timestamp(created_at)
+        if job_kind not in _JOB_KINDS:
+            raise ValueError("sync job kind is invalid")
+        with self._store.rollout_transaction() as connection:
+            row = connection.execute(
+                """SELECT job_id FROM sync_jobs WHERE job_kind=?
+                     AND state IN ('queued','running') ORDER BY updated_at DESC,job_id DESC LIMIT 1""",
+                (job_kind,),
+            ).fetchone()
+            if row is not None:
+                return str(row[0]), True
+            identifier = f"sync_{uuid.uuid4().hex}"
+            connection.execute(
+                """INSERT INTO sync_jobs(job_id,job_kind,state,sources_discovered,sources_completed,bytes_processed,
+                       created_at,updated_at,completed_at) VALUES (?,?,'queued',0,0,0,?,?,NULL)""",
+                (identifier, job_kind, created_at, created_at),
+            )
+            self._bump_revision(connection, created_at)
+            return identifier, False
+
     @staticmethod
     def _job_from_row(row) -> SyncJob:
         return SyncJob(str(row[0]), str(row[1]), str(row[2]), int(row[3]), int(row[4]), int(row[5]),

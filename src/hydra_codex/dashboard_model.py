@@ -18,7 +18,7 @@ from .public_payload import reject_private_fields
 from .reporting import NumericFact
 
 
-DASHBOARD_SCHEMA = "hydra.dashboard/v1"
+DASHBOARD_SCHEMA = "hydra.dashboard/v2"
 TASK_LIST_SCHEMA = "hydra.dashboard-task-list/v1"
 _PROJECT_REF = re.compile(r"project_[0-9a-f]{12,64}\Z")
 _TASK_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
@@ -209,6 +209,12 @@ class DashboardSnapshot:
     project_json: str | None
     selected_task_json: str | None
     refresh: DashboardRefreshView
+    data_revision: int = 0
+    sync: Mapping[str, object] = field(default_factory=lambda: {
+        "schema_version": "hydra.dashboard-sync/v1", "sync_ref": None,
+        "kind": None, "state": "idle", "started_at": None, "finished_at": None,
+        "progress": {"sources_queued": 0, "sources_processed": 0, "new_bytes": 0},
+    })
 
     def __post_init__(self) -> None:
         _timestamp(self.generated_at, "dashboard generated_at")
@@ -244,6 +250,13 @@ class DashboardSnapshot:
             _task_ref(task.get("task_ref"))
         if not isinstance(self.refresh, DashboardRefreshView):
             raise ValueError("refresh must be a DashboardRefreshView")
+        if isinstance(self.data_revision, bool) or not isinstance(self.data_revision, int) or self.data_revision < 0:
+            raise ValueError("dashboard revision must be non-negative")
+        if not isinstance(self.sync, Mapping):
+            raise ValueError("dashboard sync summary must be public mapping")
+        frozen_sync = _freeze(self.sync)
+        reject_private_fields(_thaw(frozen_sync))
+        object.__setattr__(self, "sync", frozen_sync)
 
     def as_dict(self) -> dict[str, object]:
         payload = {
@@ -254,6 +267,7 @@ class DashboardSnapshot:
             "project": None if self.project_json is None else json.loads(self.project_json),
             "selected_task": None if self.selected_task_json is None else json.loads(self.selected_task_json),
             "refresh": self.refresh.as_dict(),
+            "data_revision": self.data_revision, "sync": _thaw(self.sync),
         }
         reject_private_fields(payload)
         return payload

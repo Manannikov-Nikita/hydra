@@ -250,6 +250,7 @@ class DashboardQueryService:
     def _recent_task(report: TaskReport) -> dict[str, object]:
         return {
             "task_ref": report.task_ref,
+            "display_name": report.display_name,
             "status": report.status,
             "last_activity_at": report.last_activity_at,
             "task_family": report.task_family,

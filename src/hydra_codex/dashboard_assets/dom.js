@@ -163,6 +163,14 @@ export function factSummaryText(fact, options = {}) {
   return `${factValueText(fact, options)} · ${provenanceText(fact)}`;
 }
 
+export function taskDisplay(task) {
+  if (task && typeof task.display_name === "string" && task.display_name.trim()) return task.display_name;
+  const family = task && typeof task.task_family === "string" && task.task_family.trim() ? task.task_family : null;
+  const date = task && typeof task.last_activity_at === "string" && /^\d{4}-\d{2}-\d{2}/.test(task.last_activity_at) ? task.last_activity_at.slice(0, 10) : null;
+  const ref = task && typeof task.task_ref === "string" ? task.task_ref.slice(-8) : null;
+  return [family, date, ref].filter(Boolean).join(" · ") || "Unlabelled task";
+}
+
 export function factPercent(fact) {
   return factText(fact, {percent: true});
 }

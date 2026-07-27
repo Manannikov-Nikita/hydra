@@ -137,6 +137,27 @@ def _hook_safe_fact(payload: Mapping[str, Any], event: str) -> tuple[str, str | 
     return event_kind, category, status, safe_duration
 
 
+def _private_tool_event_identity(
+    payload: Mapping[str, Any], keys: Pseudonymizer, session_key: str, turn_key: str,
+    category: str | None, status: str | None, duration: int | None,
+) -> str:
+    """Return a non-reversible tool identity; id-less identical facts coalesce."""
+    for field in ("tool_use_id", "tool_call_id", "call_id"):
+        value = payload.get(field)
+        if (
+            isinstance(value, str) and 1 <= len(value) <= 512
+            and not any(character in value for character in ("\0", "\r", "\n"))
+        ):
+            return keys.digest(
+                "event", f"hook-tool-call-id/v1/{session_key}/{turn_key}/{value}",
+            )
+    # Without a stable hook call id, do not use arbitrary payload values.
+    # This intentionally coalesces retries and indistinguishable safe facts.
+    return keys.digest(
+        "event", f"hook-tool-fallback/v1/{session_key}/{turn_key}/{category}/{status}/{duration}",
+    )
+
+
 def _open_store(factory: StoreFactory, path: Path | None) -> HydraStore:
     # A concurrent first launch can observe a migration loser. Reopening once
     # more sees the winner's committed schema while persistent failures stay quiet.
@@ -368,7 +389,15 @@ def handle_event(
             event_kind, category, status, duration = _hook_safe_fact(payload, event)
             session_key = keys.digest("identity", _required_text(payload, "session_id"))
             turn_key = keys.digest("turn", _required_text(payload, "turn_id"))
-            event_key = keys.digest("event", f"hook-outbox/v1/{event_kind}/{session_key}/{turn_key}")
+            event_identity = (
+                _private_tool_event_identity(
+                    payload, keys, session_key, turn_key, category, status, duration,
+                )
+                if event == "PostToolUse" else turn_key
+            )
+            event_key = keys.digest(
+                "event", f"hook-outbox/v1/{event_kind}/{session_key}/{event_identity}",
+            )
             SyncStateRepository(store).record_hook_event_and_enqueue(
                 event_key=event_key, project_id=project.project_id, session_key=session_key,
                 turn_key=turn_key, event_kind=event_kind, observed_at=observed_at,

@@ -128,6 +128,32 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_distinct_post_tool_call_ids_have_distinct_private_outbox_events(self) -> None:
+        first = {
+            "hook_event_name": "PostToolUse", "session_id": "private-session",
+            "turn_id": "private-turn", "cwd": str(self.project),
+            "tool_use_id": "private-tool-call-a", "tool_category": "shell",
+            "tool_status": "success", "duration_ms": 12,
+        }
+        second = {**first, "tool_use_id": "private-tool-call-b", "duration_ms": 20}
+        handle_event(first, environ=self.environ, clock=lambda: NOW)
+        handle_event(second, environ=self.environ, clock=lambda: NOW)
+        handle_event(first, environ=self.environ, clock=lambda: NOW)
+        handle_event(second, environ=self.environ, clock=lambda: NOW)
+        store = HydraStore(self.database)
+        try:
+            rows = store.connection.execute(
+                "SELECT event_key,event_kind,tool_category,tool_status,duration_ms FROM hook_event_outbox "
+                "ORDER BY duration_ms"
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row[1:]) for row in rows],
+                [("post_tool", "shell", "success", 12), ("post_tool", "shell", "success", 20)],
+            )
+            self.assertNotIn("private-tool-call", repr(rows))
+        finally:
+            store.close()
+
     def test_sync_and_explicit_repair_are_private_bounded_commands(self) -> None:
         sync = invoke(
             ["sync", "--db", str(self.database), "--cwd", str(self.project)],

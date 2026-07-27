@@ -95,4 +95,3 @@ class DashboardSyncApiTests(unittest.TestCase):
         self.assertEqual(self.sync.started, ["sync", "repair", "sync"])
         self.assertEqual(self.payload(alias)["schema_version"], "hydra.dashboard-sync/v1")
         self.assertEqual(self.request("/api/v1/sync/sync_0123456789abcdef").status, 200)
-

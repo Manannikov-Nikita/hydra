@@ -63,4 +63,3 @@ class DashboardSyncControllerTests(unittest.TestCase):
         self.assertTrue(after["changed"])
         self.assertGreater(after["data_revision"], before["data_revision"])
         self.assertNotIn("path", repr(after).lower())
-

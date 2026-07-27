@@ -373,8 +373,7 @@ grep -q '"status":"ok"' "$TEMP_ROOT/reconcile.json" ||
     fail "synthetic reconcile failed"
 "$HYDRA" report --last 1 --format json --cwd "$PROJECT" \
     > "$TEMP_ROOT/report.json"
-"$HOST_PYTHON" - "$TEMP_ROOT/report.json" <<'PY' ||
-    fail "synthetic report failed"
+if ! "$HOST_PYTHON" - "$TEMP_ROOT/report.json" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -394,6 +393,9 @@ if (
 ):
     raise SystemExit(1)
 PY
+then
+    fail "synthetic report failed"
+fi
 
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"acceptance","turn_id":"turn-a","cwd":"%s","prompt":"acceptance"}\n' \
     "$PROJECT" | "$HYDRA" hook > "$TEMP_ROOT/hook.json"

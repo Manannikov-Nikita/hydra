@@ -314,7 +314,7 @@ class DashboardApplication:
                 raise _HttpError("invalid_request")
             if method not in {"GET", "HEAD"}:
                 raise _HttpError("method_not_allowed")
-            if live_snapshot_available(self): payload = _as_dict(self._query.snapshot(project_ref=project, task_ref=task, refresh=self._current_refresh()))
+            if live_snapshot_available(self, project, task): payload = _as_dict(self._query.snapshot(project_ref=project, task_ref=task, refresh=self._current_refresh()))
             elif task is not None:
                 payload = _as_dict(self._query.snapshot(
                     project_ref=project, task_ref=task,

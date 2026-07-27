@@ -11,6 +11,7 @@ import sqlite3
 from collections.abc import Mapping
 
 from hydra_codex.audit_model import AuditEvidence
+from hydra_codex.dashboard_contract import validate_task_report
 from hydra_codex.dashboard_model import DashboardRefreshView
 from hydra_codex.dashboard_queries import (
     CatalogProject,
@@ -229,6 +230,51 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
         self.assertEqual(payload["project"]["display_name"], "A <script>")
 
+    def test_snapshot_data_and_revision_share_one_read_transaction(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=3 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        original_prepare = self.service._prepare_snapshot_state
+
+        def prepare_then_publish(store):
+            prepared = original_prepare(store)
+            writer = HydraStore(self.database)
+            try:
+                writer.connection.execute(
+                    """UPDATE dashboard_projects SET display_name='Published later'
+                         WHERE project_id='project-a'"""
+                )
+                writer.connection.execute(
+                    "UPDATE sync_data_revision SET revision=4 WHERE singleton=1"
+                )
+                writer.connection.commit()
+            finally:
+                writer.close()
+            return prepared
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ), patch.object(
+            self.service,
+            "_prepare_snapshot_state",
+            side_effect=prepare_then_publish,
+        ):
+            payload = self.service.snapshot(
+                project_ref=project_ref,
+                task_ref=None,
+                refresh=self.refresh,
+            ).as_dict()
+
+        self.assertEqual(payload["data_revision"], 3)
+        self.assertEqual(payload["project"]["display_name"], "A <script>")
+
     def test_bootstrap_snapshots_use_catalog_without_rebuilding_reports(self) -> None:
         store = HydraStore(self.database)
         try:
@@ -361,6 +407,146 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(payload["freshness"]["state"], "current")
         self.assertEqual(payload["project"]["overview"]["headline"]["working_tokens"], report.deduplicated_tokens.working.as_dict())
         self.assertEqual(payload["data_revision"], 7)
+
+    def test_connection_bootstrap_includes_materialized_only_projects(self) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        report = replace(
+            public_report("materialized-only", input_tokens=17, second=8),
+            last_activity_at="2026-07-23T08:00:00Z",
+        )
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       reconciled_at,data_revision)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    "project-c", report.task_ref, render_json(report).rstrip("\n"),
+                    "", "", "2026-07-23T08:00:00Z", 8,
+                ),
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=8 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+
+        refs = project_catalog_references(
+            ("project-a", "project-b", "project-c"), b"k" * 32,
+        )
+        project_ref = refs["project-c"]
+        self.assertIsNone(empty)
+        self.assertIn(project_ref, snapshots)
+        payload = snapshots[project_ref].as_dict()
+        summary = next(
+            project for project in payload["projects"]
+            if project["project_ref"] == project_ref
+        )
+        self.assertEqual(summary["task_count"]["value"], 1)
+        self.assertEqual(payload["project"]["freshness_state"], "current")
+        self.assertEqual(
+            payload["project"]["overview"]["basis"]["task_ref"], report.task_ref,
+        )
+
+    def test_connection_bootstrap_bounds_reports_and_ignores_future_revisions(self) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        reports = tuple(
+            replace(
+                public_report(f"bounded-{index}", input_tokens=10 + index, second=5),
+                last_activity_at=f"2026-07-23T{index:02d}:00:00Z",
+            )
+            for index in range(12)
+        )
+        future = replace(
+            public_report("future", input_tokens=99, second=5),
+            last_activity_at="2026-07-24T00:00:00Z",
+        )
+        future_only = replace(
+            public_report("future-only", input_tokens=101, second=5),
+            last_activity_at="2026-07-25T00:00:00Z",
+        )
+        store = HydraStore(self.database)
+        try:
+            store.connection.executemany(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       reconciled_at,data_revision)
+                   VALUES (?,?,?,?,?,?,?)""",
+                tuple(
+                    (
+                        "project-a", report.task_ref,
+                        render_json(report).rstrip("\n"), "", "",
+                        "2026-07-23T12:00:00Z", 10,
+                    )
+                    for report in reports
+                ) + (
+                    (
+                        "project-a", future.task_ref,
+                        render_json(future).rstrip("\n"), "", "",
+                        "2026-07-24T00:00:00Z", 11,
+                    ),
+                    (
+                        "project-future", future_only.task_ref,
+                        render_json(future_only).rstrip("\n"), "", "",
+                        "2026-07-25T00:00:00Z", 11,
+                    ),
+                ),
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=10 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            with patch(
+                "hydra_codex.dashboard_queries.validate_task_report",
+                wraps=validate_task_report,
+            ) as validate:
+                snapshots, empty = self.service.bootstrap_snapshots_from_connection(
+                    connection, refresh=self.refresh,
+                )
+        finally:
+            connection.close()
+
+        self.assertIsNone(empty)
+        self.assertEqual(validate.call_count, 10)
+        payload = snapshots[self.catalog_refs()["project-a"]].as_dict()
+        project = payload["project"]
+        self.assertEqual(len(project["recent_tasks"]), 10)
+        self.assertEqual(
+            project["overview"]["basis"]["task_ref"], reports[-1].task_ref,
+        )
+        self.assertNotIn(
+            future.task_ref,
+            {task["task_ref"] for task in project["recent_tasks"]},
+        )
+        future_ref = project_catalog_references(
+            ("project-future",), b"k" * 32,
+        )["project-future"]
+        self.assertNotIn(future_ref, snapshots)
+        summary = next(
+            item for item in payload["projects"]
+            if item["project_ref"] == self.catalog_refs()["project-a"]
+        )
+        self.assertEqual(summary["task_count"]["value"], 12)
+        self.assertEqual(payload["data_revision"], 10)
 
     def test_bootstrap_snapshots_preserve_empty_onboarding_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

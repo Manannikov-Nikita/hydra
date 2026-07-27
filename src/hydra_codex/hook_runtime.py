@@ -56,7 +56,12 @@ def _observed_at(clock: Clock) -> tuple[datetime, str]:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError("hook clock must return an aware datetime")
     utc = value.astimezone(timezone.utc)
-    return utc, utc.isoformat().replace("+00:00", "Z")
+    rendered = utc.isoformat().replace("+00:00", "Z")
+    if "." in rendered:
+        whole, fraction = rendered[:-1].split(".", 1)
+        fraction = fraction.rstrip("0")
+        rendered = f"{whole}.{fraction}Z" if fraction else f"{whole}Z"
+    return utc, rendered
 
 
 def _database_path(environ: Mapping[str, str]) -> Path | None:
@@ -375,6 +380,12 @@ def handle_event(
         keys = key_loader(_key_path(environment))
         store = _open_store(store_factory, _database_path(environment))
         try:
+            SyncStateRepository(store).observe_project(
+                project_id=project.project_id,
+                display_name=project.display_name,
+                display_name_provenance=project.display_name_provenance,
+                observed_at=observed_at,
+            )
             drain_annotations(
                 environment,
                 store,

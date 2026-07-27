@@ -198,7 +198,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertGreaterEqual(health.wal_bytes, 0)
         self.assertEqual((health.rollout_sources, health.rollout_events), (1, 4))
         self.assertEqual((health.codex_event_sources, health.codex_events), (0, 0))
-        self.assertEqual(health.schema_version, 39)
+        self.assertEqual(health.schema_version, 42)
 
     def test_build_holds_one_nested_safe_transaction_across_status_and_reports(self) -> None:
         LocalCommandServices(environ=self.environ).audit(
@@ -259,16 +259,16 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertEqual(audit.schema_version, "hydra.audit/v1")
 
 
-class LegacyReportByteCompatibilityTests(unittest.TestCase):
-    def test_report_v3_and_report_list_v1_rendered_bytes_are_unchanged(self) -> None:
+class ReportV4ByteStabilityTests(unittest.TestCase):
+    def test_report_v4_and_report_list_v2_rendered_bytes_are_stable(self) -> None:
         reports = (
             public_report("compat-a", input_tokens=100, second=10),
             public_report("compat-b", input_tokens=200, second=20),
         )
         expected = {
-            "json": "7f22fafd301b63f7f954f4cd6ef73cb053230d1f135d20fc19e9cb35dc205917",
-            "markdown": "501fd8bdf5c563cd999732fcf04fb1d27cf5ac8f72968cba13737736c05d5c12",
-            "html": "f82ba9a9348ad1351d7e35e457fd61c75581f8782f5761f88d0403e695ac33c0",
+            "json": "e330dcee43ed0d6a2207ab4edbc691513d71e37b5b541e2e82e7f7a20c4e3f5a",
+            "markdown": "243795a4ca62a37efb46696dc116d2e275c26bb34b57ce95d4d37d07f2e1f172",
+            "html": "c2f7b058be5f8f2830998ab295b722fa359739b9bfec024522880142b554c359",
         }
 
         for output_format, digest in expected.items():

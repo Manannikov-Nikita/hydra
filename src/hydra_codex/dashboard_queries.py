@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
@@ -46,7 +47,17 @@ class CatalogProject:
     display_name_provenance: str | None = None
 
 
-def _catalog_rows(connection: sqlite3.Connection) -> tuple[CatalogProject, ...]:
+def _catalog_rows(
+    connection: sqlite3.Connection, maximum_revision: int | None = None,
+) -> tuple[CatalogProject, ...]:
+    materialized_filter = (
+        ""
+        if maximum_revision is None
+        else " WHERE data_revision<=?"
+    )
+    parameters: tuple[object, ...] = (
+        () if maximum_revision is None else (maximum_revision,)
+    )
     return tuple(
         CatalogProject(
             str(row["project_id"]),
@@ -55,10 +66,44 @@ def _catalog_rows(connection: sqlite3.Connection) -> tuple[CatalogProject, ...]:
             None if row["display_name_provenance"] is None else str(row["display_name_provenance"]),
         )
         for row in connection.execute(
-            """SELECT project_id,display_name,first_seen_at,last_seen_at,display_name_provenance
-                 FROM dashboard_projects ORDER BY project_id""",
+            f"""WITH materialized AS (
+                   SELECT project_id,MIN(reconciled_at) AS first_seen_at,
+                          MAX(reconciled_at) AS last_seen_at
+                     FROM materialized_report_snapshots{materialized_filter}
+                    GROUP BY project_id
+               ),
+               catalog AS (
+                   SELECT project_id,display_name,first_seen_at,last_seen_at,
+                          display_name_provenance
+                     FROM dashboard_projects
+                   UNION ALL
+                   SELECT materialized.project_id,NULL,materialized.first_seen_at,
+                          materialized.last_seen_at,NULL
+                     FROM materialized
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM dashboard_projects
+                         WHERE dashboard_projects.project_id=materialized.project_id
+                    )
+               )
+               SELECT project_id,display_name,first_seen_at,last_seen_at,
+                      display_name_provenance
+                 FROM catalog ORDER BY project_id""",
+            parameters,
         )
     )
+
+
+@contextmanager
+def _consistent_read(connection: sqlite3.Connection) -> Iterator[None]:
+    """Pin all reads to one SQLite snapshot without owning caller transactions."""
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if owns_transaction and connection.in_transaction:
+            connection.rollback()
 
 
 def sync_project_catalog(
@@ -97,22 +142,16 @@ def observe_resolved_project(
     store: HydraStore, resolution: ProjectResolution, observed_at: str,
 ) -> None:
     """Remember a local project's optional trusted display name and recency."""
-    with store.rollout_transaction() as connection:
-        connection.execute(
-            """INSERT INTO dashboard_projects(
-                   project_id,display_name,first_seen_at,last_seen_at,display_name_provenance)
-               VALUES (?,?,?,?,?)
-               ON CONFLICT(project_id) DO UPDATE SET
-                 display_name=CASE WHEN excluded.display_name_provenance='config'
-                     THEN excluded.display_name ELSE COALESCE(display_name,excluded.display_name) END,
-                 display_name_provenance=CASE WHEN excluded.display_name_provenance='config'
-                     THEN 'config' ELSE COALESCE(display_name_provenance,excluded.display_name_provenance) END,
-                 last_seen_at=MAX(last_seen_at,excluded.last_seen_at)""",
-            (
-                resolution.project_id, resolution.display_name, observed_at, observed_at,
-                resolution.display_name_provenance,
-            ),
-        )
+    SyncStateRepository(store).observe_project(
+        project_id=resolution.project_id,
+        display_name=resolution.display_name,
+        display_name_provenance=(
+            resolution.display_name_provenance
+            if resolution.display_name_provenance is not None
+            else "repo_basename" if resolution.display_name is not None else None
+        ),
+        observed_at=observed_at,
+    )
 
 
 StoreFactory = Callable[[], HydraStore]
@@ -153,9 +192,9 @@ class DashboardQueryService:
         return public_timestamp(self._clock())
 
     def _catalog(
-        self, store: _ConnectionSource,
+        self, store: _ConnectionSource, maximum_revision: int | None = None,
     ) -> tuple[tuple[CatalogProject, str], ...]:
-        catalog = _catalog_rows(store.connection)
+        catalog = _catalog_rows(store.connection, maximum_revision)
         projection = project_catalog_references(
             (item.project_id for item in catalog), self._installation_key,
         )
@@ -358,9 +397,15 @@ class DashboardQueryService:
     ) -> DashboardSnapshot:
         store = self._store_factory()
         try:
-            return self._snapshot_from_store(
-                store, project_ref=project_ref, task_ref=task_ref, refresh=refresh,
-            )
+            with _consistent_read(store.connection):
+                data_revision = SyncStateRepository(store).data_revision()
+                return self._snapshot_from_store(
+                    store,
+                    project_ref=project_ref,
+                    task_ref=task_ref,
+                    refresh=refresh,
+                    data_revision=data_revision,
+                )
         finally:
             store.close()
 
@@ -390,34 +435,47 @@ class DashboardQueryService:
         """Build launch DTOs from a caller-owned, bounded read-only connection."""
         if not isinstance(connection, sqlite3.Connection):
             raise TypeError("dashboard bootstrap requires a SQLite connection")
-        return self._materialized_bootstrap_from_connection(connection, refresh=refresh)
+        with _consistent_read(connection):
+            return self._materialized_bootstrap_from_connection(
+                connection, refresh=refresh,
+            )
 
     def _materialized_bootstrap_from_connection(
         self, connection: sqlite3.Connection, *, refresh: DashboardRefreshView,
     ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
         """Serve already persisted public report JSON without raw-source discovery."""
         store = _BootstrapStore(connection)
-        catalog = self._catalog(store)
         revision = int(connection.execute(
             "SELECT revision FROM sync_data_revision WHERE singleton=1"
         ).fetchone()[0])
+        catalog = self._catalog(store, revision)
         summaries: list[DashboardProjectSummary] = []
         prepared: list[tuple[CatalogProject, str, list[dict[str, object]], str]] = []
         for item, public_ref in catalog:
+            report_count = int(connection.execute(
+                """SELECT COUNT(*) FROM materialized_report_snapshots
+                     WHERE project_id=? AND data_revision<=?""",
+                (item.project_id, revision),
+            ).fetchone()[0])
             reports: list[dict[str, object]] = []
             for row in connection.execute(
-                """SELECT report_json FROM materialized_report_snapshots WHERE project_id=?
-                     ORDER BY reconciled_at DESC,task_ref""", (item.project_id,),
+                """SELECT report_json FROM materialized_report_snapshots
+                     WHERE project_id=? AND data_revision<=?
+                     ORDER BY CASE WHEN json_valid(report_json)
+                              THEN json_extract(report_json,'$.last_activity_at')
+                              END DESC,task_ref
+                     LIMIT 10""",
+                (item.project_id, revision),
             ):
                 payload = json.loads(str(row[0]))
                 validate_task_report(payload)
                 reject_private_fields(payload)
                 reports.append(payload)
-            state = "current" if reports else "stale"
+            state = "current" if report_count else "stale"
             summaries.append(DashboardProjectSummary(
                 public_ref, self._display_name(item, public_ref),
                 str(reports[0]["last_activity_at"]) if reports else item.last_seen_at,
-                state, NumericFact(len(reports), "count", "derived"),
+                state, NumericFact(report_count, "count", "derived"),
             ))
             prepared.append((item, public_ref, reports, state))
         project_catalog = DashboardProjectCatalog(tuple(summaries))
@@ -501,6 +559,7 @@ class DashboardQueryService:
         task_ref: str | None,
         refresh: DashboardRefreshView,
         generated_at: str | None = None,
+        data_revision: int,
     ) -> DashboardSnapshot:
         """Build one immutable DTO without taking ownership of *store*."""
         catalog, by_project, summaries = self._prepare_snapshot_state(store)
@@ -513,7 +572,7 @@ class DashboardQueryService:
             task_ref=task_ref,
             refresh=refresh,
             generated_at=generated_at or self._generated_at(),
-            data_revision=SyncStateRepository(store).data_revision(),
+            data_revision=data_revision,
         )
 
     def _prepare_snapshot_state(

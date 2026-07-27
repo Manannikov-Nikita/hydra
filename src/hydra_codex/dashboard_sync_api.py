@@ -41,18 +41,34 @@ def payload(app: object) -> dict[str, object]:
     return result
 
 
-def live_snapshot_available(app: object) -> bool:
-    """Use live materialized reads unless launch storage is still unavailable."""
+def live_snapshot_available(
+    app: object, project_ref: str | None, task_ref: str | None,
+) -> bool:
+    """Use live reads only when the materialized launch cache is not current."""
     controller = app._sync_controller
     if controller is None:
         return False
-    if app._fallback_error is None:
+    if app._fallback_error is not None:
+        try:
+            current = controller.current()
+        except Exception:
+            return False
+        if not isinstance(current, dict) or current.get("state") not in {"succeeded", "partial"}:
+            return False
+    if task_ref is not None:
         return True
-    try:
-        current = controller.current()
-    except Exception:
-        return False
-    return isinstance(current, dict) and current.get("state") in {"succeeded", "partial"}
+    selected = project_ref
+    if selected is None:
+        refs = app._cache.refs()
+        selected = refs[0] if refs else None
+    cached = None if selected is None else app._controller.snapshot(selected)
+    if cached is None:
+        return True
+    serialized = cached.as_dict()
+    revision = serialized.get("data_revision") if isinstance(serialized, dict) else None
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        return True
+    return bool(controller.changes(revision)["changed"])
 
 
 def dashboard_payload(app: object, result: dict[str, object]) -> dict[str, object]:

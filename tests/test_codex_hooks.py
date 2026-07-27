@@ -178,6 +178,44 @@ class CodexHookTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_hook_persists_the_trusted_project_display_name_for_dashboard_reads(self) -> None:
+        (self.root / ".hydra" / "project.toml").write_text(
+            f'project_id = "{PROJECT_ID}"\ndisplay_name = "Hydra Hooks"\n',
+            encoding="utf-8",
+        )
+
+        self.handle(prompt_payload(cwd=str(self.root)))
+
+        store = HydraStore(self.database)
+        try:
+            row = store.connection.execute(
+                """SELECT display_name,display_name_provenance
+                     FROM dashboard_projects WHERE project_id=?""",
+                (PROJECT_ID,),
+            ).fetchone()
+        finally:
+            store.close()
+        self.assertEqual(tuple(row), ("Hydra Hooks", "config"))
+
+    def test_hook_canonicalizes_fractional_timestamp_before_durable_queue_writes(self) -> None:
+        observed = NOW.replace(microsecond=123450)
+
+        response = handle_event(
+            prompt_payload(cwd=str(self.root)),
+            environ=self.environ,
+            clock=lambda: observed,
+        )
+
+        self.capability(response)
+        store = HydraStore(self.database)
+        try:
+            persisted = store.connection.execute(
+                "SELECT observed_at FROM hook_event_outbox",
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(persisted, "2026-07-21T04:30:00.12345Z")
+
     def test_parallel_chats_in_same_cwd_get_separate_turns(self) -> None:
         payloads = (
             prompt_payload(cwd=str(self.root), session_id="session-a", turn_id="turn-a"),

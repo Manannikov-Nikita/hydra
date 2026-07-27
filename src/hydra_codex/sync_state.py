@@ -120,8 +120,12 @@ def _timestamp(value: str | None) -> str:
         parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError("timestamp must be canonical UTC RFC3339") from error
-    if parsed.tzinfo != timezone.utc or ("." in candidate and candidate[:-1].endswith("0")):
+    if parsed.tzinfo != timezone.utc:
         raise ValueError("timestamp must be canonical UTC RFC3339")
+    if "." in candidate:
+        whole, fraction = candidate[:-1].split(".", 1)
+        fraction = fraction.rstrip("0")
+        candidate = f"{whole}.{fraction}Z" if fraction else f"{whole}Z"
     return candidate
 
 
@@ -450,6 +454,47 @@ class SyncStateRepository:
                  FROM sync_source_registry ORDER BY root_kind,source_locator"""
         ))
 
+    def observe_project(
+        self, *, project_id: str, display_name: str | None,
+        display_name_provenance: str | None, observed_at: str,
+    ) -> None:
+        """Persist only a validated project identity, never its filesystem path."""
+        observed_at = _timestamp(observed_at)
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project id is invalid")
+        if display_name is not None and (
+            not isinstance(display_name, str)
+            or not 1 <= len(display_name) <= 80
+        ):
+            raise ValueError("project display name is invalid")
+        if display_name_provenance not in {None, "config", "repo_basename"}:
+            raise ValueError("project display name provenance is invalid")
+        if (display_name is None) != (display_name_provenance is None):
+            raise ValueError("project display name provenance is inconsistent")
+        with self._store.rollout_transaction() as connection:
+            connection.execute(
+                """INSERT INTO dashboard_projects(
+                       project_id,display_name,first_seen_at,last_seen_at,
+                       display_name_provenance)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(project_id) DO UPDATE SET
+                     display_name=CASE WHEN excluded.display_name_provenance='config'
+                         THEN excluded.display_name
+                         ELSE COALESCE(display_name,excluded.display_name) END,
+                     display_name_provenance=CASE
+                         WHEN excluded.display_name_provenance='config' THEN 'config'
+                         ELSE COALESCE(
+                             display_name_provenance,
+                             excluded.display_name_provenance
+                         )
+                     END,
+                     last_seen_at=MAX(last_seen_at,excluded.last_seen_at)""",
+                (
+                    project_id, display_name, observed_at, observed_at,
+                    display_name_provenance,
+                ),
+            )
+
     def list_queue(self, limit: int = 100) -> tuple[QueueItem, ...]:
         if not 1 <= limit <= 1000:
             raise ValueError("queue limit must be between 1 and 1000")
@@ -460,6 +505,12 @@ class SyncStateRepository:
                    ON s.root_kind=q.root_kind AND s.source_locator=q.source_locator
                 ORDER BY q.available_at,q.enqueued_at,q.root_kind,q.source_locator LIMIT ?""", (limit,),
         ))
+
+    def queue_count(self) -> int:
+        """Return durable queued/claimed work without enumerating source rows."""
+        return int(self._store.connection.execute(
+            "SELECT COUNT(*) FROM sync_ingest_queue",
+        ).fetchone()[0])
 
     def claim_next(self, owner_key: str, observed_at: str, claim_expires_at: str) -> QueueItem | None:
         observed_at = _timestamp(observed_at)
@@ -833,7 +884,32 @@ class SyncStateRepository:
             raise ValueError("completed sources cannot exceed discovered sources")
         if state in {"succeeded", "partial", "failed"} and completed_at is None:
             completed_at = updated_at
+        if state not in {"succeeded", "partial", "failed"} and completed_at is not None:
+            raise ValueError("active sync jobs cannot have a completion time")
         with self._store.rollout_transaction() as connection:
+            previous = connection.execute(
+                """SELECT state,sources_discovered,sources_completed,bytes_processed,updated_at
+                     FROM sync_jobs WHERE job_id=?""",
+                (job_id,),
+            ).fetchone()
+            if previous is None:
+                raise KeyError("sync job is unknown")
+            previous_state = str(previous[0])
+            if previous_state in {"succeeded", "partial", "failed"} and state != previous_state:
+                raise ValueError("terminal sync job state cannot regress")
+            if any(
+                current < int(old)
+                for current, old in zip(
+                    (sources_discovered, sources_completed, bytes_processed),
+                    previous[1:4],
+                    strict=True,
+                )
+            ):
+                raise ValueError("sync job progress cannot regress")
+            if datetime.fromisoformat(updated_at.replace("Z", "+00:00")) < datetime.fromisoformat(
+                str(previous[4]).replace("Z", "+00:00"),
+            ):
+                raise ValueError("sync job timestamp cannot regress")
             if connection.execute(
                 """UPDATE sync_jobs SET state=?,sources_discovered=?,sources_completed=?,bytes_processed=?,
                        updated_at=?,completed_at=? WHERE job_id=?""",

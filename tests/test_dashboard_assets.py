@@ -517,6 +517,24 @@ class DashboardAssetContractTests(unittest.TestCase):
             poll.index("acknowledgeRevision"),
         )
 
+    def test_change_polling_only_acknowledges_the_loaded_snapshot_revision(self) -> None:
+        app = self.asset("app.js")
+        poll = app.split("async function pollChanges", 1)[-1].split(
+            "function startChangePolling", 1,
+        )[0]
+
+        self.assertIn(
+            "const loadedRevision = state.snapshot && state.snapshot.data_revision",
+            poll,
+        )
+        self.assertIn("loadedRevision < pendingRevision", poll)
+        self.assertIn("acknowledgeRevision(loadedRevision)", poll)
+        self.assertNotIn("acknowledgeRevision(pendingRevision)", poll)
+        self.assertLess(
+            poll.index("loadedRevision < pendingRevision"),
+            poll.index("acknowledgeRevision(loadedRevision)"),
+        )
+
     def test_one_active_job_owns_both_mutating_controls_and_polling(self) -> None:
         app = self.asset("app.js")
 
@@ -533,6 +551,28 @@ class DashboardAssetContractTests(unittest.TestCase):
                 "function announceRefreshOutcome", 1,
             )[0],
             r"refreshButton\.(?:disabled|textContent)|repairButton\.(?:disabled|textContent)",
+        )
+
+    def test_reused_active_job_adopts_the_backend_kind(self) -> None:
+        app = self.asset("app.js")
+        active_job = app.split("function runActiveJob", 1)[-1].split(
+            "async function startRefresh", 1,
+        )[0]
+
+        self.assertIn(
+            'jobKind = started.kind === "repair" ? "repair" : "sync"',
+            active_job,
+        )
+        self.assertIn("activeJobKind = jobKind", active_job)
+        self.assertIn(
+            "retry = jobKind === \"repair\" ? startRepair : startRefresh",
+            active_job,
+        )
+        self.assertIn("setMutatingBusy(jobKind, true)", active_job)
+        self.assertIn("pollRefresh(started.sync_ref, jobKind, retry)", active_job)
+        self.assertLess(
+            active_job.index('jobKind = started.kind === "repair"'),
+            active_job.index("pollRefresh(started.sync_ref, jobKind, retry)"),
         )
 
     def test_repair_confirmation_transfers_and_restores_focus(self) -> None:

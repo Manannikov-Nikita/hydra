@@ -410,6 +410,30 @@ class IncrementalWorkerTests(unittest.TestCase):
             ["nested/one.jsonl", "rollout.jsonl"],
         )
 
+    def test_repair_reuses_an_active_sync_job_instead_of_creating_a_second_job(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        sync_job = self.repository.create_job("sync", "2026-07-26T00:00:00Z")
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        reused = repair.start_backfill(
+            "2026-07-26T00:00:01Z", job_kind="repair",
+        )
+        result = repair.run_batch(reused, "2026-07-26T00:00:01Z")
+
+        self.assertEqual(reused, sync_job)
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            [(job.job_id, job.job_kind, job.state) for job in self.repository.list_jobs()],
+            [(sync_job, "sync", "queued")],
+        )
+
     def test_repair_full_materializes_attributed_source_then_append_can_tail(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, ResumableRepair, TrustedSourceRoots
 
@@ -424,6 +448,11 @@ class IncrementalWorkerTests(unittest.TestCase):
         repair = ResumableRepair(self.store, roots)
         repaired = repair.repair_source("sessions", "rollout.jsonl", "2026-07-26T00:00:00Z")
         self.assertTrue(repaired)
+        project_row = self.store.connection.execute(
+            """SELECT display_name,display_name_provenance
+                 FROM dashboard_projects WHERE project_id='hprj_safe'""",
+        ).fetchone()
+        self.assertEqual(tuple(project_row), ("project", "repo_basename"))
         checkpoint = self.repository.checkpoint_for("sessions", "rollout.jsonl")
         self.assertGreater(checkpoint.byte_offset, 0)
         self.assertEqual(self.repository.source_for("sessions", "rollout.jsonl").project_id, "hprj_safe")

@@ -81,6 +81,33 @@ class RevisionSync(Sync):
                 "changed": 6 > after, "sync": self.current()}
 
 
+class CachedSnapshotQuery:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def snapshot(self, **_kwargs):
+        self.calls += 1
+        raise AssertionError("a coherent materialized bootstrap must not be rebuilt")
+
+
+class CurrentCache:
+    def refs(self):
+        return ("project_0123456789ab",)
+
+
+class CurrentRefresh(Refresh):
+    def snapshot(self, project_ref):
+        if project_ref != "project_0123456789ab":
+            return None
+        return type("Payload", (), {"as_dict": lambda _self: {
+            "schema_version": "hydra.dashboard/v2",
+            "selected_project_ref": project_ref,
+            "data_revision": 4,
+            "sync": Sync.current(),
+            "source": "materialized-bootstrap",
+        }})()
+
+
 class DashboardSyncApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sync = Sync()
@@ -140,3 +167,18 @@ class DashboardSyncApiTests(unittest.TestCase):
         payload = self.payload(response)
         self.assertEqual(payload["data_revision"], 5)
         self.assertEqual(payload["sync"]["progress"]["sources_processed"], 2)
+
+    def test_snapshot_keeps_revision_coherent_materialized_bootstrap(self) -> None:
+        query = CachedSnapshotQuery()
+        app = DashboardApplication(
+            token=TOKEN, query_service=query, refresh_controller=CurrentRefresh(),
+            sync_controller=Sync(), snapshot_cache=CurrentCache(),
+            assets={"/": DashboardAsset("text/html", b"ok")},
+        ).bound_to(AUTHORITY)
+        headers = (("Host", AUTHORITY), ("Authorization", f"Bearer {TOKEN}"))
+
+        response = app.handle(DashboardRequest("GET", "/api/v1/snapshot", headers, b""))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.payload(response)["source"], "materialized-bootstrap")
+        self.assertEqual(query.calls, 0)

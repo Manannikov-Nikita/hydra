@@ -363,11 +363,14 @@ def reconcile_project(
         )
     # Building report views is intentionally part of explicit reconciliation.
     # The read path below uses only these materialized, public-safe snapshots.
+    from .pilot import read_only_pilot_statuses
     from .reconcile_reports import list_reconciled_reports as build_reports
 
-    _persist_report_snapshots(
-        store, project_id, build_reports(store, project_id), completed_instant.canonical,
-    )
+    with read_only_pilot_statuses():
+        _persist_report_snapshots(
+            store, project_id, build_reports(store, project_id),
+            completed_instant.canonical,
+        )
     complete_count = sum(item.status == "complete" for item in plans)
     return ReconciliationSummary(
         run_id, project_id, RECONCILIATION_VERSION, len(plans),

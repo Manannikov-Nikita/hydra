@@ -158,39 +158,81 @@ class DashboardSyncControllerTests(unittest.TestCase):
         )
         controller = self.controller()
         try:
-            started, reused = controller.start_sync()
-            terminal = self.wait_for(controller, started["sync_ref"], {"succeeded", "partial", "failed"})
+            terminal = self.wait_for(
+                controller, job_id, {"succeeded", "partial", "failed"},
+            )
         finally:
             controller.close()
 
-        self.assertTrue(reused)
-        self.assertEqual(started["sync_ref"], job_id)
         self.assertEqual(terminal["state"], "succeeded")
         self.assertEqual(self.repository.list_queue(), ())
 
-    def test_held_lease_keeps_job_running_until_a_recovery_controller_can_drain(self) -> None:
+    def test_held_lease_is_retried_by_the_same_controller_until_it_can_drain(self) -> None:
         self.enqueue_source("leased.jsonl")
         self.assertTrue(self.repository.acquire_lease(
             "other-worker", "2026-07-27T10:00:00Z", "2026-07-27T10:05:00Z",
         ))
-        first = self.controller()
+        controller = self.controller()
         try:
-            started, _reused = first.start_sync()
-            still_running = self.wait_for(first, started["sync_ref"], {"running"})
+            started, _reused = controller.start_sync()
+            still_running = self.wait_for(
+                controller, started["sync_ref"], {"running"},
+            )
             self.assertEqual(still_running["state"], "running")
             self.assertEqual(len(self.repository.list_queue()), 1)
+            self.assertTrue(self.repository.release_lease(
+                "other-worker", "2026-07-27T10:00:01Z",
+            ))
+            terminal = self.wait_for(
+                controller, started["sync_ref"], {"succeeded", "partial", "failed"},
+            )
         finally:
-            first.close()
-        self.assertTrue(self.repository.release_lease("other-worker", "2026-07-27T10:00:01Z"))
+            controller.close()
 
-        recovered = self.controller()
+        self.assertEqual(terminal["state"], "succeeded")
+        self.assertEqual(self.repository.list_queue(), ())
+
+    def test_deferred_queue_item_is_retried_when_the_controller_clock_advances(self) -> None:
+        self.enqueue_source("deferred.jsonl")
+        self.assertTrue(self.repository.acquire_lease(
+            "setup", "2026-07-27T10:00:00Z", "2026-07-27T10:00:30Z",
+        ))
+        item = self.repository.claim_next(
+            "setup", "2026-07-27T10:00:00Z", "2026-07-27T10:00:30Z",
+        )
+        self.assertIsNotNone(item)
+        self.assertTrue(self.repository.retry_claim(
+            "setup", "sessions", "deferred.jsonl",
+            reason_code="transient_failure",
+            available_at="2026-07-27T10:00:01Z",
+            observed_at="2026-07-27T10:00:00Z",
+        ))
+        self.assertTrue(self.repository.release_lease(
+            "setup", "2026-07-27T10:00:00Z",
+        ))
+        now = [self.now]
+        from hydra_codex.dashboard_sync import DashboardSyncController
+        from hydra_codex.incremental_sync import TrustedSourceRoots
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=Path(self.temporary.name) / "archived",
+            ),
+            installation_key=b"k" * 32,
+            clock=lambda: now[0],
+        )
         try:
-            resumed, reused = recovered.start_sync()
-            terminal = self.wait_for(recovered, resumed["sync_ref"], {"succeeded", "partial", "failed"})
+            started, _reused = controller.start_sync()
+            self.wait_for(controller, started["sync_ref"], {"running"})
+            self.assertEqual(len(self.repository.list_queue()), 1)
+            now[0] = datetime(2026, 7, 27, 10, 0, 2, tzinfo=timezone.utc)
+            terminal = self.wait_for(
+                controller, started["sync_ref"], {"succeeded", "partial", "failed"},
+            )
         finally:
-            recovered.close()
+            controller.close()
 
-        self.assertTrue(reused)
         self.assertEqual(terminal["state"], "succeeded")
         self.assertEqual(self.repository.list_queue(), ())
 

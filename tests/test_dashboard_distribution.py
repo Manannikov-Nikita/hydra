@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from hydra_codex.dashboard_launch import (
     _bootstrap_database,
@@ -370,7 +370,7 @@ class DashboardDistributionTests(unittest.TestCase):
                 )
                 captured["application"]._controller._runner._store_factory()
 
-            constructor.assert_called_once_with(None)
+            self.assertEqual(constructor.call_args_list, [call(None), call(None)])
 
 
 if __name__ == "__main__":

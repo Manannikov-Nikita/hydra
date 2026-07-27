@@ -287,6 +287,14 @@ class DurableSyncStateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     repository.create_job("sync", value)
 
+        job_id = repository.create_job(
+            "sync", "2026-07-26T00:00:00.123450Z",
+        )
+        self.assertEqual(
+            repository.get_job(job_id).created_at,
+            "2026-07-26T00:00:00.12345Z",
+        )
+
     def test_tampered_w23_locator_trigger_fails_closed_on_reopen(self) -> None:
         self.store.close()
         altered = sqlite3.connect(self.database)
@@ -379,9 +387,40 @@ class DurableSyncStateTests(unittest.TestCase):
             "2026/07/26",
         )
         self.assertEqual(
-            reopened.connection.execute("SELECT revision FROM sync_data_revision WHERE singleton=1").fetchone()[0],
+            reopened.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
             persisted_revision,
         )
+
+    def test_job_progress_and_terminal_state_cannot_regress(self) -> None:
+        repository = self._repository()
+        job_id = repository.create_job("sync", "2026-07-26T00:00:00Z")
+        repository.update_job(
+            job_id, state="running", sources_discovered=4, sources_completed=2,
+            bytes_processed=128, updated_at="2026-07-26T00:00:01Z",
+        )
+
+        for counters in ((3, 2, 128), (4, 1, 128), (4, 2, 127)):
+            with self.subTest(counters=counters):
+                with self.assertRaisesRegex(ValueError, "regress"):
+                    repository.update_job(
+                        job_id, state="running",
+                        sources_discovered=counters[0],
+                        sources_completed=counters[1],
+                        bytes_processed=counters[2],
+                        updated_at="2026-07-26T00:00:02Z",
+                    )
+
+        repository.update_job(
+            job_id, state="succeeded", sources_discovered=4, sources_completed=4,
+            bytes_processed=256, updated_at="2026-07-26T00:00:03Z",
+        )
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            repository.update_job(
+                job_id, state="running", sources_discovered=4, sources_completed=4,
+                bytes_processed=256, updated_at="2026-07-26T00:00:04Z",
+            )
 
     def test_v38_database_upgrades_without_losing_existing_catalog_rows(self) -> None:
         legacy_path = Path(self.temporary.name) / "v38.sqlite3"

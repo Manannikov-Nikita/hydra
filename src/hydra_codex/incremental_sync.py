@@ -864,10 +864,13 @@ class ResumableRepair:
         """Start or resume the explicit full-history path, never normal sync."""
         if job_kind not in {"backfill", "repair"}:
             raise ValueError("backfill job kind is invalid")
-        job = self.repository.current_job(job_kind)
-        if job is not None:
-            return job.job_id
-        job_id = self.repository.create_job(job_kind, observed_at)
+        job_id, reused = self.repository.get_or_create_active_job(
+            job_kind, observed_at,
+        )
+        job = self.repository.get_job(job_id)
+        assert job is not None
+        if reused:
+            return job_id
         for root_kind in ("sessions", "archived_sessions"):
             try:
                 self.roots.root_for(root_kind)
@@ -905,6 +908,12 @@ class ResumableRepair:
                 root_kind=root_kind, source_locator=locator, observed_at=observed_at,
             )
             return False
+        self.repository.observe_project(
+            project_id=project.project_id,
+            display_name=project.display_name,
+            display_name_provenance=project.display_name_provenance,
+            observed_at=observed_at,
+        )
         label = "active" if root_kind == "sessions" else "archived"
         # ``prepared_scans`` makes legacy ingest use exactly this validated
         # source prefix; no directory discovery, raw transcript copy or global
@@ -1004,7 +1013,11 @@ class ResumableRepair:
         if not 1 <= directory_limit <= 1000:
             raise ValueError("directory_limit must be between 1 and 1000")
         job = self.repository.get_job(job_id)
-        if job is None or job.job_kind not in {"repair", "backfill"}:
+        if job is None:
+            raise KeyError("repair job is unknown")
+        if job.job_kind not in {"repair", "backfill"}:
+            if job.state in {"queued", "running"}:
+                return RepairRun(0, 0, False)
             raise KeyError("repair job is unknown")
         # A job identifies durable work, not a process.  An invocation needs a
         # fresh lease identity so a second dashboard/MCP call cannot renew the

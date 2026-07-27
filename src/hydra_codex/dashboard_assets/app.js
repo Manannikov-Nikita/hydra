@@ -471,22 +471,32 @@ function hideRepairConfirmation(nextFocus = repairButton) {
   }
 }
 
-function runActiveJob(jobKind, start) {
-  if (activeJobPoll) return activeJobPoll;
-  activeJobKind = jobKind;
-  lastRefreshProgress = null;
-  setMutatingBusy(jobKind, true);
+function showActiveJobLoading(jobKind) {
   const jobTitle = jobKind === "repair" ? "Repairing history" : "Syncing evidence";
   const jobDetail = jobKind === "repair"
     ? "Repair history is walking all trusted telemetry files; existing evidence remains visible."
     : "Current evidence stays visible while new queued telemetry is reconciled.";
   showAsyncState("loading", jobTitle, jobDetail);
+}
+
+function runActiveJob(requestedKind, start) {
+  if (activeJobPoll) return activeJobPoll;
+  let jobKind = requestedKind;
+  activeJobKind = jobKind;
+  lastRefreshProgress = null;
+  setMutatingBusy(jobKind, true);
+  showActiveJobLoading(jobKind);
 
   let terminalState = null;
   let failed = false;
-  const retry = jobKind === "repair" ? startRepair : startRefresh;
+  let retry = jobKind === "repair" ? startRepair : startRefresh;
   activeJobPoll = (async () => {
     const started = await start();
+    jobKind = started.kind === "repair" ? "repair" : "sync";
+    activeJobKind = jobKind;
+    retry = jobKind === "repair" ? startRepair : startRefresh;
+    setMutatingBusy(jobKind, true);
+    showActiveJobLoading(jobKind);
     announce(started.reused
       ? `Existing ${jobKind} reused`
       : jobKind === "repair" ? "Repair started" : "Sync started");
@@ -548,8 +558,9 @@ async function pollChanges() {
     if (!changes.changed || pendingRevision === null || activeJobPoll) return;
     const reloaded = await reloadAfterRefresh(false);
     if (!reloaded) return;
-    acknowledgeRevision(state.snapshot && state.snapshot.data_revision);
-    acknowledgeRevision(pendingRevision);
+    const loadedRevision = state.snapshot && state.snapshot.data_revision;
+    if (!Number.isInteger(loadedRevision) || loadedRevision < pendingRevision) return;
+    acknowledgeRevision(loadedRevision);
   } catch (_) { /* A later one-second poll retries without exposing transport details. */ }
 }
 

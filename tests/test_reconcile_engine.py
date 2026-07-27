@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from hydra_codex.contracts import AnnotationContext, ModelAnnotationInput, materialize_annotation
 from hydra_codex.reconcile_engine import (
@@ -14,6 +15,7 @@ from hydra_codex.reconcile_engine import (
     list_reconciled_tasks,
     list_reconciled_reports,
     reconcile_project,
+    render_materialized_report_collection,
 )
 from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout import ingest_rollouts
@@ -272,6 +274,31 @@ class ReconcileEngineTests(unittest.TestCase):
         report = list_reconciled_reports(self.store, PROJECT)[0]
         self.assertEqual(report.display_name, "Initial label")
         self.assertNotIn("Too late", render_json(report))
+
+    def test_materialized_report_reads_snapshot_without_reassembling_or_writing(self) -> None:
+        self.session("snapshot-root", 0)
+        self.token("snapshot-root", 1, 2, 10, 1, 1, 0)
+        self.complete("snapshot-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"s" * 32)
+        statements: list[str] = []
+        self.connection.set_trace_callback(statements.append)
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=AssertionError("report must not reassemble"),
+            ):
+                rendered = render_materialized_report_collection(
+                    self.store, PROJECT, 1, "json",
+                    {"schema_version": "hydra.sync-freshness/v1", "state": "idle", "data_revision": 0},
+                )
+        finally:
+            self.connection.set_trace_callback(None)
+        self.assertEqual(json.loads(rendered)["reports"][0]["schema_version"], "hydra.report/v4")
+        self.assertFalse(any(
+            statement.lstrip().upper().startswith(("BEGIN IMMEDIATE", "INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        ), statements)
 
     def test_reconcile_deduplicates_fork_replay_then_attributes_exact_deltas_to_intervals(self) -> None:
         self.session("root", 0)

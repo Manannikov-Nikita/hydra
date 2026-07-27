@@ -154,6 +154,43 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_cli_sync_consumes_post_tool_and_lifecycle_outbox_facts(self) -> None:
+        common = {
+            "session_id": "private-session", "turn_id": "private-turn",
+            "cwd": str(self.project),
+        }
+        handle_event(
+            {"hook_event_name": "UserPromptSubmit", **common, "prompt": "not persisted"},
+            environ=self.environ, clock=lambda: NOW,
+        )
+        handle_event(
+            {"hook_event_name": "PostToolUse", **common, "tool_use_id": "private-call",
+             "tool_category": "shell", "tool_status": "success", "duration_ms": 5},
+            environ=self.environ, clock=lambda: NOW,
+        )
+        handle_event(
+            {"hook_event_name": "Stop", "stop_hook_active": True, **common},
+            environ=self.environ, clock=lambda: NOW,
+        )
+        sync = invoke(
+            ["sync", "--db", str(self.database), "--cwd", str(self.project)],
+            environ=self.environ,
+        )
+        self.assertEqual(sync[0], 0, sync[2])
+        store = HydraStore(self.database)
+        try:
+            self.assertEqual(store.connection.execute(
+                "SELECT COUNT(*) FROM hook_event_outbox WHERE acknowledged_at IS NOT NULL"
+            ).fetchone()[0], 3)
+            self.assertEqual(store.connection.execute(
+                "SELECT COUNT(*) FROM hook_safe_facts"
+            ).fetchone()[0], 3)
+            self.assertNotIn("private-call", repr(store.connection.execute(
+                "SELECT * FROM hook_event_outbox"
+            ).fetchall()))
+        finally:
+            store.close()
+
     def test_sync_and_explicit_repair_are_private_bounded_commands(self) -> None:
         sync = invoke(
             ["sync", "--db", str(self.database), "--cwd", str(self.project)],
@@ -170,6 +207,25 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertEqual(sync_payload["command"], "sync")
         self.assertEqual(repair_payload["command"], "repair")
         self.assertNotIn(str(self.root), sync[1] + repair[1])
+
+    def test_sync_freshness_prioritizes_any_repair_required_source_over_queue_order(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_and_enqueue(
+                root_kind="sessions", source_locator="a/queued.jsonl",
+                observed_at="2026-07-21T00:00:00Z",
+            )
+            repository.register_source(
+                root_kind="sessions", source_locator="z/repair.jsonl",
+            )
+            repository.mark_repair_required(
+                "sessions", "z/repair.jsonl", "2026-07-21T00:00:01Z",
+            )
+            freshness = LocalCommandServices._sync_freshness(store)
+        finally:
+            store.close()
+        self.assertEqual(freshness["state"], "repair_required")
 
     def _annotate(self, capability: str, *, finish: bool = False):
         payload = {
@@ -536,6 +592,55 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertIn(refs[0].replace("_", r"\_"), compared[1])
         self.assertNotIn("task-a", compared[1])
         self.assertNotIn("task-b", compared[1])
+
+    def test_report_uses_materialized_snapshot_without_source_assembly(self) -> None:
+        self._rollout("snapshot-task", second=10, input_tokens=100)
+        common = ["--db", str(self.database), "--cwd", str(self.project)]
+        self.assertEqual(invoke(
+            ["ingest", *common, "--source", f"explicit={self.root / 'rollouts'}"],
+            environ=self.environ,
+        )[0], 0)
+        self.assertEqual(invoke(["reconcile", *common], environ=self.environ)[0], 0)
+        with mock.patch(
+            "hydra_codex.reconcile_engine._assemble_project",
+            side_effect=AssertionError("report must not reassemble"),
+        ):
+            rendered = LocalCommandServices(environ=self.environ).report(
+                1, "json", self.database, self.project,
+            )
+        self.assertEqual(json.loads(rendered)["reports"][0]["schema_version"], "hydra.report/v4")
+
+    def test_snapshot_formats_show_current_queued_and_repair_freshness(self) -> None:
+        self._rollout("freshness-task", second=10, input_tokens=100)
+        common = ["--db", str(self.database), "--cwd", str(self.project)]
+        self.assertEqual(invoke(
+            ["ingest", *common, "--source", f"explicit={self.root / 'rollouts'}"],
+            environ=self.environ,
+        )[0], 0)
+        self.assertEqual(invoke(["reconcile", *common], environ=self.environ)[0], 0)
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_and_enqueue(
+                root_kind="sessions", source_locator="a/queued.jsonl",
+                observed_at="2026-07-21T00:00:01Z",
+            )
+        finally:
+            store.close()
+        service = LocalCommandServices(environ=self.environ)
+        queued = {fmt: service.report(1, fmt, self.database, self.project) for fmt in ("json", "markdown", "html")}
+        self.assertEqual(json.loads(queued["json"])["sync_freshness"]["state"], "queued")
+        self.assertIn("Sync freshness: queued.", queued["markdown"])
+        self.assertIn("Sync freshness: queued.", queued["html"])
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_source(root_kind="sessions", source_locator="z/repair.jsonl")
+            repository.mark_repair_required("sessions", "z/repair.jsonl", "2026-07-21T00:00:02Z")
+        finally:
+            store.close()
+        repair = service.report(1, "json", self.database, self.project)
+        self.assertEqual(json.loads(repair)["sync_freshness"]["state"], "repair_required")
 
 
 if __name__ == "__main__":

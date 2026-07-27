@@ -82,6 +82,21 @@ class BackfillFrontier:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class HookEvent:
+    """One private, safe hook fact leased for durable projection."""
+
+    event_key: str
+    project_id: str
+    session_key: str
+    turn_key: str
+    event_kind: str
+    tool_category: str | None
+    tool_status: str | None
+    duration_ms: int | None
+    observed_at: str
+
+
 def validate_root_relative_locator(locator: str) -> str:
     """Return an ASCII canonical root-relative locator suitable for SQLite storage."""
     if not isinstance(locator, str) or not 1 <= len(locator) <= 512:
@@ -287,6 +302,115 @@ class SyncStateRepository:
                     )
             self._bump_revision(connection, now)
             return inserted
+
+    @staticmethod
+    def _hook_event_from_row(row) -> HookEvent:
+        return HookEvent(
+            event_key=str(row[0]), project_id=str(row[1]), session_key=str(row[2]),
+            turn_key=str(row[3]), event_kind=str(row[4]),
+            tool_category=None if row[5] is None else str(row[5]),
+            tool_status=None if row[6] is None else str(row[6]),
+            duration_ms=None if row[7] is None else int(row[7]), observed_at=str(row[8]),
+        )
+
+    def claim_hook_events(
+        self, owner_key: str, observed_at: str, claim_expires_at: str, *, limit: int = 1000,
+    ) -> tuple[HookEvent, ...]:
+        """Lease and project unacknowledged safe hook facts exactly once per claim.
+
+        Projection is deliberately tiny and privacy preserving: a hook event
+        only makes its already-opaque project root dirty.  Reconciliation can
+        fail or restart independently because this durable marker survives the
+        outbox acknowledgement.
+        """
+        owner = _identity(owner_key, "worker owner key")
+        now = _timestamp(observed_at)
+        expiry = _timestamp(claim_expires_at)
+        if expiry <= now:
+            raise ValueError("hook event claim expiry must be in the future")
+        if not 1 <= limit <= 1000:
+            raise ValueError("hook event claim limit must be between 1 and 1000")
+        with self._store.rollout_transaction() as connection:
+            lease = connection.execute(
+                "SELECT expires_at FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+                (owner, now),
+            ).fetchone()
+            if lease is None:
+                return ()
+            if expiry > str(lease[0]):
+                raise ValueError("hook event claim cannot outlive worker lease")
+            rows = connection.execute(
+                """SELECT event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at
+                     FROM hook_event_outbox
+                    WHERE acknowledged_at IS NULL AND (claimed_by IS NULL OR claim_expires_at<=?)
+                    ORDER BY observed_at,event_key LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+            if not rows:
+                return ()
+            events = tuple(self._hook_event_from_row(row) for row in rows)
+            for event in events:
+                changed = connection.execute(
+                    """UPDATE hook_event_outbox SET claimed_by=?,claimed_at=?,claim_expires_at=?
+                         WHERE event_key=? AND acknowledged_at IS NULL
+                           AND (claimed_by IS NULL OR claim_expires_at<=?)""",
+                    (owner, now, expiry, event.event_key, now),
+                ).rowcount == 1
+                if not changed:
+                    # A defensive retry guard for a future non-serialized DB
+                    # backend: only project facts our lease actually won.
+                    continue
+                connection.execute(
+                    """INSERT INTO hook_safe_facts(
+                           event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at)
+                       VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING""",
+                    (
+                        event.event_key, event.project_id, event.session_key, event.turn_key,
+                        event.event_kind, event.tool_category, event.tool_status,
+                        event.duration_ms, event.observed_at,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at)
+                       VALUES (?,?, 'project', ?,NULL,NULL)
+                       ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
+                         observed_at=excluded.observed_at,claim_owner=NULL,claim_expires_at=NULL""",
+                    (event.project_id, event.project_id, now),
+                )
+            claimed = tuple(
+                event for event in events if connection.execute(
+                    "SELECT claimed_by FROM hook_event_outbox WHERE event_key=?", (event.event_key,),
+                ).fetchone()[0] == owner
+            )
+            if claimed:
+                self._bump_revision(connection, now)
+            return claimed
+
+    def acknowledge_hook_events(
+        self, owner_key: str, event_keys: tuple[str, ...], observed_at: str,
+    ) -> int:
+        """Acknowledge only facts still held by this live worker lease."""
+        owner = _identity(owner_key, "worker owner key")
+        now = _timestamp(observed_at)
+        if not event_keys:
+            return 0
+        if len(event_keys) > 1000:
+            raise ValueError("too many hook events to acknowledge")
+        keys = tuple(_identity(key, "hook event identity") for key in event_keys)
+        if len(set(keys)) != len(keys):
+            raise ValueError("hook event identities must be unique")
+        placeholders = ",".join("?" for _ in keys)
+        with self._store.rollout_transaction() as connection:
+            changed = connection.execute(
+                f"""UPDATE hook_event_outbox
+                       SET acknowledged_at=?,claimed_by=NULL,claimed_at=NULL,claim_expires_at=NULL
+                     WHERE event_key IN ({placeholders}) AND acknowledged_at IS NULL
+                       AND claimed_by=? AND claim_expires_at>?""",
+                (now, *keys, owner, now),
+            ).rowcount
+            if changed:
+                self._bump_revision(connection, now)
+            return int(changed)
 
     def enqueue(self, root_kind: str, source_locator: str, observed_at: str | None = None) -> bool:
         root = self._validate_root(root_kind)

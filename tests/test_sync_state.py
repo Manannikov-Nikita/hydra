@@ -26,7 +26,7 @@ class DurableSyncStateTests(unittest.TestCase):
             self.fail(f"durable sync state module is missing: {error}")
         return SyncStateRepository(self.store)
 
-    def test_schema_41_creates_private_durable_sync_tables(self) -> None:
+    def test_schema_42_creates_private_durable_sync_tables(self) -> None:
         tables = {
             str(row[0])
             for row in self.store.connection.execute(
@@ -34,11 +34,12 @@ class DurableSyncStateTests(unittest.TestCase):
             )
         }
 
-        self.assertEqual(self.store.schema_version(), 41)
+        self.assertEqual(self.store.schema_version(), 42)
         self.assertTrue({
             "sync_source_registry", "sync_source_checkpoints", "sync_ingest_queue",
             "sync_worker_leases", "sync_dirty_roots", "sync_jobs",
             "sync_backfill_frontier", "sync_data_revision", "hook_event_outbox",
+            "materialized_report_snapshots",
         }.issubset(tables))
         self.assertEqual(
             self.store.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000,
@@ -405,13 +406,27 @@ class DurableSyncStateTests(unittest.TestCase):
 
         upgraded = HydraStore(legacy_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.schema_version(), 41)
+        self.assertEqual(upgraded.schema_version(), 42)
         self.assertEqual(
             upgraded.connection.execute(
                 "SELECT display_name FROM dashboard_projects WHERE project_id='hprj_preserved'"
             ).fetchone()[0],
             "Preserved",
         )
+
+    def test_tampered_v42_materialized_snapshot_schema_fails_closed_on_reopen(self) -> None:
+        self.store.connection.execute("DROP TABLE materialized_report_snapshots")
+        self.store.connection.execute(
+            """CREATE TABLE materialized_report_snapshots (
+                   project_id TEXT NOT NULL,task_ref TEXT NOT NULL,report_json TEXT NOT NULL,
+                   report_markdown TEXT NOT NULL,report_html TEXT,
+                   reconciled_at TEXT NOT NULL,data_revision INTEGER NOT NULL,
+                   PRIMARY KEY(project_id,task_ref)) WITHOUT ROWID""",
+        )
+        self.store.connection.commit()
+        self.store.close()
+        with self.assertRaisesRegex(Exception, "schema"):
+            HydraStore(self.database)
 
 
 if __name__ == "__main__":

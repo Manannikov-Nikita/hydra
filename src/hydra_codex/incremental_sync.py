@@ -724,6 +724,7 @@ class IncrementalSyncWorker:
     def sync_once(
         self, owner_key: str, observed_at: str, lease_expires_at: str, *,
         maximum_sources: int = 100, crash_after_materialize: bool = False,
+        crash_after_outbox_consume: bool = False,
     ) -> SyncRun:
         if not 1 <= maximum_sources <= 1000:
             raise ValueError("maximum_sources must be between 1 and 1000")
@@ -808,6 +809,18 @@ class IncrementalSyncWorker:
                 continue
             completed += 1
             processed += tail.bytes_read
+        hook_events = self.repository.claim_hook_events(
+            owner_key, now, lease_expires_at,
+        )
+        if crash_after_outbox_consume:
+            # Test-only fault point.  The safe facts have been projected into
+            # durable dirty roots, but remain unacknowledged for an idempotent
+            # replay once this lease expires.
+            raise RuntimeError("injected crash after outbox consume")
+        if hook_events:
+            self.repository.acknowledge_hook_events(
+                owner_key, tuple(event.event_key for event in hook_events), now,
+            )
         self.reconcile_dirty(owner_key, now, lease_expires_at)
         return SyncRun(claimed, completed, repairs, processed)
 

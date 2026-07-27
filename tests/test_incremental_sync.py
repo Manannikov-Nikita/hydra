@@ -148,6 +148,56 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.repository.list_queue(), ())
         self.assertEqual([(root.project_id, root.root_kind) for root in self.repository.list_dirty_roots()], [("hprj_safe", "project")])
 
+    def test_hook_outbox_replays_post_tool_and_lifecycle_events_after_crash_before_ack(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
+
+        self.repository.record_hook_event_and_enqueue(
+            event_key="prompt-event", project_id="hprj_safe", session_key="session-safe",
+            turn_key="turn-safe", event_kind="prompt", observed_at="2026-07-26T00:00:00Z",
+        )
+        self.repository.record_hook_event_and_enqueue(
+            event_key="tool-event", project_id="hprj_safe", session_key="session-safe",
+            turn_key="turn-safe", event_kind="post_tool", tool_category="shell",
+            tool_status="success", duration_ms=8, observed_at="2026-07-26T00:00:00Z",
+            source=("sessions", "rollout.jsonl"),
+        )
+        self.repository.record_hook_event_and_enqueue(
+            event_key="stop-event", project_id="hprj_safe", session_key="session-safe",
+            turn_key="turn-safe", event_kind="stop", observed_at="2026-07-26T00:00:00Z",
+        )
+        materialized: list[int] = []
+        reconciled: list[str] = []
+
+        def materialize(_item, tail, _connection):
+            materialized.extend(line.ordinal for line in tail.lines)
+            return MaterializedSource(project_id="hprj_safe")
+
+        worker = IncrementalSyncWorker(
+            self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
+            materialize=materialize, reconcile=reconciled.append,
+        )
+        with self.assertRaisesRegex(RuntimeError, "outbox consume"):
+            worker.sync_once(
+                "worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z",
+                crash_after_outbox_consume=True,
+            )
+        self.assertEqual(materialized, [1])
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM hook_event_outbox WHERE acknowledged_at IS NULL"
+        ).fetchone()[0], 3)
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM sync_dirty_roots"
+        ).fetchone()[0], 1)
+
+        report = worker.sync_once("worker", "2026-07-26T00:02:00Z", "2026-07-26T00:03:00Z")
+        self.assertEqual((report.claimed, report.completed), (0, 0))
+        self.assertEqual(materialized, [1])
+        self.assertEqual(reconciled, ["hprj_safe"])
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM hook_event_outbox WHERE acknowledged_at IS NOT NULL"
+        ).fetchone()[0], 3)
+        self.assertEqual(self.repository.list_dirty_roots(), ())
+
     def test_unattributed_source_is_requeued_without_a_checkpoint(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
 

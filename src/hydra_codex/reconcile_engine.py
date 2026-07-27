@@ -198,11 +198,20 @@ def _assemble_project(
             (project_id,),
         )
     ]
+    hook_safe_facts = [
+        [str(row[0]), str(row[1]), str(row[2]), row[3], row[4], row[5]]
+        for row in store.connection.execute(
+            """SELECT event_key,event_kind,observed_at,tool_category,tool_status,duration_ms
+                 FROM hook_safe_facts WHERE project_id=? ORDER BY event_key""",
+            (project_id,),
+        )
+    ]
     payload = json.dumps(
         {
             "tasks": fingerprints,
             "project_event_issues": project_event_issues,
             "lifecycle_source_facts": lifecycle_source_facts,
+            "hook_safe_facts": hook_safe_facts,
         },
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
@@ -352,10 +361,106 @@ def reconcile_project(
                 completed_instant.canonical, len(plans),
             ),
         )
+    # Building report views is intentionally part of explicit reconciliation.
+    # The read path below uses only these materialized, public-safe snapshots.
+    from .reconcile_reports import list_reconciled_reports as build_reports
+
+    _persist_report_snapshots(
+        store, project_id, build_reports(store, project_id), completed_instant.canonical,
+    )
     complete_count = sum(item.status == "complete" for item in plans)
     return ReconciliationSummary(
         run_id, project_id, RECONCILIATION_VERSION, len(plans),
         complete_count, len(plans) - complete_count,
+    )
+
+
+def _persist_report_snapshots(
+    store: HydraStore, project_id: str, reports: tuple[object, ...], reconciled_at: str,
+) -> None:
+    """Persist the public report contract only after successful reconciliation."""
+    from .report_renderers import render_html, render_json, render_markdown
+    from .sync_state import SyncStateRepository
+
+    revision = SyncStateRepository(store).data_revision()
+    snapshots = [
+        (
+            project_id, report.task_ref, render_json(report).rstrip("\n"),
+            render_markdown(report), render_html(report), reconciled_at, revision,
+        )
+        for report in reports
+    ]
+    with store.rollout_transaction() as connection:
+        connection.execute("DELETE FROM materialized_report_snapshots WHERE project_id=?", (project_id,))
+        connection.executemany(
+            """INSERT INTO materialized_report_snapshots(
+                   project_id,task_ref,report_json,report_markdown,report_html,reconciled_at,data_revision)
+               VALUES (?,?,?,?,?,?,?)""",
+            snapshots,
+        )
+
+
+def render_materialized_report_collection(
+    store: HydraStore, project_id: str, limit: int, output_format: str,
+    sync_freshness: dict[str, object],
+) -> str:
+    """Read and render precomputed public reports without source reassembly or writes."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if output_format not in {"json", "markdown", "html"}:
+        raise ValueError("unsupported report format")
+    from .dashboard_contract import validate_task_report
+    from .public_payload import reject_private_fields
+    rows = list(store.connection.execute(
+        """SELECT task_ref,report_json,report_markdown,report_html,data_revision
+             FROM materialized_report_snapshots WHERE project_id=?
+             ORDER BY reconciled_at DESC,task_ref LIMIT ?""",
+        (project_id, limit),
+    ))
+    has_reconciliation = store.connection.execute(
+        """SELECT 1 FROM reconciliation_runs WHERE project_id=? AND outcome='success'
+             ORDER BY completed_at DESC LIMIT 1""",
+        (project_id,),
+    ).fetchone()
+    if has_reconciliation is None:
+        raise ReconciliationStale("reconcile_required")
+    reports: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            payload = json.loads(str(row[1]))
+        except (TypeError, ValueError) as error:
+            raise ReconciliationStale("reconcile_required") from error
+        validate_task_report(payload)
+        reject_private_fields(payload)
+        if payload.get("task_ref") != row[0]:
+            raise ReconciliationStale("reconcile_required")
+        reports.append(payload)
+    wrapper = {
+        "schema_version": "hydra.report-list/v2",
+        "reports": reports,
+        "sync_freshness": sync_freshness,
+    }
+    if output_format == "json":
+        return json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    freshness = str(sync_freshness.get("state", "unknown"))
+    if output_format == "markdown":
+        if not reports:
+            return f"# Hydra task reports\n\nSync freshness: {freshness}.\n\nNo reconciled tasks.\n"
+        return "# Hydra task reports\n\n" + f"Sync freshness: {freshness}.\n\n" + "\n---\n\n".join(
+            str(row[2]).removeprefix("# Hydra task report\n\n") for row in rows
+        )
+    from html import escape
+
+    values = "".join(
+        f"<section><h2>{escape(str(report['display_name'] or 'unavailable'))} "
+        f"<code>{escape(str(report['task_ref']))}</code></h2><pre>"
+        f"{escape(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(',', ':')))}</pre></section>"
+        for report in reports
+    )
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<title>Hydra task reports</title></head><body><h1>Hydra task reports</h1>"
+        f"<p>Sync freshness: {escape(freshness)}.</p>{values}</body></html>\n"
     )
 
 

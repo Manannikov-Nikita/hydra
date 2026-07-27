@@ -54,6 +54,8 @@ from .migrations_w23 import (
 )
 from .migrations_x24 import (
     X24_DASHBOARD_PROJECTS_TABLE_SQL,
+    X24_HOOK_SAFE_FACTS_TABLE_SQL,
+    X24_MATERIALIZED_REPORT_SNAPSHOTS_TABLE_SQL,
     X24_MIGRATIONS,
     X24_REQUIRED_SCHEMA,
 )
@@ -556,6 +558,12 @@ class HydraStore:
             raise StorageUnavailable(
                 "Hydra schema has altered dashboard project catalog trust constraints"
             )
+        for table, expected_sql in {
+            "hook_safe_facts": X24_HOOK_SAFE_FACTS_TABLE_SQL,
+            "materialized_report_snapshots": X24_MATERIALIZED_REPORT_SNAPSHOTS_TABLE_SQL,
+        }.items():
+            if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
+                raise StorageUnavailable("Hydra schema has altered materialized report trust constraints")
         for table, expected_sql in W23_REQUIRED_TABLE_SQL.items():
             if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
                 raise StorageUnavailable(

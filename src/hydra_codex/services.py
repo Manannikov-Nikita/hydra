@@ -204,30 +204,49 @@ class LocalCommandServices:
         database_path: Path | None,
         cwd: Path,
     ) -> str:
-        from .reconcile_engine import list_reconciled_reports
+        from .reconcile_engine import ReconciliationStale, render_materialized_report_collection
 
         project = self._project(cwd)
         store = HydraStore(self._database_path(database_path))
         try:
-            reports = list_reconciled_reports(
-                store, project.project_id, limit=last,
-            )
-            return render_report_collection(
-                reports, output_format, sync_freshness=self._sync_freshness(store),
-            )
+            freshness = self._sync_freshness(store)
+            try:
+                return render_materialized_report_collection(
+                    store, project.project_id, last, output_format, freshness,
+                )
+            except ReconciliationStale:
+                return render_report_collection(
+                    (), output_format,
+                    sync_freshness={**freshness, "state": "reconcile_required"},
+                )
         finally:
             store.close()
 
     @staticmethod
     def _sync_freshness(store: HydraStore) -> dict[str, object]:
         repository = SyncStateRepository(store)
-        queued = repository.list_queue(limit=1)
-        repair = any(item.source_state == "repair_required" for item in queued)
-        job = repository.current_job("repair") or repository.current_job("backfill")
+        connection = store.connection
+        repair = connection.execute(
+            "SELECT 1 FROM sync_source_registry WHERE source_state='repair_required' LIMIT 1",
+        ).fetchone() is not None
+        queued = connection.execute(
+            """SELECT 1 FROM sync_ingest_queue WHERE queue_state='queued' LIMIT 1""",
+        ).fetchone() is not None or connection.execute(
+            """SELECT 1 FROM hook_event_outbox
+                 WHERE acknowledged_at IS NULL AND claimed_by IS NULL LIMIT 1""",
+        ).fetchone() is not None or connection.execute(
+            "SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1",
+        ).fetchone() is not None
+        running = connection.execute(
+            "SELECT 1 FROM sync_ingest_queue WHERE queue_state='claimed' LIMIT 1",
+        ).fetchone() is not None or connection.execute(
+            """SELECT 1 FROM hook_event_outbox
+                 WHERE acknowledged_at IS NULL AND claimed_by IS NOT NULL LIMIT 1""",
+        ).fetchone() is not None or connection.execute(
+            "SELECT 1 FROM sync_jobs WHERE state='running' LIMIT 1",
+        ).fetchone() is not None
         state = (
-            "repair_required" if repair else "repairing"
-            if job is not None and job.state in {"queued", "running"}
-            else "queued" if queued else "idle"
+            "repair_required" if repair else "queued" if queued else "running" if running else "current"
         )
         return {
             "schema_version": "hydra.sync-freshness/v1",

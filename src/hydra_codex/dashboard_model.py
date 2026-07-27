@@ -23,6 +23,7 @@ TASK_LIST_SCHEMA = "hydra.dashboard-task-list/v1"
 _PROJECT_REF = re.compile(r"project_[0-9a-f]{12,64}\Z")
 _TASK_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
 _REFRESH_REF = re.compile(r"refresh_[0-9a-f]{12,64}\Z")
+_SYNC_REF = re.compile(r"sync_[0-9a-f]{32}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z")
 _REFRESH_STATES = frozenset({
     "idle", "queued", "running", "succeeded", "partial", "failed",
@@ -91,6 +92,29 @@ def _canonical_object(value: str, field: str) -> dict[str, object]:
         raise ValueError(f"{field} must be a canonical JSON object")
     reject_private_fields(decoded)
     return decoded
+
+
+def _validate_sync_summary(value: Mapping[str, object]) -> None:
+    required = {"schema_version", "sync_ref", "kind", "state", "started_at", "finished_at", "progress"}
+    if set(value) != required or value["schema_version"] != "hydra.dashboard-sync/v1":
+        raise ValueError("dashboard sync summary schema is invalid")
+    ref, kind, state = value["sync_ref"], value["kind"], value["state"]
+    if state == "idle":
+        if ref is not None or kind is not None or value["started_at"] is not None or value["finished_at"] is not None:
+            raise ValueError("idle dashboard sync summary is invalid")
+    elif (_SYNC_REF.fullmatch(ref) if isinstance(ref, str) else None) is None or kind not in {"sync", "repair", "backfill"} or state not in {"queued", "running", "succeeded", "partial", "failed"}:
+        raise ValueError("dashboard sync summary identity is invalid")
+    _timestamp(value["started_at"], "dashboard sync started_at")
+    _timestamp(value["finished_at"], "dashboard sync finished_at")
+    if state in {"succeeded", "partial", "failed"} and value["finished_at"] is None:
+        raise ValueError("terminal dashboard sync requires finished_at")
+    progress = value["progress"]
+    if not isinstance(progress, Mapping) or set(progress) != {"sources_queued", "sources_processed", "new_bytes"}:
+        raise ValueError("dashboard sync progress schema is invalid")
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in progress.values()):
+        raise ValueError("dashboard sync progress is invalid")
+    if progress["sources_processed"] > progress["sources_queued"]:
+        raise ValueError("dashboard sync progress is invalid")
 
 
 @dataclass(frozen=True)
@@ -255,7 +279,9 @@ class DashboardSnapshot:
         if not isinstance(self.sync, Mapping):
             raise ValueError("dashboard sync summary must be public mapping")
         frozen_sync = _freeze(self.sync)
-        reject_private_fields(_thaw(frozen_sync))
+        thawed_sync = _thaw(frozen_sync)
+        _validate_sync_summary(thawed_sync)
+        reject_private_fields(thawed_sync)
         object.__setattr__(self, "sync", frozen_sync)
 
     def as_dict(self) -> dict[str, object]:

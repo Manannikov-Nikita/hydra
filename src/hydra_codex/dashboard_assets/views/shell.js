@@ -1,4 +1,4 @@
-import {el} from "../dom.js";
+import {copyRefButton, el, referenceLabel, shortRef} from "../dom.js";
 
 const ROUTE_ITEMS = Object.freeze([
   ["Overview", "overview"],
@@ -15,6 +15,7 @@ let projectList = null;
 let routeList = null;
 let projectSelect = null;
 let selectProject = null;
+let copyReference = null;
 let initialized = false;
 
 function routeButton(label, route, navigate) {
@@ -29,6 +30,7 @@ export function initializeShell(actions) {
   if (initialized) return;
   initialized = true;
   selectProject = actions.selectProject;
+  copyReference = actions.copyReference;
   projectList = el("div", {class: "rail-list"});
   routeList = el("div", {class: "rail-list"});
   document.getElementById("project-navigation").append(projectList);
@@ -45,7 +47,8 @@ export function initializeShell(actions) {
 function removeMissingProjects(available) {
   for (const [projectRef, button] of projectButtons) {
     if (available.has(projectRef)) continue;
-    button.remove();
+    const item = button.parentElement;
+    if (item) item.remove();
     projectButtons.delete(projectRef);
     const option = projectOptions.get(projectRef);
     if (option) option.remove();
@@ -65,17 +68,25 @@ export function updateShell(snapshot, state) {
       button = el("button", {class: "nav-button", type: "button"});
       button.addEventListener("click", () => selectProject(project.project_ref));
       projectButtons.set(project.project_ref, button);
+      projectList.append(el("div", {class: "project-reference"}, [
+        button,
+        copyRefButton(
+          project.project_ref, "project", copyReference, project.display_name,
+        ),
+      ]));
     }
-    button.textContent = project.display_name;
+    button.textContent = "";
+    button.append(referenceLabel(project.display_name, project.project_ref));
+    button.setAttribute("aria-label", `Select project ${project.display_name}`);
     button.setAttribute("aria-pressed", String(project.project_ref === state.projectRef));
-    projectList.append(button);
+    projectList.append(button.parentElement);
 
     let option = projectOptions.get(project.project_ref);
     if (!option) {
       option = el("option", {value: project.project_ref});
       projectOptions.set(project.project_ref, option);
     }
-    option.textContent = project.display_name;
+    option.textContent = `${project.display_name} · ${shortRef(project.project_ref)}`;
     projectSelect.append(option);
   }
   projectSelect.value = state.projectRef || "";

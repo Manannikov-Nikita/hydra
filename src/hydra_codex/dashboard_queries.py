@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import sqlite3
 from typing import Protocol, cast
 
@@ -18,6 +19,7 @@ from .dashboard_model import (
     DashboardTaskPage,
     canonical_json,
 )
+from .dashboard_contract import validate_task_report
 from .dashboard_projections import project_pilot_status, project_storage_status
 from .diagnostics import DoctorReport
 from .exact_time import public_timestamp
@@ -30,6 +32,7 @@ from .report_operations import compare_reports
 from .reporting import ComparisonReport, NumericFact, TaskReport
 from .storage import HydraStore
 from .storage_health import storage_status
+from .sync_state import SyncStateRepository
 
 
 @dataclass(frozen=True)
@@ -387,9 +390,65 @@ class DashboardQueryService:
         """Build launch DTOs from a caller-owned, bounded read-only connection."""
         if not isinstance(connection, sqlite3.Connection):
             raise TypeError("dashboard bootstrap requires a SQLite connection")
-        return self._bootstrap_snapshots_from_source(
-            _BootstrapStore(connection), refresh=refresh,
-        )
+        return self._materialized_bootstrap_from_connection(connection, refresh=refresh)
+
+    def _materialized_bootstrap_from_connection(
+        self, connection: sqlite3.Connection, *, refresh: DashboardRefreshView,
+    ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
+        """Serve already persisted public report JSON without raw-source discovery."""
+        store = _BootstrapStore(connection)
+        catalog = self._catalog(store)
+        revision = int(connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0])
+        summaries: list[DashboardProjectSummary] = []
+        prepared: list[tuple[CatalogProject, str, list[dict[str, object]], str]] = []
+        for item, public_ref in catalog:
+            reports: list[dict[str, object]] = []
+            for row in connection.execute(
+                """SELECT report_json FROM materialized_report_snapshots WHERE project_id=?
+                     ORDER BY reconciled_at DESC,task_ref""", (item.project_id,),
+            ):
+                payload = json.loads(str(row[0]))
+                validate_task_report(payload)
+                reject_private_fields(payload)
+                reports.append(payload)
+            state = "current" if reports else "stale"
+            summaries.append(DashboardProjectSummary(
+                public_ref, self._display_name(item, public_ref),
+                str(reports[0]["last_activity_at"]) if reports else item.last_seen_at,
+                state, NumericFact(len(reports), "count", "derived"),
+            ))
+            prepared.append((item, public_ref, reports, state))
+        project_catalog = DashboardProjectCatalog(tuple(summaries))
+        generated_at = self._generated_at()
+        snapshots: dict[str, DashboardSnapshot] = {}
+        for item, public_ref, reports, state in prepared:
+            latest = reports[0] if reports else None
+            unavailable = self._unavailable
+            headline = ({"working_tokens": latest["deduplicated_tokens"]["working"],
+                         "full_context_tokens": latest["deduplicated_tokens"]["full_context"],
+                         "wall_clock_ms": latest["timing"]["wall_clock"]} if latest else
+                        {"working_tokens": unavailable("tokens").as_dict(), "full_context_tokens": unavailable("tokens").as_dict(),
+                         "wall_clock_ms": unavailable("milliseconds").as_dict()})
+            project = {"project_ref": public_ref, "display_name": self._display_name(item, public_ref),
+                       "last_activity_at": latest["last_activity_at"] if latest else item.last_seen_at,
+                       "freshness_state": state,
+                       "overview": {"basis": {"kind": "latest_task", "task_ref": None if latest is None else latest["task_ref"]},
+                                    "headline": headline, "phase_allocation": None if latest is None else latest["semantic"]["breakdown"]},
+                       "recent_tasks": [{"task_ref": report["task_ref"], "display_name": report["display_name"], "status": report["status"],
+                                         "last_activity_at": report["last_activity_at"], "task_family": report["task_family"],
+                                         "headline": {"working_tokens": report["deduplicated_tokens"]["working"],
+                                                      "full_context_tokens": report["deduplicated_tokens"]["full_context"],
+                                                      "wall_clock_ms": report["timing"]["wall_clock"]}} for report in reports[:10]],
+                       "pilot": None, "storage": self._bootstrap_storage(),
+                       "system_health": {"scope": "global_launch_context", "doctor": self._doctor_report.as_dict()}}
+            snapshots[public_ref] = DashboardSnapshot(generated_at, {"state": state, "doctor": {"scope": "global_launch_context", "report": self._doctor_report.as_dict()}},
+                                                       project_catalog, public_ref, canonical_json(project), None, refresh, revision)
+        if snapshots:
+            return snapshots, None
+        return {}, self._assemble_snapshot(store, catalog, {}, project_catalog, project_ref=None, task_ref=None,
+                                            refresh=refresh, generated_at=generated_at, bootstrap=True, data_revision=revision)
 
     def _bootstrap_snapshots_from_source(
         self,
@@ -454,6 +513,7 @@ class DashboardQueryService:
             task_ref=task_ref,
             refresh=refresh,
             generated_at=generated_at or self._generated_at(),
+            data_revision=SyncStateRepository(store).data_revision(),
         )
 
     def _prepare_snapshot_state(
@@ -493,6 +553,7 @@ class DashboardQueryService:
         task_ref: str | None,
         refresh: DashboardRefreshView,
         generated_at: str,
+        data_revision: int = 0,
         bootstrap: bool = False,
         resolved_project: CatalogProject | None = None,
     ) -> DashboardSnapshot:
@@ -539,7 +600,7 @@ class DashboardQueryService:
         }
         return DashboardSnapshot(
             generated_at, freshness, summaries,
-            selected_ref, project_json, selected_task_json, refresh,
+            selected_ref, project_json, selected_task_json, refresh, data_revision,
         )
 
     def _refresh_snapshots_from_store(

@@ -7,10 +7,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType
 from typing import Any
 from .dashboard_model import DashboardRefreshView
-from .dashboard_sync_api import dashboard_payload, dispatch as dispatch_sync
+from .dashboard_sync_api import dashboard_payload, dispatch as dispatch_sync, live_snapshot_available
 from .public_payload import reject_private_fields
 from .storage import StorageUnavailable
-
 _CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
     "connect-src 'self'; img-src 'self' data:; font-src 'none'; "
@@ -315,7 +314,8 @@ class DashboardApplication:
                 raise _HttpError("invalid_request")
             if method not in {"GET", "HEAD"}:
                 raise _HttpError("method_not_allowed")
-            if task is not None:
+            if live_snapshot_available(self): payload = _as_dict(self._query.snapshot(project_ref=project, task_ref=task, refresh=self._current_refresh()))
+            elif task is not None:
                 payload = _as_dict(self._query.snapshot(
                     project_ref=project, task_ref=task,
                     refresh=self._current_refresh(),

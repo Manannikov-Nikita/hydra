@@ -370,6 +370,7 @@ class SyncRun:
     completed: int
     repair_required: int
     bytes_processed: int
+    lease_acquired: bool = False
 
 
 Materializer = Callable[[QueueItem, TailRead, object], MaterializedSource]
@@ -730,7 +731,7 @@ class IncrementalSyncWorker:
             raise ValueError("maximum_sources must be between 1 and 1000")
         now = _utc(observed_at)
         if not self.repository.acquire_lease(owner_key, now, lease_expires_at):
-            return SyncRun(0, 0, 0, 0)
+            return SyncRun(0, 0, 0, 0, False)
         claimed = completed = repairs = processed = 0
         for _ in range(maximum_sources):
             item = self.repository.claim_next(owner_key, now, lease_expires_at)
@@ -822,7 +823,8 @@ class IncrementalSyncWorker:
                 owner_key, tuple(event.event_key for event in hook_events), now,
             )
         self.reconcile_dirty(owner_key, now, lease_expires_at)
-        return SyncRun(claimed, completed, repairs, processed)
+        self.repository.release_lease(owner_key, now)
+        return SyncRun(claimed, completed, repairs, processed, True)
 
 
 @dataclass(frozen=True)

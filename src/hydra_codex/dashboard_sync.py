@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 import threading
 import uuid
+import re
 
 from .exact_time import public_timestamp
 from .incremental_sync import IncrementalSyncWorker, ResumableRepair, TrustedSourceRoots
@@ -15,6 +16,7 @@ from .sync_state import SyncJob, SyncStateRepository
 
 
 _TERMINAL = frozenset({"succeeded", "partial", "failed"})
+_SYNC_REF = re.compile(r"sync_[0-9a-f]{32}\Z")
 
 
 def _summary(job: SyncJob | None) -> dict[str, object]:
@@ -26,6 +28,12 @@ def _summary(job: SyncJob | None) -> dict[str, object]:
             "finished_at": None,
             "progress": {"sources_queued": 0, "sources_processed": 0, "new_bytes": 0},
         }
+    if (_SYNC_REF.fullmatch(job.job_id) is None or job.job_kind not in {"sync", "repair", "backfill"}
+            or job.state not in {"queued", "running", *_TERMINAL}
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                   for value in (job.sources_discovered, job.sources_completed, job.bytes_processed))
+            or job.sources_completed > job.sources_discovered):
+        raise ValueError("persisted dashboard sync job is invalid")
     return {
         "schema_version": "hydra.dashboard-sync/v1", "sync_ref": job.job_id,
         "kind": job.job_kind, "state": job.state, "started_at": job.created_at,
@@ -51,8 +59,9 @@ class DashboardSyncController:
             raise ValueError("dashboard sync installation key is invalid")
         self._store_factory, self._roots = store_factory, roots
         self._key, self._clock = installation_key, clock
-        self._threads: set[threading.Thread] = set()
+        self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._closed = threading.Event()
 
     def _now(self) -> str:
         return public_timestamp(self._clock())
@@ -118,23 +127,29 @@ class DashboardSyncController:
             assert job is not None
         finally:
             store.close()
-        if not reused:
+        should_start = not reused
+        with self._lock:
+            local = self._threads.get(job_id)
+            should_start = should_start or local is None or not local.is_alive()
+        if should_start:
             thread = threading.Thread(
-                target=self._run, args=(kind, job_id), name="hydra-dashboard-sync", daemon=True,
+                target=self._run, args=(job.job_kind, job_id), name="hydra-dashboard-sync", daemon=True,
             )
             with self._lock:
-                self._threads.add(thread)
+                self._threads[job_id] = thread
             try:
                 thread.start()
             except Exception:
                 with self._lock:
-                    self._threads.discard(thread)
+                    self._threads.pop(job_id, None)
                 self._fail(job_id)
                 return self.get(job_id), False
         return _summary(job), reused
 
     def _run(self, kind: str, job_id: str) -> None:
         try:
+            if self._closed.is_set():
+                return
             if kind == "sync":
                 self._run_sync(job_id)
             else:
@@ -143,7 +158,7 @@ class DashboardSyncController:
             self._fail(job_id)
         finally:
             with self._lock:
-                self._threads.discard(threading.current_thread())
+                self._threads.pop(job_id, None)
 
     def _run_sync(self, job_id: str) -> None:
         assert self._roots is not None
@@ -160,17 +175,28 @@ class DashboardSyncController:
                 store, self._roots,
                 reconcile=lambda project_id: reconcile_project(store, project_id, self._key),
             )
-            result = worker.sync_once("dashboard-" + uuid.uuid4().hex, now, expiry)
-            current = repository.get_job(job_id)
-            assert current is not None
-            repository.update_job(
-                job_id,
-                state="partial" if result.repair_required else "succeeded",
-                sources_discovered=max(current.sources_discovered, result.claimed),
-                sources_completed=result.completed,
-                bytes_processed=result.bytes_processed,
-                updated_at=self._now(), completed_at=self._now(),
-            )
+            completed = processed = repairs = 0
+            while not self._closed.is_set():
+                result = worker.sync_once("dashboard-" + uuid.uuid4().hex, now, expiry, maximum_sources=1000)
+                if not result.lease_acquired:
+                    return
+                completed += result.completed
+                processed += result.bytes_processed
+                repairs += result.repair_required
+                remaining = repository.list_queue(1)
+                current = repository.get_job(job_id)
+                assert current is not None
+                if not remaining:
+                    repository.update_job(job_id, state="partial" if repairs else "succeeded",
+                                          sources_discovered=max(current.sources_discovered, completed + repairs),
+                                          sources_completed=completed, bytes_processed=processed,
+                                          updated_at=self._now(), completed_at=self._now())
+                    return
+                repository.update_job(job_id, state="running",
+                                      sources_discovered=max(current.sources_discovered, completed + repairs),
+                                      sources_completed=completed, bytes_processed=processed, updated_at=self._now())
+                if result.claimed == 0:
+                    return
         finally:
             store.close()
 
@@ -194,7 +220,14 @@ class DashboardSyncController:
                         job_id=job_id, root_kind=root_kind, directory_locator="@root",
                         state="pending", discovered_count=0, updated_at=now,
                     )
-            repair.run_batch(job_id, now)
+            while not self._closed.is_set():
+                result = repair.run_batch(job_id, now)
+                job = repository.get_job(job_id)
+                assert job is not None
+                if job.state in _TERMINAL or result.completed:
+                    return
+                if result.discovered == 0 and result.directories_scanned == 0:
+                    return
         finally:
             store.close()
 
@@ -215,8 +248,9 @@ class DashboardSyncController:
             return
 
     def close(self, timeout: float = 5.0) -> None:
+        self._closed.set()
         with self._lock:
-            threads = tuple(self._threads)
+            threads = tuple(self._threads.values())
         for thread in threads:
             if thread is not threading.current_thread():
                 thread.join(timeout)

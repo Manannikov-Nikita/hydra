@@ -1,4 +1,4 @@
-import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseFigure, taskDisplay} from "../dom.js";
+import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseFigure, referenceIdentity, taskDisplay} from "../dom.js";
 
 function basisText(project, overview) {
   if (overview.basis && overview.basis.task_ref) {
@@ -41,7 +41,9 @@ export function renderOverview(snapshot, actions) {
   const unclassified = Number(phase && phase.unclassified && phase.unclassified.working && phase.unclassified.working.value) || 0;
   const classifiedShare = classified + unclassified > 0 ? classified / (classified + unclassified) * 100 : null;
   const rows = recent.map(task => [
-    taskDisplay(task),
+    referenceIdentity(
+      taskDisplay(task), task.task_ref, "task", actions.copyReference,
+    ),
     task.task_family || "Unclassified",
     task.status,
     factSummaryText(task.headline && task.headline.working_tokens),
@@ -55,6 +57,9 @@ export function renderOverview(snapshot, actions) {
   systemButton.addEventListener("click", () => actions.navigate("health"));
   return el("div", {}, [
     pageHeader(project.display_name, `${project.freshness_state} · ${project.last_activity_at}`),
+    referenceIdentity(
+      project.display_name, project.project_ref, "project", actions.copyReference,
+    ),
     el("p", {class: "muted", text: basisText(project, overview)}),
     cards,
     el("section", {class: "section", "aria-labelledby": "overview-phases"}, [

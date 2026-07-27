@@ -16,6 +16,7 @@ _JOB_STATES = frozenset({"queued", "running", "succeeded", "partial", "failed"})
 _FRONTIER_STATES = frozenset({"pending", "scanned", "repair_required"})
 _HEX_ANCHOR = re.compile(r"[0-9a-f]{64}")
 _SAFE_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_JOB_IDENTIFIER = re.compile(r"sync_[0-9a-f]{32}\Z")
 _CANONICAL_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 
 
@@ -760,7 +761,7 @@ class SyncStateRepository:
         if job_kind not in _JOB_KINDS:
             raise ValueError("sync job kind is invalid")
         identifier = job_id or f"sync_{uuid.uuid4().hex}"
-        if not 1 <= len(identifier) <= 128:
+        if _JOB_IDENTIFIER.fullmatch(identifier) is None:
             raise ValueError("sync job id is invalid")
         with self._store.rollout_transaction() as connection:
             connection.execute(
@@ -778,9 +779,8 @@ class SyncStateRepository:
             raise ValueError("sync job kind is invalid")
         with self._store.rollout_transaction() as connection:
             row = connection.execute(
-                """SELECT job_id FROM sync_jobs WHERE job_kind=?
-                     AND state IN ('queued','running') ORDER BY updated_at DESC,job_id DESC LIMIT 1""",
-                (job_kind,),
+                """SELECT job_id FROM sync_jobs WHERE state IN ('queued','running')
+                     ORDER BY updated_at DESC,job_id DESC LIMIT 1""",
             ).fetchone()
             if row is not None:
                 return str(row[0]), True

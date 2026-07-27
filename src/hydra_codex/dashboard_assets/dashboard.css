@@ -78,6 +78,7 @@ p { max-width: 70ch; }
 }
 .project-rail h2:not(:first-child) { margin-top: 32px; }
 .rail-list { display: grid; gap: 4px; }
+.project-reference { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; }
 .nav-button {
   width: 100%;
   padding: 8px 10px;
@@ -142,12 +143,20 @@ th { color: var(--ink-muted); font-size: 13px; line-height: 1.25; font-weight: 5
 td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; }
 .row-button { width: 100%; min-height: 32px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; }
 .row-button:hover { color: var(--primary); }
+.reference-identity { display: inline-flex; max-width: 100%; align-items: center; gap: 8px; }
+.reference-label { display: inline-flex; min-width: 0; flex-direction: column; align-items: flex-start; }
+.reference-name { max-width: 100%; overflow-wrap: anywhere; }
+.reference-ref { color: var(--ink-muted); font-size: 12px; white-space: nowrap; }
+.copy-ref { min-height: 28px; padding: 3px 7px; font-size: 12px; white-space: nowrap; }
+.project-reference .copy-ref { padding-inline: 5px; }
 .divider-list { margin: 0; }
 .divider-row { display: grid; grid-template-columns: minmax(160px, .7fr) minmax(0, 1.3fr); gap: 24px; padding: 13px 0; border-bottom: 1px solid var(--border); }
 .divider-row dt { color: var(--ink-muted); }
 .divider-row dd { margin: 0; overflow-wrap: anywhere; }
 .chip { display: inline-block; padding: 3px 9px; border-radius: 999px; background: var(--surface-subtle); color: var(--ink); font-size: 13px; }
 .control-row { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.comparison-references { display: flex; flex-wrap: wrap; gap: 16px 28px; margin: 12px 0; }
+.comparison-references > div { display: grid; gap: 4px; }
 .field { min-width: 180px; }
 .filter-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
 .filter-row .button[aria-pressed="true"] { border-color: var(--primary); background: var(--primary-soft); }

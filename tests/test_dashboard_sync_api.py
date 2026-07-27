@@ -59,6 +59,28 @@ class Sync:
         return self.current()
 
 
+class RevisionQuery:
+    """A snapshot read at revision 5 while the controller has already reached 6."""
+
+    def snapshot(self, **_kwargs):
+        return type("Payload", (), {"as_dict": lambda _self: {
+            "schema_version": "hydra.dashboard/v2", "selected_project_ref": None,
+            "data_revision": 5,
+            "sync": {"schema_version": "hydra.dashboard-sync/v1",
+                     "sync_ref": "sync_0123456789abcdef", "kind": "sync",
+                     "state": "running", "started_at": "2026-07-27T10:00:00Z",
+                     "finished_at": None,
+                     "progress": {"sources_queued": 4, "sources_processed": 2,
+                                  "new_bytes": 10}},
+        }})()
+
+
+class RevisionSync(Sync):
+    def changes(self, after):
+        return {"schema_version": "hydra.dashboard-changes/v1", "data_revision": 6,
+                "changed": 6 > after, "sync": self.current()}
+
+
 class DashboardSyncApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sync = Sync()
@@ -93,5 +115,28 @@ class DashboardSyncApiTests(unittest.TestCase):
         alias = self.request("/api/v1/refresh", "POST", origin)
         self.assertEqual((sync.status, repair.status, alias.status), (202, 202, 202))
         self.assertEqual(self.sync.started, ["sync", "repair", "sync"])
-        self.assertEqual(self.payload(alias)["schema_version"], "hydra.dashboard-sync/v1")
+        self.assertEqual(self.payload(alias)["schema_version"], "hydra.dashboard-refresh/v1")
         self.assertEqual(self.request("/api/v1/sync/sync_0123456789abcdef").status, 200)
+
+    def test_refresh_alias_retains_the_v1_reference_and_location_contract(self) -> None:
+        response = self.request("/api/v1/refresh", "POST", f"http://{AUTHORITY}")
+        self.assertEqual(response.status, 202)
+        payload = self.payload(response)
+        self.assertEqual(payload["schema_version"], "hydra.dashboard-refresh/v1")
+        self.assertTrue(payload["refresh_ref"].startswith("refresh_"))
+        self.assertEqual(dict(response.headers)["Location"], f"/api/v1/refresh/{payload['refresh_ref']}")
+
+    def test_snapshot_never_claims_a_revision_newer_than_its_materialized_read(self) -> None:
+        app = DashboardApplication(
+            token=TOKEN, query_service=RevisionQuery(), refresh_controller=Refresh(),
+            sync_controller=RevisionSync(), snapshot_cache=Cache(),
+            assets={"/": DashboardAsset("text/html", b"ok")},
+        ).bound_to(AUTHORITY)
+        headers = (("Host", AUTHORITY), ("Authorization", f"Bearer {TOKEN}"))
+
+        response = app.handle(DashboardRequest("GET", "/api/v1/snapshot", headers, b""))
+
+        self.assertEqual(response.status, 200)
+        payload = self.payload(response)
+        self.assertEqual(payload["data_revision"], 5)
+        self.assertEqual(payload["sync"]["progress"]["sources_processed"], 2)

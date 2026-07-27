@@ -171,6 +171,40 @@ export function taskDisplay(task) {
   return [family, date, ref].filter(Boolean).join(" · ") || "Unlabelled task";
 }
 
+export function shortRef(value) {
+  const reference = typeof value === "string" ? value.trim() : "";
+  if (!reference) return "Unavailable";
+  if (reference.length <= 16) return reference;
+  const separator = reference.indexOf("_");
+  const prefix = separator > 0 && separator <= 12
+    ? reference.slice(0, separator + 1) : "";
+  return `${prefix}…${reference.slice(-8)}`;
+}
+
+export function referenceLabel(displayName, reference) {
+  return el("span", {class: "reference-label"}, [
+    el("span", {class: "reference-name", text: displayName || "Unlabelled"}),
+    el("span", {class: "reference-ref mono", text: shortRef(reference)}),
+  ]);
+}
+
+export function copyRefButton(reference, kind, copyReference, displayName = "") {
+  const action = kind === "project" ? "Copy project ref" : "Copy task ref";
+  const button = el("button", {
+    class: "button ghost copy-ref", type: "button", text: "Copy ref",
+    "aria-label": displayName ? `${action} for ${displayName}` : action,
+  });
+  button.addEventListener("click", () => copyReference(reference, kind));
+  return button;
+}
+
+export function referenceIdentity(displayName, reference, kind, copyReference) {
+  return el("span", {class: "reference-identity"}, [
+    referenceLabel(displayName, reference),
+    copyRefButton(reference, kind, copyReference, displayName),
+  ]);
+}
+
 export function factPercent(fact) {
   return factText(fact, {percent: true});
 }

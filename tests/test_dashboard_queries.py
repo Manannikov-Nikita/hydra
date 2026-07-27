@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+import sqlite3
 from collections.abc import Mapping
 
 from hydra_codex.audit_model import AuditEvidence
@@ -327,6 +328,39 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertIsNone(empty)
         self.assertEqual(len(snapshots), 2)
         self.assertEqual(resolve_project.call_count, 0)
+
+    def test_connection_bootstrap_reads_materialized_reports_immediately(self) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        report = self.reports["project-a"][0]
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,reconciled_at,data_revision)
+                   VALUES (?,?,?,?,?,?,?)""",
+                ("project-a", report.task_ref, render_json(report).rstrip("\n"), "", "",
+                 "2026-07-22T11:00:00Z", 7),
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=7 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+        payload = snapshots[self.catalog_refs()["project-a"]].as_dict()
+        self.assertIsNone(empty)
+        self.assertEqual(payload["freshness"]["state"], "current")
+        self.assertEqual(payload["project"]["overview"]["headline"]["working_tokens"], report.deduplicated_tokens.working.as_dict())
+        self.assertEqual(payload["data_revision"], 7)
 
     def test_bootstrap_snapshots_preserve_empty_onboarding_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

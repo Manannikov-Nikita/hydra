@@ -5,6 +5,27 @@ from __future__ import annotations
 from .public_payload import reject_private_fields
 
 
+def _refresh_ref(sync_ref: str) -> str:
+    return "refresh_" + sync_ref.removeprefix("sync_")
+
+
+def _sync_ref(refresh_ref: str) -> str:
+    return "sync_" + refresh_ref.removeprefix("refresh_")
+
+
+def _refresh_payload(summary: dict[str, object], reused: bool | None = None) -> dict[str, object]:
+    progress = summary["progress"]
+    fact = lambda value: {"value": value, "unit": "count", "provenance": "derived", "caveats": [], "lower_bound": None}
+    result = {"schema_version": "hydra.dashboard-refresh/v1", "refresh_ref": _refresh_ref(str(summary["sync_ref"])),
+              "state": summary["state"], "stage": "reconcile" if summary["state"] == "running" else None,
+              "started_at": summary["started_at"], "finished_at": summary["finished_at"],
+              "progress": {"sources_discovered": fact(progress["sources_queued"]), "sources_inspected": fact(progress["sources_processed"]),
+                           "sources_scanned": fact(progress["sources_processed"]), "projects_total": fact(0),
+                           "projects_completed": fact(0), "projects_refreshed": fact(0)}, "diagnostic_codes": []}
+    if reused is not None: result["reused"] = reused
+    return result
+
+
 def payload(app: object) -> dict[str, object]:
     controller = app._sync_controller
     if controller is None:
@@ -20,17 +41,37 @@ def payload(app: object) -> dict[str, object]:
     return result
 
 
+def live_snapshot_available(app: object) -> bool:
+    """Use live materialized reads unless launch storage is still unavailable."""
+    controller = app._sync_controller
+    if controller is None:
+        return False
+    if app._fallback_error is None:
+        return True
+    try:
+        current = controller.current()
+    except Exception:
+        return False
+    return isinstance(current, dict) and current.get("state") in {"succeeded", "partial"}
+
+
 def dashboard_payload(app: object, result: dict[str, object]) -> dict[str, object]:
     changes = payload(app)
     result["schema_version"] = "hydra.dashboard/v2"
-    result["data_revision"], result["sync"] = changes["data_revision"], changes["sync"]
+    revision = result.get("data_revision")
+    if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0:
+        current = app._sync_controller.changes(revision) if app._sync_controller is not None else changes
+        result["data_revision"] = revision
+        result["sync"] = current["sync"] if not current["changed"] else result.get("sync", changes["sync"])
+    else:
+        result["data_revision"], result["sync"] = changes["data_revision"], changes["sync"]
     reject_private_fields(result)
     return result
 
 
 def dispatch(app: object, method: str, path: str, raw_query: str | None):
     """Return a response for sync routes or ``None`` when another router owns it."""
-    from .dashboard_server import _HttpError, _SYNC_REF, _as_dict
+    from .dashboard_server import _HttpError, _REFRESH_REF, _SYNC_REF, _as_dict
 
     controller = app._sync_controller
     if path == "/api/v1/changes":
@@ -72,13 +113,13 @@ def dispatch(app: object, method: str, path: str, raw_query: str | None):
             current, reused = controller.start_sync()
         except Exception:
             raise _HttpError("refresh_unavailable") from None
-        return app._json(202, {**current, "reused": bool(reused)}, method,
-                         extra=(("Location", f"/api/v1/sync/{current['sync_ref']}"),))
+        result = _refresh_payload(current, bool(reused))
+        return app._json(202, result, method, extra=(("Location", f"/api/v1/refresh/{result['refresh_ref']}"),))
     if path.startswith("/api/v1/refresh/") and controller is not None:
         app._parse_query_fields(raw_query, allowed=())
         if method not in {"GET", "HEAD"}:
             raise _HttpError("method_not_allowed")
-        sync_ref = app._reference(path.removeprefix("/api/v1/refresh/"), _SYNC_REF)
-        assert sync_ref is not None
-        return app._json(200, controller.get(sync_ref), method)
+        refresh_ref = app._reference(path.removeprefix("/api/v1/refresh/"), _REFRESH_REF)
+        assert refresh_ref is not None
+        return app._json(200, _refresh_payload(controller.get(_sync_ref(refresh_ref))), method)
     return None

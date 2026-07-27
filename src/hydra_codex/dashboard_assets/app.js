@@ -1,6 +1,6 @@
 import {DashboardApi, ApiError} from "./api.js";
 import {asyncState, el, emptyState, formatNumber, pageHeader} from "./dom.js";
-import {initialState, reduce, ROUTES} from "./state.js";
+import {initialState, reduce, ROUTES, runSerializedPoll} from "./state.js";
 import {initializeShell, updateShell} from "./views/shell.js";
 import {renderOverview} from "./views/overview.js";
 import {renderTasks} from "./views/tasks.js";
@@ -27,7 +27,10 @@ let routeWorkGeneration = 0;
 let lastAnnouncement = null;
 let lastRefreshProgress = null;
 let dataRevision = 0;
-let changePoll = null;
+let changePolling = false;
+let changePollPromise = null;
+let activeJobPoll = null;
+let activeJobKind = null;
 
 function dispatch(action) {
   state = reduce(state, action);
@@ -44,7 +47,8 @@ function showAsyncState(kind, title, detail, retry = null, actionLabel = "Retry"
   asyncStatus.replaceChildren(asyncState(kind, title, detail, retry, actionLabel));
 }
 
-function clearAsyncState() {
+function clearAsyncState(force = false) {
+  if (activeJobPoll && !force) return;
   asyncStatus.replaceChildren();
 }
 
@@ -155,6 +159,12 @@ function errorMessage(code) {
   return messages[code] || "The request could not be completed.";
 }
 
+function acknowledgeRevision(candidate) {
+  if (Number.isInteger(candidate) && candidate >= 0 && candidate > dataRevision) {
+    dataRevision = candidate;
+  }
+}
+
 function renderError(code, retry = loadRoute) {
   showAsyncState("error", "Evidence unavailable", errorMessage(code), retry);
   announce("Evidence unavailable");
@@ -191,6 +201,7 @@ function actions() {
           await loadAllTasks(context);
         }
         if (!isCurrentRouteWork(context)) return;
+        acknowledgeRevision(snapshot.data_revision);
         announce("Project changed");
       }, () => actions().selectProject(projectRef));
     },
@@ -214,6 +225,22 @@ function actions() {
       "Finding evidence", context => findEvidence(projectRef, evidenceRef, context),
       () => actions().findEvidence(projectRef, evidenceRef),
     ),
+    copyReference: async (reference, kind) => {
+      const label = kind === "project" ? "Project" : "Task";
+      const clipboard = navigator.clipboard;
+      if (!clipboard || typeof clipboard.writeText !== "function") {
+        announce(`${label} ref copy is unavailable. Use the visible short ref instead.`);
+        return false;
+      }
+      try {
+        await clipboard.writeText(reference);
+        announce(`${label} ref copied`);
+        return true;
+      } catch (_) {
+        announce(`Could not copy ${label.toLowerCase()} ref. Use the visible short ref instead.`);
+        return false;
+      }
+    },
   };
 }
 
@@ -254,7 +281,6 @@ async function loadSnapshot(projectRef = state.projectRef, context) {
   const snapshot = await api.snapshot(projectRef, null, abortPrevious());
   if (!isCurrentRouteWork(context)) return null;
   dispatch({type: "snapshot", snapshot});
-  dataRevision = Number.isInteger(snapshot.data_revision) && snapshot.data_revision >= 0 ? snapshot.data_revision : dataRevision;
   context.projectRef = state.projectRef;
   renderRoute();
   return snapshot;
@@ -324,6 +350,7 @@ async function loadRoute() {
       if (!loaded || !isCurrentRouteWork(context)) return;
     }
     if (!isCurrentRouteWork(context)) return;
+    acknowledgeRevision(state.snapshot && state.snapshot.data_revision);
     renderRoute();
     clearAsyncState();
     announce(`${state.route} ready`);
@@ -335,7 +362,7 @@ async function loadRoute() {
   }
 }
 
-async function reloadAfterRefresh() {
+async function reloadAfterRefresh(acknowledge = true) {
   const preferredProject = state.projectRef;
   dispatch({type: "reset_after_refresh"});
   const context = beginRouteWork();
@@ -355,46 +382,54 @@ async function reloadAfterRefresh() {
     const loaded = await loadAllTasks(context);
     if (!loaded || !isCurrentRouteWork(context)) return false;
   }
-  return isCurrentRouteWork(context);
+  if (!isCurrentRouteWork(context)) return false;
+  if (acknowledge) acknowledgeRevision(state.snapshot && state.snapshot.data_revision);
+  return true;
 }
 
 function announceRefresh(current) {
+  const jobKind = activeJobKind || "sync";
   const stage = REFRESH_STAGES.includes(current.stage) ? current.stage : current.state;
-  const progressKey = `${current.state}:${stage}`;
+  const progressKey = `${jobKind}:${current.state}:${stage}`;
   if (progressKey === lastRefreshProgress) return;
   lastRefreshProgress = progressKey;
-  if (!TERMINAL_REFRESH.has(current.state)) announce(`Sync ${stage}`);
+  if (!TERMINAL_REFRESH.has(current.state)) {
+    if (jobKind === "repair") announce(`Repair ${stage}`);
+    else announce(`Sync ${stage}`);
+  }
 }
 
-async function pollRefresh(refreshRef) {
+async function pollRefresh(refreshRef, jobKind, retry) {
   for (;;) {
     await new Promise(resolve => window.setTimeout(resolve, 1000));
     const current = await api.syncStatus(refreshRef);
-    showAsyncState("loading", "Syncing evidence", refreshProgressDetail(current));
+    if (jobKind === "repair") {
+      showAsyncState("loading", "Repairing history", refreshProgressDetail(current));
+    } else {
+      showAsyncState("loading", "Syncing evidence", refreshProgressDetail(current));
+    }
     announceRefresh(current);
     if (!TERMINAL_REFRESH.has(current.state)) continue;
 
     const reloaded = await reloadAfterRefresh();
-    refreshButton.disabled = false;
-    refreshButton.removeAttribute("aria-busy");
-    refreshButton.textContent = current.state === "partial"
-      ? "Sync again" : current.state === "failed" ? "Retry" : "Sync now";
-    if (!reloaded) return;
+    if (!reloaded) return current;
     if (current.state === "partial" || current.state === "failed") {
       const partial = current.state === "partial";
-      const title = partial ? "Sync needs another pass" : "Sync failed";
+      const title = jobKind === "repair"
+        ? partial ? "Repair needs another pass" : "Repair history failed"
+        : partial ? "Sync needs another pass" : "Sync failed";
       const detail = refreshDiagnosticDetail(current);
       showAsyncState(
-        partial ? "notice" : "error", title, detail, startRefresh,
-        partial ? "Sync again" : "Retry",
+        partial ? "notice" : "error", title, detail, retry,
+        partial ? jobKind === "repair" ? "Repair again" : "Sync again" : "Retry",
       );
       routeStatus.textContent = "";
       announceRefreshOutcome(`${title}. ${detail}`);
     } else {
-      clearAsyncState();
-      announce("Sync complete");
+      clearAsyncState(true);
+      announce(jobKind === "repair" ? "Repair complete" : "Sync complete");
     }
-    return;
+    return current;
   }
 }
 
@@ -404,59 +439,131 @@ function announceRefreshOutcome(message) {
   liveRegion.textContent = message;
 }
 
-async function startRefresh() {
-  if (!api || refreshButton.disabled) return;
-  refreshButton.disabled = true;
-  refreshButton.setAttribute("aria-busy", "true");
-  lastRefreshProgress = null;
-  showAsyncState("loading", "Syncing evidence", "Current evidence stays visible while new queued telemetry is reconciled.");
-  try {
-    const started = await api.startSync();
-    announce(started.reused ? "Existing sync reused" : "Sync started");
-    await pollRefresh(started.sync_ref);
-  } catch (error) {
-    refreshButton.disabled = false;
-    refreshButton.removeAttribute("aria-busy");
-    refreshButton.textContent = "Retry sync";
-    const code = error instanceof ApiError ? error.code : "internal_failure";
-    showAsyncState("error", "Sync failed", errorMessage(code), startRefresh);
-    routeStatus.textContent = "";
-    announceRefreshOutcome("Sync failed");
+function setMutatingBusy(jobKind, busy) {
+  refreshButton.disabled = busy;
+  repairButton.disabled = busy;
+  repairConfirmButton.disabled = busy;
+  refreshButton.removeAttribute("aria-busy");
+  repairButton.removeAttribute("aria-busy");
+  if (busy) {
+    const initiatingControl = jobKind === "repair" ? repairButton : refreshButton;
+    initiatingControl.setAttribute("aria-busy", "true");
   }
+}
+
+function updateMutatingLabels(jobKind, terminalState, failed) {
+  if (jobKind === "sync") {
+    refreshButton.textContent = failed
+      ? "Retry sync"
+      : terminalState === "partial" ? "Sync again"
+        : terminalState === "failed" ? "Retry" : "Sync now";
+  }
+  repairButton.textContent = "Repair history";
+}
+
+function hideRepairConfirmation(nextFocus = repairButton) {
+  const focusWasInside = repairConfirmation.contains(document.activeElement);
+  repairConfirmation.hidden = true;
+  repairButton.setAttribute("aria-expanded", "false");
+  if (nextFocus && (focusWasInside || nextFocus === asyncStatus)) {
+    if (nextFocus === asyncStatus) asyncStatus.focus({preventScroll: true});
+    else nextFocus.focus({preventScroll: true});
+  }
+}
+
+function runActiveJob(jobKind, start) {
+  if (activeJobPoll) return activeJobPoll;
+  activeJobKind = jobKind;
+  lastRefreshProgress = null;
+  setMutatingBusy(jobKind, true);
+  const jobTitle = jobKind === "repair" ? "Repairing history" : "Syncing evidence";
+  const jobDetail = jobKind === "repair"
+    ? "Repair history is walking all trusted telemetry files; existing evidence remains visible."
+    : "Current evidence stays visible while new queued telemetry is reconciled.";
+  showAsyncState("loading", jobTitle, jobDetail);
+
+  let terminalState = null;
+  let failed = false;
+  const retry = jobKind === "repair" ? startRepair : startRefresh;
+  activeJobPoll = (async () => {
+    const started = await start();
+    announce(started.reused
+      ? `Existing ${jobKind} reused`
+      : jobKind === "repair" ? "Repair started" : "Sync started");
+    const terminal = await pollRefresh(started.sync_ref, jobKind, retry);
+    terminalState = terminal && terminal.state;
+    return terminal;
+  })().catch(error => {
+    failed = true;
+    const code = error instanceof ApiError ? error.code : "internal_failure";
+    const title = jobKind === "repair" ? "Repair history failed" : "Sync failed";
+    showAsyncState("error", title, errorMessage(code), retry);
+    routeStatus.textContent = "";
+    announceRefreshOutcome(title);
+    return null;
+  }).finally(() => {
+    setMutatingBusy(jobKind, false);
+    updateMutatingLabels(jobKind, terminalState, failed);
+    activeJobPoll = null;
+    activeJobKind = null;
+    if (jobKind === "repair" && document.activeElement === asyncStatus) {
+      repairButton.focus({preventScroll: true});
+    }
+  });
+  return activeJobPoll;
+}
+
+async function startRefresh() {
+  if (!api) return null;
+  return runActiveJob("sync", () => api.startSync());
+}
+
+async function startRepair() {
+  if (!api) return null;
+  return runActiveJob("repair", () => api.startRepair());
 }
 
 refreshButton.addEventListener("click", startRefresh);
 repairButton.addEventListener("click", () => {
-  const visible = repairConfirmation.hidden;
-  repairConfirmation.hidden = !visible;
-  repairButton.setAttribute("aria-expanded", String(visible));
-  if (visible) repairConfirmButton.focus({preventScroll: true});
+  if (repairConfirmation.hidden) {
+    repairConfirmation.hidden = false;
+    repairButton.setAttribute("aria-expanded", "true");
+    repairConfirmButton.focus({preventScroll: true});
+  } else {
+    hideRepairConfirmation(repairButton);
+  }
 });
-repairConfirmButton.addEventListener("click", async () => {
-  repairConfirmButton.disabled = true;
+repairConfirmButton.addEventListener("click", () => {
   showAsyncState("loading", "Repairing history", "Repair history is walking all trusted telemetry files; existing evidence remains visible.");
-  try {
-    const started = await api.startRepair();
-    repairConfirmation.hidden = true;
-    repairButton.setAttribute("aria-expanded", "false");
-    await pollRefresh(started.sync_ref);
-  } catch (error) {
-    showAsyncState("error", "Repair history failed", errorMessage(error instanceof ApiError ? error.code : "internal_failure"));
-  } finally { repairConfirmButton.disabled = false; }
+  hideRepairConfirmation(asyncStatus);
+  runActiveJob("repair", () => api.startRepair());
 });
 
 async function pollChanges() {
   if (!api) return;
   try {
     const changes = await api.changes(dataRevision);
-    if (Number.isInteger(changes.data_revision) && changes.data_revision > dataRevision) dataRevision = changes.data_revision;
-    if (changes.changed && !refreshButton.disabled) await reloadAfterRefresh();
+    const pendingRevision = Number.isInteger(changes.data_revision)
+      && changes.data_revision > dataRevision ? changes.data_revision : null;
+    if (!changes.changed || pendingRevision === null || activeJobPoll) return;
+    const reloaded = await reloadAfterRefresh(false);
+    if (!reloaded) return;
+    acknowledgeRevision(state.snapshot && state.snapshot.data_revision);
+    acknowledgeRevision(pendingRevision);
   } catch (_) { /* A later one-second poll retries without exposing transport details. */ }
 }
 
 function startChangePolling() {
-  if (changePoll !== null) window.clearInterval(changePoll);
-  changePoll = window.setInterval(pollChanges, 1000);
+  if (changePollPromise) return changePollPromise;
+  changePolling = true;
+  changePollPromise = runSerializedPoll(
+    delay => new Promise(resolve => window.setTimeout(resolve, delay)),
+    pollChanges,
+    () => changePolling,
+  ).finally(() => {
+    changePollPromise = null;
+  });
+  return changePollPromise;
 }
 window.addEventListener("popstate", () => {
   dispatch({type: "route", route: routeFromLocation()});
@@ -474,6 +581,9 @@ window.addEventListener("hydra-dashboard-ready", event => {
   loadRoute();
   startChangePolling();
   api.sync().then(current => {
-    if (current && (current.state === "queued" || current.state === "running")) pollRefresh(current.sync_ref);
+    if (current && (current.state === "queued" || current.state === "running")) {
+      const jobKind = current.kind === "repair" ? "repair" : "sync";
+      runActiveJob(jobKind, () => Promise.resolve(current));
+    }
   }).catch(() => undefined);
 }, {once: true});

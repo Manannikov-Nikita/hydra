@@ -31,7 +31,7 @@ from .project import resolve_project
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .services import configured_database_path, configured_installation_key_path
 from .platform_paths import default_database_path
-from .storage import MIGRATIONS, HydraStore
+from .storage import MIGRATIONS, HydraStore, ValidatedStoreProvider
 
 
 _ASSETS = MappingProxyType({
@@ -217,7 +217,10 @@ def run_dashboard(
     key_path = configured_installation_key_path(environ, installation_key_path)
     key = Pseudonymizer.installation_key(key_path).key
     now = lambda: datetime.now(timezone.utc)
-    store_factory = lambda: HydraStore(selected_database)
+    store_provider = ValidatedStoreProvider(
+        lambda: HydraStore.open_current(selected_database),
+    )
+    store_factory = store_provider.open
     bootstrap_connection, database_state = _bootstrap_database(actual_database)
     doctor = _bootstrap_doctor(
         cwd=cwd, database_path=actual_database, database_state=database_state,
@@ -252,7 +255,7 @@ def run_dashboard(
     controller = RefreshController(cache, _DisabledRefreshRunner(store_factory), clock=now)
     sync_controller = DashboardSyncController(
         store_factory=store_factory, roots=_sync_roots(environ),
-        installation_key=key, clock=now,
+        installation_key=key, clock=now, auto_activate=False,
     )
     token = secrets.token_urlsafe(32)
     application = DashboardApplication(

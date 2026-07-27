@@ -447,12 +447,21 @@ def main(
     input_stream: TextIO | None = None,
     output_stream: TextIO | None = None,
     command_prefix: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> int:
-    serve(
-        sys.stdin if input_stream is None else input_stream,
-        sys.stdout if output_stream is None else output_stream,
-        StdioMcpServer(command_prefix=command_prefix),
+    from .mcp_sync import create_mcp_sync_controller
+
+    sync_controller = create_mcp_sync_controller(
+        os.environ if environ is None else environ,
     )
+    try:
+        serve(
+            sys.stdin if input_stream is None else input_stream,
+            sys.stdout if output_stream is None else output_stream,
+            StdioMcpServer(command_prefix=command_prefix),
+        )
+    finally:
+        sync_controller.close()
     return 0
 
 

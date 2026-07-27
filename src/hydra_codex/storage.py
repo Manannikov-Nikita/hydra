@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Iterator
+import threading
+from typing import Callable, Iterator
 
 from .contracts import AnnotationRecord, ConflictRecord, ThreadSessionRecord, TurnRecord
+from .exact_time import require_exact_timestamp
 from .migration_support import V2_TRIGGER_STATEMENTS
 from .migrations_b2 import B2_MIGRATIONS
 from .migrations_c3 import C3_MIGRATIONS, C3_REQUIRED_SCHEMA
@@ -55,15 +57,69 @@ from .migrations_w23 import (
 from .migrations_x24 import (
     X24_DASHBOARD_PROJECTS_TABLE_SQL,
     X24_HOOK_SAFE_FACTS_TABLE_SQL,
-    X24_MATERIALIZED_REPORT_SNAPSHOTS_TABLE_SQL,
     X24_MIGRATIONS,
     X24_REQUIRED_SCHEMA,
+)
+from .migrations_y25 import (
+    Y25_MATERIALIZED_REPORT_SNAPSHOTS_TABLE_SQL,
+    Y25_MIGRATIONS,
+    Y25_REQUIRED_SCHEMA,
+    Y25_REQUIRED_TRIGGER_SQL,
+)
+from .migrations_z26 import (
+    Z26_MATERIALIZED_PROJECT_STATS_TABLE_SQL,
+    Z26_MIGRATIONS,
+    Z26_REQUIRED_SCHEMA,
+    Z26_REQUIRED_TRIGGER_SQL,
+    Z26_SYNC_JOBS_TABLE_SQL,
+)
+from .migrations_aa27 import (
+    AA27_MIGRATIONS,
+    AA27_REQUIRED_SCHEMA,
+    AA27_REQUIRED_TRIGGER_SQL,
+    AA27_SYNC_DIRTY_ROOTS_TABLE_SQL,
+    AA27_SYNC_INGEST_QUEUE_TABLE_SQL,
+    AA27_SYNC_WORK_SUMMARY_TABLE_SQL,
 )
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
 class StorageUnavailable(RuntimeError):
     """Raised when the configured database cannot safely be opened."""
+
+
+_MIGRATION_THREAD_LOCK = threading.RLock()
+
+
+def _rfc3339_nanoseconds(value: object) -> int:
+    instant = require_exact_timestamp(value, "private sync eligibility")
+    epoch = instant.epoch_nanoseconds
+    if not -(1 << 63) <= epoch < (1 << 63):
+        raise ValueError("private sync eligibility exceeds SQLite range")
+    return epoch
+
+
+@contextmanager
+def _database_migration_lock(database_path: Path) -> Iterator[None]:
+    """Serialize schema migration across threads and local Hydra processes."""
+    with _MIGRATION_THREAD_LOCK:
+        if os.name != "posix":
+            yield
+            return
+        import fcntl
+
+        lock_path = database_path.with_name(database_path.name + ".migration.lock")
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
 
 @dataclass(frozen=True)
 class WriteResult:
@@ -294,7 +350,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -361,6 +417,18 @@ def _table_schema_sql(connection: sqlite3.Connection, table: str) -> str:
 class HydraStore:
     """Single-process SQLite store; callers provide an explicit path for tests."""
 
+    _BOUNDED_MIGRATION_MIN_VERSION = 38
+
+    @staticmethod
+    def _configure_connection(connection: sqlite3.Connection) -> None:
+        connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "hydra_rfc3339_nanos",
+            1,
+            _rfc3339_nanoseconds,
+            deterministic=True,
+        )
+
     def __init__(self, path: Path | str | None = None) -> None:
         self.database_path = default_database_path() if path is None else Path(path)
         try:
@@ -371,19 +439,211 @@ class HydraStore:
             elif not self.database_path.parent.is_dir():
                 raise StorageUnavailable(f"database parent does not exist: {self.database_path.parent}")
             self.connection = sqlite3.connect(self.database_path)
-            self.connection.row_factory = sqlite3.Row
+            self._configure_connection(self.connection)
             if os.name == "posix":
                 os.chmod(self.database_path, 0o600)
             self.connection.execute("PRAGMA foreign_keys = ON")
-            self.connection.execute("PRAGMA journal_mode = WAL")
             self.connection.execute("PRAGMA busy_timeout = 5000")
-            self._migrate()
+            current_version = int(
+                self.connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if current_version < MIGRATIONS[-1][0]:
+                with _database_migration_lock(self.database_path):
+                    self.connection.execute("PRAGMA journal_mode = WAL")
+                    self._migrate()
+            else:
+                self.connection.execute("PRAGMA journal_mode = WAL")
+                self._migrate()
+        except StorageUnavailable:
+            self.close()
+            raise
         except (OSError, sqlite3.Error) as error:
+            self.close()
+            raise StorageUnavailable(f"cannot open Hydra database: {self.database_path}") from error
+
+    def validated_reopener(self) -> Callable[[], HydraStore]:
+        """Return a lightweight opener capability for this validated database."""
+        if self.connection is None:
+            raise StorageUnavailable("validated Hydra database is closed")
+        database_path = self.database_path.resolve()
+        identity = os.stat(database_path)
+        expected_identity = (identity.st_dev, identity.st_ino)
+        expected_version = int(
+            self.connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        expected_schema_version = int(
+            self.connection.execute("PRAGMA schema_version").fetchone()[0]
+        )
+        store_type = type(self)
+        return lambda: store_type._open_validated(
+            database_path,
+            expected_version,
+            expected_schema_version,
+            expected_identity,
+        )
+
+    @classmethod
+    def open_current(cls, path: Path | str | None = None) -> HydraStore:
+        """Open a current database without repeating its whole-file audit.
+
+        Fresh or stale databases fall back to the normal migration and full
+        validation boundary. Current databases use cheap identity, version and
+        schema-cookie guards; long-lived callers should additionally retain a
+        :meth:`validated_reopener` capability rather than trust a pathname.
+        """
+        database_path = default_database_path() if path is None else Path(path)
+        try:
+            identity = os.stat(database_path)
+        except FileNotFoundError:
+            return cls(path)
+        except OSError as error:
+            raise StorageUnavailable(
+                f"cannot inspect Hydra database: {database_path}",
+            ) from error
+        expected_identity = (identity.st_dev, identity.st_ino)
+        store = cls.__new__(cls)
+        store.database_path = database_path.resolve()
+        try:
+            database_uri = store.database_path.as_uri() + "?mode=rw"
+            store.connection = sqlite3.connect(database_uri, uri=True)
+            cls._configure_connection(store.connection)
+            store.connection.execute("PRAGMA foreign_keys = ON")
+            store.connection.execute("PRAGMA busy_timeout = 5000")
+            schema_before = int(
+                store.connection.execute("PRAGMA schema_version").fetchone()[0]
+            )
+            current_version = int(
+                store.connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            schema_after = int(
+                store.connection.execute("PRAGMA schema_version").fetchone()[0]
+            )
+            current_identity = os.stat(store.database_path)
+            if (
+                (current_identity.st_dev, current_identity.st_ino)
+                != expected_identity
+            ):
+                raise StorageUnavailable(
+                    "Hydra database changed during current-schema open",
+                )
+            if schema_before != schema_after:
+                raise StorageUnavailable(
+                    "Hydra database schema changed during current-schema open",
+                )
+            latest = MIGRATIONS[-1][0]
+            if current_version == latest:
+                return store
+            if current_version > latest:
+                raise StorageUnavailable(
+                    f"Hydra database schema {current_version} is newer than "
+                    f"supported {latest}",
+                )
+            with _database_migration_lock(store.database_path):
+                # A concurrent first creator or bounded upgrader may have won
+                # while this opener waited. Re-read under the cross-process
+                # migration guard rather than failing open and losing the hook.
+                current_version = int(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+                if current_version == latest:
+                    return store
+                if current_version > latest:
+                    raise StorageUnavailable(
+                        f"Hydra database schema {current_version} is newer than "
+                        f"supported {latest}",
+                    )
+                if current_version < cls._BOUNDED_MIGRATION_MIN_VERSION:
+                    raise StorageUnavailable(
+                        "Hydra database schema requires an explicit upgrade",
+                    )
+                # v38+ upgrades add only bounded incremental-state/materialized
+                # structures. Validate their exact schema after migration
+                # without turning a hook handshake into a whole-database scan.
+                store.connection.execute("PRAGMA journal_mode = WAL")
+                store._migrate(full_validation=False)
+                migrated_identity = os.stat(store.database_path)
+                if (
+                    (migrated_identity.st_dev, migrated_identity.st_ino)
+                    != expected_identity
+                ):
+                    raise StorageUnavailable(
+                        "Hydra database changed during bounded migration",
+                    )
+                return store
+        except (OSError, sqlite3.Error) as error:
+            store.close()
+            raise StorageUnavailable(
+                f"cannot open current Hydra database: {store.database_path}",
+            ) from error
+        except BaseException:
+            store.close()
+            raise
+
+    @classmethod
+    def _open_validated(
+        cls,
+        path: Path,
+        expected_version: int,
+        expected_schema_version: int,
+        expected_identity: tuple[int, int],
+    ) -> HydraStore:
+        """Open an existing database through a validated-store capability.
+
+        This deliberately skips migration and whole-database integrity checks.
+        The private entry point is exposed only by :meth:`validated_reopener`;
+        cheap inode and schema-version guards reject replacement or migration.
+        """
+        store = cls.__new__(cls)
+        store.database_path = path
+        try:
+            if not store.database_path.parent.is_dir():
+                raise StorageUnavailable(
+                    f"database parent does not exist: {store.database_path.parent}"
+                )
+            identity = os.stat(store.database_path)
+            if (identity.st_dev, identity.st_ino) != expected_identity:
+                raise StorageUnavailable(
+                    "Hydra database changed after startup validation"
+                )
+            database_uri = store.database_path.as_uri() + "?mode=rw"
+            store.connection = sqlite3.connect(database_uri, uri=True)
+            cls._configure_connection(store.connection)
+            store.connection.execute("PRAGMA foreign_keys = ON")
+            store.connection.execute("PRAGMA busy_timeout = 5000")
+            current_version = int(
+                store.connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            current_schema_version = int(
+                store.connection.execute("PRAGMA schema_version").fetchone()[0]
+            )
+            identity = os.stat(store.database_path)
+            if (identity.st_dev, identity.st_ino) != expected_identity:
+                raise StorageUnavailable(
+                    "Hydra database changed after startup validation"
+                )
+            if (
+                current_version != expected_version
+                or current_version != MIGRATIONS[-1][0]
+                or current_schema_version != expected_schema_version
+            ):
+                raise StorageUnavailable(
+                    "Hydra database schema changed after startup validation"
+                )
+            return store
+        except (OSError, sqlite3.Error):
             try:
-                self.connection.close()
+                store.connection.close()
             except AttributeError:
                 pass
-            raise StorageUnavailable(f"cannot open Hydra database: {self.database_path}") from error
+            raise StorageUnavailable(
+                f"cannot open validated Hydra database: {store.database_path}"
+            ) from None
+        except BaseException:
+            try:
+                store.connection.close()
+            except AttributeError:
+                pass
+            raise
 
     def close(self) -> None:
         connection = getattr(self, "connection", None)
@@ -410,7 +670,29 @@ class HydraStore:
         with self._transaction() as connection:
             yield connection
 
-    def _migrate(self) -> None:
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Hold one coherent SQLite snapshot while rejecting accidental writes."""
+        if self.connection.in_transaction:
+            yield self.connection
+            return
+        previous_query_only = int(
+            self.connection.execute("PRAGMA query_only").fetchone()[0]
+        )
+        try:
+            self.connection.execute("PRAGMA query_only=ON")
+            self.connection.execute("BEGIN")
+            yield self.connection
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
+        finally:
+            self.connection.execute(
+                f"PRAGMA query_only={'ON' if previous_query_only else 'OFF'}"
+            )
+
+    def _migrate(self, *, full_validation: bool = True) -> None:
         try:
             current_version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
             latest = MIGRATIONS[-1][0]
@@ -491,16 +773,39 @@ class HydraStore:
                         reconcile_turn_attempts(connection)
                         materialize_test_evidence(connection)
                         reconcile_test_retries(connection)
+                    if version == 43:
+                        from .migrations_y25 import (
+                            backfill_materialized_report_activity,
+                        )
+
+                        backfill_materialized_report_activity(connection)
+                    if version == 44:
+                        from .migrations_z26 import (
+                            backfill_bounded_materialized_indexes,
+                        )
+
+                        backfill_bounded_materialized_indexes(connection)
+                    if version == 45:
+                        from .migrations_aa27 import (
+                            backfill_sync_work_eligibility,
+                        )
+
+                        backfill_sync_work_eligibility(connection)
                     connection.execute(
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
                         (version,),
                     )
                     connection.execute(f"PRAGMA user_version = {version}")
-            self._validate_schema(latest)
+            if full_validation:
+                self._validate_schema(latest)
+            else:
+                self._validate_schema(latest, full_validation=False)
         except sqlite3.Error as error:
             raise StorageUnavailable(f"cannot migrate Hydra database: {self.database_path}") from error
 
-    def _validate_schema(self, latest: int) -> None:
+    def _validate_schema(
+        self, latest: int, *, full_validation: bool = True,
+    ) -> None:
         versions = [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
         if versions != list(range(1, latest + 1)):
             raise StorageUnavailable("Hydra schema migration history is inconsistent")
@@ -533,6 +838,9 @@ class HydraStore:
         required.update(U21_REQUIRED_SCHEMA)
         required.update(W23_REQUIRED_SCHEMA)
         required.update(X24_REQUIRED_SCHEMA)
+        required.update(Y25_REQUIRED_SCHEMA)
+        required.update(Z26_REQUIRED_SCHEMA)
+        required.update(AA27_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -560,14 +868,25 @@ class HydraStore:
             )
         for table, expected_sql in {
             "hook_safe_facts": X24_HOOK_SAFE_FACTS_TABLE_SQL,
-            "materialized_report_snapshots": X24_MATERIALIZED_REPORT_SNAPSHOTS_TABLE_SQL,
+            "materialized_report_snapshots":
+                Y25_MATERIALIZED_REPORT_SNAPSHOTS_TABLE_SQL,
+            "materialized_project_stats":
+                Z26_MATERIALIZED_PROJECT_STATS_TABLE_SQL,
+            "sync_work_summary": AA27_SYNC_WORK_SUMMARY_TABLE_SQL,
         }.items():
             if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
                 raise StorageUnavailable("Hydra schema has altered materialized report trust constraints")
         for table, expected_sql in W23_REQUIRED_TABLE_SQL.items():
+            if table == "sync_jobs":
+                expected_sql = Z26_SYNC_JOBS_TABLE_SQL
+            elif table == "sync_ingest_queue":
+                expected_sql = AA27_SYNC_INGEST_QUEUE_TABLE_SQL
+            elif table == "sync_dirty_roots":
+                expected_sql = AA27_SYNC_DIRTY_ROOTS_TABLE_SQL
             if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
                 raise StorageUnavailable(
-                    "Hydra schema has altered incremental sync trust constraints"
+                    "Hydra schema has altered incremental sync trust "
+                    f"constraints: {table}"
                 )
         tool_role_foreign_key = (
             (
@@ -651,6 +970,43 @@ class HydraStore:
                 raise StorageUnavailable(
                     "Hydra schema has altered incremental sync trust constraints"
                 )
+        for name, expected_sql in Y25_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered materialized "
+                    f"report activity trigger: {name}"
+                )
+        for name, expected_sql in Z26_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered bounded "
+                    f"materialization trigger: {name}"
+                )
+        for name, expected_sql in AA27_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered bounded "
+                    f"sync-work trigger: {name}"
+                )
+        if full_validation:
+            self._validate_database_integrity()
+
+    def _validate_database_integrity(self) -> None:
         if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise StorageUnavailable("Hydra schema has foreign-key violations")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
@@ -795,3 +1151,30 @@ class HydraStore:
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")
         return int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+class ValidatedStoreProvider:
+    """Share one guarded database identity across thread-local connections."""
+
+    def __init__(self, bootstrap: Callable[[], HydraStore]) -> None:
+        if not callable(bootstrap):
+            raise TypeError("validated store bootstrap must be callable")
+        self._bootstrap = bootstrap
+        self._reopen: Callable[[], HydraStore] | None = None
+        self._lock = threading.Lock()
+
+    def open(self) -> HydraStore:
+        reopen = self._reopen
+        if reopen is not None:
+            return reopen()
+        with self._lock:
+            reopen = self._reopen
+            if reopen is not None:
+                return reopen()
+            store = self._bootstrap()
+            try:
+                self._reopen = store.validated_reopener()
+            except BaseException:
+                store.close()
+                raise
+            return store

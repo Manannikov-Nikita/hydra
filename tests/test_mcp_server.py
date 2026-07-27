@@ -310,7 +310,7 @@ class StdioMcpServerTests(unittest.TestCase):
         self.assertEqual(runner.calls, [(("hydra-test", "report", "--last", "1", "--format", "json"), None)])
         self.assertNotIn("private", response["result"]["content"][0]["text"])
 
-    def test_report_audit_mode_delegates_to_one_shot_audit_command(self) -> None:
+    def test_report_audit_mode_delegates_to_read_only_materialized_audit(self) -> None:
         pilot_id = "hpilot_v1_0123456789abcdef0123456789abcdef"
         runner = FakeRunner([
             ProcessResult(0, '{"schema_version":"hydra.audit/v1"}\n', ""),

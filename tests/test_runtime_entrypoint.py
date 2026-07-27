@@ -86,6 +86,7 @@ class RuntimeCliRouteTests(unittest.TestCase):
             input_stream=stdin,
             output_stream=stdout,
             command_prefix=prefix,
+            environ=ANY,
         )
         self.assertEqual(stderr.getvalue(), "")
 

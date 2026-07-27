@@ -157,7 +157,8 @@ W23_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         W23_SYNC_BACKFILL_FRONTIER_TABLE_SQL,
         W23_SYNC_DATA_REVISION_TABLE_SQL,
         *W23_LOCATOR_TRIGGER_STATEMENTS,
-        "INSERT INTO sync_data_revision(singleton,revision,updated_at) VALUES (1,0,datetime('now'))",
+        """INSERT INTO sync_data_revision(singleton,revision,updated_at)
+           VALUES (1,0,'1970-01-01T00:00:00Z')""",
         "CREATE INDEX sync_ingest_queue_available ON sync_ingest_queue(queue_state,available_at,enqueued_at)",
         "CREATE INDEX sync_dirty_roots_project ON sync_dirty_roots(project_id,root_kind,observed_at)",
         "CREATE INDEX sync_dirty_roots_claim ON sync_dirty_roots(claim_expires_at,observed_at)",

@@ -52,8 +52,13 @@ class DashboardSyncController:
     def __init__(
         self, *, store_factory: Callable[[], HydraStore], roots: TrustedSourceRoots | None,
         installation_key: bytes, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        auto_activate: bool = True,
     ) -> None:
-        if not callable(store_factory) or not callable(clock):
+        if (
+            not callable(store_factory)
+            or not callable(clock)
+            or not isinstance(auto_activate, bool)
+        ):
             raise TypeError("dashboard sync dependencies must be callable")
         if not isinstance(installation_key, bytes) or len(installation_key) < 16:
             raise ValueError("dashboard sync installation key is invalid")
@@ -61,15 +66,58 @@ class DashboardSyncController:
         self._key, self._clock = installation_key, clock
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._activation_lock = threading.RLock()
         self._closed = threading.Event()
-        if self._roots is not None:
-            self._resume_persisted_job()
+        self._watcher: threading.Thread | None = None
+        self._validated_store_factory: Callable[[], HydraStore] | None = None
+        if auto_activate:
+            self.activate()
 
     def _now(self) -> str:
         return public_timestamp(self._clock())
 
+    def _validated_factory(self) -> Callable[[], HydraStore]:
+        factory = self._validated_store_factory
+        if factory is not None:
+            return factory
+        with self._activation_lock:
+            factory = self._validated_store_factory
+            if factory is not None:
+                return factory
+            if self._closed.is_set():
+                raise RuntimeError("dashboard sync controller is closed")
+            validated = self._store_factory()
+            try:
+                factory = validated.validated_reopener()
+            finally:
+                validated.close()
+            self._validated_store_factory = factory
+            return factory
+
+    def activate(self) -> None:
+        """Lazily validate storage and start the watcher on first live use.
+
+        Dashboard launch can bind and serve its materialized/unavailable
+        bootstrap before any potentially expensive or failing full database
+        validation. MCP explicitly activates the same controller at startup.
+        """
+        self._validated_factory()
+        if self._roots is None or self._watcher is not None:
+            return
+        with self._activation_lock:
+            if self._watcher is not None:
+                return
+            if self._closed.is_set():
+                raise RuntimeError("dashboard sync controller is closed")
+            self._resume_persisted_job()
+            self._watcher = threading.Thread(
+                target=self._watch_for_work,
+                name="hydra-dashboard-sync-watcher", daemon=True,
+            )
+            self._watcher.start()
+
     def _repository(self) -> tuple[HydraStore, SyncStateRepository]:
-        store = self._store_factory()
+        store = self._validated_factory()()
         return store, SyncStateRepository(store)
 
     @staticmethod
@@ -78,14 +126,11 @@ class DashboardSyncController:
             active = repository.current_job(kind)
             if active is not None:
                 return active
-        jobs = repository.list_jobs()
-        active = next(
-            (job for job in jobs if job.state in {"queued", "running"}),
-            None,
-        )
-        return active if active is not None else jobs[0] if jobs else None
+        active = repository.latest_active_job()
+        return active if active is not None else repository.latest_job()
 
     def current(self) -> dict[str, object]:
+        self.activate()
         store, repository = self._repository()
         try:
             job = self._latest(repository)
@@ -100,6 +145,7 @@ class DashboardSyncController:
         return _summary(job)
 
     def get(self, sync_ref: str) -> dict[str, object]:
+        self.activate()
         store, repository = self._repository()
         try:
             job = repository.get_job(sync_ref)
@@ -112,6 +158,7 @@ class DashboardSyncController:
     def changes(self, after: int) -> dict[str, object]:
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("dashboard revision must be non-negative")
+        self.activate()
         store, repository = self._repository()
         try:
             store.connection.execute("BEGIN")
@@ -137,6 +184,7 @@ class DashboardSyncController:
     def _start(self, kind: str) -> tuple[dict[str, object], bool]:
         if self._roots is None:
             raise RuntimeError("dashboard sync roots are unavailable")
+        self.activate()
         now = self._now()
         store, repository = self._repository()
         try:
@@ -152,13 +200,7 @@ class DashboardSyncController:
         try:
             store, repository = self._repository()
             try:
-                active = next(
-                    (
-                        job for job in repository.list_jobs()
-                        if job.state in {"queued", "running"}
-                    ),
-                    None,
-                )
+                active = repository.latest_active_job()
             finally:
                 store.close()
         except Exception:
@@ -167,6 +209,27 @@ class DashboardSyncController:
             return
         if active is not None:
             self._ensure_thread(active.job_kind, active.job_id)
+
+    def _watch_for_work(self) -> None:
+        """Wake normal sync for newly queued hook work while the dashboard lives."""
+        while not self._closed.wait(0.5):
+            try:
+                store, repository = self._repository()
+                try:
+                    active = repository.latest_active_job()
+                    if active is None and repository.pending_work(self._now()).total:
+                        job_id, _reused = repository.get_or_create_active_job(
+                            "sync", self._now(),
+                        )
+                        active = repository.get_job(job_id)
+                finally:
+                    store.close()
+                if active is not None:
+                    self._ensure_thread(active.job_kind, active.job_id)
+            except Exception:
+                # A transient busy/unavailable store is retried by the bounded
+                # watcher interval; dashboard reads retain their own diagnostics.
+                continue
 
     def _ensure_thread(self, kind: str, job_id: str) -> bool:
         """Atomically register one local observer for a durable job."""
@@ -207,55 +270,66 @@ class DashboardSyncController:
         try:
             current = repository.get_job(job_id)
             assert current is not None
+            if current.state in _TERMINAL:
+                return
             queued = repository.queue_count()
-            completed = current.sources_completed
-            processed = current.bytes_processed
-            repairs = max(
-                0, current.sources_discovered - current.sources_completed - queued,
-            )
             discovered = max(
-                current.sources_discovered, completed + repairs + queued,
+                current.sources_discovered, current.sources_completed + queued,
             )
             repository.update_job(
                 job_id, state="running", sources_discovered=discovered,
-                sources_completed=completed, bytes_processed=processed,
+                sources_completed=current.sources_completed,
+                bytes_processed=current.bytes_processed,
                 updated_at=self._now(),
             )
             worker = IncrementalSyncWorker(
                 store, self._roots,
                 reconcile=lambda project_id: reconcile_project(store, project_id, self._key),
+                clock=self._clock,
             )
             while not self._closed.is_set():
-                now = self._now()
-                expiry = public_timestamp(self._clock() + timedelta(seconds=300))
-                result = worker.sync_once("dashboard-" + uuid.uuid4().hex, now, expiry, maximum_sources=1000)
-                if not result.lease_acquired:
-                    self._closed.wait(0.1)
-                    continue
-                completed += result.completed
-                processed += result.bytes_processed
-                repairs += result.repair_required
-                remaining = repository.queue_count()
                 current = repository.get_job(job_id)
                 assert current is not None
-                discovered = max(
-                    discovered, current.sources_discovered,
-                    completed + repairs + remaining,
-                )
-                if remaining == 0:
-                    finished_at = self._now()
-                    repository.update_job(job_id, state="partial" if repairs else "succeeded",
-                                          sources_discovered=discovered,
-                                          sources_completed=completed, bytes_processed=processed,
-                                          updated_at=finished_at, completed_at=finished_at)
+                if current.state in _TERMINAL:
                     return
-                repository.update_job(job_id, state="running",
-                                      sources_discovered=discovered,
-                                      sources_completed=completed, bytes_processed=processed, updated_at=self._now())
-                if result.claimed == 0:
-                    self._closed.wait(0.1)
+                now = self._now()
+                pending = repository.pending_work(now)
+                if pending.total and not pending.eligible:
+                    self._closed.wait(self._eligibility_delay(pending.next_eligible_at))
+                    continue
+                expiry = public_timestamp(self._clock() + timedelta(seconds=300))
+                owner = "dashboard-" + uuid.uuid4().hex
+                try:
+                    result = worker.sync_once(
+                        owner, now, expiry, maximum_sources=1000,
+                        release_lease=False, job_id=job_id,
+                    )
+                except Exception:
+                    repository.release_lease(owner, self._now())
+                    raise
+                if not result.lease_acquired:
+                    self._closed.wait(0.5)
+                    continue
+                finished = False
+                try:
+                    terminal = repository.finish_job_if_idle(
+                        job_id, updated_at=self._now(),
+                    )
+                    finished = terminal is not None
+                finally:
+                    repository.release_lease(owner, self._now())
+                if finished:
+                    return
         finally:
             store.close()
+
+    def _eligibility_delay(self, next_eligible_at: str | None) -> float:
+        """Sleep until the next work boundary, polling at most once per second."""
+        if next_eligible_at is None:
+            return 1.0
+        eligible = datetime.fromisoformat(next_eligible_at.replace("Z", "+00:00"))
+        delay = (eligible - self._clock()).total_seconds()
+        return min(1.0, max(0.05, delay))
 
     def _run_repair(self, job_id: str) -> None:
         assert self._roots is not None
@@ -316,3 +390,6 @@ class DashboardSyncController:
         for thread in threads:
             if thread is not threading.current_thread():
                 thread.join(timeout)
+        watcher = self._watcher
+        if watcher is not None and watcher is not threading.current_thread():
+            watcher.join(timeout)

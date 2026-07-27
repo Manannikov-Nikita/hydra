@@ -27,9 +27,13 @@ under `$TMPDIR/Hydra/spool`; `PostToolUse` normally drains it, while
 `UserPromptSubmit` and `Stop` provide safety-net drains. The model-side command
 never writes the global Hydra database directly.
 
-The report tool returns the same `hydra.report/v3` contract as the CLI,
-including provenance-aware semantic markers, deterministic test evidence,
-pilot health, and conservative trend results.
+In recent-report mode, the tool returns `hydra.report-list/v2`, containing
+`hydra.report/v4` items with privacy-safe task display names, provenance-aware
+semantic markers, deterministic test evidence, pilot health, conservative
+trend results, and the same materialized-state `sync_freshness` snapshot as the
+list. Pilot mode returns the canonical `hydra.audit/v1` document. Reading a
+report never starts ingest or reconciliation; the MCP lifecycle hosts the
+separate lease-coordinated incremental worker.
 
 The plugin deliberately does not expose doctor or storage maintenance. Run
 `hydra-codex doctor`, `hydra-codex storage status`, and confirmed compaction

@@ -223,15 +223,29 @@ def _persist_task(
     plan: TaskPlan, input_digest: str, deltas: Iterable[DeltaFact], semantic: SemanticAssembly,
 ) -> None:
     placeholders = ",".join("?" for _ in plan.session_ids)
-    label_row = connection.execute(
-        f"""SELECT task_label FROM annotations
+    label_rows = connection.execute(
+        f"""SELECT task_label,observed_at,sequence,annotation_id FROM annotations
               WHERE project_id=? AND session_id IN ({placeholders})
                 AND provenance='model_reported' AND task_label IS NOT NULL
-                AND observed_at<=?
-              ORDER BY observed_at DESC,sequence DESC,annotation_id DESC LIMIT 1""",
-        (project_id, *plan.session_ids, _plan_instant(plan).canonical),
-    ).fetchone()
-    display_name = None if label_row is None else normalize_task_label(label_row[0])
+              ORDER BY annotation_id""",
+        (project_id, *plan.session_ids),
+    )
+    cutoff = _plan_instant(plan)
+    eligible_labels = tuple(
+        (
+            require_exact_timestamp(row[1], "annotation timestamp"),
+            int(row[2]),
+            str(row[3]),
+            row[0],
+        )
+        for row in label_rows
+    )
+    label_row = max(
+        (row for row in eligible_labels if row[0] <= cutoff),
+        key=lambda row: (row[0].epoch_nanoseconds, row[1], row[2]),
+        default=None,
+    )
+    display_name = None if label_row is None else normalize_task_label(label_row[3])
     connection.execute(
         """INSERT INTO reconciled_tasks(
                project_id,root_key,public_ref,status,cutoff_at,last_activity_at,task_family,
@@ -383,23 +397,125 @@ def _persist_report_snapshots(
 ) -> None:
     """Persist the public report contract only after successful reconciliation."""
     from .report_renderers import render_html, render_json, render_markdown
-    from .sync_state import SyncStateRepository
 
-    revision = SyncStateRepository(store).data_revision()
-    snapshots = [
+    snapshot_content = [
         (
             project_id, report.task_ref, render_json(report).rstrip("\n"),
-            render_markdown(report), render_html(report), reconciled_at, revision,
+            render_markdown(report), render_html(report),
+            report.last_activity_at,
+            require_exact_timestamp(
+                report.last_activity_at, "report activity timestamp",
+            ).epoch_nanoseconds,
         )
         for report in reports
     ]
+    snapshot_content.sort(key=lambda row: str(row[1]))
+    reconciled = require_exact_timestamp(
+        reconciled_at, "materialized reconciliation timestamp",
+    )
+
+    def project_stats(revision: int) -> tuple[object, ...]:
+        activities = sorted(
+            (
+                (
+                    require_exact_timestamp(
+                        snapshot[5], "materialized report activity timestamp",
+                    ),
+                    int(snapshot[6]),
+                )
+                for snapshot in snapshot_content
+            ),
+            key=lambda item: item[0].epoch_nanoseconds,
+        )
+        for activity, indexed_epoch in activities:
+            if activity.epoch_nanoseconds != indexed_epoch:
+                raise ValueError("materialized report activity index is invalid")
+        first = activities[0][0] if activities else None
+        last = activities[-1][0] if activities else None
+        return (
+            project_id,
+            len(snapshot_content),
+            reconciled.canonical,
+            reconciled.canonical,
+            None if first is None else first.canonical,
+            None if first is None else first.epoch_nanoseconds,
+            None if last is None else last.canonical,
+            None if last is None else last.epoch_nanoseconds,
+            revision,
+        )
+
     with store.rollout_transaction() as connection:
+        current = [
+            tuple(row)
+            for row in connection.execute(
+                """SELECT project_id,task_ref,report_json,report_markdown,report_html
+                          ,last_activity_at,last_activity_epoch_ns
+                     FROM materialized_report_snapshots
+                    WHERE project_id=? ORDER BY task_ref""",
+                (project_id,),
+            )
+        ]
+        if current == snapshot_content:
+            row = connection.execute(
+                """SELECT project_id,report_count,first_reconciled_at,
+                          last_reconciled_at,first_activity_at,
+                          first_activity_epoch_ns,last_activity_at,
+                          last_activity_epoch_ns,data_revision
+                     FROM materialized_project_stats WHERE project_id=?""",
+                (project_id,),
+            ).fetchone()
+            if row is not None and tuple(row) == project_stats(int(row[8])):
+                return
+            if row is not None:
+                raise sqlite3.IntegrityError(
+                    "materialized project stats are incoherent",
+                )
+        connection.execute(
+            """UPDATE sync_data_revision
+                  SET revision=revision+1,updated_at=?
+                WHERE singleton=1""",
+            (reconciled_at,),
+        )
+        revision = int(connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0])
         connection.execute("DELETE FROM materialized_report_snapshots WHERE project_id=?", (project_id,))
+        connection.execute(
+            "DELETE FROM materialized_project_stats WHERE project_id=?",
+            (project_id,),
+        )
         connection.executemany(
             """INSERT INTO materialized_report_snapshots(
-                   project_id,task_ref,report_json,report_markdown,report_html,reconciled_at,data_revision)
-               VALUES (?,?,?,?,?,?,?)""",
-            snapshots,
+                   project_id,task_ref,report_json,report_markdown,report_html,
+                   reconciled_at,data_revision,last_activity_at,last_activity_epoch_ns)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                (
+                    *snapshot[:5],
+                    reconciled_at,
+                    revision,
+                    *snapshot[5:],
+                )
+                for snapshot in snapshot_content
+            ),
+        )
+        connection.execute(
+            """INSERT INTO materialized_project_stats(
+                   project_id,report_count,first_reconciled_at,
+                   last_reconciled_at,first_activity_at,
+                   first_activity_epoch_ns,last_activity_at,
+                   last_activity_epoch_ns,data_revision)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(project_id) DO UPDATE SET
+                   report_count=excluded.report_count,
+                   first_reconciled_at=excluded.first_reconciled_at,
+                   last_reconciled_at=excluded.last_reconciled_at,
+                   first_activity_at=excluded.first_activity_at,
+                   first_activity_epoch_ns=excluded.first_activity_epoch_ns,
+                   last_activity_at=excluded.last_activity_at,
+                   last_activity_epoch_ns=excluded.last_activity_epoch_ns,
+                   data_revision=excluded.data_revision""",
+            project_stats(revision),
         )
 
 
@@ -414,18 +530,38 @@ def render_materialized_report_collection(
         raise ValueError("unsupported report format")
     from .dashboard_contract import validate_task_report
     from .public_payload import reject_private_fields
-    rows = list(store.connection.execute(
-        """SELECT task_ref,report_json,report_markdown,report_html,data_revision
-             FROM materialized_report_snapshots WHERE project_id=?
-             ORDER BY reconciled_at DESC,task_ref LIMIT ?""",
-        (project_id, limit),
-    ))
+    from .reporting import normalize_sync_freshness
+    freshness_payload = normalize_sync_freshness(sync_freshness)
     has_reconciliation = store.connection.execute(
         """SELECT 1 FROM reconciliation_runs WHERE project_id=? AND outcome='success'
              ORDER BY completed_at DESC LIMIT 1""",
         (project_id,),
     ).fetchone()
-    if has_reconciliation is None:
+    stats = store.connection.execute(
+        """SELECT report_count,data_revision FROM materialized_project_stats
+            WHERE project_id=?""",
+        (project_id,),
+    ).fetchone()
+    if has_reconciliation is None or stats is None:
+        raise ReconciliationStale("reconcile_required")
+    report_count, snapshot_revision = stats
+    if (
+        isinstance(report_count, bool)
+        or not isinstance(report_count, int)
+        or report_count < 0
+        or isinstance(snapshot_revision, bool)
+        or not isinstance(snapshot_revision, int)
+        or snapshot_revision < 0
+    ):
+        raise ReconciliationStale("reconcile_required")
+    rows = list(store.connection.execute(
+        """SELECT task_ref,report_json,report_markdown,report_html,data_revision,
+                  last_activity_at,last_activity_epoch_ns
+             FROM materialized_report_snapshots WHERE project_id=?
+             ORDER BY last_activity_epoch_ns DESC,task_ref LIMIT ?""",
+        (project_id, limit),
+    ))
+    if len(rows) != min(report_count, limit):
         raise ReconciliationStale("reconcile_required")
     reports: list[dict[str, object]] = []
     for row in rows:
@@ -433,19 +569,35 @@ def render_materialized_report_collection(
             payload = json.loads(str(row[1]))
         except (TypeError, ValueError) as error:
             raise ReconciliationStale("reconcile_required") from error
-        validate_task_report(payload)
+        validate_task_report(payload, allow_legacy_without_sync_freshness=True)
         reject_private_fields(payload)
-        if payload.get("task_ref") != row[0]:
+        if payload.get("task_ref") != row[0] or row[4] != snapshot_revision:
+            raise ReconciliationStale("reconcile_required")
+        payload["sync_freshness"] = dict(freshness_payload)
+        validate_task_report(payload)
+        try:
+            activity = require_exact_timestamp(
+                payload.get("last_activity_at"), "report activity timestamp",
+            )
+            stored_activity = require_exact_timestamp(
+                row[5], "materialized report activity timestamp",
+            )
+        except ValueError as error:
+            raise ReconciliationStale("reconcile_required") from error
+        if (
+            activity.epoch_nanoseconds != stored_activity.epoch_nanoseconds
+            or activity.epoch_nanoseconds != row[6]
+        ):
             raise ReconciliationStale("reconcile_required")
         reports.append(payload)
     wrapper = {
         "schema_version": "hydra.report-list/v2",
         "reports": reports,
-        "sync_freshness": sync_freshness,
+        "sync_freshness": freshness_payload,
     }
     if output_format == "json":
         return json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    freshness = str(sync_freshness.get("state", "unknown"))
+    freshness = str(freshness_payload["state"])
     if output_format == "markdown":
         if not reports:
             return f"# Hydra task reports\n\nSync freshness: {freshness}.\n\nNo reconciled tasks.\n"

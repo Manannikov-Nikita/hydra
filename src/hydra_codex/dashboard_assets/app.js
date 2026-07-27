@@ -32,6 +32,10 @@ let changePollPromise = null;
 let activeJobPoll = null;
 let activeJobKind = null;
 
+export function syncJobKind(kind) {
+  return kind === "repair" || kind === "backfill" ? "repair" : "sync";
+}
+
 function dispatch(action) {
   state = reduce(state, action);
 }
@@ -198,7 +202,7 @@ function actions() {
         if (!snapshot || !isCurrentRouteWork(context)) return;
         if (!routeNeedsRefresh()
           && (state.route === "tasks" || state.route === "compare")) {
-          await loadAllTasks(context);
+          await loadTaskPage(context);
         }
         if (!isCurrentRouteWork(context)) return;
         acknowledgeRevision(snapshot.data_revision);
@@ -216,7 +220,10 @@ function actions() {
       dispatch({type: "filters", family, status});
       renderRoute();
     },
-    loadMore: () => runAsync("Loading tasks", context => loadAllTasks(context), () => actions().loadMore()),
+    loadMore: () => runAsync(
+      "Loading tasks", context => loadTaskPage(context, true),
+      () => actions().loadMore(),
+    ),
     compare: (left, right) => runAsync(
       "Comparing tasks", context => compareTasks(left, right, context),
       () => actions().compare(left, right),
@@ -286,20 +293,19 @@ async function loadSnapshot(projectRef = state.projectRef, context) {
   return snapshot;
 }
 
-async function loadAllTasks(context) {
+async function loadTaskPage(context, append = false) {
   if (!isCurrentRouteWork(context)) return false;
   if (!state.projectRef) return true;
   const projectRef = state.projectRef;
-  let cursor = state.cursor;
-  const collected = state.tasks.length === 0 ? [] : state.tasks.slice();
-  do {
-    const page = await api.tasks(projectRef, cursor, 50, abortPrevious());
-    if (!isCurrentRouteWork(context)) return false;
-    collected.push(...page.items);
-    cursor = page.page && page.page.next_cursor;
-  } while (cursor);
+  const cursor = append ? state.cursor : null;
+  if (append && !cursor) return true;
+  const page = await api.tasks(projectRef, cursor, 50, abortPrevious());
   if (!isCurrentRouteWork(context)) return false;
-  dispatch({type: "tasks", items: collected, cursor: null});
+  dispatch({
+    type: append ? "append_tasks" : "tasks",
+    items: page.items,
+    cursor: page.page && page.page.next_cursor,
+  });
   renderRoute();
   return true;
 }
@@ -346,7 +352,7 @@ async function loadRoute() {
       return;
     }
     if (needsTasks && state.tasks.length === 0) {
-      const loaded = await loadAllTasks(context);
+      const loaded = await loadTaskPage(context);
       if (!loaded || !isCurrentRouteWork(context)) return;
     }
     if (!isCurrentRouteWork(context)) return;
@@ -379,7 +385,7 @@ async function reloadAfterRefresh(acknowledge = true) {
   if (!routeNeedsRefresh()
     && (state.route === "tasks" || state.route === "compare")
     && state.projectRef) {
-    const loaded = await loadAllTasks(context);
+    const loaded = await loadTaskPage(context);
     if (!loaded || !isCurrentRouteWork(context)) return false;
   }
   if (!isCurrentRouteWork(context)) return false;
@@ -492,7 +498,7 @@ function runActiveJob(requestedKind, start) {
   let retry = jobKind === "repair" ? startRepair : startRefresh;
   activeJobPoll = (async () => {
     const started = await start();
-    jobKind = started.kind === "repair" ? "repair" : "sync";
+    jobKind = syncJobKind(started.kind);
     activeJobKind = jobKind;
     retry = jobKind === "repair" ? startRepair : startRefresh;
     setMutatingBusy(jobKind, true);
@@ -593,7 +599,7 @@ window.addEventListener("hydra-dashboard-ready", event => {
   startChangePolling();
   api.sync().then(current => {
     if (current && (current.state === "queued" || current.state === "running")) {
-      const jobKind = current.kind === "repair" ? "repair" : "sync";
+      const jobKind = syncJobKind(current.kind);
       runActiveJob(jobKind, () => Promise.resolve(current));
     }
   }).catch(() => undefined);

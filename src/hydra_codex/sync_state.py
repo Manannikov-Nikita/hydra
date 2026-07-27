@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import re
 import uuid
 
+from .exact_time import require_exact_timestamp
 from .storage import HydraStore
 
 
@@ -98,6 +99,15 @@ class HookEvent:
     observed_at: str
 
 
+@dataclass(frozen=True)
+class SyncWorkState:
+    """A read-only snapshot of all durable normal-sync work."""
+
+    total: int
+    eligible: int
+    next_eligible_at: str | None
+
+
 def validate_root_relative_locator(locator: str) -> str:
     """Return an ASCII canonical root-relative locator suitable for SQLite storage."""
     if not isinstance(locator, str) or not 1 <= len(locator) <= 512:
@@ -129,6 +139,31 @@ def _timestamp(value: str | None) -> str:
     return candidate
 
 
+def _instant(value: str) -> datetime:
+    """Parse an already validated timestamp for chronological comparisons."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _epoch_microseconds(value: object) -> int:
+    """SQLite scalar preserving the full RFC3339 microsecond precision."""
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be text")
+    instant = _instant(_timestamp(value))
+    delta = instant - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+
+
+def _epoch_nanoseconds(value: str) -> int:
+    """Persist an exact sortable instant alongside public timestamp text."""
+    return require_exact_timestamp(
+        value, "sync job updated timestamp",
+    ).epoch_nanoseconds
+
+
 def _anchor(value: str | None, field: str) -> str | None:
     if value is None:
         return None
@@ -150,6 +185,10 @@ class SyncStateRepository:
 
     def __init__(self, store: HydraStore) -> None:
         self._store = store
+        self._store.connection.create_function(
+            "hydra_rfc3339_micros", 1, _epoch_microseconds,
+            deterministic=True,
+        )
 
     def _bump_revision(self, connection, observed_at: str) -> int:
         connection.execute(
@@ -238,10 +277,10 @@ class SyncStateRepository:
             )
             result = connection.execute(
                 """INSERT INTO sync_ingest_queue(
-                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code)
-                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL)
+                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code,eligible_epoch_ns)
+                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL,?)
                    ON CONFLICT(root_kind,source_locator) DO NOTHING""",
-                (root, locator, now, now),
+                (root, locator, now, now, _epoch_nanoseconds(now)),
             )
             inserted = result.rowcount == 1
             if not inserted:
@@ -281,9 +320,12 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             connection.execute(
                 """INSERT INTO hook_event_outbox(
-                       event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING""",
-                (event, project, session, turn, event_kind, tool_category, tool_status, duration_ms, now),
+                       event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at,eligible_epoch_ns)
+                   VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING""",
+                (
+                    event, project, session, turn, event_kind, tool_category,
+                    tool_status, duration_ms, now, _epoch_nanoseconds(now),
+                ),
             )
             inserted = False
             if prepared is not None:
@@ -294,10 +336,10 @@ class SyncStateRepository:
                 )
                 result = connection.execute(
                     """INSERT INTO sync_ingest_queue(
-                           root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code)
-                       VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL)
+                           root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code,eligible_epoch_ns)
+                       VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL,?)
                        ON CONFLICT(root_kind,source_locator) DO NOTHING""",
-                    (root, locator, now, now),
+                    (root, locator, now, now, _epoch_nanoseconds(now)),
                 )
                 inserted = result.rowcount == 1
                 if not inserted:
@@ -331,35 +373,43 @@ class SyncStateRepository:
         owner = _identity(owner_key, "worker owner key")
         now = _timestamp(observed_at)
         expiry = _timestamp(claim_expires_at)
-        if expiry <= now:
+        if _instant(expiry) <= _instant(now):
             raise ValueError("hook event claim expiry must be in the future")
         if not 1 <= limit <= 1000:
             raise ValueError("hook event claim limit must be between 1 and 1000")
         with self._store.rollout_transaction() as connection:
             lease = connection.execute(
-                "SELECT expires_at FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+                """SELECT expires_at FROM sync_worker_leases
+                     WHERE lease_name='ingest' AND owner_key=?
+                       AND hydra_rfc3339_micros(expires_at)
+                           >hydra_rfc3339_micros(?)""",
                 (owner, now),
             ).fetchone()
             if lease is None:
                 return ()
-            if expiry > str(lease[0]):
+            if _instant(expiry) > _instant(str(lease[0])):
                 raise ValueError("hook event claim cannot outlive worker lease")
             rows = connection.execute(
                 """SELECT event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at
                      FROM hook_event_outbox
-                    WHERE acknowledged_at IS NULL AND (claimed_by IS NULL OR claim_expires_at<=?)
-                    ORDER BY observed_at,event_key LIMIT ?""",
-                (now, limit),
+                    WHERE acknowledged_at IS NULL
+                      AND eligible_epoch_ns<=?
+                    ORDER BY eligible_epoch_ns,event_key LIMIT ?""",
+                (_epoch_nanoseconds(now), limit),
             ).fetchall()
             if not rows:
                 return ()
             events = tuple(self._hook_event_from_row(row) for row in rows)
             for event in events:
                 changed = connection.execute(
-                    """UPDATE hook_event_outbox SET claimed_by=?,claimed_at=?,claim_expires_at=?
+                    """UPDATE hook_event_outbox SET claimed_by=?,claimed_at=?,claim_expires_at=?,
+                           eligible_epoch_ns=?
                          WHERE event_key=? AND acknowledged_at IS NULL
-                           AND (claimed_by IS NULL OR claim_expires_at<=?)""",
-                    (owner, now, expiry, event.event_key, now),
+                           AND eligible_epoch_ns<=?""",
+                    (
+                        owner, now, expiry, _epoch_nanoseconds(expiry),
+                        event.event_key, _epoch_nanoseconds(now),
+                    ),
                 ).rowcount == 1
                 if not changed:
                     # A defensive retry guard for a future non-serialized DB
@@ -376,11 +426,16 @@ class SyncStateRepository:
                     ),
                 )
                 connection.execute(
-                    """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at)
-                       VALUES (?,?, 'project', ?,NULL,NULL)
+                    """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at,eligible_epoch_ns)
+                       VALUES (?,?, 'project', ?,NULL,NULL,?)
                        ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
-                         observed_at=excluded.observed_at,claim_owner=NULL,claim_expires_at=NULL""",
-                    (event.project_id, event.project_id, now),
+                         observed_at=excluded.observed_at,claim_owner=NULL,
+                         claim_expires_at=NULL,
+                         eligible_epoch_ns=excluded.eligible_epoch_ns""",
+                    (
+                        event.project_id, event.project_id, now,
+                        _epoch_nanoseconds(now),
+                    ),
                 )
             claimed = tuple(
                 event for event in events if connection.execute(
@@ -408,9 +463,12 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 f"""UPDATE hook_event_outbox
-                       SET acknowledged_at=?,claimed_by=NULL,claimed_at=NULL,claim_expires_at=NULL
+                       SET acknowledged_at=?,claimed_by=NULL,claimed_at=NULL,
+                           claim_expires_at=NULL,eligible_epoch_ns=NULL
                      WHERE event_key IN ({placeholders}) AND acknowledged_at IS NULL
-                       AND claimed_by=? AND claim_expires_at>?""",
+                       AND claimed_by=?
+                       AND hydra_rfc3339_micros(claim_expires_at)
+                           >hydra_rfc3339_micros(?)""",
                 (now, *keys, owner, now),
             ).rowcount
             if changed:
@@ -424,10 +482,10 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             result = connection.execute(
                 """INSERT INTO sync_ingest_queue(
-                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code)
-                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL)
+                       root_kind,source_locator,queue_state,enqueued_at,available_at,claimed_by,claimed_at,claim_expires_at,requeue_pending,attempts,reason_code,eligible_epoch_ns)
+                   VALUES (?,?,'queued',?,?,NULL,NULL,NULL,0,0,NULL,?)
                    ON CONFLICT(root_kind,source_locator) DO NOTHING""",
-                (root, locator, now, now),
+                (root, locator, now, now, _epoch_nanoseconds(now)),
             )
             inserted = result.rowcount == 1
             if not inserted:
@@ -509,42 +567,110 @@ class SyncStateRepository:
     def queue_count(self) -> int:
         """Return durable queued/claimed work without enumerating source rows."""
         return int(self._store.connection.execute(
-            "SELECT COUNT(*) FROM sync_ingest_queue",
+            """SELECT ingest_total FROM sync_work_summary
+                WHERE singleton=1""",
         ).fetchone()[0])
+
+    def pending_work(self, observed_at: str) -> SyncWorkState:
+        """Return all normal-sync work and its earliest chronological eligibility.
+
+        This is intentionally read-only: polling a deferred item must not churn
+        the data revision or acquire/release the singleton worker lease.
+        """
+        now = _timestamp(observed_at)
+        row = self._store.connection.execute(
+            """SELECT summary.ingest_total+summary.outbox_total
+                          +summary.dirty_total,
+                      ingest.eligible_at,ingest.eligible_epoch_ns,
+                      outbox.eligible_at,outbox.eligible_epoch_ns,
+                      dirty.eligible_at,dirty.eligible_epoch_ns
+                 FROM sync_work_summary AS summary
+                 LEFT JOIN (
+                     SELECT CASE queue_state WHEN 'queued' THEN available_at
+                                 ELSE claim_expires_at END AS eligible_at,
+                            eligible_epoch_ns
+                       FROM sync_ingest_queue
+                      ORDER BY eligible_epoch_ns,root_kind,source_locator
+                      LIMIT 1
+                 ) AS ingest ON 1
+                 LEFT JOIN (
+                     SELECT CASE WHEN claimed_by IS NULL THEN observed_at
+                                 ELSE claim_expires_at END AS eligible_at,
+                            eligible_epoch_ns
+                       FROM hook_event_outbox
+                            INDEXED BY hook_event_outbox_eligibility
+                      WHERE acknowledged_at IS NULL
+                      ORDER BY eligible_epoch_ns,event_key
+                      LIMIT 1
+                 ) AS outbox ON 1
+                 LEFT JOIN (
+                     SELECT CASE WHEN claim_owner IS NULL THEN observed_at
+                                 ELSE claim_expires_at END AS eligible_at,
+                            eligible_epoch_ns
+                       FROM sync_dirty_roots
+                      ORDER BY eligible_epoch_ns,project_id,root_kind,root_key
+                      LIMIT 1
+                 ) AS dirty ON 1
+                WHERE summary.singleton=1""",
+        ).fetchone()
+        assert row is not None
+        candidates = tuple(
+            (str(row[index]), int(row[index + 1]))
+            for index in (1, 3, 5)
+            if row[index] is not None and row[index + 1] is not None
+        )
+        earliest = min(candidates, key=lambda item: (item[1], item[0])) if candidates else None
+        return SyncWorkState(
+            total=int(row[0]),
+            # Consumers only need readiness. Returning a bounded 0/1 flag
+            # avoids recounting an arbitrarily large eligible prefix.
+            eligible=int(
+                earliest is not None
+                and earliest[1] <= _epoch_nanoseconds(now)
+            ),
+            next_eligible_at=None if earliest is None else earliest[0],
+        )
 
     def claim_next(self, owner_key: str, observed_at: str, claim_expires_at: str) -> QueueItem | None:
         observed_at = _timestamp(observed_at)
         claim_expires_at = _timestamp(claim_expires_at)
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
-        if claim_expires_at <= observed_at:
+        if _instant(claim_expires_at) <= _instant(observed_at):
             raise ValueError("queue claim expiry must follow claim time")
         with self._store.rollout_transaction() as connection:
             lease = connection.execute(
-                "SELECT expires_at FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+                """SELECT expires_at FROM sync_worker_leases
+                     WHERE lease_name='ingest' AND owner_key=?
+                       AND hydra_rfc3339_micros(expires_at)
+                           >hydra_rfc3339_micros(?)""",
                 (owner_key, observed_at),
             ).fetchone()
             if lease is None:
                 return None
-            if claim_expires_at > str(lease[0]):
+            if _instant(claim_expires_at) > _instant(str(lease[0])):
                 raise ValueError("queue claim cannot outlive worker lease")
             selected = connection.execute(
                 """SELECT root_kind,source_locator FROM sync_ingest_queue
-                     WHERE (queue_state='queued' AND available_at<=?)
-                        OR (queue_state='claimed' AND claim_expires_at<=?)
-                     ORDER BY available_at,enqueued_at,root_kind,source_locator LIMIT 1""", (observed_at, observed_at),
+                     WHERE eligible_epoch_ns<=?
+                     ORDER BY eligible_epoch_ns,root_kind,source_locator
+                     LIMIT 1""",
+                (_epoch_nanoseconds(observed_at),),
             ).fetchone()
             if selected is None:
                 return None
             root, locator = str(selected[0]), str(selected[1])
             changed = connection.execute(
-                """UPDATE sync_ingest_queue SET queue_state='claimed',claimed_by=?,claimed_at=?,claim_expires_at=?,
-                       requeue_pending=0
-                     WHERE root_kind=? AND source_locator=? AND (
-                         (queue_state='queued' AND available_at<=?)
-                         OR (queue_state='claimed' AND claim_expires_at<=?)
-                     )""",
-                (owner_key, observed_at, claim_expires_at, root, locator, observed_at, observed_at),
+                """UPDATE sync_ingest_queue SET queue_state='claimed',
+                       claimed_by=?,claimed_at=?,claim_expires_at=?,
+                       eligible_epoch_ns=?,requeue_pending=0
+                     WHERE root_kind=? AND source_locator=?
+                       AND eligible_epoch_ns<=?""",
+                (
+                    owner_key, observed_at, claim_expires_at,
+                    _epoch_nanoseconds(claim_expires_at), root, locator,
+                    _epoch_nanoseconds(observed_at),
+                ),
             ).rowcount
             if changed != 1:
                 return None
@@ -571,9 +697,13 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
-                       claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,attempts=attempts+1,reason_code=?
+                       claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,
+                       attempts=attempts+1,reason_code=?,eligible_epoch_ns=?
                      WHERE root_kind=? AND source_locator=? AND queue_state='claimed' AND claimed_by=?""",
-                (available_at, reason_code, root, locator, owner_key),
+                (
+                    available_at, reason_code, _epoch_nanoseconds(available_at),
+                    root, locator, owner_key,
+                ),
             ).rowcount == 1
             if changed:
                 self._bump_revision(connection, observed_at)
@@ -588,20 +718,49 @@ class SyncStateRepository:
         lease_expires_at = _timestamp(lease_expires_at)
         root = self._validate_root(root_kind)
         locator = validate_root_relative_locator(source_locator)
-        if lease_expires_at <= observed_at:
+        if _instant(lease_expires_at) <= _instant(observed_at):
             raise ValueError("renewal expiry must follow observation")
         with self._store.rollout_transaction() as connection:
             held = connection.execute(
-                """UPDATE sync_worker_leases SET acquired_at=?,expires_at=?
-                     WHERE lease_name='ingest' AND owner_key=?""",
-                (observed_at, lease_expires_at, owner_key),
+                """UPDATE sync_worker_leases
+                      SET acquired_at=CASE
+                              WHEN hydra_rfc3339_micros(acquired_at)
+                                   <hydra_rfc3339_micros(?)
+                              THEN ? ELSE acquired_at END,
+                          expires_at=CASE
+                              WHEN hydra_rfc3339_micros(expires_at)
+                                   <hydra_rfc3339_micros(?)
+                              THEN ? ELSE expires_at END
+                    WHERE lease_name='ingest' AND owner_key=?
+                      AND hydra_rfc3339_micros(expires_at)
+                          >hydra_rfc3339_micros(?)""",
+                (
+                    observed_at, observed_at,
+                    lease_expires_at, lease_expires_at,
+                    owner_key, observed_at,
+                ),
             ).rowcount == 1
             if not held:
                 return False
             renewed = connection.execute(
-                """UPDATE sync_ingest_queue SET claim_expires_at=? WHERE root_kind=? AND source_locator=?
-                     AND queue_state='claimed' AND claimed_by=?""",
-                (lease_expires_at, root, locator, owner_key),
+                """UPDATE sync_ingest_queue
+                      SET claim_expires_at=CASE
+                              WHEN hydra_rfc3339_micros(claim_expires_at)
+                                   <hydra_rfc3339_micros(?)
+                              THEN ? ELSE claim_expires_at END,
+                          eligible_epoch_ns=CASE
+                              WHEN hydra_rfc3339_micros(claim_expires_at)
+                                   <hydra_rfc3339_micros(?)
+                              THEN ? ELSE eligible_epoch_ns END
+                    WHERE root_kind=? AND source_locator=?
+                      AND queue_state='claimed' AND claimed_by=?
+                      AND hydra_rfc3339_micros(claim_expires_at)
+                          >hydra_rfc3339_micros(?)""",
+                (
+                    lease_expires_at, lease_expires_at,
+                    lease_expires_at, _epoch_nanoseconds(lease_expires_at),
+                    root, locator, owner_key, observed_at,
+                ),
             ).rowcount == 1
             if renewed:
                 self._bump_revision(connection, observed_at)
@@ -614,7 +773,9 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             changed = connection.execute(
                 """DELETE FROM sync_ingest_queue WHERE root_kind=? AND source_locator=?
-                     AND queue_state='claimed' AND claimed_by=? AND claim_expires_at>?
+                     AND queue_state='claimed' AND claimed_by=?
+                     AND hydra_rfc3339_micros(claim_expires_at)
+                         >hydra_rfc3339_micros(?)
                      AND requeue_pending=0""",
                 (root, locator, owner_key, observed_at),
             ).rowcount == 1
@@ -622,10 +783,17 @@ class SyncStateRepository:
             if not changed:
                 requeued = connection.execute(
                     """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
-                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0
+                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,
+                           eligible_epoch_ns=?
                          WHERE root_kind=? AND source_locator=? AND queue_state='claimed'
-                           AND claimed_by=? AND claim_expires_at>? AND requeue_pending=1""",
-                    (observed_at, root, locator, owner_key, observed_at),
+                           AND claimed_by=?
+                           AND hydra_rfc3339_micros(claim_expires_at)
+                               >hydra_rfc3339_micros(?)
+                           AND requeue_pending=1""",
+                    (
+                        observed_at, _epoch_nanoseconds(observed_at),
+                        root, locator, owner_key, observed_at,
+                    ),
                 ).rowcount == 1
             if changed or requeued:
                 self._bump_revision(connection, observed_at)
@@ -673,7 +841,16 @@ class SyncStateRepository:
             None if row[5] is None else int(row[5]), None if row[6] is None else int(row[6]),
         )
 
-    def mark_repair_required(self, root_kind: str, source_locator: str, observed_at: str | None = None) -> int:
+    def mark_repair_required(
+        self,
+        root_kind: str,
+        source_locator: str,
+        observed_at: str | None = None,
+        *,
+        discard_queue: bool = False,
+    ) -> int:
+        if not isinstance(discard_queue, bool):
+            raise TypeError("discard_queue must be a boolean")
         root = self._validate_root(root_kind)
         locator = validate_root_relative_locator(source_locator)
         now = _timestamp(observed_at)
@@ -683,6 +860,12 @@ class SyncStateRepository:
                 (now, root, locator),
             ).rowcount != 1:
                 raise KeyError("source is unknown")
+            if discard_queue:
+                connection.execute(
+                    """DELETE FROM sync_ingest_queue
+                         WHERE root_kind=? AND source_locator=?""",
+                    (root, locator),
+                )
             return self._bump_revision(connection, now)
 
     def acquire_lease(self, owner_key: str, acquired_at: str, expires_at: str) -> bool:
@@ -690,15 +873,32 @@ class SyncStateRepository:
         expires_at = _timestamp(expires_at)
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
-        if expires_at <= acquired_at:
+        if _instant(expires_at) <= _instant(acquired_at):
             raise ValueError("worker lease expiry must follow acquisition")
         with self._store.rollout_transaction() as connection:
             result = connection.execute(
                 """INSERT INTO sync_worker_leases(lease_name,owner_key,acquired_at,expires_at)
                    VALUES ('ingest',?,?,?) ON CONFLICT(lease_name) DO UPDATE SET
-                       owner_key=excluded.owner_key,acquired_at=excluded.acquired_at,expires_at=excluded.expires_at
-                   WHERE sync_worker_leases.owner_key=excluded.owner_key
-                      OR sync_worker_leases.expires_at<=excluded.acquired_at""", (owner_key, acquired_at, expires_at),
+                       owner_key=excluded.owner_key,
+                       acquired_at=CASE
+                           WHEN hydra_rfc3339_micros(sync_worker_leases.acquired_at)
+                                <hydra_rfc3339_micros(excluded.acquired_at)
+                           THEN excluded.acquired_at
+                           ELSE sync_worker_leases.acquired_at END,
+                       expires_at=CASE
+                           WHEN hydra_rfc3339_micros(sync_worker_leases.expires_at)
+                                <hydra_rfc3339_micros(excluded.expires_at)
+                           THEN excluded.expires_at
+                           ELSE sync_worker_leases.expires_at END
+                   WHERE (
+                           sync_worker_leases.owner_key=excluded.owner_key
+                           AND hydra_rfc3339_micros(
+                                   sync_worker_leases.acquired_at
+                               )<=hydra_rfc3339_micros(excluded.acquired_at)
+                       )
+                      OR hydra_rfc3339_micros(sync_worker_leases.expires_at)
+                           <=hydra_rfc3339_micros(excluded.acquired_at)""",
+                (owner_key, acquired_at, expires_at),
             )
             acquired = result.rowcount == 1
             if acquired:
@@ -709,7 +909,10 @@ class SyncStateRepository:
         """Read the singleton lease without taking a writer transaction."""
         observed_at = _timestamp(observed_at)
         row = self._store.connection.execute(
-            "SELECT 1 FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+            """SELECT 1 FROM sync_worker_leases
+                 WHERE lease_name='ingest' AND owner_key=?
+                   AND hydra_rfc3339_micros(expires_at)
+                       >hydra_rfc3339_micros(?)""",
             (owner_key, observed_at),
         ).fetchone()
         return row is not None
@@ -731,11 +934,17 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             connection.execute(
                 """INSERT INTO sync_dirty_roots(
-                       project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at)
-                   VALUES (?,?,?,?,NULL,NULL)
+                       project_id,root_key,root_kind,observed_at,claim_owner,
+                       claim_expires_at,eligible_epoch_ns)
+                   VALUES (?,?,?,?,NULL,NULL,?)
                    ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
-                       observed_at=excluded.observed_at,claim_owner=NULL,claim_expires_at=NULL""",
-                (project_id, root_key, root_kind, now),
+                       observed_at=excluded.observed_at,claim_owner=NULL,
+                       claim_expires_at=NULL,
+                       eligible_epoch_ns=excluded.eligible_epoch_ns""",
+                (
+                    project_id, root_key, root_kind, now,
+                    _epoch_nanoseconds(now),
+                ),
             )
             return self._bump_revision(connection, now)
 
@@ -757,31 +966,45 @@ class SyncStateRepository:
         claim_expires_at = _timestamp(claim_expires_at)
         if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
             raise ValueError("worker owner key is invalid")
-        if claim_expires_at <= observed_at:
+        if _instant(claim_expires_at) <= _instant(observed_at):
             raise ValueError("dirty claim expiry must follow claim time")
         if not 1 <= limit <= 1000:
             raise ValueError("dirty root limit must be between 1 and 1000")
         with self._store.rollout_transaction() as connection:
             lease = connection.execute(
-                "SELECT expires_at FROM sync_worker_leases WHERE lease_name='ingest' AND owner_key=? AND expires_at>?",
+                """SELECT expires_at FROM sync_worker_leases
+                     WHERE lease_name='ingest' AND owner_key=?
+                       AND hydra_rfc3339_micros(expires_at)
+                           >hydra_rfc3339_micros(?)""",
                 (owner_key, observed_at),
             ).fetchone()
             if lease is None:
                 return ()
-            if claim_expires_at > str(lease[0]):
+            if _instant(claim_expires_at) > _instant(str(lease[0])):
                 raise ValueError("dirty claim cannot outlive worker lease")
             rows = tuple(connection.execute(
                 """SELECT project_id,root_key,root_kind,observed_at FROM sync_dirty_roots
-                     WHERE claim_owner IS NULL OR claim_expires_at<=?
-                     ORDER BY observed_at,project_id,root_kind,root_key LIMIT ?""", (observed_at, limit),
+                     WHERE eligible_epoch_ns<=?
+                     ORDER BY eligible_epoch_ns,project_id,root_kind,root_key
+                     LIMIT ?""",
+                (_epoch_nanoseconds(observed_at), limit),
             ))
             if not rows:
                 return ()
             connection.executemany(
-                """UPDATE sync_dirty_roots SET claim_owner=?,claim_expires_at=?
+                """UPDATE sync_dirty_roots SET claim_owner=?,claim_expires_at=?,
+                       eligible_epoch_ns=?
                      WHERE project_id=? AND root_key=? AND root_kind=?
-                       AND (claim_owner IS NULL OR claim_expires_at<=?)""",
-                ((owner_key, claim_expires_at, row[0], row[1], row[2], observed_at) for row in rows),
+                       AND eligible_epoch_ns<=?""",
+                (
+                    (
+                        owner_key, claim_expires_at,
+                        _epoch_nanoseconds(claim_expires_at),
+                        row[0], row[1], row[2],
+                        _epoch_nanoseconds(observed_at),
+                    )
+                    for row in rows
+                ),
             )
             self._bump_revision(connection, observed_at)
             return tuple(
@@ -800,12 +1023,79 @@ class SyncStateRepository:
             for root in roots:
                 deleted += connection.execute(
                     """DELETE FROM sync_dirty_roots WHERE project_id=? AND root_key=? AND root_kind=?
-                         AND claim_owner=? AND claim_expires_at>?""",
+                         AND claim_owner=?
+                         AND hydra_rfc3339_micros(claim_expires_at)
+                             >hydra_rfc3339_micros(?)""",
                     (root.project_id, root.root_key, root.root_kind, owner_key, observed_at),
                 ).rowcount
             if deleted:
                 self._bump_revision(connection, observed_at)
             return deleted
+
+    def renew_dirty_claims(
+        self,
+        owner_key: str,
+        roots: tuple[DirtyRoot, ...],
+        observed_at: str,
+        lease_expires_at: str,
+    ) -> bool:
+        """Heartbeat the singleton lease and a reconciler's claimed roots."""
+        observed_at = _timestamp(observed_at)
+        lease_expires_at = _timestamp(lease_expires_at)
+        if not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 128:
+            raise ValueError("worker owner key is invalid")
+        if not roots:
+            raise ValueError("dirty claim renewal requires roots")
+        if _instant(lease_expires_at) <= _instant(observed_at):
+            raise ValueError("renewal expiry must follow observation")
+        with self._store.rollout_transaction() as connection:
+            held = connection.execute(
+                """UPDATE sync_worker_leases
+                      SET acquired_at=CASE
+                              WHEN hydra_rfc3339_micros(acquired_at)
+                                   <hydra_rfc3339_micros(?)
+                              THEN ? ELSE acquired_at END,
+                          expires_at=CASE
+                              WHEN hydra_rfc3339_micros(expires_at)
+                                   <hydra_rfc3339_micros(?)
+                              THEN ? ELSE expires_at END
+                    WHERE lease_name='ingest' AND owner_key=?
+                      AND hydra_rfc3339_micros(expires_at)
+                          >hydra_rfc3339_micros(?)""",
+                (
+                    observed_at, observed_at,
+                    lease_expires_at, lease_expires_at,
+                    owner_key, observed_at,
+                ),
+            ).rowcount == 1
+            if not held:
+                return False
+            renewed = 0
+            for root in roots:
+                renewed += connection.execute(
+                    """UPDATE sync_dirty_roots
+                          SET claim_expires_at=CASE
+                                  WHEN hydra_rfc3339_micros(claim_expires_at)
+                                       <hydra_rfc3339_micros(?)
+                                  THEN ? ELSE claim_expires_at END,
+                              eligible_epoch_ns=CASE
+                                  WHEN hydra_rfc3339_micros(claim_expires_at)
+                                       <hydra_rfc3339_micros(?)
+                                  THEN ? ELSE eligible_epoch_ns END
+                        WHERE project_id=? AND root_key=? AND root_kind=?
+                          AND claim_owner=?
+                          AND hydra_rfc3339_micros(claim_expires_at)
+                              >hydra_rfc3339_micros(?)""",
+                    (
+                        lease_expires_at, lease_expires_at,
+                        lease_expires_at,
+                        _epoch_nanoseconds(lease_expires_at),
+                        root.project_id, root.root_key, root.root_kind,
+                        owner_key, observed_at,
+                    ),
+                ).rowcount
+            self._bump_revision(connection, observed_at)
+            return renewed == len(roots)
 
     def create_job(self, job_kind: str, created_at: str, job_id: str | None = None) -> str:
         created_at = _timestamp(created_at)
@@ -817,8 +1107,12 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             connection.execute(
                 """INSERT INTO sync_jobs(job_id,job_kind,state,sources_discovered,sources_completed,bytes_processed,
-                       created_at,updated_at,completed_at) VALUES (?,?,'queued',0,0,0,?,?,NULL)""",
-                (identifier, job_kind, created_at, created_at),
+                       created_at,updated_at,completed_at,updated_epoch_ns)
+                   VALUES (?,?,'queued',0,0,0,?,?,NULL,?)""",
+                (
+                    identifier, job_kind, created_at, created_at,
+                    _epoch_nanoseconds(created_at),
+                ),
             )
             self._bump_revision(connection, created_at)
         return identifier
@@ -830,16 +1124,22 @@ class SyncStateRepository:
             raise ValueError("sync job kind is invalid")
         with self._store.rollout_transaction() as connection:
             row = connection.execute(
-                """SELECT job_id FROM sync_jobs WHERE state IN ('queued','running')
-                     ORDER BY updated_at DESC,job_id DESC LIMIT 1""",
+                """SELECT job_id FROM sync_jobs
+                     WHERE job_kind=? AND state IN ('queued','running')
+                     ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT 1""",
+                (job_kind,),
             ).fetchone()
             if row is not None:
                 return str(row[0]), True
             identifier = f"sync_{uuid.uuid4().hex}"
             connection.execute(
                 """INSERT INTO sync_jobs(job_id,job_kind,state,sources_discovered,sources_completed,bytes_processed,
-                       created_at,updated_at,completed_at) VALUES (?,?,'queued',0,0,0,?,?,NULL)""",
-                (identifier, job_kind, created_at, created_at),
+                       created_at,updated_at,completed_at,updated_epoch_ns)
+                   VALUES (?,?,'queued',0,0,0,?,?,NULL,?)""",
+                (
+                    identifier, job_kind, created_at, created_at,
+                    _epoch_nanoseconds(created_at),
+                ),
             )
             self._bump_revision(connection, created_at)
             return identifier, False
@@ -862,15 +1162,38 @@ class SyncStateRepository:
         row = self._store.connection.execute(
             """SELECT job_id,job_kind,state,sources_discovered,sources_completed,bytes_processed,
                       created_at,updated_at,completed_at FROM sync_jobs
-                 WHERE job_kind=? AND state IN ('queued','running') ORDER BY updated_at DESC,job_id DESC LIMIT 1""",
+                 WHERE job_kind=? AND state IN ('queued','running')
+                 ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT 1""",
             (job_kind,),
+        ).fetchone()
+        return None if row is None else self._job_from_row(row)
+
+    def latest_active_job(self) -> SyncJob | None:
+        row = self._store.connection.execute(
+            """SELECT job_id,job_kind,state,sources_discovered,
+                      sources_completed,bytes_processed,created_at,
+                      updated_at,completed_at
+                 FROM sync_jobs
+                WHERE state IN ('queued','running')
+                ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT 1""",
+        ).fetchone()
+        return None if row is None else self._job_from_row(row)
+
+    def latest_job(self) -> SyncJob | None:
+        row = self._store.connection.execute(
+            """SELECT job_id,job_kind,state,sources_discovered,
+                      sources_completed,bytes_processed,created_at,
+                      updated_at,completed_at
+                 FROM sync_jobs
+                ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT 1""",
         ).fetchone()
         return None if row is None else self._job_from_row(row)
 
     def list_jobs(self, limit: int = 100) -> tuple[SyncJob, ...]:
         return tuple(self._job_from_row(row) for row in self._store.connection.execute(
             """SELECT job_id,job_kind,state,sources_discovered,sources_completed,bytes_processed,
-                      created_at,updated_at,completed_at FROM sync_jobs ORDER BY updated_at DESC,job_id DESC LIMIT ?""",
+                      created_at,updated_at,completed_at FROM sync_jobs
+                 ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT ?""",
             (limit,),
         ))
 
@@ -895,8 +1218,10 @@ class SyncStateRepository:
             if previous is None:
                 raise KeyError("sync job is unknown")
             previous_state = str(previous[0])
-            if previous_state in {"succeeded", "partial", "failed"} and state != previous_state:
-                raise ValueError("terminal sync job state cannot regress")
+            if previous_state in {"succeeded", "partial", "failed"}:
+                raise ValueError("terminal sync job is immutable")
+            if previous_state == "running" and state == "queued":
+                raise ValueError("sync job state transition is invalid")
             if any(
                 current < int(old)
                 for current, old in zip(
@@ -912,15 +1237,241 @@ class SyncStateRepository:
                 raise ValueError("sync job timestamp cannot regress")
             if connection.execute(
                 """UPDATE sync_jobs SET state=?,sources_discovered=?,sources_completed=?,bytes_processed=?,
-                       updated_at=?,completed_at=? WHERE job_id=?""",
-                (state, sources_discovered, sources_completed, bytes_processed, updated_at, completed_at, job_id),
+                       updated_at=?,completed_at=?,updated_epoch_ns=?
+                     WHERE job_id=?""",
+                (
+                    state, sources_discovered, sources_completed,
+                    bytes_processed, updated_at, completed_at,
+                    _epoch_nanoseconds(updated_at), job_id,
+                ),
             ).rowcount != 1:
                 raise KeyError("sync job is unknown")
             return self._bump_revision(connection, updated_at)
 
+    def advance_job(
+        self, job_id: str, *, sources_completed_delta: int,
+        bytes_processed_delta: int, repair_required_delta: int,
+        remaining_sources: int, updated_at: str,
+    ) -> SyncJob:
+        """Atomically add one leased batch to a running job.
+
+        Absolute counters are unsafe across process handoff: two controllers can
+        both have read the same previous value. Additive updates serialize in
+        SQLite and preserve every completed source and byte.
+        """
+        updated_at = _timestamp(updated_at)
+        values = (
+            sources_completed_delta, bytes_processed_delta,
+            repair_required_delta, remaining_sources,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("sync job batch progress is invalid")
+        with self._store.rollout_transaction() as connection:
+            previous = connection.execute(
+                """SELECT state,sources_discovered,sources_completed,bytes_processed,
+                          created_at,updated_at,completed_at,job_kind
+                     FROM sync_jobs WHERE job_id=?""",
+                (job_id,),
+            ).fetchone()
+            if previous is None:
+                raise KeyError("sync job is unknown")
+            if str(previous[0]) != "running":
+                raise ValueError("sync job batch requires a running job")
+            if str(previous[7]) != "sync":
+                raise ValueError("sync job batch requires sync kind")
+            if _instant(updated_at) < _instant(str(previous[5])):
+                raise ValueError("sync job timestamp cannot regress")
+            completed = int(previous[2]) + sources_completed_delta
+            processed = int(previous[3]) + bytes_processed_delta
+            discovered = max(
+                int(previous[1]),
+                completed + repair_required_delta + remaining_sources,
+            )
+            connection.execute(
+                """UPDATE sync_jobs
+                      SET sources_discovered=?,sources_completed=?,
+                          bytes_processed=?,updated_at=?,updated_epoch_ns=?
+                    WHERE job_id=? AND state='running'""",
+                (
+                    discovered, completed, processed, updated_at,
+                    _epoch_nanoseconds(updated_at), job_id,
+                ),
+            )
+            self._bump_revision(connection, updated_at)
+            return SyncJob(
+                job_id, str(previous[7]), "running", discovered, completed,
+                processed, str(previous[4]), updated_at, None,
+            )
+
+    def finish_job_if_idle(
+        self, job_id: str, *, updated_at: str,
+    ) -> SyncJob | None:
+        """Atomically finish one running sync job only when no durable work remains."""
+        updated_at = _timestamp(updated_at)
+        with self._store.rollout_transaction() as connection:
+            previous = connection.execute(
+                """SELECT job_id,job_kind,state,sources_discovered,
+                          sources_completed,bytes_processed,created_at,
+                          updated_at,completed_at
+                     FROM sync_jobs WHERE job_id=?""",
+                (job_id,),
+            ).fetchone()
+            if previous is None:
+                raise KeyError("sync job is unknown")
+            current = self._job_from_row(previous)
+            if current.state in {"succeeded", "partial", "failed"}:
+                return current
+            if current.state != "running":
+                raise ValueError("sync job completion requires a running job")
+            if _instant(updated_at) < _instant(current.updated_at):
+                raise ValueError("sync job timestamp cannot regress")
+            has_work = connection.execute(
+                """SELECT
+                       EXISTS(SELECT 1 FROM sync_ingest_queue)
+                       OR EXISTS(
+                           SELECT 1 FROM hook_event_outbox
+                            WHERE acknowledged_at IS NULL
+                       )
+                       OR EXISTS(SELECT 1 FROM sync_dirty_roots)"""
+            ).fetchone()
+            if has_work is None or bool(has_work[0]):
+                return None
+            state = (
+                "partial"
+                if current.sources_discovered > current.sources_completed
+                else "succeeded"
+            )
+            if connection.execute(
+                """UPDATE sync_jobs SET state=?,updated_at=?,completed_at=?,
+                                        updated_epoch_ns=?
+                     WHERE job_id=? AND state='running'""",
+                (
+                    state, updated_at, updated_at,
+                    _epoch_nanoseconds(updated_at), job_id,
+                ),
+            ).rowcount != 1:
+                raise ValueError("sync job state transition is invalid")
+            self._bump_revision(connection, updated_at)
+            return SyncJob(
+                current.job_id, current.job_kind, state,
+                current.sources_discovered, current.sources_completed,
+                current.bytes_processed, current.created_at,
+                updated_at, updated_at,
+            )
+
     @staticmethod
     def _frontier_from_row(row) -> BackfillFrontier:
         return BackfillFrontier(*(str(value) if value is not None else None for value in row))  # type: ignore[arg-type]
+
+    @staticmethod
+    def _frontier_progress(connection, job_id: str) -> tuple[int, int, int]:
+        """Derive durable source progress from file frontiers and checkpoints."""
+        row = connection.execute(
+            """SELECT
+                   COUNT(*),
+                   COALESCE(SUM(CASE WHEN f.state='scanned' THEN 1 ELSE 0 END),0),
+                   COALESCE(SUM(
+                       CASE WHEN f.state='scanned' THEN COALESCE(c.file_size,0)
+                            ELSE 0 END
+                   ),0)
+                 FROM sync_backfill_frontier AS f
+                 LEFT JOIN sync_source_checkpoints AS c
+                   ON c.root_kind=f.root_kind
+                  AND c.source_locator=substr(f.directory_locator,7)
+                WHERE f.job_id=? AND substr(f.directory_locator,1,6)='@file/'""",
+            (job_id,),
+        ).fetchone()
+        assert row is not None
+        return int(row[0]), int(row[1]), int(row[2])
+
+    @staticmethod
+    def _lease_owned_in(
+        connection, owner_key: str, observed_at: str,
+    ) -> bool:
+        return connection.execute(
+            """SELECT 1 FROM sync_worker_leases
+                 WHERE lease_name='ingest' AND owner_key=?
+                   AND hydra_rfc3339_micros(expires_at)
+                       >hydra_rfc3339_micros(?)""",
+            (owner_key, observed_at),
+        ).fetchone() is not None
+
+    def _refresh_job_from_frontier(
+        self, connection, job_id: str, updated_at: str, *,
+        state: str | None = None, completed_at: str | None = None,
+    ) -> SyncJob:
+        previous = connection.execute(
+            """SELECT job_id,job_kind,state,sources_discovered,
+                      sources_completed,bytes_processed,created_at,
+                      updated_at,completed_at
+                 FROM sync_jobs WHERE job_id=?""",
+            (job_id,),
+        ).fetchone()
+        if previous is None:
+            raise KeyError("sync job is unknown")
+        current = self._job_from_row(previous)
+        if current.state in {"succeeded", "partial", "failed"}:
+            if state is not None and state != current.state:
+                raise ValueError("terminal sync job is immutable")
+            return current
+        next_state = current.state if state is None else state
+        if next_state not in _JOB_STATES:
+            raise ValueError("sync job state is invalid")
+        if current.state == "running" and next_state == "queued":
+            raise ValueError("sync job state transition is invalid")
+        if _instant(updated_at) < _instant(current.updated_at):
+            raise ValueError("sync job timestamp cannot regress")
+        durable_discovered, durable_completed, durable_bytes = (
+            self._frontier_progress(connection, job_id)
+        )
+        discovered = max(
+            current.sources_discovered, durable_discovered, durable_completed,
+        )
+        completed = max(current.sources_completed, durable_completed)
+        # A checkpoint can later grow due to normal append sync while a repair
+        # job is still visible. Only adopt its byte aggregate when a newly
+        # durable completed frontier is being recovered.
+        processed = current.bytes_processed
+        if durable_completed > current.sources_completed:
+            processed = max(processed, durable_bytes)
+        if next_state in {"succeeded", "partial", "failed"}:
+            completed_at = _timestamp(completed_at or updated_at)
+        elif completed_at is not None:
+            raise ValueError("non-terminal sync job cannot have completed_at")
+        connection.execute(
+            """UPDATE sync_jobs
+                  SET state=?,sources_discovered=?,sources_completed=?,
+                      bytes_processed=?,updated_at=?,completed_at=?,
+                      updated_epoch_ns=?
+                WHERE job_id=?""",
+            (
+                next_state, discovered, completed, processed, updated_at,
+                completed_at, _epoch_nanoseconds(updated_at), job_id,
+            ),
+        )
+        return SyncJob(
+            current.job_id, current.job_kind, next_state, discovered,
+            completed, processed, current.created_at, updated_at, completed_at,
+        )
+
+    def refresh_job_from_frontier_if_owned(
+        self, job_id: str, *, owner_key: str, lease_observed_at: str,
+        state: str, updated_at: str, completed_at: str | None = None,
+    ) -> SyncJob | None:
+        """Refresh repair progress and state under the same live-lease write."""
+        lease_observed_at = _timestamp(lease_observed_at)
+        updated_at = _timestamp(updated_at)
+        with self._store.rollout_transaction() as connection:
+            if not self._lease_owned_in(
+                connection, owner_key, lease_observed_at,
+            ):
+                return None
+            result = self._refresh_job_from_frontier(
+                connection, job_id, updated_at, state=state,
+                completed_at=completed_at,
+            )
+            self._bump_revision(connection, updated_at)
+            return result
 
     def save_frontier(self, *, job_id: str, root_kind: str, directory_locator: str, state: str,
                       discovered_count: int, updated_at: str) -> int:
@@ -940,6 +1491,44 @@ class SyncStateRepository:
                 (job_id, root, locator, state, discovered_count, updated_at),
             )
             return self._bump_revision(connection, updated_at)
+
+    def save_frontier_if_owned(
+        self, *, job_id: str, root_kind: str, directory_locator: str,
+        state: str, discovered_count: int, updated_at: str,
+        owner_key: str, lease_observed_at: str,
+    ) -> bool:
+        """Persist one frontier and its derived job counters iff lease is live."""
+        updated_at = _timestamp(updated_at)
+        lease_observed_at = _timestamp(lease_observed_at)
+        root = self._validate_root(root_kind)
+        locator = (
+            directory_locator
+            if directory_locator == "@root"
+            else validate_root_relative_locator(directory_locator)
+        )
+        if state not in _FRONTIER_STATES or discovered_count < 0:
+            raise ValueError("backfill frontier is invalid")
+        with self._store.rollout_transaction() as connection:
+            if not self._lease_owned_in(
+                connection, owner_key, lease_observed_at,
+            ):
+                return False
+            connection.execute(
+                """INSERT INTO sync_backfill_frontier(
+                       job_id,root_kind,directory_locator,state,
+                       discovered_count,updated_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(job_id,root_kind,directory_locator) DO UPDATE SET
+                     state=excluded.state,
+                     discovered_count=excluded.discovered_count,
+                     updated_at=excluded.updated_at""",
+                (job_id, root, locator, state, discovered_count, updated_at),
+            )
+            self._refresh_job_from_frontier(
+                connection, job_id, updated_at,
+            )
+            self._bump_revision(connection, updated_at)
+            return True
 
     def list_frontier(self, job_id: str, state: str | None = None) -> tuple[BackfillFrontier, ...]:
         if state is not None and state not in _FRONTIER_STATES:

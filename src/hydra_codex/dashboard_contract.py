@@ -19,7 +19,7 @@ from .report_semantics import (
     TEST_SEMANTIC_CAUSES,
     TEST_SEMANTIC_PHASES,
 )
-from .reporting import REPORT_SCHEMA
+from .reporting import REPORT_SCHEMA, normalize_sync_freshness
 from .dashboard_validation import (
     array as _array,
     fact_value,
@@ -196,14 +196,25 @@ def _validate_annotations(value: object) -> None:
     safe_codes(annotations["caveats"], "semantic annotation caveats")
 
 
-def validate_task_report(value: object) -> None:
-    report = _object(value, {
+def validate_task_report(
+    value: object, *, allow_legacy_without_sync_freshness: bool = False,
+) -> None:
+    keys = {
         "schema_version", "task_ref", "status", "last_activity_at", "task_family", "display_name",
         "recorded_tokens", "deduplicated_tokens", "timing", "counts", "semantic",
-        "instrumentation_overhead", "pilot_health", "trend",
-    }, "task report")
+        "instrumentation_overhead", "pilot_health", "trend", "sync_freshness",
+    }
+    if (
+        allow_legacy_without_sync_freshness
+        and isinstance(value, Mapping)
+        and "sync_freshness" not in value
+    ):
+        keys.remove("sync_freshness")
+    report = _object(value, keys, "task report")
     if report["schema_version"] != REPORT_SCHEMA:
         raise ValueError("task report schema is invalid")
+    if "sync_freshness" in report:
+        normalize_sync_freshness(report["sync_freshness"])  # type: ignore[arg-type]
     _task_ref(report["task_ref"], "task report task_ref")
     if report["status"] not in {"complete", "incomplete"}:
         raise ValueError("task report status is invalid")

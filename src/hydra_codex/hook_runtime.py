@@ -333,7 +333,7 @@ def handle_event(
     *,
     environ: Mapping[str, str] | None = None,
     clock: Clock | None = None,
-    store_factory: StoreFactory = HydraStore,
+    store_factory: StoreFactory = HydraStore.open_current,
     key_loader: KeyLoader = Pseudonymizer.installation_key,
     project_resolver: ProjectResolver = resolve_project,
     annotation_command: str | None = None,

@@ -10,7 +10,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from hydra_codex.annotation_core import (
     TrustedAnnotationContext,
@@ -178,6 +180,25 @@ class CodexHookTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_repeated_hook_uses_current_schema_without_full_database_audit(self) -> None:
+        first = self.handle(prompt_payload(cwd=str(self.root)))
+        self.capability(first)
+
+        with mock.patch.object(
+            HydraStore,
+            "_validate_schema",
+            side_effect=AssertionError("hook repeated the full database audit"),
+        ):
+            second = self.handle(
+                prompt_payload(
+                    cwd=str(self.root),
+                    session_id="session-private-b",
+                    turn_id="turn-private-b",
+                ),
+            )
+
+        self.capability(second)
+
     def test_hook_persists_the_trusted_project_display_name_for_dashboard_reads(self) -> None:
         (self.root / ".hydra" / "project.toml").write_text(
             f'project_id = "{PROJECT_ID}"\ndisplay_name = "Hydra Hooks"\n',
@@ -221,8 +242,29 @@ class CodexHookTests(unittest.TestCase):
             prompt_payload(cwd=str(self.root), session_id="session-a", turn_id="turn-a"),
             prompt_payload(cwd=str(self.root), session_id="session-b", turn_id="turn-b"),
         )
+        open_barrier = threading.Barrier(2)
+
+        def concurrent_first_open(
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            waited = False
+
+            def store_factory(path: Path | None) -> HydraStore:
+                nonlocal waited
+                if not waited:
+                    waited = True
+                    open_barrier.wait(timeout=5)
+                return HydraStore.open_current(path)
+
+            return handle_event(
+                payload,
+                environ=self.environ,
+                clock=lambda: NOW,
+                store_factory=store_factory,
+            )
+
         with ThreadPoolExecutor(max_workers=2) as executor:
-            responses = tuple(executor.map(self.handle, payloads))
+            responses = tuple(executor.map(concurrent_first_open, payloads))
 
         self.assertNotEqual(self.capability(responses[0]), self.capability(responses[1]))
         store = HydraStore(self.database)

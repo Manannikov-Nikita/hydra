@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 
-from hydra_codex.storage import HydraStore
+from hydra_codex.exact_time import require_exact_timestamp
+from hydra_codex.storage import MIGRATIONS, HydraStore
 
 
 class DurableSyncStateTests(unittest.TestCase):
@@ -34,7 +36,7 @@ class DurableSyncStateTests(unittest.TestCase):
             )
         }
 
-        self.assertEqual(self.store.schema_version(), 42)
+        self.assertEqual(self.store.schema_version(), MIGRATIONS[-1][0])
         self.assertTrue({
             "sync_source_registry", "sync_source_checkpoints", "sync_ingest_queue",
             "sync_worker_leases", "sync_dirty_roots", "sync_jobs",
@@ -103,6 +105,144 @@ class DurableSyncStateTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(repository.list_queue()), 2)
+
+    def test_deferred_work_poll_uses_bounded_summary_and_eligibility_indexes(
+        self,
+    ) -> None:
+        repository = self._repository()
+        future = "2026-07-27T00:00:00Z"
+        for index in range(256):
+            repository.register_and_enqueue(
+                root_kind="sessions",
+                source_locator=f"deferred/{index:04d}.jsonl",
+                observed_at=future,
+            )
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            state = repository.pending_work("2026-07-26T00:00:00Z")
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        self.assertEqual(
+            (state.total, state.eligible, state.next_eligible_at),
+            (256, 0, future),
+        )
+        poll = next(
+            statement for statement in statements
+            if "sync_ingest_queue" in statement
+            and statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        )
+        plan = tuple(
+            str(row[3]).upper()
+            for row in self.store.connection.execute(
+                "EXPLAIN QUERY PLAN " + poll,
+            )
+        )
+        for table in (
+            "SYNC_INGEST_QUEUE", "HOOK_EVENT_OUTBOX", "SYNC_DIRTY_ROOTS",
+        ):
+            self.assertFalse(
+                any(detail == f"SCAN {table}" for detail in plan),
+                plan,
+            )
+
+    def test_queue_rejects_a_valid_epoch_borrowed_from_another_source(
+        self,
+    ) -> None:
+        repository = self._repository()
+        repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="deferred/first.jsonl",
+            observed_at="2026-07-27T00:00:00Z",
+        )
+        repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="deferred/second.jsonl",
+            observed_at="2026-07-28T00:00:00Z",
+        )
+        borrowed = self.store.connection.execute(
+            """SELECT eligible_epoch_ns FROM sync_ingest_queue
+                WHERE source_locator='deferred/second.jsonl'""",
+        ).fetchone()[0]
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                """UPDATE sync_ingest_queue SET eligible_epoch_ns=?
+                    WHERE source_locator='deferred/first.jsonl'""",
+                (borrowed,),
+            )
+
+        state = repository.pending_work("2026-07-26T00:00:00Z")
+        self.assertEqual(
+            (state.total, state.eligible, state.next_eligible_at),
+            (2, 0, "2026-07-27T00:00:00Z"),
+        )
+
+    def test_pending_outbox_poll_uses_eligibility_index_without_sorting(
+        self,
+    ) -> None:
+        repository = self._repository()
+        future = "2026-07-27T00:00:00Z"
+        with self.store.rollout_transaction() as connection:
+            connection.executemany(
+                """INSERT INTO hook_event_outbox(
+                       event_key,project_id,session_key,turn_key,event_kind,
+                       observed_at,acknowledged_at,eligible_epoch_ns)
+                   VALUES (?,?,?,?,?,?,?,NULL)""",
+                (
+                    (
+                        f"acknowledged-{index:04d}", f"old-project-{index:04d}",
+                        f"old-session-{index:04d}", f"old-turn-{index:04d}",
+                        "prompt", future, future,
+                    )
+                    for index in range(1_500)
+                ),
+            )
+        for index in range(1_500):
+            repository.record_hook_event_and_enqueue(
+                event_key=f"event-{index:04d}",
+                project_id=f"project-{index:04d}",
+                session_key=f"session-{index:04d}",
+                turn_key=f"turn-{index:04d}",
+                event_kind="prompt",
+                observed_at=future,
+            )
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            state = repository.pending_work("2026-07-26T00:00:00Z")
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        self.assertEqual(
+            (state.total, state.eligible, state.next_eligible_at),
+            (1_500, 0, future),
+        )
+        poll = next(
+            statement for statement in statements
+            if "sync_work_summary AS summary" in statement
+        )
+        plan = tuple(
+            str(row[3]).upper()
+            for row in self.store.connection.execute(
+                "EXPLAIN QUERY PLAN " + poll,
+            )
+        )
+        index_sql = str(self.store.connection.execute(
+            """SELECT sql FROM sqlite_master
+                WHERE type='index'
+                  AND name='hook_event_outbox_eligibility'""",
+        ).fetchone()[0]).upper()
+        self.assertIn("WHERE ACKNOWLEDGED_AT IS NULL", index_sql)
+        self.assertTrue(
+            any("HOOK_EVENT_OUTBOX_ELIGIBILITY" in detail for detail in plan),
+            plan,
+        )
+        self.assertFalse(
+            any("TEMP B-TREE" in detail for detail in plan),
+            plan,
+        )
 
     def test_queue_and_checkpoint_are_idempotent_and_keep_only_append_state(self) -> None:
         repository = self._repository()
@@ -173,6 +313,89 @@ class DurableSyncStateTests(unittest.TestCase):
             "SELECT owner_key,expires_at FROM sync_worker_leases WHERE lease_name='ingest'"
         ).fetchone()
         self.assertEqual(tuple(lease), ("worker-b", "2026-07-26T00:00:20Z"))
+
+    def test_claim_renewal_never_moves_live_ownership_backwards(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/monotonic.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator,
+            project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker", "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z",
+        ))
+        self.assertIsNotNone(repository.claim_next(
+            "worker", "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z",
+        ))
+
+        self.assertTrue(repository.renew_claim(
+            "worker", "sessions", locator,
+            "2026-07-26T00:00:11Z",
+            "2026-07-26T00:00:15Z",
+        ))
+
+        lease = self.store.connection.execute(
+            """SELECT acquired_at,expires_at FROM sync_worker_leases
+                 WHERE lease_name='ingest'""",
+        ).fetchone()
+        queue = self.store.connection.execute(
+            """SELECT claim_expires_at FROM sync_ingest_queue
+                 WHERE root_kind='sessions' AND source_locator=?""",
+            (locator,),
+        ).fetchone()
+        self.assertEqual(tuple(lease), (
+            "2026-07-26T00:00:11Z", "2026-07-26T00:00:20Z",
+        ))
+        self.assertEqual(queue[0], "2026-07-26T00:00:20Z")
+        revision = repository.data_revision()
+        self.assertFalse(repository.acquire_lease(
+            "worker", "2026-07-26T00:00:10.5Z",
+            "2026-07-26T00:00:16Z",
+        ))
+        self.assertEqual(repository.data_revision(), revision)
+
+    def test_lease_and_queue_eligibility_compare_fractional_timestamps_chronologically(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/fractional.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions", source_locator=locator,
+            observed_at="2026-07-26T00:00:00.01Z",
+        )
+        self.store.connection.execute(
+            """UPDATE sync_ingest_queue
+                  SET available_at='2026-07-26T00:00:00.100002Z',
+                      eligible_epoch_ns=?""",
+            (
+                require_exact_timestamp(
+                    "2026-07-26T00:00:00.100002Z",
+                    "test queue eligibility",
+                ).epoch_nanoseconds,
+            ),
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker-a", "2026-07-26T00:00:00.01Z",
+            "2026-07-26T00:00:00.100002Z",
+        ))
+
+        self.assertFalse(repository.acquire_lease(
+            "worker-b", "2026-07-26T00:00:00.1Z",
+            "2026-07-26T00:00:01Z",
+        ))
+        self.assertIsNone(repository.claim_next(
+            "worker-a", "2026-07-26T00:00:00.1Z",
+            "2026-07-26T00:00:00.100002Z",
+        ))
+        self.assertTrue(repository.acquire_lease(
+            "worker-b", "2026-07-26T00:00:00.100002Z",
+            "2026-07-26T00:00:01Z",
+        ))
+        self.assertIsNotNone(repository.claim_next(
+            "worker-b", "2026-07-26T00:00:00.100002Z",
+            "2026-07-26T00:00:01Z",
+        ))
 
     def test_two_connections_claim_once_and_busy_failure_leaves_no_partial_state(self) -> None:
         second = HydraStore(self.database)
@@ -412,6 +635,12 @@ class DurableSyncStateTests(unittest.TestCase):
                         updated_at="2026-07-26T00:00:02Z",
                     )
 
+        with self.assertRaisesRegex(ValueError, "transition"):
+            repository.update_job(
+                job_id, state="queued", sources_discovered=4, sources_completed=2,
+                bytes_processed=128, updated_at="2026-07-26T00:00:02Z",
+            )
+
         repository.update_job(
             job_id, state="succeeded", sources_discovered=4, sources_completed=4,
             bytes_processed=256, updated_at="2026-07-26T00:00:03Z",
@@ -421,6 +650,236 @@ class DurableSyncStateTests(unittest.TestCase):
                 job_id, state="running", sources_discovered=4, sources_completed=4,
                 bytes_processed=256, updated_at="2026-07-26T00:00:04Z",
             )
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            repository.update_job(
+                job_id, state="succeeded", sources_discovered=5, sources_completed=5,
+                bytes_processed=512, updated_at="2026-07-26T00:00:04Z",
+            )
+
+    def test_job_batch_progress_is_additive_across_worker_lease_handoff(self) -> None:
+        repository = self._repository()
+        second_store = HydraStore(self.database)
+        self.addCleanup(second_store.close)
+        from hydra_codex.sync_state import SyncStateRepository
+        second = SyncStateRepository(second_store)
+        job_id = repository.create_job("sync", "2026-07-26T00:00:00Z")
+        repository.update_job(
+            job_id, state="running", sources_discovered=2, sources_completed=0,
+            bytes_processed=0, updated_at="2026-07-26T00:00:00.01Z",
+        )
+
+        first = repository.advance_job(
+            job_id, sources_completed_delta=1, bytes_processed_delta=100,
+            repair_required_delta=0, remaining_sources=1,
+            updated_at="2026-07-26T00:00:00.1Z",
+        )
+        final = second.advance_job(
+            job_id, sources_completed_delta=1, bytes_processed_delta=250,
+            repair_required_delta=0, remaining_sources=0,
+            updated_at="2026-07-26T00:00:00.11Z",
+        )
+
+        self.assertEqual(
+            (first.sources_completed, first.bytes_processed), (1, 100),
+        )
+        self.assertEqual(
+            (final.sources_discovered, final.sources_completed, final.bytes_processed),
+            (2, 2, 350),
+        )
+
+    def test_active_job_reuse_is_scoped_to_the_requested_kind(self) -> None:
+        repository = self._repository()
+
+        sync_id, sync_reused = repository.get_or_create_active_job(
+            "sync", "2026-07-26T00:00:00Z",
+        )
+        repair_id, repair_reused = repository.get_or_create_active_job(
+            "repair", "2026-07-26T00:00:01Z",
+        )
+        second_sync, second_sync_reused = repository.get_or_create_active_job(
+            "sync", "2026-07-26T00:00:02Z",
+        )
+        second_repair, second_repair_reused = repository.get_or_create_active_job(
+            "repair", "2026-07-26T00:00:03Z",
+        )
+
+        self.assertFalse(sync_reused)
+        self.assertFalse(repair_reused)
+        self.assertNotEqual(sync_id, repair_id)
+        self.assertEqual((second_sync, second_sync_reused), (sync_id, True))
+        self.assertEqual((second_repair, second_repair_reused), (repair_id, True))
+
+    def test_terminal_job_transition_waits_for_and_observes_concurrent_enqueue(self) -> None:
+        repository = self._repository()
+        repository.register_source(
+            root_kind="sessions", source_locator="concurrent.jsonl",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        job_id = repository.create_job("sync", "2026-07-26T00:00:00Z")
+        repository.update_job(
+            job_id, state="running", sources_discovered=0,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(
+            hasattr(repository, "finish_job_if_idle"),
+            "terminal transition must share one transaction with the work check",
+        )
+
+        queued_but_uncommitted = threading.Event()
+        allow_enqueue_commit = threading.Event()
+        finish_started = threading.Event()
+        finish_result: list[object] = []
+
+        def enqueue_while_finisher_waits() -> None:
+            writer = HydraStore(self.database)
+            try:
+                writer_repository = type(repository)(writer)
+                with writer.rollout_transaction() as connection:
+                    connection.execute(
+                        """INSERT INTO sync_ingest_queue(
+                               root_kind,source_locator,queue_state,enqueued_at,
+                               available_at,claimed_by,claimed_at,claim_expires_at,
+                               requeue_pending,attempts,reason_code,
+                               eligible_epoch_ns)
+                           VALUES ('sessions','concurrent.jsonl','queued',
+                                   '2026-07-26T00:00:01Z','2026-07-26T00:00:01Z',
+                                   NULL,NULL,NULL,0,0,NULL,?)""",
+                        (
+                            require_exact_timestamp(
+                                "2026-07-26T00:00:01Z",
+                                "test queue eligibility",
+                            ).epoch_nanoseconds,
+                        ),
+                    )
+                    writer_repository._bump_revision(
+                        connection, "2026-07-26T00:00:01Z",
+                    )
+                    queued_but_uncommitted.set()
+                    allow_enqueue_commit.wait(2)
+            finally:
+                writer.close()
+
+        def finish_after_enqueue_started() -> None:
+            finisher = HydraStore(self.database)
+            try:
+                finish_started.set()
+                finish_result.append(type(repository)(finisher).finish_job_if_idle(
+                    job_id, updated_at="2026-07-26T00:00:02Z",
+                ))
+            except BaseException as error:
+                finish_result.append(error)
+            finally:
+                finisher.close()
+
+        writer_thread = threading.Thread(target=enqueue_while_finisher_waits)
+        finish_thread = threading.Thread(target=finish_after_enqueue_started)
+        writer_thread.start()
+        self.assertTrue(queued_but_uncommitted.wait(1))
+        finish_thread.start()
+        self.assertTrue(finish_started.wait(1))
+        time.sleep(0.05)
+        self.assertTrue(finish_thread.is_alive())
+        allow_enqueue_commit.set()
+        writer_thread.join(2)
+        finish_thread.join(2)
+
+        self.assertFalse(writer_thread.is_alive())
+        self.assertFalse(finish_thread.is_alive())
+        self.assertEqual(finish_result, [None])
+        self.assertEqual(repository.get_job(job_id).state, "running")
+        self.assertEqual(repository.queue_count(), 1)
+
+    def test_active_job_ordering_uses_chronological_rfc3339_instants(self) -> None:
+        repository = self._repository()
+        older = repository.create_job(
+            "sync", "2026-07-26T10:00:00Z",
+            job_id="sync_00000000000000000000000000000001",
+        )
+        newer = repository.create_job(
+            "sync", "2026-07-26T10:00:00.1Z",
+            job_id="sync_00000000000000000000000000000002",
+        )
+
+        self.assertEqual(repository.current_job("sync").job_id, newer)
+        self.assertEqual(repository.list_jobs()[0].job_id, newer)
+        repair, reused = repository.get_or_create_active_job(
+            "repair", "2026-07-26T10:00:01Z",
+        )
+        self.assertFalse(reused)
+        self.assertNotEqual(repair, newer)
+        self.assertEqual(repository.get_job(repair).job_kind, "repair")
+        self.assertNotEqual(older, newer)
+
+    def test_latest_job_queries_use_exact_epoch_indexes_and_constant_limits(self) -> None:
+        repository = self._repository()
+        with self.store.rollout_transaction() as connection:
+            connection.executemany(
+                """INSERT INTO sync_jobs(
+                       job_id,job_kind,state,sources_discovered,
+                       sources_completed,bytes_processed,created_at,
+                       updated_at,completed_at,updated_epoch_ns)
+                   VALUES (?,'sync','succeeded',0,0,0,?,?,?,?)""",
+                (
+                    (
+                        f"sync_{index + 1_000:032x}",
+                        "2026-07-25T10:00:00Z",
+                        "2026-07-25T10:00:00Z",
+                        "2026-07-25T10:00:00Z",
+                        require_exact_timestamp(
+                            "2026-07-25T10:00:00Z",
+                        ).epoch_nanoseconds,
+                    )
+                    for index in range(1, 501)
+                ),
+            )
+        older = repository.create_job(
+            "sync", "2026-07-26T10:00:00Z",
+            job_id="sync_00000000000000000000000000000011",
+        )
+        newest_terminal = repository.create_job(
+            "repair", "2026-07-26T10:00:00.100000Z",
+            job_id="sync_00000000000000000000000000000012",
+        )
+        repository.update_job(
+            newest_terminal, state="succeeded",
+            sources_discovered=0, sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-26T10:00:00.100000Z",
+        )
+        active = repository.create_job(
+            "backfill", "2026-07-26T10:00:00.000001Z",
+            job_id="sync_00000000000000000000000000000013",
+        )
+
+        self.assertEqual(repository.latest_job().job_id, newest_terminal)
+        self.assertEqual(repository.latest_active_job().job_id, active)
+        self.assertEqual(repository.current_job("sync").job_id, older)
+        epochs = tuple(self.store.connection.execute(
+            "SELECT updated_epoch_ns FROM sync_jobs ORDER BY job_id",
+        ))
+        self.assertTrue(all(
+            isinstance(row[0], int) for row in epochs
+        ))
+        plans = {
+            "latest": "\n".join(
+                str(row[3]) for row in self.store.connection.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT job_id FROM sync_jobs
+                        ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT 1""",
+                )
+            ),
+            "active": "\n".join(
+                str(row[3]) for row in self.store.connection.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT job_id FROM sync_jobs
+                        WHERE state IN ('queued','running')
+                        ORDER BY updated_epoch_ns DESC,job_id DESC LIMIT 1""",
+                )
+            ),
+        }
+        self.assertIn("sync_jobs_updated_epoch", plans["latest"])
+        self.assertIn("sync_jobs_active_updated_epoch", plans["active"])
+        self.assertNotIn("TEMP B-TREE", repr(plans))
 
     def test_v38_database_upgrades_without_losing_existing_catalog_rows(self) -> None:
         legacy_path = Path(self.temporary.name) / "v38.sqlite3"
@@ -445,7 +904,7 @@ class DurableSyncStateTests(unittest.TestCase):
 
         upgraded = HydraStore(legacy_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.schema_version(), 42)
+        self.assertEqual(upgraded.schema_version(), MIGRATIONS[-1][0])
         self.assertEqual(
             upgraded.connection.execute(
                 "SELECT display_name FROM dashboard_projects WHERE project_id='hprj_preserved'"

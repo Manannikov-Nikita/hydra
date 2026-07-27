@@ -18,9 +18,42 @@ from .task_tree_types import ScalarFact, TokenVectorFact, validate_provenance
 
 REPORT_SCHEMA = "hydra.report/v4"
 COMPARISON_SCHEMA = "hydra.comparison/v2"
+SYNC_FRESHNESS_SCHEMA = "hydra.sync-freshness/v1"
 _PUBLIC_REF = re.compile(r"task_[0-9a-f]{1,64}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z")
 _UNITS = frozenset({"tokens", "milliseconds", "count", "ratio", "percent"})
+_SYNC_FRESHNESS_STATES = frozenset({
+    "current", "queued", "running", "repair_required",
+    "reconcile_required", "unknown",
+})
+
+
+def normalize_sync_freshness(
+    value: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the strict, privacy-safe freshness snapshot used by public reports."""
+    if value is None:
+        return {
+            "schema_version": SYNC_FRESHNESS_SCHEMA,
+            "state": "unknown",
+            "data_revision": 0,
+        }
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version", "state", "data_revision",
+    }:
+        raise ValueError("sync freshness must contain only public contract fields")
+    if value["schema_version"] != SYNC_FRESHNESS_SCHEMA:
+        raise ValueError("sync freshness schema is invalid")
+    if value["state"] not in _SYNC_FRESHNESS_STATES:
+        raise ValueError("sync freshness state is invalid")
+    revision = value["data_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("sync freshness data revision must be non-negative")
+    return {
+        "schema_version": SYNC_FRESHNESS_SCHEMA,
+        "state": str(value["state"]),
+        "data_revision": revision,
+    }
 
 
 def _finite(value: object, field: str, *, allow_none: bool) -> int | float | None:
@@ -367,6 +400,7 @@ class TaskReport:
             "last_activity_at": self.last_activity_at,
             "task_family": self.task_family,
             "display_name": self.display_name,
+            "sync_freshness": normalize_sync_freshness(),
             "recorded_tokens": self.recorded_tokens.as_dict(),
             "deduplicated_tokens": self.deduplicated_tokens.as_dict(),
             "timing": {

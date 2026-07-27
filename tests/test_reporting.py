@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from hydra_codex import report_operations
+from hydra_codex.dashboard_contract import validate_task_report
 from hydra_codex.report_renderers import (
     render_html,
     render_json,
@@ -113,6 +114,12 @@ class PublicReportContractTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], REPORT_SCHEMA)
         self.assertEqual(payload["task_ref"], public_ref)
         self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["sync_freshness"], {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "unknown",
+            "data_revision": 0,
+        })
+        validate_task_report(payload)
         self.assertEqual(report.recorded_tokens.working.value, 90)
         self.assertEqual(report.deduplicated_tokens.working.value, 90)
         self.assertEqual(report.wall_clock.value, 10_000)
@@ -387,6 +394,10 @@ class CompareAndRendererTests(unittest.TestCase):
         payload = json.loads(rendered["json"])
         self.assertEqual(payload["schema_version"], "hydra.report-list/v2")
         self.assertEqual(payload["sync_freshness"]["state"], "unknown")
+        self.assertTrue(all(
+            item["sync_freshness"] == payload["sync_freshness"]
+            for item in payload["reports"]
+        ))
         self.assertEqual(
             [item["task_ref"] for item in payload["reports"]],
             [item.task_ref for item in reports],
@@ -406,6 +417,7 @@ class CompareAndRendererTests(unittest.TestCase):
                 "reports": [], "schema_version": "hydra.report-list/v2",
                 "sync_freshness": {
                     "schema_version": "hydra.sync-freshness/v1", "state": "unknown",
+                    "data_revision": 0,
                 },
             },
         )
@@ -413,6 +425,35 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertIn("0 reconciled tasks", render_report_collection((), "html"))
         with self.assertRaisesRegex(ValueError, "format"):
             render_report_collection((), "xml")
+
+    def test_task_report_rejects_missing_or_malformed_sync_freshness(self) -> None:
+        payload = self.report("freshness-contract", 10).as_dict()
+        payload.pop("sync_freshness", None)
+        with self.assertRaisesRegex(ValueError, "task report"):
+            validate_task_report(payload)
+
+        for malformed in (
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "private-state",
+                "data_revision": 1,
+            },
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "current",
+                "data_revision": True,
+            },
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "current",
+                "data_revision": 1,
+                "source_path": "/private/source.jsonl",
+            },
+        ):
+            candidate = self.report("freshness-contract", 10).as_dict()
+            candidate["sync_freshness"] = malformed
+            with self.assertRaisesRegex(ValueError, "freshness"):
+                validate_task_report(candidate)
 
 
 if __name__ == "__main__":

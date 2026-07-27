@@ -595,6 +595,7 @@ def main(
                 input_stream=input_stream,
                 output_stream=output_stream,
                 command_prefix=command_prefix,
+                environ=environment,
             )
         if arguments.command == "dashboard":
             from .dashboard_launch import run_dashboard

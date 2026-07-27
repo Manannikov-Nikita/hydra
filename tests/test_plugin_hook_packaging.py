@@ -242,7 +242,7 @@ class PluginHookContractTests(unittest.TestCase):
         self.assertEqual(
             manifest["interface"]["defaultPrompt"],
             [
-                "Use $hydra-report to reconcile local Codex telemetry and "
+                "Use $hydra-report to read materialized local Codex telemetry and "
                 "summarize the latest task report.",
             ],
         )
@@ -320,12 +320,15 @@ class PluginHookContractTests(unittest.TestCase):
         self.assertNotIn("trusted turn transport", normalized)
         self.assertIn("does not advertise `hydra.annotate`", normalized)
         self.assertIn("does not expose doctor or storage maintenance", normalized)
+        self.assertIn("returns `hydra.report-list/v2`", normalized)
+        self.assertIn("`hydra.report/v4` items", normalized)
 
         schema = (
             ROOT / "plugins" / "hydra-codex" / "skills" / "hydra-report"
             / "references" / "report-schema.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("`hydra.report/v3`", schema)
+        self.assertIn("`hydra.report/v4`", schema)
+        self.assertIn("same `sync_freshness` value", schema)
         self.assertIn("`semantic.annotations`", schema)
         self.assertIn("`hydra.comparison/v2`", schema)
         self.assertIn("`comparable`", schema)

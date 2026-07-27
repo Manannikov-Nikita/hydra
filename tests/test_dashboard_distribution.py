@@ -354,8 +354,8 @@ class DashboardDistributionTests(unittest.TestCase):
                 "hydra_codex.dashboard_launch.default_database_path",
                 return_value=root / "missing-parent" / "hydra.sqlite3",
             ), patch(
-                "hydra_codex.dashboard_launch.HydraStore",
-            ) as constructor, patch(
+                "hydra_codex.dashboard_launch.HydraStore.open_current",
+            ) as open_current, patch(
                 "hydra_codex.dashboard_launch.create_dashboard_server",
                 side_effect=create,
             ):
@@ -370,7 +370,7 @@ class DashboardDistributionTests(unittest.TestCase):
                 )
                 captured["application"]._controller._runner._store_factory()
 
-            self.assertEqual(constructor.call_args_list, [call(None), call(None)])
+            self.assertEqual(open_current.call_args_list, [call(None)])
 
 
 if __name__ == "__main__":

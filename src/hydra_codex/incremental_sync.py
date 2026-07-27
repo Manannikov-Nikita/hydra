@@ -32,7 +32,14 @@ from .rollout_privacy import canonical_timestamp, nonempty_string
 from .rollout_reconcile import reconcile_fork_baselines, reconcile_token_epochs, reconcile_turn_attempts
 from .rollout_sources import SOURCE_CHANGED_MESSAGE, SourceChanged, SourceStat, line_fingerprint, open_source, scan_source, source_stat
 from .storage import HydraStore
-from .sync_state import QueueItem, SourceCheckpoint, SyncStateRepository, validate_root_relative_locator
+from .sync_state import (
+    DirtyRoot,
+    QueueItem,
+    SourceCheckpoint,
+    SyncStateRepository,
+    _epoch_nanoseconds,
+    validate_root_relative_locator,
+)
 from .test_evidence import reconcile_test_evidence
 from .token_selection import refresh_token_source_selection
 
@@ -50,7 +57,9 @@ class TrustedSourceRoots:
     sessions: Path
     archived_sessions: Path
 
-    def root_for(self, root_kind: str) -> Path:
+    def _root_with_identity(
+        self, root_kind: str,
+    ) -> tuple[Path, tuple[int, int]]:
         try:
             value = {"sessions": self.sessions, "archived_sessions": self.archived_sessions}[root_kind]
         except KeyError as error:
@@ -61,7 +70,48 @@ class TrustedSourceRoots:
             raise RepairRequired("trusted source root is unavailable") from error
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
             raise RepairRequired("trusted source root is unavailable")
-        return value
+        return value, (int(details.st_dev), int(details.st_ino))
+
+    def root_for(self, root_kind: str) -> Path:
+        return self._root_with_identity(root_kind)[0]
+
+    @contextmanager
+    def open_directory(self, root_kind: str, locator: str) -> Iterator[int]:
+        """Hold one trusted directory by descriptor-relative, no-follow opens."""
+        root, expected_root = self._root_with_identity(root_kind)
+        directory: int | None = None
+        try:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            directory = os.open(root, flags)
+            opened_root = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(opened_root.st_mode)
+                or (int(opened_root.st_dev), int(opened_root.st_ino))
+                != expected_root
+            ):
+                raise RepairRequired("trusted source root changed during open")
+            if locator != "@root":
+                for component in validate_root_relative_locator(locator).split("/"):
+                    child = os.open(component, flags, dir_fd=directory)
+                    if not stat.S_ISDIR(os.fstat(child).st_mode):
+                        os.close(child)
+                        raise RepairRequired(
+                            "repair frontier is no longer a directory",
+                        )
+                    os.close(directory)
+                    directory = child
+            yield directory
+        except RepairRequired:
+            raise
+        except OSError as error:
+            raise RepairRequired("repair frontier is unavailable") from error
+        finally:
+            if directory is not None:
+                os.close(directory)
 
     @contextmanager
     def open_held(self, root_kind: str, locator: str) -> Iterator[tuple[BinaryIO, SourceStat]]:
@@ -73,13 +123,18 @@ class TrustedSourceRoots:
         validates anchors and reads the append.
         """
         relative = validate_root_relative_locator(locator)
-        root = self.root_for(root_kind)
+        root, expected_root = self._root_with_identity(root_kind)
         directory: int | None = None
         source: int | None = None
         try:
             flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
             directory = os.open(root, flags)
-            if not stat.S_ISDIR(os.fstat(directory).st_mode):
+            opened_root = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(opened_root.st_mode)
+                or (int(opened_root.st_dev), int(opened_root.st_ino))
+                != expected_root
+            ):
                 raise RepairRequired("trusted source root is unavailable")
             parts = relative.split("/")
             for component in parts[:-1]:
@@ -341,7 +396,9 @@ def read_incremental_source(
             else:
                 partial_line = bool(buffered)
         return TailRead(tuple(lines), next_checkpoint, consumed, has_complete_work, partial_line)
-    except RepairRequired:
+    except RepairRequired as error:
+        if str(error) == "source changed while tailing":
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
         raise
     except SourceChanged as error:
         raise RepairRequired("source changed while tailing") from error
@@ -538,17 +595,22 @@ class IncrementalSyncWorker:
     def __init__(
         self, store: HydraStore, roots: TrustedSourceRoots, *, materialize: Materializer | None = None,
         reconcile: Reconciler | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
+        if not callable(clock):
+            raise TypeError("incremental sync clock must be callable")
         self.store = store
         self.roots = roots
         self.repository = SyncStateRepository(store)
         self.materialize = materialize or rollout_tail_materializer(store)
         self.reconcile = reconcile
+        self.clock = clock
 
     @contextmanager
     def _lease_heartbeat(
         self, owner_key: str, lease_expires_at: str, item: QueueItem | None = None,
-        *, interval_seconds: float | None = None,
+        *, dirty_roots: tuple[DirtyRoot, ...] = (),
+        interval_seconds: float | None = None,
     ) -> Iterator[threading.Event]:
         """Renew a held lease while arbitrary parser/reconciler code runs.
 
@@ -556,6 +618,8 @@ class IncrementalSyncWorker:
         cannot starve the renewal behind its transaction.  A failed renewal is
         sticky: callers must not acknowledge/commit derived state afterwards.
         """
+        if item is not None and dirty_roots:
+            raise ValueError("heartbeat cannot renew queue and dirty claims together")
         try:
             deadline = datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
             remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
@@ -568,14 +632,21 @@ class IncrementalSyncWorker:
             return
         stop = threading.Event()
         lost = threading.Event()
+        try:
+            reopen = self.store.validated_reopener()
+        except Exception:
+            lost.set()
+            yield lost
+            return
         interval = max(0.01, interval_seconds if interval_seconds is not None else remaining / 3)
         def beat() -> None:
             # SQLite connections are thread-affine.  Construct this auxiliary
             # store inside the heartbeat thread, rather than accidentally
             # catching ProgrammingError forever on a connection opened by the
             # invoking MCP/dashboard thread.
-            auxiliary = HydraStore(self.store.database_path)
+            auxiliary: HydraStore | None = None
             try:
+                auxiliary = reopen()
                 # A materializer may hold SQLite's single writer lock.  A
                 # heartbeat must retry on the next cadence, not wait through
                 # the normal five-second contention timeout.
@@ -588,12 +659,19 @@ class IncrementalSyncWorker:
                         observed_now + timedelta(seconds=remaining),
                     )
                     try:
-                        if item is None:
-                            held = repository.acquire_lease(owner_key, observed, renewed_expiry)
-                        else:
+                        if item is not None:
                             held = repository.renew_claim(
                                 owner_key, item.root_kind, item.source_locator,
                                 observed, renewed_expiry,
+                            )
+                        elif dirty_roots:
+                            held = repository.renew_dirty_claims(
+                                owner_key, dirty_roots,
+                                observed, renewed_expiry,
+                            )
+                        else:
+                            held = repository.acquire_lease(
+                                owner_key, observed, renewed_expiry,
                             )
                     except (OSError, sqlite3.Error):
                         # Busy means our own in-flight atomic materialization
@@ -602,6 +680,9 @@ class IncrementalSyncWorker:
                     except ValueError:
                         held = False
                     if not held:
+                        if dirty_roots:
+                            lost.set()
+                            return
                         # A false claim renewal can race the successful queue
                         # ack. Only a read-confirmed owner change is terminal.
                         try:
@@ -611,8 +692,11 @@ class IncrementalSyncWorker:
                         if not still_owned:
                             lost.set()
                             return
+            except Exception:
+                lost.set()
             finally:
-                auxiliary.close()
+                if auxiliary is not None:
+                    auxiliary.close()
 
         thread = threading.Thread(target=beat, name="hydra-sync-lease", daemon=True)
         thread.start()
@@ -622,7 +706,14 @@ class IncrementalSyncWorker:
             stop.set()
             thread.join(timeout=max(1.0, interval * 2))
 
-    def reconcile_dirty(self, owner_key: str, observed_at: str, lease_expires_at: str) -> int:
+    def reconcile_dirty(
+        self,
+        owner_key: str,
+        observed_at: str,
+        lease_expires_at: str,
+        *,
+        current_time: Callable[[], str] | None = None,
+    ) -> int:
         """Reconcile only roots claimed by this worker, never the full catalog.
 
         The current conservative boundary is project-level: task dirty markers
@@ -636,25 +727,39 @@ class IncrementalSyncWorker:
         if not roots:
             return 0
         completed = 0
+        fresh = current_time or (lambda: observed_at)
         for project_id in sorted({root.project_id for root in roots}):
             project_roots = tuple(root for root in roots if root.project_id == project_id)
-            with self._lease_heartbeat(owner_key, lease_expires_at) as lost:
+            with self._lease_heartbeat(
+                owner_key, lease_expires_at,
+                dirty_roots=project_roots,
+            ) as lost:
                 self.reconcile(project_id)
             if lost.is_set():
                 continue
-            completed += self.repository.acknowledge_dirty_roots(owner_key, project_roots, observed_at)
+            acknowledged_at = fresh()
+            if not self.repository.lease_owned(owner_key, acknowledged_at):
+                continue
+            completed += self.repository.acknowledge_dirty_roots(
+                owner_key, project_roots, acknowledged_at,
+            )
         return completed
 
     def _commit(
         self, item: QueueItem, tail: TailRead, result: MaterializedSource,
-        owner_key: str, observed_at: str, ownership_lost: threading.Event | None = None,
-    ) -> None:
+        owner_key: str, current_time: Callable[[], str],
+        ownership_lost: threading.Event | None = None,
+        job_id: str | None = None,
+    ) -> bool:
         """Commit parser facts, checkpoint, dirty marker and queue ack together."""
         with self.store.rollout_transaction() as connection:
+            observed_at = current_time()
             # A stale/dead worker cannot commit over the next lease holder.
             owned = connection.execute(
                 """SELECT requeue_pending FROM sync_ingest_queue WHERE root_kind=? AND source_locator=?
-                     AND queue_state='claimed' AND claimed_by=? AND claim_expires_at>?""",
+                     AND queue_state='claimed' AND claimed_by=?
+                     AND hydra_rfc3339_micros(claim_expires_at)
+                         >hydra_rfc3339_micros(?)""",
                 (item.root_kind, item.source_locator, owner_key, observed_at),
             ).fetchone()
             if owned is None:
@@ -665,6 +770,20 @@ class IncrementalSyncWorker:
                 # raising here rolls them back before a successor can observe
                 # any facts or a durable checkpoint.
                 raise RepairRequired("worker lease lost")
+            observed_at = current_time()
+            owned = connection.execute(
+                """SELECT requeue_pending FROM sync_ingest_queue
+                     WHERE root_kind=? AND source_locator=?
+                       AND queue_state='claimed' AND claimed_by=?
+                       AND hydra_rfc3339_micros(claim_expires_at)
+                           >hydra_rfc3339_micros(?)""",
+                (
+                    item.root_kind, item.source_locator,
+                    owner_key, observed_at,
+                ),
+            ).fetchone()
+            if owned is None:
+                raise RepairRequired("queue claim expired")
             if result.project_id is not None:
                 # Keep incremental facts in the same derived-state shape as a
                 # legacy ingest batch before exposing the project as dirty.
@@ -701,18 +820,28 @@ class IncrementalSyncWorker:
                 )
                 root_key = result.dirty_root_key or result.project_id
                 connection.execute(
-                    """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at)
-                       VALUES (?,?,?,?,NULL,NULL)
+                    """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at,eligible_epoch_ns)
+                       VALUES (?,?,?,?,NULL,NULL,?)
                        ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
-                         observed_at=excluded.observed_at,claim_owner=NULL,claim_expires_at=NULL""",
-                    (result.project_id, root_key, result.dirty_root_kind, observed_at),
+                         observed_at=excluded.observed_at,claim_owner=NULL,
+                         claim_expires_at=NULL,
+                         eligible_epoch_ns=excluded.eligible_epoch_ns""",
+                    (
+                        result.project_id, root_key, result.dirty_root_kind,
+                        observed_at, _epoch_nanoseconds(observed_at),
+                    ),
                 )
-            if tail.has_complete_work or int(owned[0]):
+            requeued = tail.has_complete_work or bool(owned[0])
+            if requeued:
                 connection.execute(
                     """UPDATE sync_ingest_queue SET queue_state='queued',available_at=?,claimed_by=NULL,
-                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,reason_code=NULL
+                           claimed_at=NULL,claim_expires_at=NULL,requeue_pending=0,
+                           reason_code=NULL,eligible_epoch_ns=?
                          WHERE root_kind=? AND source_locator=?""",
-                    (observed_at, item.root_kind, item.source_locator),
+                    (
+                        observed_at, _epoch_nanoseconds(observed_at),
+                        item.root_kind, item.source_locator,
+                    ),
                 )
             else:
                 connection.execute(
@@ -720,21 +849,80 @@ class IncrementalSyncWorker:
                          AND queue_state='claimed' AND claimed_by=?""",
                     (item.root_kind, item.source_locator, owner_key),
                 )
+            if job_id is not None:
+                remaining_sources = int(connection.execute(
+                    """SELECT ingest_total FROM sync_work_summary
+                        WHERE singleton=1""",
+                ).fetchone()[0])
+                self.repository.advance_job(
+                    job_id,
+                    sources_completed_delta=int(not requeued),
+                    bytes_processed_delta=tail.bytes_read,
+                    repair_required_delta=0,
+                    remaining_sources=remaining_sources,
+                    updated_at=observed_at,
+                )
             self.repository._bump_revision(connection, observed_at)
+            return not requeued
 
     def sync_once(
         self, owner_key: str, observed_at: str, lease_expires_at: str, *,
         maximum_sources: int = 100, crash_after_materialize: bool = False,
         crash_after_outbox_consume: bool = False,
+        release_lease: bool = True,
+        job_id: str | None = None,
     ) -> SyncRun:
         if not 1 <= maximum_sources <= 1000:
             raise ValueError("maximum_sources must be between 1 and 1000")
+        if not isinstance(release_lease, bool):
+            raise TypeError("release_lease must be a boolean")
+        if job_id is not None:
+            job = self.repository.get_job(job_id)
+            if (
+                job is None
+                or job.job_kind != "sync"
+                or job.state != "running"
+            ):
+                raise ValueError("normal sync progress requires a running sync job")
         now = _utc(observed_at)
-        if not self.repository.acquire_lease(owner_key, now, lease_expires_at):
+        requested_at = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        requested_deadline = datetime.fromisoformat(
+            lease_expires_at.replace("Z", "+00:00"),
+        )
+        lease_seconds = max(
+            0.01, (requested_deadline - requested_at).total_seconds(),
+        )
+        use_wall_clock = requested_deadline > self.clock()
+
+        def lease_window() -> tuple[str, str]:
+            if not use_wall_clock:
+                return now, lease_expires_at
+            observed = self.clock()
+            return (
+                _precise_utc(observed),
+                _precise_utc(
+                    observed + timedelta(seconds=lease_seconds),
+                ),
+            )
+
+        def current_time() -> str:
+            return lease_window()[0]
+
+        lease_now, active_expiry = lease_window()
+        if not self.repository.acquire_lease(
+            owner_key, lease_now, active_expiry,
+        ):
             return SyncRun(0, 0, 0, 0, False)
         claimed = completed = repairs = processed = 0
         for _ in range(maximum_sources):
-            item = self.repository.claim_next(owner_key, now, lease_expires_at)
+            claim_now, claim_expiry = lease_window()
+            if not self.repository.acquire_lease(
+                owner_key, claim_now, claim_expiry,
+            ):
+                break
+            item = self.repository.claim_next(
+                owner_key, claim_now, claim_expiry,
+            )
             if item is None:
                 break
             claimed += 1
@@ -743,9 +931,38 @@ class IncrementalSyncWorker:
                     self.roots, item.root_kind, item.source_locator,
                     self.repository.checkpoint_for(item.root_kind, item.source_locator),
                 )
+            except SourceChanged:
+                retry_at, _ = lease_window()
+                self.repository.retry_claim(
+                    owner_key, item.root_kind, item.source_locator,
+                    reason_code="source_changed",
+                    available_at=retry_at,
+                    observed_at=retry_at,
+                )
+                continue
             except RepairRequired:
-                self.repository.mark_repair_required(item.root_kind, item.source_locator, now)
-                self.repository.acknowledge_claim(owner_key, item.root_kind, item.source_locator, now)
+                repair_at, _ = lease_window()
+                with self.store.rollout_transaction() as connection:
+                    self.repository.mark_repair_required(
+                        item.root_kind, item.source_locator, repair_at,
+                    )
+                    self.repository.acknowledge_claim(
+                        owner_key, item.root_kind,
+                        item.source_locator, repair_at,
+                    )
+                    if job_id is not None:
+                        remaining_sources = int(connection.execute(
+                            """SELECT ingest_total FROM sync_work_summary
+                                WHERE singleton=1""",
+                        ).fetchone()[0])
+                        self.repository.advance_job(
+                            job_id,
+                            sources_completed_delta=0,
+                            bytes_processed_delta=0,
+                            repair_required_delta=1,
+                            remaining_sources=remaining_sources,
+                            updated_at=repair_at,
+                        )
                 repairs += 1
                 continue
             if item.project_id is None:
@@ -753,7 +970,9 @@ class IncrementalSyncWorker:
                 # offset would irreversibly discard facts we cannot attribute.
                 self.repository.retry_claim(
                     owner_key, item.root_kind, item.source_locator,
-                    reason_code="unattributed", available_at=lease_expires_at, observed_at=now,
+                    reason_code="unattributed",
+                    available_at=claim_expiry,
+                    observed_at=claim_now,
                 )
                 continue
             # SQLite permits only one writer.  Give a materialization
@@ -761,17 +980,19 @@ class IncrementalSyncWorker:
             # heartbeating from a separate connection whenever the write lock
             # is free.  Without this extension an otherwise healthy, slow
             # parser could block the heartbeat behind its own transaction.
-            requested_deadline = datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
-            live_lease = requested_deadline > datetime.now(timezone.utc)
+            live_lease = use_wall_clock
             protected_expiry = (
-                max(
-                    lease_expires_at,
-                    (datetime.now(timezone.utc) + timedelta(seconds=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-                )
-                if live_lease else lease_expires_at
+                _precise_utc(max(
+                    datetime.fromisoformat(
+                        claim_expiry.replace("Z", "+00:00"),
+                    ),
+                    self.clock() + timedelta(seconds=60),
+                ))
+                if live_lease else claim_expiry
             )
             if not self.repository.renew_claim(
-                owner_key, item.root_kind, item.source_locator, now, protected_expiry,
+                owner_key, item.root_kind, item.source_locator,
+                claim_now, protected_expiry,
             ):
                 # A competing owner or expired lease won before materialization;
                 # leave the queue item for normal expiry/reclaim semantics.
@@ -783,7 +1004,7 @@ class IncrementalSyncWorker:
                     self.materialize(item, tail, connection)
                 raise RuntimeError("injected crash after materialize")
             try:
-                requested_seconds = max(0.01, (requested_deadline - datetime.now(timezone.utc)).total_seconds())
+                requested_seconds = lease_seconds
                 heartbeat = (
                     self._lease_heartbeat(
                         owner_key, protected_expiry, item,
@@ -793,25 +1014,38 @@ class IncrementalSyncWorker:
                 with heartbeat as lost:
                     if lost.is_set():
                         raise RepairRequired("worker lease lost")
-                    self._commit(item, tail, MaterializedSource(), owner_key, now, lost)
+                    drained = self._commit(
+                        item, tail, MaterializedSource(),
+                        owner_key, current_time, lost, job_id,
+                    )
             except RepairRequired:
+                retry_at, retry_expiry = lease_window()
                 self.repository.retry_claim(
                     owner_key, item.root_kind, item.source_locator,
-                    reason_code="lease_lost", available_at=lease_expires_at, observed_at=now,
+                    reason_code="lease_lost",
+                    available_at=retry_expiry,
+                    observed_at=retry_at,
                 )
                 continue
             except (OSError, sqlite3.OperationalError, SourceChanged, RuntimeError):
                 # The materializer transaction rolled back; release this claim
                 # for a bounded retry rather than relying on process death.
+                retry_at, retry_expiry = lease_window()
                 self.repository.retry_claim(
                     owner_key, item.root_kind, item.source_locator,
-                    reason_code="transient_failure", available_at=lease_expires_at, observed_at=now,
+                    reason_code="transient_failure",
+                    available_at=retry_expiry,
+                    observed_at=retry_at,
                 )
                 continue
-            completed += 1
+            completed += int(drained)
             processed += tail.bytes_read
+        hook_now, hook_expiry = lease_window()
+        self.repository.acquire_lease(
+            owner_key, hook_now, hook_expiry,
+        )
         hook_events = self.repository.claim_hook_events(
-            owner_key, now, lease_expires_at,
+            owner_key, hook_now, hook_expiry,
         )
         if crash_after_outbox_consume:
             # Test-only fault point.  The safe facts have been projected into
@@ -819,11 +1053,22 @@ class IncrementalSyncWorker:
             # replay once this lease expires.
             raise RuntimeError("injected crash after outbox consume")
         if hook_events:
+            acknowledged_at, _ = lease_window()
             self.repository.acknowledge_hook_events(
-                owner_key, tuple(event.event_key for event in hook_events), now,
+                owner_key,
+                tuple(event.event_key for event in hook_events),
+                acknowledged_at,
             )
-        self.reconcile_dirty(owner_key, now, lease_expires_at)
-        self.repository.release_lease(owner_key, now)
+        reconcile_now, reconcile_expiry = lease_window()
+        self.repository.acquire_lease(
+            owner_key, reconcile_now, reconcile_expiry,
+        )
+        self.reconcile_dirty(
+            owner_key, reconcile_now, reconcile_expiry,
+            current_time=current_time,
+        )
+        if release_lease:
+            self.repository.release_lease(owner_key, current_time())
         return SyncRun(claimed, completed, repairs, processed, True)
 
 
@@ -897,15 +1142,21 @@ class ResumableRepair:
         scan = scan_source(path, hasher.key, hasher.digest, opener=opener)
         materialized_scan = scan.complete_prefix()
         if materialized_scan.identity is None or materialized_scan.cwd is None:
-            self.repository.register_and_enqueue(
+            self.repository.register_source(
                 root_kind=root_kind, source_locator=locator, observed_at=observed_at,
+            )
+            self.repository.mark_repair_required(
+                root_kind, locator, observed_at, discard_queue=True,
             )
             return False
         try:
             project = resolve_project(materialized_scan.cwd)
         except (ProjectNotFound, OSError, TypeError, ValueError):
-            self.repository.register_and_enqueue(
+            self.repository.register_source(
                 root_kind=root_kind, source_locator=locator, observed_at=observed_at,
+            )
+            self.repository.mark_repair_required(
+                root_kind, locator, observed_at, discard_queue=True,
             )
             return False
         self.repository.observe_project(
@@ -941,7 +1192,9 @@ class ResumableRepair:
                 root_kind=root_kind, source_locator=locator, project_id=project.project_id,
                 observed_at=observed_at,
             )
-            self.repository.mark_repair_required(root_kind, locator, observed_at)
+            self.repository.mark_repair_required(
+                root_kind, locator, observed_at, discard_queue=True,
+            )
             return False
         location_key = hasher.digest("source", str(path))
         row = self.store.connection.execute(
@@ -953,9 +1206,12 @@ class ResumableRepair:
         if row is None or row[1] is None:
             # Preserve the full ingest's unresolved/quarantine behavior, and
             # never checkpoint it as though attribution were complete.
-            self.repository.register_and_enqueue(
+            self.repository.register_source(
                 root_kind=root_kind, source_locator=locator, project_id=project.project_id,
                 observed_at=observed_at,
+            )
+            self.repository.mark_repair_required(
+                root_kind, locator, observed_at, discard_queue=True,
             )
             return False
         checkpoint = _full_scan_checkpoint(self.roots, root_kind, locator, scan)
@@ -990,24 +1246,29 @@ class ResumableRepair:
         """Repair exactly one known source; no root scan is performed."""
         return self._full_materialize(root_kind, source_locator, observed_at)
 
-    def _directory(self, root_kind: str, locator: str) -> Path:
-        root = self.roots.root_for(root_kind)
-        if locator == self._ROOT_MARKER:
-            return root
-        # Directory frontier shares locator validation but deliberately permits
-        # directories, unlike TrustedSourceRoots.resolve which requires a file.
-        candidate = root
-        try:
-            for component in validate_root_relative_locator(locator).split("/"):
-                candidate = candidate / component
-                details = candidate.lstat()
-                if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
-                    raise RepairRequired("repair frontier is no longer a directory")
-        except RepairRequired:
-            raise
-        except OSError as error:
-            raise RepairRequired("repair frontier is unavailable") from error
-        return candidate
+    @contextmanager
+    def _directory(self, root_kind: str, locator: str) -> Iterator[int]:
+        """Yield a held directory descriptor rooted in one trusted source tree."""
+        with self.roots.open_directory(root_kind, locator) as directory:
+            yield directory
+
+    def _lease_window(self) -> tuple[str, str]:
+        """Return a fresh wall-clock lease window for one repair operation."""
+        observed = datetime.now(timezone.utc)
+        return (
+            _precise_utc(observed),
+            _precise_utc(
+                observed + timedelta(seconds=self.lease_ttl_seconds),
+            ),
+        )
+
+    def _renew_lease(self, owner_key: str) -> tuple[str, str] | None:
+        observed_at, expires_at = self._lease_window()
+        if not self.repository.acquire_lease(
+            owner_key, observed_at, expires_at,
+        ):
+            return None
+        return observed_at, expires_at
 
     def run_batch(self, job_id: str, observed_at: str, *, directory_limit: int = 100) -> RepairRun:
         if not 1 <= directory_limit <= 1000:
@@ -1023,18 +1284,33 @@ class ResumableRepair:
         # fresh lease identity so a second dashboard/MCP call cannot renew the
         # first call's singleton lease merely by knowing the job id.
         owner = f"repair-{uuid.uuid4().hex}"
-        expiry = _precise_utc(
-            datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-            + timedelta(seconds=self.lease_ttl_seconds),
-        )
+        lease_observed_at, expiry = self._lease_window()
         # Directory and file frontiers share the singleton ingest lease: a
         # second dashboard/MCP worker observes progress but does no I/O.
-        if not self.repository.acquire_lease(owner, observed_at, expiry):
+        if not self.repository.acquire_lease(
+            owner, lease_observed_at, expiry,
+        ):
             return RepairRun(0, 0, False)
+        if job.state in {"succeeded", "partial", "failed"}:
+            self.repository.release_lease(owner, lease_observed_at)
+            return RepairRun(0, 0, True)
         pending = self.repository.resume_frontier(job_id)[:directory_limit]
-        discovered = directories = completed_sources = processed_bytes = 0
+        discovered = directories = 0
+        lease_lost = False
         try:
+            started = self.repository.refresh_job_from_frontier_if_owned(
+                job_id, owner_key=owner,
+                lease_observed_at=lease_observed_at, state="running",
+                updated_at=observed_at,
+            )
+            if started is None:
+                return RepairRun(0, 0, False)
             for frontier in pending:
+                lease_window = self._renew_lease(owner)
+                if lease_window is None:
+                    lease_lost = True
+                    break
+                lease_observed_at, expiry = lease_window
                 if frontier.directory_locator.startswith(self._FILE_PREFIX):
                     locator = frontier.directory_locator.removeprefix(self._FILE_PREFIX)
                     try:
@@ -1043,91 +1319,202 @@ class ResumableRepair:
                         if lost.is_set():
                             # The durable frontier remains pending; a later
                             # owner may safely retry the idempotent full scan.
-                            continue
+                            lease_lost = True
+                            break
                     except (OSError, RepairRequired, SourceChanged):
-                        self.repository.save_frontier(
+                        lease_window = self._renew_lease(owner)
+                        if lease_window is None:
+                            lease_lost = True
+                            break
+                        lease_observed_at, expiry = lease_window
+                        if not self.repository.save_frontier_if_owned(
                             job_id=job_id, root_kind=frontier.root_kind,
                             directory_locator=frontier.directory_locator, state="repair_required",
                             discovered_count=1, updated_at=observed_at,
-                        )
+                            owner_key=owner,
+                            lease_observed_at=lease_observed_at,
+                        ):
+                            lease_lost = True
+                            break
                         continue
                     if materialized:
                         details = self.repository.checkpoint_for(frontier.root_kind, locator)
-                        self.repository.save_frontier(
+                        lease_window = self._renew_lease(owner)
+                        if lease_window is None:
+                            lease_lost = True
+                            break
+                        lease_observed_at, expiry = lease_window
+                        if not self.repository.save_frontier_if_owned(
                             job_id=job_id, root_kind=frontier.root_kind,
                             directory_locator=frontier.directory_locator, state="scanned",
                             discovered_count=1, updated_at=observed_at,
-                        )
-                        completed_sources += 1
-                        processed_bytes += details.file_size
+                            owner_key=owner,
+                            lease_observed_at=lease_observed_at,
+                        ):
+                            lease_lost = True
+                            break
                     else:
-                        self.repository.save_frontier(
+                        lease_window = self._renew_lease(owner)
+                        if lease_window is None:
+                            lease_lost = True
+                            break
+                        lease_observed_at, expiry = lease_window
+                        if not self.repository.save_frontier_if_owned(
                             job_id=job_id, root_kind=frontier.root_kind,
                             directory_locator=frontier.directory_locator, state="repair_required",
                             discovered_count=1, updated_at=observed_at,
-                        )
+                            owner_key=owner,
+                            lease_observed_at=lease_observed_at,
+                        ):
+                            lease_lost = True
+                            break
                     continue
                 try:
+                    children: list[tuple[str, int]] = []
+                    directory_discovered = 0
                     with self._lease_heartbeat(owner, expiry) as lost:
-                        directory = self._directory(frontier.root_kind, frontier.directory_locator)
-                        with os.scandir(directory) as entries:
-                            for entry in entries:
-                                try:
-                                    details = entry.stat(follow_symlinks=False)
-                                except OSError:
-                                    continue
-                                if stat.S_ISLNK(details.st_mode):
-                                    continue
-                                relative = entry.name if frontier.directory_locator == self._ROOT_MARKER else f"{frontier.directory_locator}/{entry.name}"
-                                if stat.S_ISDIR(details.st_mode):
-                                    self.repository.save_frontier(
-                                        job_id=job_id, root_kind=frontier.root_kind, directory_locator=relative,
-                                        state="pending", discovered_count=0, updated_at=observed_at,
+                        with self._directory(
+                            frontier.root_kind,
+                            frontier.directory_locator,
+                        ) as directory:
+                            with os.scandir(directory) as entries:
+                                for entry in entries:
+                                    try:
+                                        details = entry.stat(
+                                            follow_symlinks=False,
+                                        )
+                                    except OSError:
+                                        continue
+                                    if stat.S_ISLNK(details.st_mode):
+                                        continue
+                                    relative = (
+                                        entry.name
+                                        if frontier.directory_locator
+                                        == self._ROOT_MARKER
+                                        else
+                                        f"{frontier.directory_locator}/{entry.name}"
                                     )
-                                elif stat.S_ISREG(details.st_mode) and entry.name.endswith(".jsonl"):
-                                    self.repository.save_frontier(
-                                        job_id=job_id, root_kind=frontier.root_kind,
-                                        directory_locator=self._FILE_PREFIX + relative, state="pending",
-                                        discovered_count=1, updated_at=observed_at,
-                                    )
-                                    discovered += 1
+                                    if stat.S_ISDIR(details.st_mode):
+                                        children.append((relative, 0))
+                                    elif (
+                                        stat.S_ISREG(details.st_mode)
+                                        and entry.name.endswith(".jsonl")
+                                    ):
+                                        children.append(
+                                            (self._FILE_PREFIX + relative, 1),
+                                        )
+                                        directory_discovered += 1
                     if lost.is_set():
-                        continue
-                    self.repository.save_frontier(
+                        lease_lost = True
+                        break
+                    for child_locator, child_discovered in children:
+                        lease_window = self._renew_lease(owner)
+                        if lease_window is None:
+                            lease_lost = True
+                            break
+                        lease_observed_at, expiry = lease_window
+                        if not self.repository.save_frontier_if_owned(
+                            job_id=job_id,
+                            root_kind=frontier.root_kind,
+                            directory_locator=child_locator,
+                            state="pending",
+                            discovered_count=child_discovered,
+                            updated_at=observed_at,
+                            owner_key=owner,
+                            lease_observed_at=lease_observed_at,
+                        ):
+                            lease_lost = True
+                            break
+                    if lease_lost:
+                        break
+                    lease_window = self._renew_lease(owner)
+                    if lease_window is None:
+                        lease_lost = True
+                        break
+                    lease_observed_at, expiry = lease_window
+                    if not self.repository.save_frontier_if_owned(
                         job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
-                        state="scanned", discovered_count=discovered, updated_at=observed_at,
-                    )
+                        state="scanned", discovered_count=directory_discovered, updated_at=observed_at,
+                        owner_key=owner,
+                        lease_observed_at=lease_observed_at,
+                    ):
+                        lease_lost = True
+                        break
+                    discovered += directory_discovered
                     directories += 1
                 except RepairRequired:
-                    self.repository.save_frontier(
+                    lease_window = self._renew_lease(owner)
+                    if lease_window is None:
+                        lease_lost = True
+                        break
+                    lease_observed_at, expiry = lease_window
+                    if not self.repository.save_frontier_if_owned(
                         job_id=job_id, root_kind=frontier.root_kind, directory_locator=frontier.directory_locator,
                         state="repair_required", discovered_count=0, updated_at=observed_at,
-                    )
+                        owner_key=owner,
+                        lease_observed_at=lease_observed_at,
+                    ):
+                        lease_lost = True
+                        break
+            if lease_lost:
+                return RepairRun(discovered, directories, False)
             pending_after = self.repository.resume_frontier(job_id)
             complete = not pending_after
             partial = bool(self.repository.list_frontier(job_id, "repair_required"))
             reconciliation_settled = False
             if complete:
-                dirty = self.repository.claim_dirty_roots(owner, observed_at, expiry)
+                lease_window = self._renew_lease(owner)
+                if lease_window is None:
+                    return RepairRun(discovered, directories, False)
+                lease_observed_at, expiry = lease_window
+                dirty = self.repository.claim_dirty_roots(
+                    owner, lease_observed_at, expiry,
+                )
                 for project_id in sorted({root.project_id for root in dirty}):
                     group = tuple(root for root in dirty if root.project_id == project_id)
+                    lease_window = self._renew_lease(owner)
+                    if lease_window is None:
+                        lease_lost = True
+                        break
+                    lease_observed_at, expiry = lease_window
                     with self._lease_heartbeat(owner, expiry) as lost:
                         reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
                     if lost.is_set():
+                        lease_lost = True
                         break
-                    self.repository.acknowledge_dirty_roots(owner, group, observed_at)
+                    ownership_checked_at, _ = self._lease_window()
+                    if not self.repository.lease_owned(
+                        owner, ownership_checked_at,
+                    ):
+                        lease_lost = True
+                        break
+                    self.repository.acknowledge_dirty_roots(
+                        owner, group, lease_observed_at,
+                    )
                 reconciliation_settled = not self.repository.list_dirty_roots()
             finished = complete and reconciliation_settled
-            latest = self.repository.get_job(job_id)
-            assert latest is not None
-            self.repository.update_job(
-                job_id, state="partial" if finished and partial else "succeeded" if finished else "running",
-                sources_discovered=latest.sources_discovered + discovered,
-                sources_completed=latest.sources_completed + completed_sources,
-                bytes_processed=latest.bytes_processed + processed_bytes,
+            if lease_lost:
+                return RepairRun(discovered, directories, False)
+            lease_window = self._renew_lease(owner)
+            if lease_window is None:
+                return RepairRun(discovered, directories, False)
+            lease_observed_at, expiry = lease_window
+            persisted = self.repository.refresh_job_from_frontier_if_owned(
+                job_id, owner_key=owner,
+                lease_observed_at=lease_observed_at,
+                state=(
+                    "partial"
+                    if finished and partial
+                    else "succeeded"
+                    if finished
+                    else "running"
+                ),
                 updated_at=observed_at,
                 completed_at=observed_at if finished else None,
             )
+            if persisted is None:
+                return RepairRun(discovered, directories, False)
             return RepairRun(discovered, directories, finished)
         finally:
-            self.repository.release_lease(owner, observed_at)
+            released_at, _ = self._lease_window()
+            self.repository.release_lease(owner, released_at)

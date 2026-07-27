@@ -13,6 +13,7 @@ from unittest import mock
 
 from hydra_codex.cli import main
 from hydra_codex.contracts import ModelAnnotationInput
+from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.services import LocalCommandServices
 from hydra_codex.storage import HydraStore
@@ -208,6 +209,105 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertEqual(repair_payload["command"], "repair")
         self.assertNotIn(str(self.root), sync[1] + repair[1])
 
+    def test_cli_repair_all_runs_every_bounded_batch_to_completion(self) -> None:
+        sessions = self.root / ".codex" / "sessions"
+        for index in range(101):
+            (sessions / f"batch-{index:03d}").mkdir(parents=True)
+
+        code, stdout, stderr = invoke(
+            ["repair", "--all", "--db", str(self.database), "--cwd", str(self.project)],
+            environ=self.environ,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["directories_scanned"], 102)
+        self.assertEqual(payload["sources_discovered"], 0)
+        self.assertEqual(payload["batches"], 3)
+        store = HydraStore(self.database)
+        try:
+            jobs = SyncStateRepository(store).list_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].state, "succeeded")
+            self.assertEqual(
+                SyncStateRepository(store).resume_frontier(jobs[0].job_id), (),
+            )
+        finally:
+            store.close()
+
+    def test_cli_repair_all_reuses_existing_frontier_without_recounting_prior_batch(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        sessions = self.root / ".codex" / "sessions"
+        for index in range(3):
+            (sessions / f"resume-{index}").mkdir(parents=True)
+        (sessions / "discovered-before-resume.jsonl").write_text(
+            "", encoding="utf-8",
+        )
+        store = HydraStore(self.database)
+        try:
+            repair = ResumableRepair(
+                store,
+                TrustedSourceRoots(
+                    sessions=sessions,
+                    archived_sessions=self.root / ".codex" / "archived_sessions",
+                ),
+            )
+            job_id = repair.start_backfill(
+                "2026-07-21T00:00:00Z", job_kind="repair",
+            )
+            first = repair.run_batch(
+                job_id, "2026-07-21T00:00:00Z", directory_limit=1,
+            )
+            self.assertEqual(first.directories_scanned, 1)
+            self.assertEqual(first.discovered, 1)
+            self.assertFalse(first.completed)
+        finally:
+            store.close()
+
+        code, stdout, stderr = invoke(
+            ["repair", "--all", "--db", str(self.database), "--cwd", str(self.project)],
+            environ=self.environ,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["diagnostic"], "repair_required")
+        self.assertEqual(payload["directories_scanned"], 3)
+        # The first invocation already persisted this source in the job total;
+        # this invocation reports only newly discovered sources.
+        self.assertEqual(payload["sources_discovered"], 0)
+        store = HydraStore(self.database)
+        try:
+            jobs = SyncStateRepository(store).list_jobs()
+            self.assertEqual([job.job_id for job in jobs], [job_id])
+            self.assertEqual(jobs[0].state, "partial")
+            self.assertEqual(jobs[0].sources_discovered, 1)
+        finally:
+            store.close()
+
+    def test_cli_repair_all_stops_with_partial_diagnostic_when_batch_cannot_progress(self) -> None:
+        from hydra_codex.incremental_sync import RepairRun
+
+        (self.root / ".codex" / "sessions").mkdir(parents=True)
+        with mock.patch(
+            "hydra_codex.incremental_sync.ResumableRepair.run_batch",
+            return_value=RepairRun(0, 0, False),
+        ) as run_batch:
+            code, stdout, stderr = invoke(
+                ["repair", "--all", "--db", str(self.database), "--cwd", str(self.project)],
+                environ=self.environ,
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(run_batch.call_count, 1)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["diagnostic"], "no_progress")
+        self.assertEqual(payload["batches"], 1)
+
     def test_sync_freshness_prioritizes_any_repair_required_source_over_queue_order(self) -> None:
         store = HydraStore(self.database)
         try:
@@ -287,6 +387,32 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
         self.assertEqual(freshness["state"], "running")
+
+    def test_sync_freshness_expires_whole_second_claim_before_fractional_now(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_and_enqueue(
+                root_kind="sessions", source_locator="a/fractional-expiry.jsonl",
+                observed_at="2026-07-21T09:59:58Z",
+            )
+            self.assertTrue(repository.acquire_lease(
+                "worker", "2026-07-21T09:59:58Z", "2026-07-21T10:01:00Z",
+            ))
+            repository.claim_next(
+                "worker", "2026-07-21T09:59:59Z", "2026-07-21T10:00:00Z",
+            )
+            freshness = LocalCommandServices(
+                environ=self.environ,
+                clock=lambda: datetime(
+                    2026, 7, 21, 10, 0, 0, 100_000,
+                    tzinfo=timezone.utc,
+                ),
+            )._sync_freshness(store)
+        finally:
+            store.close()
+
+        self.assertEqual(freshness["state"], "queued")
 
     def _annotate(self, capability: str, *, finish: bool = False):
         payload = {
@@ -634,6 +760,10 @@ class LocalCommandServiceTests(unittest.TestCase):
             {item["schema_version"] for item in payload["reports"]},
             {"hydra.report/v4"},
         )
+        self.assertTrue(all(
+            item["sync_freshness"] == payload["sync_freshness"]
+            for item in payload["reports"]
+        ))
         refs = [item["task_ref"] for item in payload["reports"]]
         self.assertTrue(all(re.fullmatch(r"task_[0-9a-f]+", item) for item in refs))
         self.assertEqual(
@@ -665,11 +795,116 @@ class LocalCommandServiceTests(unittest.TestCase):
         with mock.patch(
             "hydra_codex.reconcile_engine._assemble_project",
             side_effect=AssertionError("report must not reassemble"),
+        ), mock.patch.object(
+            HydraStore,
+            "_validate_schema",
+            side_effect=AssertionError("report repeated the full database audit"),
         ):
-            rendered = LocalCommandServices(environ=self.environ).report(
+            service = LocalCommandServices(environ=self.environ)
+            rendered = service.report(
                 1, "json", self.database, self.project,
             )
+            service.report(1, "json", self.database, self.project)
         self.assertEqual(json.loads(rendered)["reports"][0]["schema_version"], "hydra.report/v4")
+
+    def test_report_pins_materialized_rows_freshness_and_revision_before_concurrent_enqueue(
+        self,
+    ) -> None:
+        from hydra_codex.reconcile_engine import render_materialized_report_collection
+        from hydra_codex.report_renderers import render_json
+        from tests.test_audit_builder import public_report
+
+        self._rollout("snapshot-before-enqueue", second=10, input_tokens=100)
+        common = ["--db", str(self.database), "--cwd", str(self.project)]
+        self.assertEqual(invoke(
+            ["ingest", *common, "--source", f"explicit={self.root / 'rollouts'}"],
+            environ=self.environ,
+        )[0], 0)
+        self.assertEqual(invoke(["reconcile", *common], environ=self.environ)[0], 0)
+        store = HydraStore(self.database)
+        try:
+            before_revision = SyncStateRepository(store).data_revision()
+            before_ref = str(store.connection.execute(
+                """SELECT task_ref FROM materialized_report_snapshots
+                     WHERE project_id='hprj_local_services'"""
+            ).fetchone()[0])
+        finally:
+            store.close()
+        published = public_report("published-after-enqueue", input_tokens=777, second=20)
+
+        def enqueue_and_publish(store, project_id, limit, output_format, freshness):
+            writer = HydraStore(self.database)
+            try:
+                repository = SyncStateRepository(writer)
+                repository.register_and_enqueue(
+                    root_kind="sessions",
+                    source_locator="concurrent/new.jsonl",
+                    project_id=project_id,
+                    observed_at="2026-07-21T00:01:00Z",
+                )
+                revision = repository.data_revision()
+                with writer.rollout_transaction() as connection:
+                    connection.execute(
+                        "DELETE FROM materialized_report_snapshots WHERE project_id=?",
+                        (project_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM materialized_project_stats WHERE project_id=?",
+                        (project_id,),
+                    )
+                    connection.execute(
+                        """INSERT INTO materialized_report_snapshots(
+                               project_id,task_ref,report_json,report_markdown,report_html,
+                               reconciled_at,data_revision,last_activity_at,
+                               last_activity_epoch_ns)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (
+                            project_id, published.task_ref,
+                            render_json(published).rstrip("\n"), "", "",
+                            "2026-07-21T00:01:00Z", revision,
+                            published.last_activity_at,
+                            require_exact_timestamp(
+                                published.last_activity_at,
+                                "test report activity",
+                            ).epoch_nanoseconds,
+                        ),
+                    )
+            finally:
+                writer.close()
+            return render_materialized_report_collection(
+                store, project_id, limit, output_format, freshness,
+            )
+
+        with mock.patch(
+            "hydra_codex.reconcile_engine.render_materialized_report_collection",
+            side_effect=enqueue_and_publish,
+        ):
+            first = json.loads(LocalCommandServices(environ=self.environ).report(
+                1, "json", self.database, self.project,
+            ))
+
+        self.assertEqual(first["reports"][0]["task_ref"], before_ref)
+        self.assertEqual(first["sync_freshness"], {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "current",
+            "data_revision": before_revision,
+        })
+        self.assertEqual(
+            first["reports"][0]["sync_freshness"],
+            first["sync_freshness"],
+        )
+        second = json.loads(LocalCommandServices(environ=self.environ).report(
+            1, "json", self.database, self.project,
+        ))
+        self.assertEqual(second["reports"][0]["task_ref"], published.task_ref)
+        self.assertEqual(second["sync_freshness"]["state"], "queued")
+        self.assertEqual(
+            second["reports"][0]["sync_freshness"],
+            second["sync_freshness"],
+        )
+        self.assertGreater(
+            second["sync_freshness"]["data_revision"], before_revision,
+        )
 
     def test_snapshot_formats_show_current_queued_and_repair_freshness(self) -> None:
         self._rollout("freshness-task", second=10, input_tokens=100)

@@ -52,6 +52,41 @@ class DashboardAssetContractTests(unittest.TestCase):
     def evaluate_dom(self, expression: str) -> object:
         return self.evaluate_module("dom.js", expression.replace("dom.", "subject."))
 
+    def evaluate_app(self, expression: str) -> object:
+        source = f"""
+const element = {{
+  addEventListener() {{}},
+  removeAttribute() {{}},
+  setAttribute() {{}},
+  contains() {{ return false; }},
+  focus() {{}},
+  replaceChildren() {{}},
+  textContent: "",
+  hidden: true,
+}};
+globalThis.document = {{
+  getElementById() {{ return element; }},
+  activeElement: null,
+}};
+globalThis.window = {{
+  addEventListener() {{}},
+  location: {{hash: ""}},
+  setTimeout,
+}};
+globalThis.history = {{pushState() {{}}}};
+const subject = await import({json.dumps((ASSET_ROOT / "app.js").as_uri())});
+process.stdout.write(JSON.stringify(await ({expression})));
+"""
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", source],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
     def test_inventory_is_exact_utf8_and_self_contained(self) -> None:
         inventory = {
             path.relative_to(ASSET_ROOT).as_posix()
@@ -544,7 +579,7 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn("if (activeJobPoll) return activeJobPoll", app)
         self.assertIn("refreshButton.disabled = busy", app)
         self.assertIn("repairButton.disabled = busy", app)
-        self.assertIn('current.kind === "repair"', app)
+        self.assertIn("syncJobKind(current.kind)", app)
         self.assertIn('jobKind === "repair" ? "Repairing history" : "Syncing evidence"', app)
         self.assertNotRegex(
             app.split("async function pollRefresh", 1)[-1].split(
@@ -560,7 +595,7 @@ class DashboardAssetContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn(
-            'jobKind = started.kind === "repair" ? "repair" : "sync"',
+            "jobKind = syncJobKind(started.kind)",
             active_job,
         )
         self.assertIn("activeJobKind = jobKind", active_job)
@@ -571,9 +606,23 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn("setMutatingBusy(jobKind, true)", active_job)
         self.assertIn("pollRefresh(started.sync_ref, jobKind, retry)", active_job)
         self.assertLess(
-            active_job.index('jobKind = started.kind === "repair"'),
+            active_job.index("jobKind = syncJobKind(started.kind)"),
             active_job.index("pollRefresh(started.sync_ref, jobKind, retry)"),
         )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_persisted_backfill_uses_repair_status_and_retry_contract(self) -> None:
+        self.assertEqual(
+            self.evaluate_app(
+                "['sync', 'repair', 'backfill', null].map(subject.syncJobKind)"
+            ),
+            ["sync", "repair", "repair", "sync"],
+        )
+        ready = self.asset("app.js").split(
+            'window.addEventListener("hydra-dashboard-ready"', 1,
+        )[-1]
+        self.assertIn("const jobKind = syncJobKind(current.kind)", ready)
+        self.assertIn("runActiveJob(jobKind", ready)
 
     def test_repair_confirmation_transfers_and_restores_focus(self) -> None:
         app = self.asset("app.js")
@@ -643,6 +692,19 @@ class DashboardAssetContractTests(unittest.TestCase):
         self.assertIn("page.page && page.page.next_cursor", app)
         self.assertNotRegex(app, r"cursor\s*=\s*page\.next_cursor")
 
+    def test_task_routes_and_load_more_fetch_exactly_one_page_per_action(self) -> None:
+        app = self.asset("app.js")
+        loader = app.split("async function loadTaskPage", 1)[-1].split(
+            "async function compareTasks", 1,
+        )[0]
+
+        self.assertEqual(loader.count("await api.tasks("), 1)
+        self.assertNotIn("while (", loader)
+        self.assertNotIn("do {", loader)
+        self.assertIn('type: append ? "append_tasks" : "tasks"', loader)
+        self.assertIn("loadTaskPage(context, true)", app)
+        self.assertNotIn("loadAllTasks", app)
+
     def test_stale_task_routes_require_refresh_before_expensive_queries(self) -> None:
         app = self.asset("app.js")
 
@@ -663,7 +725,7 @@ class DashboardAssetContractTests(unittest.TestCase):
         )
         self.assertLess(
             load_route.index("routeNeedsRefresh"),
-            load_route.index("loadAllTasks"),
+            load_route.index("loadTaskPage"),
         )
 
     def test_route_async_results_are_generation_scoped_and_cancelled(self) -> None:

@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import threading
@@ -105,6 +106,57 @@ class IncrementalSourceReaderTests(unittest.TestCase):
         with self.assertRaises(RepairRequired):
             read_incremental_source(roots, "sessions", "2026/07/rollout.jsonl")
 
+    def test_source_open_rejects_non_symlink_root_replacement(self) -> None:
+        from hydra_codex.incremental_sync import RepairRequired, read_incremental_source
+
+        replacement = Path(self.temporary.name) / "replacement"
+        redirected = replacement / "2026" / "07" / "rollout.jsonl"
+        redirected.parent.mkdir(parents=True)
+        redirected.write_bytes(b'{"redirected":true}\n')
+        parked = Path(self.temporary.name) / "parked"
+        original_open = os.open
+        swapped = False
+
+        def swap_before_root_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(path) == self.root and kwargs.get("dir_fd") is None:
+                self.root.rename(parked)
+                replacement.rename(self.root)
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch("hydra_codex.incremental_sync.os.open", side_effect=swap_before_root_open),
+            self.assertRaisesRegex(RepairRequired, "trusted source root"),
+        ):
+            read_incremental_source(
+                self._reader(), "sessions", "2026/07/rollout.jsonl",
+            )
+
+    def test_directory_open_rejects_non_symlink_root_replacement(self) -> None:
+        from hydra_codex.incremental_sync import RepairRequired
+
+        replacement = Path(self.temporary.name) / "replacement"
+        replacement.mkdir()
+        parked = Path(self.temporary.name) / "parked"
+        original_open = os.open
+        swapped = False
+
+        def swap_before_root_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(path) == self.root and kwargs.get("dir_fd") is None:
+                self.root.rename(parked)
+                replacement.rename(self.root)
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch("hydra_codex.incremental_sync.os.open", side_effect=swap_before_root_open),
+            self.assertRaisesRegex(RepairRequired, "trusted source root"),
+        ):
+            with self._reader().open_directory("sessions", "@root"):
+                self.fail("replaced root must not be yielded")
+
 
 class IncrementalWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -120,6 +172,33 @@ class IncrementalWorkerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.temporary.cleanup()
+
+    def test_controller_can_retain_worker_lease_until_job_progress_is_durable(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl",
+            project_id="hprj_safe", observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root, archived_sessions=self.root / "archive",
+            ),
+        )
+
+        result = worker.sync_once(
+            "dashboard-worker", "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z", release_lease=False,
+        )
+
+        self.assertTrue(result.lease_acquired)
+        self.assertTrue(self.repository.lease_owned(
+            "dashboard-worker", "2026-07-26T00:00:01Z",
+        ))
+        self.assertTrue(self.repository.release_lease(
+            "dashboard-worker", "2026-07-26T00:00:01Z",
+        ))
 
     def test_crash_after_materialization_replays_idempotently_then_acks_and_marks_only_dirty_project(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
@@ -212,6 +291,28 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.repository.list_queue()[0].queue_state, "queued")
         self.assertEqual(self.repository.list_queue()[0].reason_code, "unattributed")
 
+    def test_unattributed_explicit_repair_is_partial_without_normal_queue_loop(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        self.assertFalse(repair.repair_source(
+            "sessions", "rollout.jsonl", "2026-07-26T00:00:00Z",
+        ))
+        self.assertEqual(self.repository.list_queue(), ())
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions", "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
+
     def test_bounded_tail_requeues_until_large_complete_source_is_drained(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
 
@@ -235,9 +336,137 @@ class IncrementalWorkerTests(unittest.TestCase):
             "worker", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
         )
         self.assertGreater(report.claimed, 1)
+        self.assertEqual(report.completed, 1)
+        self.assertEqual(report.bytes_processed, len(line) * 35_000)
         self.assertEqual(seen, list(range(1, 35_001)))
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, len(line) * 35_000)
         self.assertEqual(self.repository.list_queue(), ())
+
+    def test_concurrent_append_during_bounded_read_retries_without_permanent_repair(self) -> None:
+        from hydra_codex import incremental_sync
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            MaterializedSource,
+            TrustedSourceRoots,
+        )
+
+        self.repository.register_and_enqueue(
+            root_kind="sessions", source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        original_checkpoint = incremental_sync._checkpoint_for
+        appended = False
+
+        def checkpoint_then_append(handle, details, offset, line_number):
+            nonlocal appended
+            checkpoint = original_checkpoint(
+                handle, details, offset, line_number,
+            )
+            if not appended:
+                appended = True
+                with self.path.open("ab") as writer:
+                    writer.write(b'{"type":"event_msg"}\n')
+            return checkpoint
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            materialize=lambda *_args: MaterializedSource(
+                project_id="hprj_safe",
+            ),
+        )
+        with mock.patch.object(
+            incremental_sync, "_checkpoint_for",
+            side_effect=checkpoint_then_append,
+        ):
+            report = worker.sync_once(
+                "worker", "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            )
+
+        self.assertEqual(report.repair_required, 0)
+        self.assertEqual(report.completed, 1)
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions", "rollout.jsonl",
+            ).source_state,
+            "ready",
+        )
+        self.assertEqual(self.repository.list_queue(), ())
+        self.assertEqual(
+            self.repository.checkpoint_for(
+                "sessions", "rollout.jsonl",
+            ).line_number,
+            2,
+        )
+
+    def test_normal_sync_uses_fresh_clock_for_commit_outbox_reconcile_and_release(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            MaterializedSource,
+            TrustedSourceRoots,
+        )
+
+        started = datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc)
+        current = [started]
+        self.repository.record_hook_event_and_enqueue(
+            event_key="fresh-clock-event", project_id="hprj_safe",
+            session_key="session-safe", turn_key="turn-safe",
+            event_kind="prompt", observed_at="2026-07-27T10:00:00Z",
+            source=("sessions", "rollout.jsonl"),
+        )
+
+        def materialize(*_args):
+            current[0] = started + timedelta(seconds=30)
+            return MaterializedSource(project_id="hprj_safe")
+
+        def reconcile(_project_id):
+            current[0] = started + timedelta(seconds=45)
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            materialize=materialize,
+            reconcile=reconcile,
+            clock=lambda: current[0],
+        )
+
+        report = worker.sync_once(
+            "worker", "2026-07-27T10:00:00Z",
+            "2026-07-27T10:01:00Z",
+        )
+
+        self.assertEqual(report.completed, 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT updated_at FROM sync_source_checkpoints
+                     WHERE root_kind='sessions'
+                       AND source_locator='rollout.jsonl'""",
+            ).fetchone()[0],
+            "2026-07-27T10:00:30Z",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT acknowledged_at FROM hook_event_outbox
+                     WHERE event_key='fresh-clock-event'""",
+            ).fetchone()[0],
+            "2026-07-27T10:00:30Z",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT updated_at FROM sync_data_revision WHERE singleton=1",
+            ).fetchone()[0],
+            "2026-07-27T10:00:45Z",
+        )
 
     def test_materializer_failure_requeues_without_checkpoint_loss(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
@@ -296,6 +525,36 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(worker.sync_once("worker", observed, expires).completed, 1)
         self.assertEqual(contender, [False])
 
+    def test_heartbeat_keeps_dirty_claim_live_during_slow_reconcile(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        now = datetime.now(timezone.utc)
+        observed = now.isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        self.repository.mark_dirty(
+            "hprj_safe", "hprj_safe", "project", observed,
+        )
+        reconciled: list[str] = []
+
+        def slow_reconcile(project_id: str) -> None:
+            time.sleep(1.4)
+            reconciled.append(project_id)
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            reconcile=slow_reconcile,
+        )
+
+        report = worker.sync_once("worker", observed, expires)
+
+        self.assertTrue(report.lease_acquired)
+        self.assertEqual(reconciled, ["hprj_safe"])
+        self.assertEqual(self.repository.list_dirty_roots(), ())
+
     def test_heartbeat_loss_rolls_back_slow_materializer_and_requeues(self) -> None:
         from datetime import datetime, timedelta, timezone
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
@@ -336,6 +595,36 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertIsNone(self.store.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='heartbeat_rollback'"
         ).fetchone())
+
+    def test_heartbeat_reopen_failure_is_fail_closed(self) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+        from hydra_codex.storage import StorageUnavailable
+
+        now = datetime.now(timezone.utc)
+        observed = now.isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        with mock.patch.object(
+            self.store,
+            "validated_reopener",
+            return_value=lambda: (_ for _ in ()).throw(
+                StorageUnavailable("heartbeat reopen failed"),
+            ),
+        ):
+            with worker._lease_heartbeat(
+                "worker", expires, interval_seconds=0.01,
+            ) as lost:
+                self.assertTrue(lost.wait(0.5))
 
     def test_normal_sync_never_discovers_or_reads_unqueued_registered_sources(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
@@ -410,7 +699,181 @@ class IncrementalWorkerTests(unittest.TestCase):
             ["nested/one.jsonl", "rollout.jsonl"],
         )
 
-    def test_repair_reuses_an_active_sync_job_instead_of_creating_a_second_job(self) -> None:
+    def test_backfill_recovers_job_progress_from_a_durable_file_frontier(self) -> None:
+        """A crash after saving @file must not leave the resumed job at 0/0."""
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        project = Path(self.temporary.name) / "progress-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text(
+            'project_id = "hprj_progress"\ntelemetry = "hybrid"\n',
+        )
+        self.path.write_text(
+            '{"type":"session_meta","payload":{"id":"progress","session_id":"progress",'
+            f'"cwd":"{project}"}}}}\n',
+        )
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root, archived_sessions=self.root / "archive",
+            ),
+        )
+        job_id = self.repository.create_job(
+            "backfill", "2026-07-26T00:00:00Z",
+        )
+        self.repository.save_frontier(
+            job_id=job_id, root_kind="sessions",
+            directory_locator="@file/rollout.jsonl", state="pending",
+            discovered_count=1, updated_at="2026-07-26T00:00:00Z",
+        )
+        self.repository.update_job(
+            job_id, state="running", sources_discovered=1,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-26T00:00:00Z",
+        )
+        # Reproduce the exact pre-fix crash image: the frontier is durable while
+        # the separately maintained job counter still says no source exists.
+        self.store.connection.execute(
+            """UPDATE sync_jobs SET sources_discovered=0,sources_completed=0,
+                   bytes_processed=0 WHERE job_id=?""",
+            (job_id,),
+        )
+
+        result = repair.run_batch(
+            job_id, "2026-07-26T00:00:01Z", directory_limit=1,
+        )
+
+        job = self.repository.get_job(job_id)
+        self.assertTrue(result.completed)
+        self.assertEqual(job.state, "succeeded")
+        self.assertEqual(
+            (job.sources_discovered, job.sources_completed, job.bytes_processed),
+            (1, 1, self.path.stat().st_size),
+        )
+
+    def test_backfill_stops_before_frontier_commit_after_ttl_handoff(self) -> None:
+        """A previous lease owner cannot mutate this or later frontiers."""
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        roots = TrustedSourceRoots(
+            sessions=self.root, archived_sessions=self.root / "archive",
+        )
+        repair = ResumableRepair(self.store, roots, lease_ttl_seconds=1)
+        job_id = self.repository.create_job(
+            "backfill", "2026-07-26T00:00:00Z",
+        )
+        for locator in ("@file/one.jsonl", "@file/two.jsonl"):
+            self.repository.save_frontier(
+                job_id=job_id, root_kind="sessions",
+                directory_locator=locator, state="pending",
+                discovered_count=1, updated_at="2026-07-26T00:00:00Z",
+            )
+        self.repository.update_job(
+            job_id, state="running", sources_discovered=2,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-26T00:00:00Z",
+        )
+        contender_store = HydraStore(self.database)
+        self.addCleanup(contender_store.close)
+        contender = SyncStateRepository(contender_store)
+        started = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        lease_clock = {"now": started}
+        observed = started.isoformat().replace("+00:00", "Z")
+        handoff = (started + timedelta(seconds=1)).isoformat().replace(
+            "+00:00", "Z",
+        )
+        calls: list[str] = []
+
+        def lease_window():
+            current = lease_clock["now"]
+            return (
+                current.isoformat().replace("+00:00", "Z"),
+                (current + timedelta(seconds=1)).isoformat().replace(
+                    "+00:00", "Z",
+                ),
+            )
+
+        def hand_off_after_materialize(_root_kind, locator, _observed_at):
+            calls.append(locator)
+            lease_clock["now"] = started + timedelta(seconds=1)
+            self.assertTrue(
+                contender.acquire_lease(
+                    "contender", handoff,
+                    (started + timedelta(minutes=1)).isoformat().replace(
+                        "+00:00", "Z",
+                    ),
+                ),
+            )
+            return False
+
+        with (
+            mock.patch.object(
+                repair, "_lease_window", side_effect=lease_window,
+            ),
+            mock.patch.object(
+                repair, "_lease_heartbeat",
+                side_effect=lambda *_args: nullcontext(threading.Event()),
+            ),
+            mock.patch.object(
+                repair, "_full_materialize",
+                side_effect=hand_off_after_materialize,
+            ),
+        ):
+            result = repair.run_batch(
+                job_id, observed, directory_limit=2,
+            )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(calls, ["one.jsonl"])
+        self.assertEqual(
+            [frontier.state for frontier in self.repository.resume_frontier(job_id)],
+            ["pending", "pending"],
+        )
+        self.assertEqual(self.repository.get_job(job_id).state, "running")
+
+    def test_backfill_scandir_uses_held_directory_after_parent_symlink_swap(self) -> None:
+        """The scan must enumerate the validated directory, never its new path."""
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        self.path.unlink()
+        nested = self.root / "nested"
+        nested.mkdir()
+        (nested / "safe.jsonl").write_text("{}\n")
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (outside / "escape.jsonl").write_text("{}\n")
+        roots = TrustedSourceRoots(
+            sessions=self.root, archived_sessions=self.root / "archive",
+        )
+        repair = ResumableRepair(self.store, roots)
+        job_id = repair.start_backfill("2026-07-26T00:00:00Z")
+        repair.run_batch(
+            job_id, "2026-07-26T00:00:01Z", directory_limit=1,
+        )
+        original_directory = self.root / "nested-original"
+        real_scandir = os.scandir
+
+        def swap_then_scan(directory):
+            nested.rename(original_directory)
+            nested.symlink_to(outside, target_is_directory=True)
+            return real_scandir(directory)
+
+        with mock.patch(
+            "hydra_codex.incremental_sync.os.scandir",
+            side_effect=swap_then_scan,
+        ):
+            repair.run_batch(
+                job_id, "2026-07-26T00:00:02Z", directory_limit=1,
+            )
+
+        locators = {
+            frontier.directory_locator
+            for frontier in self.repository.list_frontier(job_id)
+        }
+        self.assertIn("@file/nested/safe.jsonl", locators)
+        self.assertNotIn("@file/nested/escape.jsonl", locators)
+
+    def test_repair_creates_its_own_job_while_sync_is_active(self) -> None:
         from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
 
         sync_job = self.repository.create_job("sync", "2026-07-26T00:00:00Z")
@@ -422,17 +885,21 @@ class IncrementalWorkerTests(unittest.TestCase):
             ),
         )
 
-        reused = repair.start_backfill(
+        repair_job = repair.start_backfill(
             "2026-07-26T00:00:01Z", job_kind="repair",
         )
-        result = repair.run_batch(reused, "2026-07-26T00:00:01Z")
-
-        self.assertEqual(reused, sync_job)
-        self.assertFalse(result.completed)
-        self.assertEqual(
-            [(job.job_id, job.job_kind, job.state) for job in self.repository.list_jobs()],
-            [(sync_job, "sync", "queued")],
+        result = repair.run_batch(
+            repair_job, "2026-07-26T00:00:01Z",
         )
+
+        self.assertNotEqual(repair_job, sync_job)
+        self.assertFalse(result.completed)
+        jobs = {
+            job.job_id: (job.job_kind, job.state)
+            for job in self.repository.list_jobs()
+        }
+        self.assertEqual(jobs[sync_job], ("sync", "queued"))
+        self.assertEqual(jobs[repair_job][0], "repair")
 
     def test_repair_full_materializes_attributed_source_then_append_can_tail(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, ResumableRepair, TrustedSourceRoots
@@ -598,12 +1065,22 @@ class IncrementalWorkerTests(unittest.TestCase):
         repair = ResumableRepair(self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"))
         job_id = repair.start_backfill("2026-07-26T00:00:00Z")
         repair.run_batch(job_id, "2026-07-26T00:00:01Z", directory_limit=1)
-        self.assertTrue(self.repository.acquire_lease("other", "2026-07-26T00:00:01Z", "2026-07-26T00:10:00Z"))
+        lease_now = datetime.now(timezone.utc)
+        lease_observed = lease_now.isoformat().replace("+00:00", "Z")
+        lease_expiry = (lease_now + timedelta(minutes=1)).isoformat().replace(
+            "+00:00", "Z",
+        )
+        self.assertTrue(self.repository.acquire_lease(
+            "other", lease_observed, lease_expiry,
+        ))
         blocked = repair.run_batch(job_id, "2026-07-26T00:00:02Z", directory_limit=1)
         self.assertFalse(blocked.completed)
         self.assertEqual(self.repository.get_job(job_id).state, "running")
         self.assertEqual(self.repository.get_job(job_id).sources_completed, 0)
-        resumed = repair.run_batch(job_id, "2026-07-26T00:10:00Z", directory_limit=1)
+        self.assertTrue(self.repository.release_lease(
+            "other", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        ))
+        resumed = repair.run_batch(job_id, "2026-07-26T00:00:03Z", directory_limit=1)
         self.assertTrue(resumed.completed)
         self.assertEqual(self.repository.get_job(job_id).state, "succeeded")
         self.assertEqual(self.repository.list_dirty_roots(), ())

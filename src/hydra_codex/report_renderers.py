@@ -6,7 +6,12 @@ from html import escape
 import json
 import re
 
-from .reporting import ComparisonReport, NumericFact, TaskReport
+from .reporting import (
+    ComparisonReport,
+    NumericFact,
+    TaskReport,
+    normalize_sync_freshness,
+)
 
 
 Renderable = TaskReport | ComparisonReport
@@ -261,14 +266,16 @@ def render_report_collection(
     """Render recent reports in caller-supplied deterministic order."""
     if not isinstance(reports, tuple) or any(not isinstance(item, TaskReport) for item in reports):
         raise ValueError("reports must be a tuple of TaskReport values")
+    freshness = normalize_sync_freshness(sync_freshness)
     if output_format == "json":
+        payloads = [item.as_dict() for item in reports]
+        for payload in payloads:
+            payload["sync_freshness"] = dict(freshness)
         return json.dumps(
             {
                 "schema_version": REPORT_LIST_SCHEMA,
-                "reports": [item.as_dict() for item in reports],
-                "sync_freshness": sync_freshness or {
-                    "schema_version": "hydra.sync-freshness/v1", "state": "unknown",
-                },
+                "reports": payloads,
+                "sync_freshness": freshness,
             },
             ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
         ) + "\n"

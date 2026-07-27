@@ -1,13 +1,13 @@
 ---
 name: hydra-report
-description: Reconcile and explain privacy-safe Hydra telemetry for local Codex tasks. Use when the user asks about token usage, task time, files read or changed, test repetitions, subagents, semantic phase coverage, trends, or comparisons between Codex tasks.
+description: Use when the user asks about Hydra token usage, task time, files read or changed, test repetitions, subagents, semantic phase coverage, trends, or comparisons between local Codex tasks.
 ---
 
 # Hydra Report
 
 ## Overview
 
-Build reports from Hydra's deterministic ledger and clearly separate exact,
+Read reports from Hydra's materialized deterministic ledger and clearly separate exact,
 derived, model-reported, estimated, and unavailable facts. Never reconstruct
 raw prompts or turn an agent's prose summary into an exact measurement.
 
@@ -15,9 +15,15 @@ raw prompts or turn an agent's prose summary into an exact measurement.
 
 1. Confirm that the current directory belongs to a Hydra project containing
    `.hydra/project.toml`.
-2. Prefer the `hydra.report` MCP tool when available. It reconciles before
-   rendering. Otherwise run `hydra-codex ingest`, `hydra-codex reconcile`, and
-   `hydra-codex report --last N --format json` in that order.
+2. Prefer the read-only `hydra.report` MCP tool when available. Otherwise run
+   `hydra-codex report --last N --format json`. Inspect `sync_freshness`: if
+   work is `queued` or `running`, wait for the MCP/dashboard worker or run
+   `hydra-codex sync`, then read the report again. Never imply that a report
+   call starts ingest or reconciliation. If state is `repair_required`, explain
+   that the operator must explicitly run the expensive
+   `hydra-codex repair --all` backfill. `reconcile_required` means no valid
+   materialized report exists yet; run sync, then repair only if sync reports
+   that a source requires it.
 3. For a requested pair, run
    `hydra-codex compare THREAD_A THREAD_B --format json`. Accept only opaque
    public references printed by Hydra, never internal session identifiers.
@@ -51,6 +57,8 @@ whether to return the one permitted fresh capability-bearing finish retry.
 
 Use a lowercase categorical `task_family` such as `multiple-answer-quiz`, not a
 prompt excerpt, user identifier, path, email address, UUID, or secret.
+When a safe human-readable name is available, set `task_label` to at most 80
+characters; never derive historical labels from stored prompt text.
 Use a public terminal category such as `quiz`, `workflow`, `architecture`,
 `hardening`, `review`, `report`, `tests`, `runtime`, or `docs`; otherwise use
 `unclassified` rather than inventing a person- or customer-derived label.

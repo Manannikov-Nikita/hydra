@@ -8,6 +8,12 @@ import unittest
 from pathlib import Path
 
 from hydra_codex.exact_time import require_exact_timestamp
+from hydra_codex.migrations_aa27 import (
+    AA27_DIRTY_ELIGIBILITY_INSERT_TRIGGER_SQL,
+    AA27_DIRTY_ELIGIBILITY_UPDATE_TRIGGER_SQL,
+    AA27_SYNC_DIRTY_ROOTS_TABLE_SQL,
+)
+from hydra_codex.migrations_ab28 import AB28_MIGRATIONS
 from hydra_codex.storage import MIGRATIONS, HydraStore
 
 
@@ -46,6 +52,66 @@ class DurableSyncStateTests(unittest.TestCase):
         self.assertEqual(
             self.store.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000,
         )
+
+    def test_schema_46_releases_legacy_dirty_claims_and_requires_a_generation_token(self) -> None:
+        legacy = sqlite3.connect(":memory:")
+        self.addCleanup(legacy.close)
+        legacy.create_function(
+            "hydra_rfc3339_nanos",
+            1,
+            lambda value: require_exact_timestamp(
+                value, "test dirty eligibility",
+            ).epoch_nanoseconds,
+            deterministic=True,
+        )
+        legacy.execute(AA27_SYNC_DIRTY_ROOTS_TABLE_SQL)
+        legacy.execute(AA27_DIRTY_ELIGIBILITY_INSERT_TRIGGER_SQL)
+        legacy.execute(AA27_DIRTY_ELIGIBILITY_UPDATE_TRIGGER_SQL)
+        observed_at = "2026-07-26T00:00:00Z"
+        expires_at = "2026-07-26T00:00:10Z"
+        legacy.execute(
+            """INSERT INTO sync_dirty_roots(
+                   project_id,root_key,root_kind,observed_at,claim_owner,
+                   claim_expires_at,eligible_epoch_ns
+               ) VALUES (?,?,?,?,?,?,?)""",
+            (
+                "hprj_safe", "task-safe", "task", observed_at,
+                "legacy-worker", expires_at,
+                require_exact_timestamp(
+                    expires_at, "test dirty expiry",
+                ).epoch_nanoseconds,
+            ),
+        )
+
+        for statement in AB28_MIGRATIONS[0][1]:
+            legacy.execute(statement)
+
+        row = legacy.execute(
+            """SELECT claim_owner,claim_expires_at,claim_token,eligible_epoch_ns
+                 FROM sync_dirty_roots""",
+        ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                None, None, None,
+                require_exact_timestamp(
+                    observed_at, "test dirty observation",
+                ).epoch_nanoseconds,
+            ),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            legacy.execute(
+                """UPDATE sync_dirty_roots
+                      SET claim_owner='worker',
+                          claim_expires_at=?,
+                          eligible_epoch_ns=?""",
+                (
+                    expires_at,
+                    require_exact_timestamp(
+                        expires_at, "test dirty expiry",
+                    ).epoch_nanoseconds,
+                ),
+            )
 
     def test_source_locator_is_validated_and_never_accepts_an_absolute_or_escaping_path(self) -> None:
         repository = self._repository()
@@ -568,10 +634,56 @@ class DurableSyncStateTests(unittest.TestCase):
             "recovered", "2026-07-26T00:00:10Z", "2026-07-26T00:00:20Z", 10,
         )
         self.assertEqual([root.root_key for root in recovered_dirty], ["task-safe"])
+        self.assertEqual(
+            recovered.acknowledge_dirty_roots(
+                "crashed", claimed_dirty, "2026-07-26T00:00:11Z",
+            ),
+            0,
+        )
         self.assertEqual(recovered.acknowledge_dirty_roots(
             "recovered", recovered_dirty, "2026-07-26T00:00:11Z",
         ), 1)
         self.assertEqual(recovered.list_dirty_roots(), ())
+
+    def test_stale_same_owner_dirty_ack_cannot_delete_successor_claim(self) -> None:
+        repository = self._repository()
+        repository.mark_dirty(
+            "hprj_safe", "task-safe", "task", "2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "reused-owner", "2026-07-26T00:00:00Z",
+            "2026-07-26T00:00:10Z",
+        ))
+        stale = repository.claim_dirty_roots(
+            "reused-owner", "2026-07-26T00:00:00Z",
+            "2026-07-26T00:00:10Z", 10,
+        )
+
+        self.assertTrue(repository.acquire_lease(
+            "reused-owner", "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z",
+        ))
+        successor = repository.claim_dirty_roots(
+            "reused-owner", "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z", 10,
+        )
+
+        self.assertEqual(
+            repository.acknowledge_dirty_roots(
+                "reused-owner", stale, "2026-07-26T00:00:11Z",
+            ),
+            0,
+        )
+        self.assertEqual(
+            [root.root_key for root in repository.list_dirty_roots()],
+            ["task-safe"],
+        )
+        self.assertEqual(
+            repository.acknowledge_dirty_roots(
+                "reused-owner", successor, "2026-07-26T00:00:11Z",
+            ),
+            1,
+        )
 
     def test_dirty_roots_jobs_frontier_and_revision_survive_store_reopen(self) -> None:
         repository = self._repository()

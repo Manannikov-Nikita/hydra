@@ -615,8 +615,9 @@ class IncrementalSyncWorker:
         """Renew a held lease while arbitrary parser/reconciler code runs.
 
         The heartbeat owns a separate SQLite connection so a slow materializer
-        cannot starve the renewal behind its transaction.  A failed renewal is
-        sticky: callers must not acknowledge/commit derived state afterwards.
+        cannot starve the renewal behind its transaction. Queue commits still
+        require a live lease; dirty-root acknowledgements are instead fenced
+        by their immutable per-claim token after a successful reconciliation.
         """
         if item is not None and dirty_roots:
             raise ValueError("heartbeat cannot renew queue and dirty claims together")
@@ -733,13 +734,9 @@ class IncrementalSyncWorker:
             with self._lease_heartbeat(
                 owner_key, lease_expires_at,
                 dirty_roots=project_roots,
-            ) as lost:
+            ) as _lost:
                 self.reconcile(project_id)
-            if lost.is_set():
-                continue
             acknowledged_at = fresh()
-            if not self.repository.lease_owned(owner_key, acknowledged_at):
-                continue
             completed += self.repository.acknowledge_dirty_roots(
                 owner_key, project_roots, acknowledged_at,
             )
@@ -825,6 +822,7 @@ class IncrementalSyncWorker:
                        ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
                          observed_at=excluded.observed_at,claim_owner=NULL,
                          claim_expires_at=NULL,
+                         claim_token=NULL,
                          eligible_epoch_ns=excluded.eligible_epoch_ns""",
                     (
                         result.project_id, root_key, result.dirty_root_kind,
@@ -1085,13 +1083,23 @@ class ResumableRepair:
     _ROOT_MARKER = "@root"
     _FILE_PREFIX = "@file/"
 
-    def __init__(self, store: HydraStore, roots: TrustedSourceRoots, *, lease_ttl_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        store: HydraStore,
+        roots: TrustedSourceRoots,
+        *,
+        lease_ttl_seconds: int = 300,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
         if not 1 <= lease_ttl_seconds <= 3600:
             raise ValueError("repair lease TTL must be between 1 and 3600 seconds")
+        if not callable(clock):
+            raise TypeError("repair clock must be callable")
         self.store = store
         self.roots = roots
         self.repository = SyncStateRepository(store)
         self.lease_ttl_seconds = lease_ttl_seconds
+        self.clock = clock
 
     @contextmanager
     def _lease_heartbeat(self, owner_key: str, lease_expires_at: str) -> Iterator[threading.Event]:
@@ -1254,7 +1262,7 @@ class ResumableRepair:
 
     def _lease_window(self) -> tuple[str, str]:
         """Return a fresh wall-clock lease window for one repair operation."""
-        observed = datetime.now(timezone.utc)
+        observed = self.clock()
         return (
             _precise_utc(observed),
             _precise_utc(
@@ -1477,19 +1485,11 @@ class ResumableRepair:
                         lease_lost = True
                         break
                     lease_observed_at, expiry = lease_window
-                    with self._lease_heartbeat(owner, expiry) as lost:
+                    with self._lease_heartbeat(owner, expiry) as _lost:
                         reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
-                    if lost.is_set():
-                        lease_lost = True
-                        break
-                    ownership_checked_at, _ = self._lease_window()
-                    if not self.repository.lease_owned(
-                        owner, ownership_checked_at,
-                    ):
-                        lease_lost = True
-                        break
+                    acknowledged_at, _ = self._lease_window()
                     self.repository.acknowledge_dirty_roots(
-                        owner, group, lease_observed_at,
+                        owner, group, acknowledged_at,
                     )
                 reconciliation_settled = not self.repository.list_dirty_roots()
             finished = complete and reconciliation_settled

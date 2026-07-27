@@ -77,9 +77,14 @@ from .migrations_aa27 import (
     AA27_MIGRATIONS,
     AA27_REQUIRED_SCHEMA,
     AA27_REQUIRED_TRIGGER_SQL,
-    AA27_SYNC_DIRTY_ROOTS_TABLE_SQL,
     AA27_SYNC_INGEST_QUEUE_TABLE_SQL,
     AA27_SYNC_WORK_SUMMARY_TABLE_SQL,
+)
+from .migrations_ab28 import (
+    AB28_MIGRATIONS,
+    AB28_REQUIRED_SCHEMA,
+    AB28_REQUIRED_TRIGGER_SQL,
+    AB28_SYNC_DIRTY_ROOTS_TABLE_SQL,
 )
 from .platform_paths import default_database_path
 from .redaction import redact_note
@@ -350,7 +355,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -841,6 +846,7 @@ class HydraStore:
         required.update(Y25_REQUIRED_SCHEMA)
         required.update(Z26_REQUIRED_SCHEMA)
         required.update(AA27_REQUIRED_SCHEMA)
+        required.update(AB28_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -882,7 +888,7 @@ class HydraStore:
             elif table == "sync_ingest_queue":
                 expected_sql = AA27_SYNC_INGEST_QUEUE_TABLE_SQL
             elif table == "sync_dirty_roots":
-                expected_sql = AA27_SYNC_DIRTY_ROOTS_TABLE_SQL
+                expected_sql = AB28_SYNC_DIRTY_ROOTS_TABLE_SQL
             if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
                 raise StorageUnavailable(
                     "Hydra schema has altered incremental sync trust "
@@ -1002,6 +1008,17 @@ class HydraStore:
                 raise StorageUnavailable(
                     "Hydra schema has missing or altered bounded "
                     f"sync-work trigger: {name}"
+                )
+        for name, expected_sql in AB28_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered dirty-claim "
+                    f"fencing trigger: {name}"
                 )
         if full_validation:
             self._validate_database_integrity()

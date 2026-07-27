@@ -555,6 +555,52 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(reconciled, ["hprj_safe"])
         self.assertEqual(self.repository.list_dirty_roots(), ())
 
+    def test_successful_reconcile_acknowledges_its_expired_dirty_claim(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        started = datetime.now(timezone.utc)
+        observed = started.isoformat().replace("+00:00", "Z")
+        expires = (started + timedelta(seconds=0.2)).isoformat().replace(
+            "+00:00", "Z",
+        )
+        self.repository.mark_dirty(
+            "hprj_safe", "hprj_safe", "project", observed,
+        )
+        self.assertTrue(
+            self.repository.acquire_lease("worker", observed, expires),
+        )
+
+        def reconcile(_project_id: str) -> None:
+            with self.store.rollout_transaction() as connection:
+                connection.execute(
+                    "CREATE TABLE expired_dirty_claim_regression(value INTEGER)",
+                )
+                connection.execute(
+                    "INSERT INTO expired_dirty_claim_regression(value) VALUES (1)",
+                )
+                time.sleep(0.45)
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            reconcile=reconcile,
+        )
+
+        completed = worker.reconcile_dirty(
+            "worker",
+            observed,
+            expires,
+            current_time=lambda: datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z",
+            ),
+        )
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(self.repository.list_dirty_roots(), ())
+
     def test_heartbeat_loss_rolls_back_slow_materializer_and_requeues(self) -> None:
         from datetime import datetime, timedelta, timezone
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
@@ -1051,6 +1097,49 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(job.sources_completed, 1)
         self.assertEqual(self.repository.list_dirty_roots(), ())
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM reconciliation_runs WHERE project_id='hprj_backfill'").fetchone()[0], 1)
+
+    def test_backfill_acknowledges_dirty_claim_after_reconcile_outlives_lease(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        now = datetime.now(timezone.utc)
+        observed_at = now.isoformat().replace("+00:00", "Z")
+        self.repository.mark_dirty(
+            "hprj_slow", "hprj_slow", "project", observed_at,
+        )
+        job_id = self.repository.create_job("backfill", observed_at)
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            lease_ttl_seconds=1,
+        )
+        reconciled: list[str] = []
+
+        def slow_reconcile(store, project_id, _key) -> None:
+            reconciled.append(project_id)
+            with store.rollout_transaction() as connection:
+                connection.execute(
+                    "CREATE TABLE slow_backfill_reconcile(value INTEGER)",
+                )
+                connection.execute(
+                    "INSERT INTO slow_backfill_reconcile(value) VALUES (1)",
+                )
+                time.sleep(1.25)
+
+        with mock.patch(
+            "hydra_codex.incremental_sync.reconcile_project",
+            side_effect=slow_reconcile,
+        ):
+            result = repair.run_batch(
+                job_id, observed_at, directory_limit=1,
+            )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(reconciled, ["hprj_slow"])
+        self.assertEqual(self.repository.list_dirty_roots(), ())
+        self.assertEqual(self.repository.get_job(job_id).state, "succeeded")
 
     def test_backfill_waits_for_reconciliation_lease_before_succeeding(self) -> None:
         from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots

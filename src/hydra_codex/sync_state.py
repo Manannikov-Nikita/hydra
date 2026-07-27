@@ -18,6 +18,7 @@ _FRONTIER_STATES = frozenset({"pending", "scanned", "repair_required"})
 _HEX_ANCHOR = re.compile(r"[0-9a-f]{64}")
 _SAFE_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _JOB_IDENTIFIER = re.compile(r"sync_[0-9a-f]{32}\Z")
+_CLAIM_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 _CANONICAL_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 
 
@@ -59,6 +60,7 @@ class DirtyRoot:
     observed_at: str
     claim_owner: str | None
     claim_expires_at: str | None
+    claim_token: str | None
 
 
 @dataclass(frozen=True)
@@ -431,6 +433,7 @@ class SyncStateRepository:
                        ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
                          observed_at=excluded.observed_at,claim_owner=NULL,
                          claim_expires_at=NULL,
+                         claim_token=NULL,
                          eligible_epoch_ns=excluded.eligible_epoch_ns""",
                     (
                         event.project_id, event.project_id, now,
@@ -940,6 +943,7 @@ class SyncStateRepository:
                    ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
                        observed_at=excluded.observed_at,claim_owner=NULL,
                        claim_expires_at=NULL,
+                       claim_token=NULL,
                        eligible_epoch_ns=excluded.eligible_epoch_ns""",
                 (
                     project_id, root_key, root_kind, now,
@@ -954,8 +958,9 @@ class SyncStateRepository:
         return tuple(DirtyRoot(
             str(row[0]), str(row[1]), str(row[2]), str(row[3]),
             None if row[4] is None else str(row[4]), None if row[5] is None else str(row[5]),
+            None if row[6] is None else str(row[6]),
         ) for row in self._store.connection.execute(
-            """SELECT project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at
+            """SELECT project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at,claim_token
                  FROM sync_dirty_roots ORDER BY observed_at,project_id,root_kind,root_key LIMIT ?""", (limit,),
         ))
 
@@ -991,25 +996,32 @@ class SyncStateRepository:
             ))
             if not rows:
                 return ()
+            claimed_rows = tuple(
+                (row, uuid.uuid4().hex)
+                for row in rows
+            )
             connection.executemany(
-                """UPDATE sync_dirty_roots SET claim_owner=?,claim_expires_at=?,
+                """UPDATE sync_dirty_roots SET claim_owner=?,claim_expires_at=?,claim_token=?,
                        eligible_epoch_ns=?
                      WHERE project_id=? AND root_key=? AND root_kind=?
                        AND eligible_epoch_ns<=?""",
                 (
                     (
-                        owner_key, claim_expires_at,
+                        owner_key, claim_expires_at, claim_token,
                         _epoch_nanoseconds(claim_expires_at),
                         row[0], row[1], row[2],
                         _epoch_nanoseconds(observed_at),
                     )
-                    for row in rows
+                    for row, claim_token in claimed_rows
                 ),
             )
             self._bump_revision(connection, observed_at)
             return tuple(
-                DirtyRoot(str(row[0]), str(row[1]), str(row[2]), str(row[3]), owner_key, claim_expires_at)
-                for row in rows
+                DirtyRoot(
+                    str(row[0]), str(row[1]), str(row[2]), str(row[3]),
+                    owner_key, claim_expires_at, claim_token,
+                )
+                for row, claim_token in claimed_rows
             )
 
     def acknowledge_dirty_roots(
@@ -1021,12 +1033,18 @@ class SyncStateRepository:
         with self._store.rollout_transaction() as connection:
             deleted = 0
             for root in roots:
+                if (
+                    root.claim_token is None
+                    or _CLAIM_TOKEN.fullmatch(root.claim_token) is None
+                ):
+                    continue
                 deleted += connection.execute(
                     """DELETE FROM sync_dirty_roots WHERE project_id=? AND root_key=? AND root_kind=?
-                         AND claim_owner=?
-                         AND hydra_rfc3339_micros(claim_expires_at)
-                             >hydra_rfc3339_micros(?)""",
-                    (root.project_id, root.root_key, root.root_kind, owner_key, observed_at),
+                         AND claim_owner=? AND observed_at=? AND claim_token=?""",
+                    (
+                        root.project_id, root.root_key, root.root_kind,
+                        owner_key, root.observed_at, root.claim_token,
+                    ),
                 ).rowcount
             if deleted:
                 self._bump_revision(connection, observed_at)
@@ -1072,6 +1090,11 @@ class SyncStateRepository:
                 return False
             renewed = 0
             for root in roots:
+                if (
+                    root.claim_token is None
+                    or _CLAIM_TOKEN.fullmatch(root.claim_token) is None
+                ):
+                    continue
                 renewed += connection.execute(
                     """UPDATE sync_dirty_roots
                           SET claim_expires_at=CASE
@@ -1084,6 +1107,7 @@ class SyncStateRepository:
                                   THEN ? ELSE eligible_epoch_ns END
                         WHERE project_id=? AND root_key=? AND root_kind=?
                           AND claim_owner=?
+                          AND claim_token=?
                           AND hydra_rfc3339_micros(claim_expires_at)
                               >hydra_rfc3339_micros(?)""",
                     (
@@ -1091,7 +1115,7 @@ class SyncStateRepository:
                         lease_expires_at,
                         _epoch_nanoseconds(lease_expires_at),
                         root.project_id, root.root_key, root.root_kind,
-                        owner_key, observed_at,
+                        owner_key, root.claim_token, observed_at,
                     ),
                 ).rowcount
             self._bump_revision(connection, observed_at)

@@ -343,7 +343,9 @@ class DashboardSyncController:
                 sources_completed=current.sources_completed,
                 bytes_processed=current.bytes_processed, updated_at=self._now(),
             )
-            repair = ResumableRepair(store, self._roots)
+            repair = ResumableRepair(
+                store, self._roots, clock=self._clock,
+            )
             if not repository.list_frontier(job_id):
                 now = self._now()
                 for root_kind in ("sessions", "archived_sessions"):

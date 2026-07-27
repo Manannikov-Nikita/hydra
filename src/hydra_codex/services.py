@@ -222,26 +222,30 @@ class LocalCommandServices:
         finally:
             store.close()
 
-    @staticmethod
-    def _sync_freshness(store: HydraStore) -> dict[str, object]:
+    def _sync_freshness(self, store: HydraStore) -> dict[str, object]:
         repository = SyncStateRepository(store)
         connection = store.connection
+        now = _utc_now(self._clock)
         repair = connection.execute(
             "SELECT 1 FROM sync_source_registry WHERE source_state='repair_required' LIMIT 1",
         ).fetchone() is not None
         queued = connection.execute(
-            """SELECT 1 FROM sync_ingest_queue WHERE queue_state='queued' LIMIT 1""",
+            """SELECT 1 FROM sync_ingest_queue
+                 WHERE queue_state='queued' OR (queue_state='claimed' AND (claim_expires_at IS NULL OR claim_expires_at<=?))
+                 LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             """SELECT 1 FROM hook_event_outbox
-                 WHERE acknowledged_at IS NULL AND claimed_by IS NULL LIMIT 1""",
+                 WHERE acknowledged_at IS NULL AND (claimed_by IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)
+                 LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             "SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1",
         ).fetchone() is not None
         running = connection.execute(
-            "SELECT 1 FROM sync_ingest_queue WHERE queue_state='claimed' LIMIT 1",
+            """SELECT 1 FROM sync_ingest_queue
+                 WHERE queue_state='claimed' AND claim_expires_at>? LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             """SELECT 1 FROM hook_event_outbox
-                 WHERE acknowledged_at IS NULL AND claimed_by IS NOT NULL LIMIT 1""",
+                 WHERE acknowledged_at IS NULL AND claimed_by IS NOT NULL AND claim_expires_at>? LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             "SELECT 1 FROM sync_jobs WHERE state='running' LIMIT 1",
         ).fetchone() is not None

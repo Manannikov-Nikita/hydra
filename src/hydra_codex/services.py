@@ -304,35 +304,43 @@ class LocalCommandServices:
         ).fetchone() is not None
         queued = connection.execute(
             """SELECT 1 FROM sync_ingest_queue
-                 WHERE queue_state='queued' OR (
-                       queue_state='claimed' AND (
-                           claim_expires_at IS NULL
-                           OR hydra_rfc3339_micros(claim_expires_at)
+                 WHERE CASE
+                         WHEN queue_state='queued' THEN 1
+                         WHEN queue_state='claimed' AND claim_expires_at IS NULL THEN 1
+                         WHEN queue_state='claimed' THEN hydra_rfc3339_micros(claim_expires_at)
                               <=hydra_rfc3339_micros(?)
-                       )
-                 )
+                         ELSE 0
+                       END=1
                  LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             """SELECT 1 FROM hook_event_outbox
-                 WHERE acknowledged_at IS NULL AND (
-                       claimed_by IS NULL OR claim_expires_at IS NULL
-                       OR hydra_rfc3339_micros(claim_expires_at)
-                          <=hydra_rfc3339_micros(?)
-                 )
+                 WHERE acknowledged_at IS NULL
+                   AND CASE
+                         WHEN claimed_by IS NULL OR claim_expires_at IS NULL THEN 1
+                         ELSE hydra_rfc3339_micros(claim_expires_at)
+                              <=hydra_rfc3339_micros(?)
+                       END=1
                  LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             "SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1",
             ).fetchone() is not None
         running = connection.execute(
             """SELECT 1 FROM sync_ingest_queue
-                 WHERE queue_state='claimed'
-                   AND hydra_rfc3339_micros(claim_expires_at)
-                       >hydra_rfc3339_micros(?) LIMIT 1""", (now,),
+                 WHERE CASE
+                         WHEN queue_state!='claimed' OR claim_expires_at IS NULL THEN 0
+                         ELSE hydra_rfc3339_micros(claim_expires_at)
+                              >hydra_rfc3339_micros(?)
+                       END=1
+                 LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             """SELECT 1 FROM hook_event_outbox
-                 WHERE acknowledged_at IS NULL AND claimed_by IS NOT NULL
-                   AND hydra_rfc3339_micros(claim_expires_at)
-                       >hydra_rfc3339_micros(?) LIMIT 1""", (now,),
+                 WHERE acknowledged_at IS NULL
+                   AND CASE
+                         WHEN claimed_by IS NULL OR claim_expires_at IS NULL THEN 0
+                         ELSE hydra_rfc3339_micros(claim_expires_at)
+                              >hydra_rfc3339_micros(?)
+                       END=1
+                 LIMIT 1""", (now,),
         ).fetchone() is not None or connection.execute(
             "SELECT 1 FROM sync_jobs WHERE state='running' LIMIT 1",
         ).fetchone() is not None

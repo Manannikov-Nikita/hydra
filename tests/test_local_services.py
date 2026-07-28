@@ -408,6 +408,55 @@ class LocalCommandServiceTests(unittest.TestCase):
             store.close()
         self.assertEqual(freshness["state"], "queued")
 
+    def test_sync_freshness_treats_unclaimed_outbox_event_as_queued(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.record_hook_event_and_enqueue(
+                event_key="unclaimed-event", project_id="hprj_local_services",
+                session_key="session-safe", turn_key="turn-safe", event_kind="post_tool",
+                observed_at="2026-07-21T00:00:00Z",
+            )
+            claim = store.connection.execute(
+                """SELECT claimed_by,claim_expires_at FROM hook_event_outbox
+                    WHERE event_key='unclaimed-event'"""
+            ).fetchone()
+            self.assertEqual(tuple(claim), (None, None))
+
+            freshness = LocalCommandServices(
+                environ=self.environ,
+                clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
+            )._sync_freshness(store)
+        finally:
+            store.close()
+
+        self.assertEqual(freshness["state"], "queued")
+
+    def test_sync_freshness_keeps_unexpired_outbox_claim_running(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.record_hook_event_and_enqueue(
+                event_key="running-event", project_id="hprj_local_services",
+                session_key="session-safe", turn_key="turn-safe", event_kind="post_tool",
+                observed_at="2026-07-21T00:00:00Z",
+            )
+            self.assertTrue(repository.acquire_lease(
+                "worker", "2026-07-21T00:00:00Z", "2026-07-21T00:10:00Z",
+            ))
+            repository.claim_hook_events(
+                "worker", "2026-07-21T00:00:00Z", "2026-07-21T00:03:00Z",
+            )
+
+            freshness = LocalCommandServices(
+                environ=self.environ,
+                clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
+            )._sync_freshness(store)
+        finally:
+            store.close()
+
+        self.assertEqual(freshness["state"], "running")
+
     def test_sync_freshness_keeps_unexpired_claims_running(self) -> None:
         store = HydraStore(self.database)
         try:

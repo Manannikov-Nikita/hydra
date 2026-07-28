@@ -1,6 +1,6 @@
 {
   "name": "hydra-codex",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Privacy-safe local telemetry and task-cost reports for Codex.",
   "author": {
     "name": "Hydra"

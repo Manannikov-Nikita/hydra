@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import hmac
 import json
@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import BinaryIO, Callable, Iterator
+from typing import BinaryIO, Callable, ContextManager, Iterator
 
 from .rollout_privacy import canonical_timestamp, nonempty_string
 
@@ -21,6 +21,9 @@ SOURCE_CHANGED_MESSAGE = "rollout source changed during ingest"
 
 class SourceChanged(RuntimeError):
     """The source stopped matching the exact regular file being ingested."""
+
+
+SourceOpener = Callable[[Path, "SourceStat | None"], ContextManager[BinaryIO]]
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,50 @@ class SourceScan:
     segment_marker: str
     source_stat: SourceStat
     path: Path = field(repr=False)
+    # Legacy ingest intentionally retains counts for every physical record,
+    # including a final unterminated fragment. Incremental repair needs the
+    # durable newline-complete prefix separately so that fragment can be
+    # reconstructed when its writer appends the suffix.
+    complete_line_count: int | None = None
+    complete_byte_count: int | None = None
+    complete_revision_digest: str | None = None
+    complete_line_fingerprints: tuple[str, ...] | None = None
+    complete_chain_digest: str | None = None
+    complete_identity: str | None = field(default=None, repr=False)
+    complete_conversation: str | None = field(default=None, repr=False)
+    complete_cwd: str | None = field(default=None, repr=False)
+    complete_meta_timestamp: str | None = None
+    complete_segment_marker: str | None = None
+
+    def complete_prefix(self) -> "SourceScan":
+        """Return the materializable newline-complete view of this scan.
+
+        The total fields remain the exact legacy revision for discovery and
+        repair validation.  This view is used only with a descriptor-relative
+        bounded opener, so a writer's incomplete trailing record cannot become
+        a legacy parser diagnostic or a prematurely materialized fact.
+        """
+        if (
+            self.complete_revision_digest is None
+            or self.complete_line_fingerprints is None
+            or self.complete_chain_digest is None
+            or self.complete_line_count is None
+            or self.complete_byte_count is None
+        ):
+            return self
+        return replace(
+            self,
+            revision_digest=self.complete_revision_digest,
+            line_fingerprints=self.complete_line_fingerprints,
+            line_count=self.complete_line_count,
+            byte_count=self.complete_byte_count,
+            chain_digest=self.complete_chain_digest,
+            identity=self.complete_identity,
+            conversation=self.complete_conversation,
+            cwd=self.complete_cwd,
+            meta_timestamp=self.complete_meta_timestamp,
+            segment_marker=self.complete_segment_marker or "missing",
+        )
 
 
 def _regular_source_stat(details: os.stat_result) -> SourceStat:
@@ -100,27 +147,55 @@ def line_fingerprint(value: bytes, key: bytes) -> str:
     return hmac.new(key, b"hydra/source-line/" + value, hashlib.sha256).hexdigest()
 
 
-def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str]) -> SourceScan:
+def scan_source(
+    path: Path, key: bytes, pseudonymize: Callable[[str, str], str], *,
+    opener: SourceOpener | None = None,
+) -> SourceScan:
     """Read a rollout incrementally, retaining only keyed hashes and safe header fields."""
-    before_stat = source_stat(path)
-    try:
-        canonical_path = path.resolve(strict=True)
-    except OSError as error:
-        raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+    if opener is None:
+        before_stat = source_stat(path)
+        try:
+            canonical_path = path.resolve(strict=True)
+        except OSError as error:
+            raise SourceChanged(SOURCE_CHANGED_MESSAGE) from error
+        source_context = open_source(path, before_stat)
+    else:
+        # A descriptor-relative opener owns all containment checks.  The path
+        # is deliberately lexical here: resolving it would reintroduce the
+        # parent-directory TOCTOU that the trusted opener prevents.
+        canonical_path = path
+        source_context = opener(path, None)
     revision = hmac.new(key, b"hydra/source-revision/", hashlib.sha256)
     chain = hmac.new(key, b"hydra/source-chain/", hashlib.sha256)
+    complete_revision = hmac.new(key, b"hydra/source-revision/", hashlib.sha256)
+    complete_chain = hmac.new(key, b"hydra/source-chain/", hashlib.sha256)
     fingerprints: list[str] = []
+    complete_fingerprints: list[str] = []
     first_meta: tuple[str, str | None, str | None, str | None, str] | None = None
     matched_meta: tuple[int, tuple[str, str | None, str | None, str | None, str]] | None = None
+    first_complete_meta: tuple[str, str | None, str | None, str | None, str] | None = None
+    matched_complete_meta: tuple[int, tuple[str, str | None, str | None, str | None, str]] | None = None
     byte_count = 0
-    with open_source(path, before_stat) as handle:
+    complete_byte_count = 0
+    complete_line_count = 0
+    with source_context as handle:
+        if opener is not None:
+            before_stat = _regular_source_stat(os.fstat(handle.fileno()))
         for raw_line in handle:
             byte_count += len(raw_line)
+            complete = raw_line.endswith(b"\n")
+            if complete:
+                complete_byte_count += len(raw_line)
+                complete_line_count += 1
             revision.update(raw_line)
             decoded = raw_line.decode("utf-8", errors="replace")
             fingerprint = line_fingerprint(raw_line, key)
             fingerprints.append(fingerprint)
             chain.update(bytes.fromhex(fingerprint))
+            if complete:
+                complete_revision.update(raw_line)
+                complete_fingerprints.append(fingerprint)
+                complete_chain.update(bytes.fromhex(fingerprint))
             try:
                 envelope = json.loads(decoded)
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -150,14 +225,32 @@ def scan_source(path: Path, key: bytes, pseudonymize: Callable[[str, str], str])
             exact_suffix = path.name == suffix or path.name.endswith("-" + suffix)
             if exact_suffix and (matched_meta is None or len(candidate) > matched_meta[0]):
                 matched_meta = (len(candidate), candidate_meta)
+            if complete:
+                if first_complete_meta is None:
+                    first_complete_meta = candidate_meta
+                if exact_suffix and (
+                    matched_complete_meta is None or len(candidate) > matched_complete_meta[0]
+                ):
+                    matched_complete_meta = (len(candidate), candidate_meta)
     selected_meta = matched_meta[1] if matched_meta is not None else first_meta
     identity, conversation, cwd, meta_timestamp, meta_marker = selected_meta or (None, None, None, None, "missing")
+    selected_complete_meta = (
+        matched_complete_meta[1] if matched_complete_meta is not None else first_complete_meta
+    )
+    complete_identity, complete_conversation, complete_cwd, complete_meta_timestamp, complete_marker = (
+        selected_complete_meta or (None, None, None, None, "missing")
+    )
     first = fingerprints[0] if fingerprints else pseudonymize("source", "empty")
     marker = meta_marker if identity is not None else first
+    complete_first = complete_fingerprints[0] if complete_fingerprints else pseudonymize("source", "empty")
+    complete_segment_marker = complete_marker if complete_identity is not None else complete_first
     return SourceScan(
         revision.hexdigest(), tuple(fingerprints), len(fingerprints), byte_count,
         chain.hexdigest(), identity, conversation, cwd, meta_timestamp, marker,
-        before_stat, canonical_path,
+        before_stat, canonical_path, complete_line_count, complete_byte_count,
+        complete_revision.hexdigest(), tuple(complete_fingerprints), complete_chain.hexdigest(),
+        complete_identity, complete_conversation, complete_cwd, complete_meta_timestamp,
+        complete_segment_marker,
     )
 
 

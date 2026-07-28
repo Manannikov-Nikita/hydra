@@ -96,7 +96,7 @@ By default, private state is stored outside the repository. macOS uses
 installation HMAC key lives beside it. Tests and isolated runs may set
 `HYDRA_DATABASE_PATH` and `HYDRA_INSTALLATION_KEY_PATH`.
 
-For the supported chat-to-dashboard startup, canary, Refresh, recovery, and
+For the supported chat-to-dashboard startup, canary, Sync, recovery, and
 shutdown procedure, see [Dashboard operations](docs/dashboard-operations.md).
 
 ## Quick dashboard startup
@@ -106,20 +106,31 @@ task:
 
 ```bash
 .venv/bin/hydra-codex doctor --format markdown
-.venv/bin/hydra-codex ingest
-.venv/bin/hydra-codex reconcile
 .venv/bin/hydra-codex dashboard
 ```
 
 The dashboard binds only to `127.0.0.1` and normally opens the browser itself.
 It intentionally starts from a bounded stored snapshot; it does not scan local
-Codex history on launch. Press **Refresh** to import and reconcile the trusted
-active and archived rollout roots. Refresh is manual and single-flight: neither
-`Stop` nor leaving the dashboard open starts periodic background ingestion.
+Codex history on launch. Hooks enqueue new source bytes, and the MCP/dashboard
+worker consumes that queue automatically. **Sync now** explicitly drains the
+same bounded queue. **Repair history** is the separate resumable full walk.
 
 ## CLI
 
-Import the default active and archived local rollout roots:
+Process only durable hook/source queue entries:
+
+```bash
+hydra-codex sync
+```
+
+Run the explicit resumable history repair when a backfill is required:
+
+```bash
+hydra-codex repair --all
+```
+
+The legacy full import remains available for controlled migrations and
+diagnostics:
 
 ```bash
 hydra-codex ingest
@@ -265,14 +276,14 @@ Direct, unambiguous `rg`, `sed`, `cat`, `head`, and `tail` commands contribute
 privacy-safe relative file lower bounds; compound, expanded, deferred, or
 otherwise ambiguous shell expressions contribute no guessed file facts.
 
-The semantic marker explains why an interval happened. Report v3 also exposes
+The semantic marker explains why an interval happened. Report v4 also exposes
 a deterministic test-evidence cross-tab by scope, failure, retry kind, semantic
 phase, and semantic cause. This distinguishes final verification from product,
 flaky, and infrastructure retries without retaining command text or output.
 Phase token allocation is still `derived`, because Codex exposes usage per
 model call rather than per semantic operation.
 
-Every numeric fact in `hydra.report/v3` has one provenance value:
+Every numeric fact in `hydra.report/v4` has one provenance value:
 
 - `exact`: directly observed and unambiguous;
 - `derived`: deterministic calculation from observations;
@@ -300,6 +311,24 @@ The checkout hook and packaged plugin use the same runtime. If both are enabled,
 the explicit project hook owns the event and the plugin copy is suppressed
 before any database mutation.
 
+## Incremental sync
+
+Hooks persist allowlisted lifecycle facts and enqueue only validated,
+root-relative source locators. While MCP or the dashboard is running, one
+lease-coordinated worker processes new JSONL bytes from durable checkpoints and
+reconciles only dirty projects. `hydra-codex sync` performs the same bounded
+queue drain explicitly; `hydra-codex repair --all` is the separate resumable,
+potentially expensive history walk. One repair invocation continues through
+bounded batches until the persisted frontier is complete; if it cannot make
+progress (for example, another worker owns the lease), it exits with a
+privacy-safe `partial` diagnostic and a later invocation resumes that frontier.
+
+`hydra.report` reads materialized SQLite state and never starts ingest or
+reconciliation. The `hydra.report-list/v2` wrapper and every contained
+`hydra.report/v4` item carry the same `sync_freshness` snapshot and
+`data_revision`, so callers can distinguish current, queued, running,
+repair-required, and unknown state without scanning source directories.
+
 ## Privacy and source policy
 
 Hydra's deterministic adapters do not store raw prompts, assistant messages,
@@ -314,7 +343,10 @@ turn IDs, or timestamps. `task_family` is a lowercase categorical code such as
 `multiple-answer-quiz`; every separator-delimited segment must come from
 Hydra's small public taxonomy, and unsafe or private-looking values are rejected before
 storage and unsafe legacy values never form a trend cohort.
-Common accepted terminals include `quiz`, `workflow`, `architecture`,
+An optional `task_label` supplies the human-readable task name shown in reports
+and the dashboard. It is Unicode-normalized, limited to 80 characters, and
+rejects control/bidi characters, paths, and secret-like content. Common
+accepted `task_family` terminals include `quiz`, `workflow`, `architecture`,
 `hardening`, `review`, `report`, `tests`, `runtime`, and `docs`; use
 `unclassified` when no public category fits rather than embedding an identity.
 
@@ -326,7 +358,8 @@ drift is diagnosed without retaining an unknown payload.
 ## MCP, skill, and plugin status
 
 The source plugin is packaged under `plugins/hydra-codex/` for the post-pilot
-stage. Its MCP server advertises `hydra.report` by default. The tool accepts
+stage. Its MCP server advertises `hydra.report` by default and hosts the durable
+incremental worker independently of report calls. The tool accepts
 exactly one of `last` for the existing report list or `pilot` for a canonical
 pilot audit, plus the requested format. It deliberately does
 not advertise `hydra.annotate` until Codex provides an authenticated turn
@@ -343,7 +376,7 @@ overwriting an existing directory, then activate the returned directory through
 the plugin installation flow provided by the Codex host. The equivalent Python
 API is `hydra_codex.plugin_bundle`.
 
-`$hydra-report` describes how to reconcile, compare, and explain facts without
+`$hydra-report` describes how to read, compare, and explain materialized facts without
 upgrading estimates into exact measurements. A skill guides workflow and
 reporting; it is not the guaranteed collection mechanism.
 

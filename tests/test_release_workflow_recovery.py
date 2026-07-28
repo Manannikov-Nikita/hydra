@@ -518,32 +518,6 @@ class ReleaseWorkflowRecoveryTests(unittest.TestCase):
                 immutable=True,
                 assets=remote_assets,
             )
-            state = self._write_release_state(
-                root,
-                release=draft,
-                latest_status=404,
-                tag_status=404,
-                immutable_enabled=False,
-                published=published,
-                sha=sha,
-            )
-            env = self._release_env(
-                root, fake_bin, gh_log, curl_log, state, assets_dir, sha,
-            )
-
-            disabled = subprocess.run(
-                ["bash", "-c", script],
-                cwd=root,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            self.assertNotEqual(disabled.returncode, 0)
-            disabled_calls = gh_log.read_text(encoding="utf-8")
-            self.assertIn("immutable-releases", disabled_calls)
-            self.assertNotIn('"PATCH"', disabled_calls)
-
             mutable_published = self._release_fixture(
                 draft=False,
                 immutable=False,
@@ -557,8 +531,10 @@ class ReleaseWorkflowRecoveryTests(unittest.TestCase):
                 published=mutable_published,
                 sha=sha,
             )
+            env = self._release_env(
+                root, fake_bin, gh_log, curl_log, state, assets_dir, sha,
+            )
             gh_log.write_text("", encoding="utf-8")
-            env["FAKE_RELEASE_STATE"] = str(state)
             mutable_response = subprocess.run(
                 ["bash", "-c", script],
                 cwd=root,
@@ -592,6 +568,10 @@ class ReleaseWorkflowRecoveryTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
             )
             self.assertEqual(initial.returncode, 0, initial.stderr)
+            self.assertNotIn(
+                "immutable-releases",
+                gh_log.read_text(encoding="utf-8"),
+            )
             initial_calls = [
                 json.loads(line)
                 for line in gh_log.read_text(encoding="utf-8").splitlines()

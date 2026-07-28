@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import json
+import json
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+import sqlite3
 from collections.abc import Mapping
 
 from hydra_codex.audit_model import AuditEvidence
+from hydra_codex.dashboard_contract import validate_task_report
 from hydra_codex.dashboard_model import DashboardRefreshView
 from hydra_codex.dashboard_queries import (
     CatalogProject,
@@ -18,12 +22,15 @@ from hydra_codex.dashboard_queries import (
     sync_project_catalog,
 )
 from hydra_codex.diagnostics import DoctorCheck, DoctorReport
+from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.project import ProjectResolution
 from hydra_codex.public_refs import (
     project_catalog_references,
     project_public_references,
 )
+from hydra_codex.report_renderers import render_json
 from hydra_codex.storage import HydraStore
+from hydra_codex.sync_state import SyncStateRepository
 from tests.test_audit_builder import public_report
 
 
@@ -106,7 +113,10 @@ class DashboardQueryTests(unittest.TestCase):
             row[1] for row in connection.execute("PRAGMA table_info(dashboard_projects)")
         }
         self.assertEqual(
-            columns, {"project_id", "display_name", "first_seen_at", "last_seen_at"},
+            columns, {
+                "project_id", "display_name", "first_seen_at", "last_seen_at",
+                "display_name_provenance",
+            },
         )
         self.assertEqual(
             [tuple(row) for row in connection.execute(
@@ -126,7 +136,7 @@ class DashboardQueryTests(unittest.TestCase):
         observe_resolved_project(
             self.store,
             ProjectResolution(
-                "project-a", Path("/private/project"), Path("nested"), "Hydra Core",
+                "project-a", Path("/private/project"), Path("nested"), "Hydra Core", "config",
             ),
             "2026-07-20T12:00:00Z",
         )
@@ -135,7 +145,9 @@ class DashboardQueryTests(unittest.TestCase):
             "SELECT * FROM dashboard_projects",
         ).fetchone()
         self.assertEqual(
-            tuple(row), ("project-a", "Hydra Core", "2026-07-20T12:00:00Z", "2026-07-20T12:00:00Z"),
+            tuple(row), (
+                "project-a", "Hydra Core", "2026-07-20T12:00:00Z", "2026-07-20T12:00:00Z", "config",
+            ),
         )
         self.assertNotIn("/private/project", "\n".join(self.store.connection.iterdump()))
 
@@ -191,14 +203,50 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def materialize(
+        self,
+        project_id: str,
+        reports: tuple[object, ...],
+        *,
+        revision: int = 7,
+    ) -> None:
+        store = HydraStore(self.database)
+        try:
+            rows = []
+            for report in reports:
+                epoch_ns = require_exact_timestamp(
+                    report.last_activity_at, "test report activity",
+                ).epoch_nanoseconds
+                rows.append((
+                    project_id, report.task_ref, render_json(report).rstrip("\n"),
+                    "", "", report.last_activity_at, epoch_ns,
+                    report.last_activity_at, revision,
+                ))
+            store.connection.executemany(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       last_activity_at,last_activity_epoch_ns,reconciled_at,
+                       data_revision)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=? WHERE singleton=1",
+                (revision,),
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
     def test_snapshot_uses_latest_task_and_never_writes(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
         latest, first = self.reports["project-a"]
+        self.materialize("project-a", self.reports["project-a"])
         before = self.database_dump()
 
         with patch(
             "hydra_codex.dashboard_queries.list_reconciled_reports",
-            side_effect=lambda _store, project_id: self.reports[project_id],
+            side_effect=AssertionError("task pages must stay materialized"),
         ):
             snapshot = self.service.snapshot(
                 project_ref=project_ref,
@@ -221,6 +269,77 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             + first.deduplicated_tokens.working.value,
         )
         self.assertEqual(payload["selected_task"]["task_ref"], first.task_ref)
+        self.assertEqual(payload["project"]["display_name"], "A <script>")
+
+    def test_task_snapshot_uses_only_revision_pinned_materialized_rows(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        latest, selected = self.reports["project-a"]
+        self.materialize("project-a", self.reports["project-a"], revision=7)
+        self.materialize("project-b", self.reports["project-b"], revision=7)
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=AssertionError(
+                "task snapshot must not reconstruct global report history",
+            ),
+        ):
+            snapshot = self.service.snapshot(
+                project_ref=project_ref,
+                task_ref=selected.task_ref,
+                refresh=self.refresh,
+            )
+
+        payload = snapshot.as_dict()
+        self.assertEqual(payload["data_revision"], 7)
+        self.assertEqual(payload["selected_task"]["task_ref"], selected.task_ref)
+        self.assertEqual(
+            payload["project"]["overview"]["basis"]["task_ref"],
+            latest.task_ref,
+        )
+
+    def test_snapshot_data_and_revision_share_one_read_transaction(self) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=3 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        original_prepare = self.service._prepare_snapshot_state
+
+        def prepare_then_publish(store):
+            prepared = original_prepare(store)
+            writer = HydraStore(self.database)
+            try:
+                writer.connection.execute(
+                    """UPDATE dashboard_projects SET display_name='Published later'
+                         WHERE project_id='project-a'"""
+                )
+                writer.connection.execute(
+                    "UPDATE sync_data_revision SET revision=4 WHERE singleton=1"
+                )
+                writer.connection.commit()
+            finally:
+                writer.close()
+            return prepared
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=lambda _store, project_id: self.reports[project_id],
+        ), patch.object(
+            self.service,
+            "_prepare_snapshot_state",
+            side_effect=prepare_then_publish,
+        ):
+            payload = self.service.snapshot(
+                project_ref=project_ref,
+                task_ref=None,
+                refresh=self.refresh,
+            ).as_dict()
+
+        self.assertEqual(payload["data_revision"], 3)
         self.assertEqual(payload["project"]["display_name"], "A <script>")
 
     def test_bootstrap_snapshots_use_catalog_without_rebuilding_reports(self) -> None:
@@ -323,6 +442,443 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(len(snapshots), 2)
         self.assertEqual(resolve_project.call_count, 0)
 
+    def test_connection_bootstrap_reads_materialized_reports_immediately(self) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        report = self.reports["project-a"][0]
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       last_activity_at,last_activity_epoch_ns,reconciled_at,
+                       data_revision)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                ("project-a", report.task_ref, render_json(report).rstrip("\n"), "", "",
+                 report.last_activity_at, require_exact_timestamp(
+                     report.last_activity_at, "test report activity",
+                 ).epoch_nanoseconds, "2026-07-22T11:00:00Z", 7),
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=7 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+        payload = snapshots[self.catalog_refs()["project-a"]].as_dict()
+        self.assertIsNone(empty)
+        self.assertEqual(payload["freshness"]["state"], "current")
+        self.assertEqual(payload["project"]["overview"]["headline"]["working_tokens"], report.deduplicated_tokens.working.as_dict())
+        self.assertEqual(payload["data_revision"], 7)
+
+    def test_warm_bootstrap_uses_project_stats_without_aggregating_report_history(
+        self,
+    ) -> None:
+        self.materialize("project-a", self.reports["project-a"])
+        unrelated = tuple(
+            replace(
+                public_report(
+                    f"unrelated-history-{index}",
+                    input_tokens=index + 1,
+                    second=1,
+                ),
+                last_activity_at=(
+                    f"2026-07-{1 + index // 24:02d}T{index % 24:02d}:00:00Z"
+                ),
+            )
+            for index in range(250)
+        )
+        self.materialize("project-unrelated-history", unrelated)
+        store = HydraStore(self.database)
+        try:
+            statements: list[str] = []
+            store.connection.set_trace_callback(statements.append)
+            self.service.bootstrap_snapshots_from_connection(
+                store.connection, refresh=self.refresh,
+            )
+        finally:
+            store.close()
+
+        snapshot_statements = tuple(
+            statement.upper()
+            for statement in statements
+            if "MATERIALIZED_REPORT_SNAPSHOTS" in statement.upper()
+        )
+        self.assertTrue(snapshot_statements)
+        self.assertFalse(any(
+            token in statement
+            for statement in snapshot_statements
+            for token in ("GROUP BY", "COUNT(", "MIN(", "MAX(")
+        ), snapshot_statements)
+        self.assertTrue(any(
+            "MATERIALIZED_PROJECT_STATS" in statement.upper()
+            for statement in statements
+        ))
+
+    def test_warm_bootstrap_fails_closed_on_incoherent_project_stats(self) -> None:
+        self.materialize("project-a", self.reports["project-a"])
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """UPDATE materialized_project_stats
+                      SET report_count=report_count+1
+                    WHERE project_id='project-a'""",
+            )
+            store.connection.commit()
+            with self.assertRaisesRegex(
+                ValueError, "materialized project stats",
+            ):
+                self.service.bootstrap_snapshots_from_connection(
+                    store.connection, refresh=self.refresh,
+                )
+        finally:
+            store.close()
+
+    def test_connection_bootstrap_includes_materialized_only_projects(self) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        report = replace(
+            public_report("materialized-only", input_tokens=17, second=8),
+            last_activity_at="2026-07-23T08:00:00Z",
+        )
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       last_activity_at,last_activity_epoch_ns,reconciled_at,
+                       data_revision)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    "project-c", report.task_ref, render_json(report).rstrip("\n"),
+                    "", "", report.last_activity_at, require_exact_timestamp(
+                        report.last_activity_at, "test report activity",
+                    ).epoch_nanoseconds, "2026-07-23T08:00:00Z", 8,
+                ),
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=8 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+
+        refs = project_catalog_references(
+            ("project-a", "project-b", "project-c"), b"k" * 32,
+        )
+        project_ref = refs["project-c"]
+        self.assertIsNone(empty)
+        self.assertEqual(len(snapshots), 1)
+        payload = next(iter(snapshots.values())).as_dict()
+        summary = next(
+            project for project in payload["projects"]
+            if project["project_ref"] == project_ref
+        )
+        self.assertEqual(summary["task_count"]["value"], 1)
+        self.assertEqual(summary["freshness_state"], "current")
+
+    def test_connection_bootstrap_bounds_reports_and_ignores_future_revisions(self) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        reports = tuple(
+            replace(
+                public_report(f"bounded-{index}", input_tokens=10 + index, second=5),
+                last_activity_at=f"2026-07-23T{index:02d}:00:00Z",
+            )
+            for index in range(12)
+        )
+        future_only = replace(
+            public_report("future-only", input_tokens=101, second=5),
+            last_activity_at="2026-07-25T00:00:00Z",
+        )
+        store = HydraStore(self.database)
+        try:
+            store.connection.executemany(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       last_activity_at,last_activity_epoch_ns,reconciled_at,
+                       data_revision)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                tuple(
+                    (
+                        "project-a", report.task_ref,
+                        render_json(report).rstrip("\n"), "", "",
+                        report.last_activity_at, require_exact_timestamp(
+                            report.last_activity_at, "test report activity",
+                        ).epoch_nanoseconds, "2026-07-23T12:00:00Z", 10,
+                    )
+                    for report in reports
+                ) + ((
+                        "project-future", future_only.task_ref,
+                        render_json(future_only).rstrip("\n"), "", "",
+                        future_only.last_activity_at, require_exact_timestamp(
+                            future_only.last_activity_at, "test report activity",
+                        ).epoch_nanoseconds, "2026-07-25T00:00:00Z", 11,
+                    ),),
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=10 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            with patch(
+                "hydra_codex.dashboard_queries.validate_task_report",
+                wraps=validate_task_report,
+            ) as validate:
+                snapshots, empty = self.service.bootstrap_snapshots_from_connection(
+                    connection, refresh=self.refresh,
+                )
+        finally:
+            connection.close()
+
+        self.assertIsNone(empty)
+        self.assertEqual(validate.call_count, 10)
+        payload = snapshots[self.catalog_refs()["project-a"]].as_dict()
+        project = payload["project"]
+        self.assertEqual(len(project["recent_tasks"]), 10)
+        self.assertEqual(
+            project["overview"]["basis"]["task_ref"], reports[-1].task_ref,
+        )
+        future_ref = project_catalog_references(
+            ("project-future",), b"k" * 32,
+        )["project-future"]
+        self.assertNotIn(future_ref, snapshots)
+        summary = next(
+            item for item in payload["projects"]
+            if item["project_ref"] == self.catalog_refs()["project-a"]
+        )
+        self.assertEqual(summary["task_count"]["value"], 12)
+        self.assertEqual(payload["data_revision"], 10)
+
+    def test_connection_bootstrap_uses_constant_queries_and_global_report_budget(
+        self,
+    ) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        project_ids = tuple(f"project-budget-{index:03d}" for index in range(40))
+        store = HydraStore(self.database)
+        try:
+            store.connection.executemany(
+                """INSERT INTO dashboard_projects(
+                       project_id,display_name,first_seen_at,last_seen_at)
+                   VALUES (?,?,?,?)""",
+                (
+                    (
+                        project_id, None, "2026-07-23T00:00:00Z",
+                        "2026-07-23T12:00:00Z",
+                    )
+                    for project_id in project_ids
+                ),
+            )
+            snapshots = []
+            for project_index, project_id in enumerate(project_ids):
+                for task_index in range(12):
+                    report = replace(
+                        public_report(
+                            f"budget-{project_index}-{task_index}",
+                            input_tokens=task_index + 1,
+                            second=5,
+                        ),
+                        last_activity_at=(
+                            f"2026-07-23T{task_index:02d}:"
+                            f"{project_index % 60:02d}:00Z"
+                        ),
+                    )
+                    snapshots.append((
+                        project_id, report.task_ref,
+                        render_json(report).rstrip("\n"), "", "",
+                        report.last_activity_at, require_exact_timestamp(
+                            report.last_activity_at, "test report activity",
+                        ).epoch_nanoseconds, report.last_activity_at, 9,
+                    ))
+            store.connection.executemany(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       last_activity_at,last_activity_epoch_ns,reconciled_at,
+                       data_revision)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                snapshots,
+            )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=9 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            with patch(
+                "hydra_codex.dashboard_queries.validate_task_report",
+                wraps=validate_task_report,
+            ) as validate:
+                cached, empty = self.service.bootstrap_snapshots_from_connection(
+                    connection, refresh=self.refresh,
+                )
+        finally:
+            connection.close()
+
+        selects = [
+            statement for statement in statements
+            if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        ]
+        self.assertIsNone(empty)
+        self.assertEqual(len(cached), 1)
+        self.assertLessEqual(len(selects), 3)
+        self.assertLessEqual(validate.call_count, 10)
+        self.assertEqual(len(next(iter(cached.values())).projects), 42)
+        warm_reads = [
+            statement for statement in selects
+            if "report_json" in statement
+            and "materialized_report_snapshots" in statement
+        ]
+        self.assertEqual(len(warm_reads), 1)
+        self.assertIn(
+            "ORDER BY last_activity_epoch_ns DESC,task_ref",
+            warm_reads[0],
+        )
+        self.assertNotIn("json_extract", warm_reads[0])
+
+    def test_connection_bootstrap_marks_materialized_projects_with_pending_work_stale(
+        self,
+    ) -> None:
+        from hydra_codex.report_renderers import render_json
+        from hydra_codex.sync_state import SyncStateRepository
+
+        store = HydraStore(self.database)
+        try:
+            for project_id, report in self.reports.items():
+                public = report[0]
+                store.connection.execute(
+                    """INSERT INTO materialized_report_snapshots(
+                           project_id,task_ref,report_json,report_markdown,report_html,
+                           last_activity_at,last_activity_epoch_ns,reconciled_at,
+                           data_revision)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        project_id, public.task_ref,
+                        render_json(public).rstrip("\n"), "", "",
+                        public.last_activity_at, require_exact_timestamp(
+                            public.last_activity_at, "test report activity",
+                        ).epoch_nanoseconds, public.last_activity_at, 1,
+                    ),
+                )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=1 WHERE singleton=1"
+            )
+            store.connection.commit()
+            repository = SyncStateRepository(store)
+            repository.record_hook_event_and_enqueue(
+                event_key="pending-a", project_id="project-a",
+                session_key="session-a", turn_key="turn-a",
+                event_kind="prompt", observed_at="2026-07-23T00:00:00Z",
+            )
+            repository.mark_dirty(
+                "project-b", "project-b", "project",
+                "2026-07-23T00:00:01Z",
+            )
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            cached, empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+
+        self.assertIsNone(empty)
+        payload = next(iter(cached.values())).as_dict()
+        states = {
+            item["project_ref"]: item["freshness_state"]
+            for item in payload["projects"]
+        }
+        refs = self.catalog_refs()
+        self.assertEqual(states[refs["project-a"]], "stale")
+        self.assertEqual(states[refs["project-b"]], "stale")
+        self.assertEqual(payload["project"]["freshness_state"], "stale")
+
+    def test_uncached_project_snapshot_loads_only_its_materialized_top_ten(
+        self,
+    ) -> None:
+        from hydra_codex.report_renderers import render_json
+
+        store = HydraStore(self.database)
+        try:
+            for project_id, reports in self.reports.items():
+                store.connection.executemany(
+                    """INSERT INTO materialized_report_snapshots(
+                           project_id,task_ref,report_json,report_markdown,report_html,
+                           last_activity_at,last_activity_epoch_ns,reconciled_at,
+                           data_revision)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        (
+                            project_id, report.task_ref,
+                            render_json(report).rstrip("\n"), "", "",
+                            report.last_activity_at, require_exact_timestamp(
+                                report.last_activity_at, "test report activity",
+                            ).epoch_nanoseconds, report.last_activity_at, 4,
+                        )
+                        for report in reports
+                    ),
+                )
+            store.connection.execute(
+                "UPDATE sync_data_revision SET revision=4 WHERE singleton=1"
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        refs = self.catalog_refs()
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=AssertionError("project snapshot must stay materialized"),
+        ), patch(
+            "hydra_codex.dashboard_queries.validate_task_report",
+            wraps=validate_task_report,
+        ) as validate:
+            payload = self.service.snapshot(
+                project_ref=refs["project-b"],
+                task_ref=None,
+                refresh=self.refresh,
+            ).as_dict()
+
+        self.assertEqual(payload["selected_project_ref"], refs["project-b"])
+        self.assertEqual(payload["project"]["freshness_state"], "current")
+        self.assertEqual(
+            payload["project"]["overview"]["basis"]["task_ref"],
+            self.reports["project-b"][0].task_ref,
+        )
+        self.assertLessEqual(validate.call_count, 10)
+
     def test_bootstrap_snapshots_preserve_empty_onboarding_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "empty.sqlite3"
@@ -340,6 +896,27 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(empty.as_dict()["projects"], [])
         self.assertIsNone(empty.as_dict()["selected_project_ref"])
         self.assertEqual(empty.as_dict()["freshness"]["state"], "unavailable")
+
+    def test_empty_materialized_snapshot_rejects_an_unknown_project_selector(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "empty.sqlite3"
+            HydraStore(database).close()
+            service = DashboardQueryService(
+                lambda: HydraStore(database), b"k" * 32,
+                lambda: datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc),
+                self.service._doctor_report,
+            )
+
+            with self.assertRaisesRegex(
+                KeyError, r"^'unknown public reference'$",
+            ):
+                service.snapshot(
+                    project_ref="project_000000000000",
+                    task_ref=None,
+                    refresh=self.refresh,
+                )
 
     def test_private_refresh_seam_reuses_caller_owned_store(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
@@ -540,16 +1117,60 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
 
     def test_task_pages_are_project_scoped_ordered_and_bounded(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
+        self.materialize("project-a", self.reports["project-a"])
+        statements: list[str] = []
+        opened: list[HydraStore] = []
+
+        def factory() -> HydraStore:
+            store = HydraStore(self.database)
+            store.connection.set_trace_callback(statements.append)
+            opened.append(store)
+            validated_reopener = store.validated_reopener
+
+            def tracked_reopener():
+                reopen = validated_reopener()
+
+                def tracked_open() -> HydraStore:
+                    reopened = reopen()
+                    reopened.connection.set_trace_callback(statements.append)
+                    opened.append(reopened)
+                    return reopened
+
+                return tracked_open
+
+            store.validated_reopener = tracked_reopener  # type: ignore[method-assign]
+            return store
+
+        service = DashboardQueryService(
+            factory,
+            b"k" * 32,
+            lambda: datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc),
+            self.service._doctor_report,
+        )
+        validated: list[str] = []
+
+        def validate(payload, **options):
+            self.assertTrue(opened[-1].connection.in_transaction)
+            validate_task_report(payload, **options)
+            validated.append(str(payload["task_ref"]))
+
         with patch(
             "hydra_codex.dashboard_queries.list_reconciled_reports",
-            side_effect=lambda _store, project_id: self.reports[project_id],
+            side_effect=AssertionError("task pages must stay materialized"),
+        ), patch(
+            "hydra_codex.dashboard_queries.validate_task_report",
+            side_effect=validate,
+        ), patch(
+            "hydra_codex.dashboard_model.validate_task_report",
+            side_effect=validate,
         ):
-            first_page = self.service.tasks(project_ref, cursor=None, limit=1).as_dict()
-            second_page = self.service.tasks(
+            first_page = service.tasks(project_ref, cursor=None, limit=1).as_dict()
+            first_validations = len(validated)
+            second_page = service.tasks(
                 project_ref, cursor=first_page["page"]["next_cursor"], limit=1,
             ).as_dict()
             with self.assertRaises(ValueError):
-                self.service.tasks(project_ref, cursor=None, limit=101)
+                service.tasks(project_ref, cursor=None, limit=101)
 
         self.assertEqual(
             [item["task_ref"] for item in first_page["items"]],
@@ -560,19 +1181,187 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             [self.reports["project-a"][1].task_ref],
         )
         self.assertFalse(second_page["page"]["has_more"])
+        # Each bounded row gets one legacy-shape validation before the safe
+        # freshness overlay, then the selected/sentinel DTO validates strictly.
+        self.assertEqual(first_validations, 4)
+        self.assertEqual(len(validated), 8)
+        report_reads = [
+            statement for statement in statements
+            if statement.lstrip().upper().startswith("SELECT")
+            and "report_json" in statement
+            and "materialized_report_snapshots" in statement
+        ]
+        self.assertEqual(len(report_reads), 3)
+        self.assertTrue(all("LIMIT 2" in statement for statement in report_reads[::2]))
+
+    def test_task_page_orders_full_timestamp_precision_before_task_ref(self) -> None:
+        older = replace(
+            public_report("nanosecond-older", input_tokens=10, second=5),
+            last_activity_at="2026-07-22T11:00:00.100000001Z",
+        )
+        newer = replace(
+            public_report("nanosecond-newer", input_tokens=20, second=5),
+            last_activity_at="2026-07-22T11:00:00.100000002Z",
+        )
+        self.materialize("project-a", (older, newer))
+
+        with patch(
+            "hydra_codex.dashboard_queries.list_reconciled_reports",
+            side_effect=AssertionError("task ordering must stay materialized"),
+        ):
+            page = self.service.tasks(
+                self.catalog_refs()["project-a"], cursor=None, limit=10,
+            ).as_dict()
+
+        self.assertEqual(
+            [item["task_ref"] for item in page["items"]],
+            [newer.task_ref, older.task_ref],
+        )
+
+    def test_repeated_hot_queries_share_one_full_store_validation(self) -> None:
+        self.materialize("project-a", self.reports["project-a"])
+        validation_calls = 0
+        original = HydraStore._validate_schema
+
+        def validate(store: HydraStore, latest: int) -> None:
+            nonlocal validation_calls
+            validation_calls += 1
+            original(store, latest)
+
+        with patch.object(HydraStore, "_validate_schema", new=validate):
+            project_ref = self.catalog_refs()["project-a"]
+            self.service.tasks(project_ref, cursor=None, limit=1)
+            self.service.tasks(project_ref, cursor=None, limit=1)
+
+        self.assertEqual(validation_calls, 1)
+
+    def test_legacy_materialized_report_gets_current_safe_freshness_overlay(
+        self,
+    ) -> None:
+        self.materialize("project-a", self.reports["project-a"])
+        store = HydraStore(self.database)
+        try:
+            row = store.connection.execute(
+                """SELECT task_ref,report_json FROM materialized_report_snapshots
+                     WHERE project_id='project-a'
+                     ORDER BY last_activity_epoch_ns DESC LIMIT 1""",
+            ).fetchone()
+            payload = json.loads(str(row["report_json"]))
+            payload.pop("sync_freshness")
+            store.connection.execute(
+                """UPDATE materialized_report_snapshots SET report_json=?
+                     WHERE project_id='project-a' AND task_ref=?""",
+                (
+                    json.dumps(
+                        payload, sort_keys=True, separators=(",", ":"),
+                    ),
+                    str(row["task_ref"]),
+                ),
+            )
+            store.connection.commit()
+            SyncStateRepository(store).register_and_enqueue(
+                root_kind="sessions",
+                source_locator="pending.jsonl",
+                project_id="project-a",
+                observed_at="2026-07-22T11:30:00Z",
+            )
+            revision = SyncStateRepository(store).data_revision()
+        finally:
+            store.close()
+
+        project_ref = self.catalog_refs()["project-a"]
+        page = self.service.tasks(
+            project_ref, cursor=None, limit=1,
+        ).as_dict()
+        self.assertEqual(page["items"][0]["sync_freshness"], {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "queued",
+            "data_revision": revision,
+        })
+
+    def test_materialized_reads_reject_swapped_index_epochs(self) -> None:
+        latest, first = self.reports["project-a"]
+        self.materialize("project-a", (latest, first))
+        connection = sqlite3.connect(self.database)
+        try:
+            latest_epoch = connection.execute(
+                """SELECT last_activity_epoch_ns
+                     FROM materialized_report_snapshots
+                    WHERE project_id='project-a' AND task_ref=?""",
+                (latest.task_ref,),
+            ).fetchone()[0]
+            first_epoch = connection.execute(
+                """SELECT last_activity_epoch_ns
+                     FROM materialized_report_snapshots
+                    WHERE project_id='project-a' AND task_ref=?""",
+                (first.task_ref,),
+            ).fetchone()[0]
+            connection.execute(
+                """UPDATE materialized_report_snapshots
+                      SET last_activity_epoch_ns=CASE task_ref
+                          WHEN ? THEN ? WHEN ? THEN ? END
+                    WHERE project_id='project-a'""",
+                (latest.task_ref, first_epoch, first.task_ref, latest_epoch),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        project_ref = self.catalog_refs()["project-a"]
+        bootstrap_connection = sqlite3.connect(self.database)
+        bootstrap_connection.row_factory = sqlite3.Row
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "materialized task report activity is invalid",
+            ):
+                self.service.bootstrap_snapshots_from_connection(
+                    bootstrap_connection, refresh=self.refresh,
+                )
+        finally:
+            bootstrap_connection.close()
+        with self.assertRaisesRegex(
+            ValueError, "materialized task report activity is invalid",
+        ):
+            self.service.tasks(project_ref, cursor=None, limit=1)
+        with self.assertRaisesRegex(
+            ValueError, "materialized task report activity is invalid",
+        ):
+            self.service.tasks(project_ref, cursor=latest.task_ref, limit=1)
 
     def test_compare_requires_both_refs_in_selected_project(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
         latest, first = self.reports["project-a"]
+        unrelated = replace(
+            public_report("unrelated", input_tokens=99, second=5),
+            last_activity_at="2026-07-22T12:00:00Z",
+        )
+        self.materialize(
+            "project-a", self.reports["project-a"] + (unrelated,),
+        )
+        from hydra_codex.audit_service import read_materialized_task_reports
+
         with patch(
             "hydra_codex.dashboard_queries.list_reconciled_reports",
-            side_effect=lambda _store, project_id: self.reports[project_id],
-        ):
+            side_effect=AssertionError("compare must stay materialized"),
+        ), patch(
+            "hydra_codex.dashboard_queries.read_materialized_task_reports",
+            wraps=read_materialized_task_reports,
+        ) as read_reports, patch(
+            "hydra_codex.audit_service.validate_task_report",
+            wraps=validate_task_report,
+        ) as validate:
             comparison = self.service.compare(project_ref, first.task_ref, latest.task_ref)
+            valid_compare_reads = validate.call_count
             with self.assertRaisesRegex(KeyError, r"^'unknown public reference'$"):
                 self.service.compare(project_ref, "task_000000000000", latest.task_ref)
 
         self.assertEqual(comparison.schema_version, "hydra.comparison/v2")
+        self.assertEqual(valid_compare_reads, 2)
+        self.assertEqual(read_reports.call_count, 2)
+        self.assertEqual(
+            read_reports.call_args_list[0].args[2],
+            (first.task_ref, latest.task_ref),
+        )
 
     def test_evidence_reads_only_latest_selected_project_pilot(self) -> None:
         store = HydraStore(self.database)
@@ -583,8 +1372,8 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
                        thresholds_json,state)
                    VALUES (?,?,?,?,1,'all','{}',?)""",
                 (
-                    ("hpilot_v1_11111111111111111111111111111111", "project-a", "2026-07-21T00:00:00Z", "2026-07-21T01:00:00Z", "closed"),
-                    ("hpilot_v1_22222222222222222222222222222222", "project-a", "2026-07-22T00:00:00Z", None, "open"),
+                    ("hpilot_v1_11111111111111111111111111111111", "project-a", "2026-07-22T00:00:00Z", "2026-07-22T01:00:00Z", "closed"),
+                    ("hpilot_v1_22222222222222222222222222222222", "project-a", "2026-07-22T00:00:00.1Z", None, "open"),
                     ("hpilot_v1_33333333333333333333333333333333", "project-b", "2026-07-23T00:00:00Z", None, "open"),
                 ),
             )
@@ -594,21 +1383,27 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         evidence = AuditEvidence(
             "ev_0123456789abcdef", "tasks.safe.working", 30, "tokens", "derived",
         )
-        called: list[tuple[str, str, bool]] = []
+        called: list[tuple[str, str]] = []
 
-        def build(_store, *, project_id, pilot_id, refresh_enrollment=True):
-            called.append((project_id, pilot_id, refresh_enrollment))
+        def build(_store, *, project_id, pilot_id):
+            called.append((project_id, pilot_id))
             return SimpleNamespace(evidence_appendix=(evidence,))
 
         before = self.database_dump()
-        with patch("hydra_codex.dashboard_queries.build_pilot_audit", side_effect=build):
+        with patch(
+            "hydra_codex.audit_service.build_pilot_audit",
+            side_effect=AssertionError("dashboard evidence must stay materialized"),
+        ), patch(
+            "hydra_codex.dashboard_queries.read_materialized_pilot_audit",
+            side_effect=build,
+        ):
             selected = self.service.evidence(
                 self.catalog_refs()["project-a"], evidence.evidence_id,
             )
 
         self.assertIs(selected, evidence)
         self.assertEqual(called, [(
-            "project-a", "hpilot_v1_22222222222222222222222222222222", False,
+            "project-a", "hpilot_v1_22222222222222222222222222222222",
         )])
         self.assertEqual(self.database_dump(), before)
 

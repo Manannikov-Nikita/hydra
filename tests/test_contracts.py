@@ -144,6 +144,23 @@ class AnnotationContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ModelAnnotationInput.from_mapping({**payload, forbidden: 1})
 
+    def test_task_label_is_optional_normalized_and_privacy_safe(self) -> None:
+        payload = {
+            "kind": "phase", "phase": "implement", "cause": "plan",
+            "scope_change": "none", "task_family": "telemetry", "confidence": 0.9,
+            "note": "begin", "task_label": "  Cafe\u0301 telemetry  ",
+        }
+        model = ModelAnnotationInput.from_mapping(payload)
+        self.assertEqual(model.task_label, "Café telemetry")
+        for value in (
+            "x" * 81, "../../private", "/Users/private", "https://private.example",
+            "019f75d4-5125-7343-8537-49b80f27f286", "task_0123456789abcdef",
+            "api_key=private", "line\nbreak", "\u202ereversed",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "task_label"):
+                    ModelAnnotationInput.from_mapping({**payload, "task_label": value})
+
     def test_trusted_context_is_required_to_materialize_an_annotation(self) -> None:
         model_input = ModelAnnotationInput(
             kind=AnnotationKind.FINISH,
@@ -154,6 +171,7 @@ class AnnotationContractTests(unittest.TestCase):
             confidence=0.9,
             outcome=Outcome.SUCCESS,
             note="completed",
+            task_label="Finish verification",
         )
         annotation = materialize_annotation(
             model_input,
@@ -171,6 +189,7 @@ class AnnotationContractTests(unittest.TestCase):
         self.assertEqual(annotation.session_id, "session-1")
         self.assertEqual(annotation.task_family, "foundation")
         self.assertEqual(annotation.provenance, Provenance.MODEL_REPORTED)
+        self.assertEqual(annotation.task_label, "Finish verification")
 
     def test_counts_reject_bool_string_and_float_values(self) -> None:
         for value in (True, "1", 1.0):

@@ -34,11 +34,49 @@ class DashboardAssetContractTests(unittest.TestCase):
     def all_sources(self) -> str:
         return "\n".join(self.asset(name) for name in sorted(EXPECTED_ASSETS))
 
-    def evaluate_dom(self, expression: str) -> object:
+    def evaluate_module(self, name: str, expression: str) -> object:
         source = (
-            f"import * as dom from {json.dumps((ASSET_ROOT / 'dom.js').as_uri())};"
-            f"process.stdout.write(JSON.stringify({expression}));"
+            f"import * as subject from {json.dumps((ASSET_ROOT / name).as_uri())};"
+            f"process.stdout.write(JSON.stringify(await ({expression})));"
         )
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", source],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def evaluate_dom(self, expression: str) -> object:
+        return self.evaluate_module("dom.js", expression.replace("dom.", "subject."))
+
+    def evaluate_app(self, expression: str) -> object:
+        source = f"""
+const element = {{
+  addEventListener() {{}},
+  removeAttribute() {{}},
+  setAttribute() {{}},
+  contains() {{ return false; }},
+  focus() {{}},
+  replaceChildren() {{}},
+  textContent: "",
+  hidden: true,
+}};
+globalThis.document = {{
+  getElementById() {{ return element; }},
+  activeElement: null,
+}};
+globalThis.window = {{
+  addEventListener() {{}},
+  location: {{hash: ""}},
+  setTimeout,
+}};
+globalThis.history = {{pushState() {{}}}};
+const subject = await import({json.dumps((ASSET_ROOT / "app.js").as_uri())});
+process.stdout.write(JSON.stringify(await ({expression})));
+"""
         completed = subprocess.run(
             ["node", "--input-type=module", "-e", source],
             check=False,
@@ -324,8 +362,8 @@ class DashboardAssetContractTests(unittest.TestCase):
             "Recent tasks", "Pilot", "System health", "dataTable(",
         ):
             self.assertIn(marker, source)
-        self.assertIn("Latest validated task unavailable — Refresh required", source)
-        self.assertIn("Recent task evidence requires Refresh.", source)
+        self.assertIn("Latest validated task unavailable — Sync required", source)
+        self.assertIn("Recent task evidence requires Sync.", source)
         self.assertNotIn("Basis: no reconciled task", source)
 
     def test_overview_distinguishes_unknown_false_and_true_readiness(self) -> None:
@@ -342,7 +380,7 @@ class DashboardAssetContractTests(unittest.TestCase):
 
         for marker in (
             "function absentPilotText", 'project.freshness_state === "stale"',
-            "Unavailable until Refresh", "Not started", "const absentPilot",
+            "Unavailable until Sync", "Not started", "const absentPilot",
             "pilot ? readinessText(pilot.transport_verified) : absentPilot",
             "pilot ? readinessText(pilot.trend_ready) : absentPilot",
         ):
@@ -409,10 +447,10 @@ class DashboardAssetContractTests(unittest.TestCase):
     def test_refresh_and_navigation_keep_prior_content_during_progress(self) -> None:
         app = self.asset("app.js")
         state = self.asset("state.js")
-        for stage in ("discover", "inspect", "scan", "reconcile"):
+        for stage in ("queued", "running", "succeeded", "partial", "failed"):
             self.assertIn(stage, app)
         for marker in (
-            "AbortController", "refresh_ref", "reused", "partial", "failed",
+            "AbortController", "sync_ref", "reused", "partial", "failed",
             "succeeded", "Retry", "aria-busy", "focus", "lastRefreshProgress",
             "reset_after_refresh", "reloadAfterRefresh",
         ):
@@ -429,7 +467,7 @@ class DashboardAssetContractTests(unittest.TestCase):
 
         for marker in (
             "Stable evidence remains visible",
-            "Refresh again",
+            "Sync again",
             "A live task changed during refresh",
             "Wait for the active task to finish writing",
         ):
@@ -447,10 +485,9 @@ class DashboardAssetContractTests(unittest.TestCase):
         app = self.asset("app.js")
 
         for marker in (
-            "function refreshProgressDetail", "sources_scanned",
-            "sources_discovered", "projects_completed", "projects_total",
-            "projects_refreshed", "Sources scanned", "Projects completed",
-            "refreshed", "provenance unavailable", "fact.value === 0",
+            "function refreshProgressDetail", "sources_queued",
+            "sources_processed", "new_bytes", "Queued", "processed",
+            "new bytes", "fact.value === 0",
         ):
             self.assertIn(marker, app)
         progress = app.split("function refreshProgressDetail", 1)[-1].split(
@@ -462,18 +499,211 @@ class DashboardAssetContractTests(unittest.TestCase):
             "async function startRefresh", 1,
         )[0]
         visible_progress = (
-            'showAsyncState("loading", "Refreshing evidence", '
+            'showAsyncState("loading", "Syncing evidence", '
             "refreshProgressDetail(current))"
         )
         self.assertIn(visible_progress, poll)
         self.assertLess(poll.index(visible_progress), poll.index("announceRefresh(current)"))
-        self.assertIn("announce(`Refresh ${stage}`)", app)
+        self.assertIn("announce(`Sync ${stage}`)", app)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_change_polling_is_serial_and_keeps_exact_cadence(self) -> None:
+        observed = self.evaluate_module(
+            "state.js",
+            """(async () => {
+              const waits = [];
+              let active = 0;
+              let maximumActive = 0;
+              let polls = 0;
+              await subject.runSerializedPoll(
+                async delay => { waits.push(delay); },
+                async () => {
+                  active += 1;
+                  maximumActive = Math.max(maximumActive, active);
+                  await Promise.resolve();
+                  polls += 1;
+                  active -= 1;
+                },
+                () => polls < 3,
+              );
+              return {waits, polls, maximumActive};
+            })()""",
+        )
+
+        self.assertEqual(observed, {
+            "waits": [1000, 1000, 1000],
+            "polls": 3,
+            "maximumActive": 1,
+        })
+
+        app = self.asset("app.js")
+        self.assertNotIn("setInterval", app)
+        self.assertIn("changePollPromise", app)
+        poll = app.split("async function pollChanges", 1)[-1].split(
+            "function startChangePolling", 1,
+        )[0]
+        self.assertRegex(
+            poll,
+            r"const pendingRevision[\s\S]+await reloadAfterRefresh\(false\)"
+            r"[\s\S]+if \(!reloaded\) return;[\s\S]+acknowledgeRevision",
+        )
+        self.assertLess(
+            poll.index("if (!reloaded) return;"),
+            poll.index("acknowledgeRevision"),
+        )
+
+    def test_change_polling_only_acknowledges_the_loaded_snapshot_revision(self) -> None:
+        app = self.asset("app.js")
+        poll = app.split("async function pollChanges", 1)[-1].split(
+            "function startChangePolling", 1,
+        )[0]
+
+        self.assertIn(
+            "const loadedRevision = state.snapshot && state.snapshot.data_revision",
+            poll,
+        )
+        self.assertIn("loadedRevision < pendingRevision", poll)
+        self.assertIn("acknowledgeRevision(loadedRevision)", poll)
+        self.assertNotIn("acknowledgeRevision(pendingRevision)", poll)
+        self.assertLess(
+            poll.index("loadedRevision < pendingRevision"),
+            poll.index("acknowledgeRevision(loadedRevision)"),
+        )
+
+    def test_one_active_job_owns_both_mutating_controls_and_polling(self) -> None:
+        app = self.asset("app.js")
+
+        self.assertIn("activeJobPoll", app)
+        self.assertEqual(app.count("pollRefresh("), 2)
+        self.assertIn("function runActiveJob", app)
+        self.assertIn("if (activeJobPoll) return activeJobPoll", app)
+        self.assertIn("refreshButton.disabled = busy", app)
+        self.assertIn("repairButton.disabled = busy", app)
+        self.assertIn("syncJobKind(current.kind)", app)
+        self.assertIn('jobKind === "repair" ? "Repairing history" : "Syncing evidence"', app)
+        self.assertNotRegex(
+            app.split("async function pollRefresh", 1)[-1].split(
+                "function announceRefreshOutcome", 1,
+            )[0],
+            r"refreshButton\.(?:disabled|textContent)|repairButton\.(?:disabled|textContent)",
+        )
+
+    def test_reused_active_job_adopts_the_backend_kind(self) -> None:
+        app = self.asset("app.js")
+        active_job = app.split("function runActiveJob", 1)[-1].split(
+            "async function startRefresh", 1,
+        )[0]
+
+        self.assertIn(
+            "jobKind = syncJobKind(started.kind)",
+            active_job,
+        )
+        self.assertIn("activeJobKind = jobKind", active_job)
+        self.assertIn(
+            "retry = jobKind === \"repair\" ? startRepair : startRefresh",
+            active_job,
+        )
+        self.assertIn("setMutatingBusy(jobKind, true)", active_job)
+        self.assertIn("pollRefresh(started.sync_ref, jobKind, retry)", active_job)
+        self.assertLess(
+            active_job.index("jobKind = syncJobKind(started.kind)"),
+            active_job.index("pollRefresh(started.sync_ref, jobKind, retry)"),
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_persisted_backfill_uses_repair_status_and_retry_contract(self) -> None:
+        self.assertEqual(
+            self.evaluate_app(
+                "['sync', 'repair', 'backfill', null].map(subject.syncJobKind)"
+            ),
+            ["sync", "repair", "repair", "sync"],
+        )
+        ready = self.asset("app.js").split(
+            'window.addEventListener("hydra-dashboard-ready"', 1,
+        )[-1]
+        self.assertIn("const jobKind = syncJobKind(current.kind)", ready)
+        self.assertIn("runActiveJob(jobKind", ready)
+
+    def test_repair_confirmation_transfers_and_restores_focus(self) -> None:
+        app = self.asset("app.js")
+        html = self.asset("index.html")
+
+        self.assertIn('id="async-status" class="async-status" tabindex="-1"', html)
+        self.assertIn("function hideRepairConfirmation", app)
+        self.assertIn("repairButton.focus({preventScroll: true})", app)
+        self.assertIn("asyncStatus.focus({preventScroll: true})", app)
+        self.assertIn('document.activeElement === asyncStatus', app)
+        confirmation_handler = app.split(
+            'repairConfirmButton.addEventListener("click"', 1,
+        )[-1].split("async function pollChanges", 1)[0]
+        self.assertLess(
+            confirmation_handler.index("hideRepairConfirmation(asyncStatus)"),
+            confirmation_handler.index('runActiveJob("repair"'),
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_primary_names_have_short_refs_and_explicit_copy_actions(self) -> None:
+        shortened = self.evaluate_dom(
+            "['project_0123456789abcdef', 'task_0123456789abcdef', 'short']"
+            ".map(subject.shortRef)"
+        )
+        self.assertEqual(shortened, [
+            "project_…89abcdef",
+            "task_…89abcdef",
+            "short",
+        ])
+
+        joined = self.all_sources()
+        for marker in (
+            "referenceLabel", "referenceIdentity", "copyRefButton",
+            "Copy project ref", "Copy task ref", "navigator.clipboard",
+            "clipboard.writeText", "Use the visible short ref instead.",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, joined)
+        self.assertIn("taskDisplay(task)", self.asset("views/overview.js"))
+        self.assertIn("taskDisplay(task)", self.asset("views/tasks.js"))
+        self.assertIn("taskDisplay(", self.asset("views/compare.js"))
+        self.assertIn("project.display_name", self.asset("views/shell.js"))
+        self.assertNotRegex(
+            self.asset("app.js"),
+            r"(?:announce|textContent)\([^)]*(?:reference|error)",
+        )
+
+    def test_sync_repair_polling_and_task_names_are_explicit_and_safe(self) -> None:
+        app = self.asset("app.js")
+        api = self.asset("api.js")
+        html = self.asset("index.html")
+        dom = self.asset("dom.js")
+        tasks = self.asset("views/tasks.js")
+
+        for marker in ("Sync now", "Repair history", "Start full repair", "startChangePolling", "runSerializedPoll"):
+            self.assertIn(marker, html + app)
+        self.assertIn("/api/v1/changes?after=", api)
+        self.assertIn("startSync", api)
+        self.assertIn("startRepair", api)
+        self.assertIn("export function taskDisplay", dom)
+        self.assertIn("taskDisplay(task)", tasks)
+        self.assertNotIn("sources_scanned", app)
 
     def test_task_loading_uses_the_canonical_nested_page_cursor(self) -> None:
         app = self.asset("app.js")
 
         self.assertIn("page.page && page.page.next_cursor", app)
         self.assertNotRegex(app, r"cursor\s*=\s*page\.next_cursor")
+
+    def test_task_routes_and_load_more_fetch_exactly_one_page_per_action(self) -> None:
+        app = self.asset("app.js")
+        loader = app.split("async function loadTaskPage", 1)[-1].split(
+            "async function compareTasks", 1,
+        )[0]
+
+        self.assertEqual(loader.count("await api.tasks("), 1)
+        self.assertNotIn("while (", loader)
+        self.assertNotIn("do {", loader)
+        self.assertIn('type: append ? "append_tasks" : "tasks"', loader)
+        self.assertIn("loadTaskPage(context, true)", app)
+        self.assertNotIn("loadAllTasks", app)
 
     def test_stale_task_routes_require_refresh_before_expensive_queries(self) -> None:
         app = self.asset("app.js")
@@ -495,7 +725,7 @@ class DashboardAssetContractTests(unittest.TestCase):
         )
         self.assertLess(
             load_route.index("routeNeedsRefresh"),
-            load_route.index("loadAllTasks"),
+            load_route.index("loadTaskPage"),
         )
 
     def test_route_async_results_are_generation_scoped_and_cancelled(self) -> None:

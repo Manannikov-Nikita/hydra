@@ -11,10 +11,12 @@ from unittest.mock import patch
 
 import hydra_codex.audit_service as audit_service_module
 from hydra_codex.audit_service import build_pilot_audit, current_storage_health
-from hydra_codex.pilot import close_pilot, start_pilot
+from hydra_codex.pilot import close_pilot, pilot_status, start_pilot
+from hydra_codex.reconcile_engine import reconcile_project
 from hydra_codex.report_renderers import render_report_collection
+from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.services import LocalCommandServices
-from hydra_codex.storage import HydraStore
+from hydra_codex.storage import MIGRATIONS, HydraStore
 from tests.test_audit_builder import public_report
 
 
@@ -90,19 +92,63 @@ class OneShotAuditServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_one_shot_service_ingests_reconciles_validates_builds_and_renders(self) -> None:
+    def _materialize_pilot(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            ingest_rollouts(
+                store,
+                audit_service_module._default_rollout_roots(self.environ),
+                self.project,
+                "hprj_audit_service",
+                hash_key=b"h" * 32,
+            )
+            reconcile_project(
+                store,
+                "hprj_audit_service",
+                b"h" * 32,
+            )
+            pilot_status(
+                store,
+                "hprj_audit_service",
+                self.run.pilot_id,
+            )
+        finally:
+            store.close()
+
+    def test_audit_service_reads_only_materialized_state_and_renders(self) -> None:
         spool = self.root / "tmp" / "Hydra" / "spool"
         spool.mkdir(parents=True)
         pending = spool / "pending.json"
         pending.write_text('{"unattested":"must remain"}', encoding="utf-8")
+        self._materialize_pilot()
+        store = HydraStore(self.database)
+        try:
+            before_runs = store.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs"
+            ).fetchone()[0]
+            before_sources = store.connection.execute(
+                "SELECT COUNT(*) FROM rollout_sources"
+            ).fetchone()[0]
+        finally:
+            store.close()
         service = LocalCommandServices(environ=self.environ)
 
-        rendered = service.audit(
-            self.run.pilot_id,
-            "json",
-            self.database,
-            self.project,
-        )
+        with patch(
+            "hydra_codex.reconcile_engine._assemble_project",
+            side_effect=AssertionError("audit report must not reassemble source facts"),
+        ), patch.object(
+            HydraStore,
+            "_validate_schema",
+            side_effect=AssertionError(
+                "materialized pilot read repeated the full database audit",
+            ),
+        ):
+            rendered = service.audit(
+                self.run.pilot_id,
+                "json",
+                self.database,
+                self.project,
+            )
         payload = json.loads(rendered)
 
         self.assertEqual(payload["schema_version"], "hydra.audit/v1")
@@ -119,24 +165,19 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertTrue(pending.exists(), "bare audit service must not drain unattested spool data")
         store = HydraStore(self.database)
         try:
-            snapshot = store.connection.execute(
-                """SELECT audit_sha256,database_bytes,wal_bytes,rollout_sources,
-                          rollout_events,codex_event_sources,codex_events,schema_version
-                     FROM storage_audit_snapshots
-                    WHERE project_id='hprj_audit_service'"""
-            ).fetchone()
+            after_runs = store.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs"
+            ).fetchone()[0]
+            after_sources = store.connection.execute(
+                "SELECT COUNT(*) FROM rollout_sources"
+            ).fetchone()[0]
+            audit_snapshots = store.connection.execute(
+                "SELECT COUNT(*) FROM storage_audit_snapshots"
+            ).fetchone()[0]
         finally:
             store.close()
-        self.assertEqual(
-            str(snapshot[0]), hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-        )
-        self.assertEqual(tuple(snapshot[1:]), tuple(
-            evidence[f"storage.{name}"]["value"] for name in (
-                "database_bytes", "wal_bytes", "rollout_sources",
-                "rollout_events", "codex_event_sources", "codex_events",
-                "schema_version",
-            )
-        ))
+        self.assertEqual((after_runs, after_sources), (before_runs, before_sources))
+        self.assertEqual(audit_snapshots, 0)
         for private in (
             "private-session", "private-turn", str(self.project), str(self.database),
             "unattested", "capability", "project_id",
@@ -144,6 +185,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
             self.assertNotIn(private, rendered)
 
     def test_failed_render_does_not_create_a_storage_baseline(self) -> None:
+        self._materialize_pilot()
         with self.assertRaises(ValueError):
             LocalCommandServices(environ=self.environ).audit(
                 self.run.pilot_id, "unsupported", self.database, self.project,
@@ -158,6 +200,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_canonical_audit_json_is_accepted_directly_by_rejected_close(self) -> None:
+        self._materialize_pilot()
         rendered = LocalCommandServices(environ=self.environ).audit(
             self.run.pilot_id, "json", self.database, self.project,
         )
@@ -182,9 +225,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         )
 
     def test_current_storage_health_is_read_only_and_project_scoped(self) -> None:
-        LocalCommandServices(environ=self.environ).audit(
-            self.run.pilot_id, "json", self.database, self.project,
-        )
+        self._materialize_pilot()
         store = HydraStore(self.database)
         try:
             before = store.connection.total_changes
@@ -198,12 +239,10 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertGreaterEqual(health.wal_bytes, 0)
         self.assertEqual((health.rollout_sources, health.rollout_events), (1, 4))
         self.assertEqual((health.codex_event_sources, health.codex_events), (0, 0))
-        self.assertEqual(health.schema_version, 38)
+        self.assertEqual(health.schema_version, MIGRATIONS[-1][0])
 
     def test_build_holds_one_nested_safe_transaction_across_status_and_reports(self) -> None:
-        LocalCommandServices(environ=self.environ).audit(
-            self.run.pilot_id, "json", self.database, self.project,
-        )
+        self._materialize_pilot()
         store = HydraStore(self.database)
         writer = sqlite3.connect(self.database, timeout=0)
         original = audit_service_module.list_reconciled_reports
@@ -239,9 +278,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertTrue(interleaving["blocked"])
 
     def test_dashboard_audit_build_does_not_refresh_pilot_enrollment(self) -> None:
-        LocalCommandServices(environ=self.environ).audit(
-            self.run.pilot_id, "json", self.database, self.project,
-        )
+        self._materialize_pilot()
         store = HydraStore(self.database)
         try:
             before = store.connection.total_changes
@@ -258,17 +295,78 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(audit.schema_version, "hydra.audit/v1")
 
+    def test_materialized_audit_uses_query_only_read_transaction(self) -> None:
+        self._materialize_pilot()
+        store = HydraStore(self.database)
+        statements: list[str] = []
+        store.connection.set_trace_callback(statements.append)
+        try:
+            with patch.object(
+                store,
+                "rollout_transaction",
+                side_effect=AssertionError(
+                    "materialized audit must not acquire a writer transaction",
+                ),
+            ):
+                audit_service_module._build_pilot_audit_with_health(
+                    store,
+                    project_id="hprj_audit_service",
+                    pilot_id=self.run.pilot_id,
+                    refresh_enrollment=False,
+                    materialized_only=True,
+                )
+            query_only_after = int(
+                store.connection.execute("PRAGMA query_only").fetchone()[0]
+            )
+        finally:
+            store.connection.set_trace_callback(None)
+            store.close()
 
-class LegacyReportByteCompatibilityTests(unittest.TestCase):
-    def test_report_v3_and_report_list_v1_rendered_bytes_are_unchanged(self) -> None:
+        normalized = tuple(statement.strip().upper() for statement in statements)
+        self.assertIn("BEGIN", normalized)
+        self.assertIn("PRAGMA QUERY_ONLY=ON", normalized)
+        self.assertNotIn("BEGIN IMMEDIATE", normalized)
+        self.assertEqual(query_only_after, 0)
+
+    def test_materialized_task_reader_distinguishes_missing_from_corrupt_state(self) -> None:
+        self._materialize_pilot()
+        store = HydraStore(self.database)
+        try:
+            task_ref = str(store.connection.execute(
+                """SELECT task_ref FROM materialized_report_snapshots
+                     WHERE project_id='hprj_audit_service'""",
+            ).fetchone()[0])
+            reports = audit_service_module.read_materialized_task_reports(
+                store, "hprj_audit_service", (task_ref,),
+            )
+            with self.assertRaisesRegex(
+                KeyError, "unknown materialized task reference",
+            ):
+                audit_service_module.read_materialized_task_reports(
+                    store,
+                    "hprj_audit_service",
+                    ("task_000000000000",),
+                )
+            with self.assertRaisesRegex(ValueError, "must be unique"):
+                audit_service_module.read_materialized_task_reports(
+                    store, "hprj_audit_service", (task_ref, task_ref),
+                )
+        finally:
+            store.close()
+
+        self.assertEqual(tuple(report.task_ref for report in reports), (task_ref,))
+
+
+class ReportV4ByteStabilityTests(unittest.TestCase):
+    def test_report_v4_and_report_list_v2_rendered_bytes_are_stable(self) -> None:
         reports = (
             public_report("compat-a", input_tokens=100, second=10),
             public_report("compat-b", input_tokens=200, second=20),
         )
         expected = {
-            "json": "7f22fafd301b63f7f954f4cd6ef73cb053230d1f135d20fc19e9cb35dc205917",
-            "markdown": "501fd8bdf5c563cd999732fcf04fb1d27cf5ac8f72968cba13737736c05d5c12",
-            "html": "f82ba9a9348ad1351d7e35e457fd61c75581f8782f5761f88d0403e695ac33c0",
+            "json": "b6b9f2b24d1b697b1d580871115f9c743ff04f136a1aec9f2426fc4a6aede14e",
+            "markdown": "243795a4ca62a37efb46696dc116d2e275c26bb34b57ce95d4d37d07f2e1f172",
+            "html": "c2f7b058be5f8f2830998ab295b722fa359739b9bfec024522880142b554c359",
         }
 
         for output_format, digest in expected.items():

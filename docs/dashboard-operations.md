@@ -87,12 +87,11 @@ Expected behavior:
    command. A repeated omission records `self_report_missing` and does not block
    the user.
 
-After the canary has finished, import and reconcile from the Hydra repository:
+After the canary has finished, drain the durable queue:
 
 ```bash
 .venv/bin/hydra-codex doctor --format markdown
-.venv/bin/hydra-codex ingest
-.venv/bin/hydra-codex reconcile
+.venv/bin/hydra-codex sync
 .venv/bin/hydra-codex report --last 1 --format markdown
 ```
 
@@ -122,68 +121,54 @@ per-launch credential. The page removes it immediately and retains it only in
 that tab's `sessionStorage`. Do not paste the handoff URL into logs, issues, or
 chat messages.
 
-Dashboard launch reads only bounded catalog metadata. A project may initially
-appear stale or require Refresh even when the database already contains tasks.
-That is expected.
+Dashboard launch reads only bounded materialized catalog metadata. A project
+may briefly appear stale while a persisted or newly queued sync job completes.
+Reloading the page reconnects to that durable job.
 
-## 6. Refresh the dashboard
+## 6. Sync and repair
 
-Press **Refresh** in the top bar. This is the only browser-triggered mutation.
-Hydra then scans the trusted default roots:
+Hooks enqueue safe lifecycle facts and validated source locators. While MCP or
+the dashboard is running, the lease-coordinated worker automatically processes
+only that new work. Press **Sync now** to request the same bounded queue drain
+explicitly. A second request reuses the active persisted job.
 
-- `~/.codex/sessions`;
-- `~/.codex/archived_sessions`.
+**Sync now never walks the rollout roots.** Existing valid evidence remains
+visible until the new materialized snapshots are ready.
 
-It reports `discover`, `inspect`, `scan`, and `reconcile` progress. A second
-Refresh request reuses the active job instead of starting a concurrent import.
-Existing valid evidence stays visible until the new project snapshots are
-ready.
-
-Refresh is intentionally manual. The following actions do **not** refresh the
-dashboard:
-
-- finishing a Codex task;
-- reloading the page;
-- leaving the dashboard open;
-- running only `hydra-codex annotate`.
-
-After new tasks finish, press Refresh again. For deterministic CLI automation,
-run `ingest` and `reconcile` before starting a fresh dashboard process.
+Use **Repair history** (or `hydra-codex repair --all`) only for the initial
+backfill or a source marked `repair_required`. Repair is the explicit expensive
+directory walk. The CLI runs successive bounded batches until completion; its
+frontier and progress survive interruption or restart. A `partial` /
+`no_progress` result means the durable frontier is still safe to resume, most
+commonly because another Hydra worker owns the singleton lease.
 
 ## 7. Recover from common states
 
 ### `source_changed`
 
-One of the rollout files or its owning root changed while Hydra was validating
-it. This is common when Refresh scans the currently active task that is still
-writing its own rollout.
+One source was truncated, replaced, or rewritten relative to its durable
+checkpoint.
 
 1. Leave the previous dashboard snapshot in place; Hydra already retains it.
 2. Finish or pause the task that is writing the source.
 3. Wait until the rollout is stable.
-4. Press **Refresh again**.
-
-Repeatedly pressing Refresh again from the same actively writing task can reproduce the
-same partial result. `ingest --source label=/path` does not isolate the import:
-explicit sources are added to the default active and archived roots. There is no
-supported exclusive-source flag in the current CLI.
+4. Run **Repair history** once.
 
 ### `database_busy`
 
-Another Hydra writer holds the database. Let the current ingest, reconcile, or
-Refresh finish, then press **Refresh again**. Do not start parallel full-history imports.
+Another Hydra worker holds the lease or SQLite writer lock. Leave MCP/dashboard
+running; the persisted job retries. Do not start parallel history repairs.
 
 ### `reconciliation_stale`
 
-The observations changed after the last reconciliation. Once writers are idle,
-run:
+The observations changed after the last materialized snapshot. Run:
 
 ```bash
-.venv/bin/hydra-codex ingest
-.venv/bin/hydra-codex reconcile
+.venv/bin/hydra-codex sync
 ```
 
-Then press **Refresh again** or restart the dashboard.
+If sync reports `repair_required`, follow with
+`.venv/bin/hydra-codex repair --all`.
 
 ### `storage_unavailable`
 
@@ -209,8 +194,8 @@ shared URL.
 ### `internal_failure`
 
 Keep the prior snapshot, run doctor, and retry after other writers stop. If the
-state repeats, stop and relaunch the dashboard, then reproduce with the explicit
-CLI sequence `ingest` followed by `reconcile`. Hydra intentionally exposes only
+state repeats, stop and relaunch the dashboard, then reproduce with
+`.venv/bin/hydra-codex sync`. Hydra intentionally exposes only
 the categorical browser diagnostic; inspect the local command exit status
 rather than publishing raw paths or payloads.
 
@@ -221,7 +206,7 @@ rather than publishing raw paths or payloads.
 2. Check `/hooks` for `UserPromptSubmit`, `PostToolUse`, and `Stop`.
 3. Trust any new or changed commands.
 4. Start a new task and repeat the canary.
-5. Run doctor, ingest, reconcile, and `report --last 1` before opening the
+5. Run doctor, sync, and `report --last 1` before opening the
    dashboard.
 
 If both the checkout hook and packaged plugin are enabled, the explicit project
@@ -231,7 +216,7 @@ copy of the same project hook to compensate for missing telemetry.
 ## 8. Stop safely
 
 Keep the dashboard process attached to its owning terminal. Stop it with
-`Ctrl+C`. Hydra closes the Refresh controller and loopback server; the launch
+`Ctrl+C`. Hydra closes the Sync controller and loopback server; the launch
 credential expires with that process.
 
 Do not use broad process-kill commands, delete SQLite files, or remove rollout
@@ -248,6 +233,6 @@ source logs.
 - A new-task canary produces a latest report with semantic markers.
 - `doctor` is healthy before relying on the dashboard.
 - The dashboard was opened from its current private launch handoff.
-- Refresh reached `succeeded`, or a partial state was handled without discarding
+- Sync reached `succeeded`, or a partial state was handled without discarding
   the previous snapshot.
 - The dashboard is stopped with `Ctrl+C` when the review session ends.

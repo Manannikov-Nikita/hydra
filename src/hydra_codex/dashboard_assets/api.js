@@ -67,11 +67,9 @@ export class DashboardApi {
     return this.request(`/api/v1/evidence/${encodeURIComponent(evidenceRef)}?project=${project}`, {signal});
   }
 
-  startRefresh(signal) {
-    return this.request("/api/v1/refresh", {method: "POST", signal});
-  }
-
-  refreshStatus(refreshRef, signal) {
-    return this.request(`/api/v1/refresh/${encodeURIComponent(refreshRef)}`, {signal});
-  }
+  sync(signal) { return this.request("/api/v1/sync", {signal}); }
+  startSync(signal) { return this.request("/api/v1/sync", {method: "POST", signal}); }
+  startRepair(signal) { return this.request("/api/v1/repair", {method: "POST", signal}); }
+  syncStatus(syncRef, signal) { return this.request(`/api/v1/sync/${encodeURIComponent(syncRef)}`, {signal}); }
+  changes(after, signal) { return this.request(`/api/v1/changes?after=${encodeURIComponent(String(after))}`, {signal}); }
 }

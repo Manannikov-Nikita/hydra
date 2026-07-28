@@ -1,12 +1,29 @@
 # Hydra report interpretation
 
-Hydra exposes a versioned `hydra.report/v3` document. Numeric facts contain:
+Hydra exposes a versioned `hydra.report/v4` document. `display_name` is a
+validated, optional human-readable task label; the opaque `task_ref` remains
+the stable copyable identity. Each report also carries a strict
+`sync_freshness` snapshot (`hydra.sync-freshness/v1`) so a detached v4 item
+retains the materialized-state revision and freshness at which it was read.
+Numeric facts contain:
 
 - `value`: measured value or `null` when unavailable;
 - `unit`: tokens, milliseconds, count, ratio, or percent;
 - `provenance`: `exact`, `derived`, `model_reported`, or `estimated`;
 - `lower_bound`: a safe observed minimum when the exact value is unavailable;
 - `caveats`: machine-readable limits on interpretation.
+
+Recent reports are wrapped in `hydra.report-list/v2`. The wrapper keeps the
+same `sync_freshness` value as every contained v4 item for list/v2
+compatibility. It contains a monotonic `data_revision` and one state:
+
+- `current`: materialized reports match all processed durable work;
+- `queued` or `running`: wait for the worker, or explicitly run
+  `hydra-codex sync`;
+- `repair_required`: an operator must explicitly run
+  `hydra-codex repair --all`;
+- `reconcile_required`: no valid materialized report exists yet;
+- `unknown`: freshness was not supplied by the calling surface.
 
 `recorded_*` includes all observed model usage. `deduplicated_*` subtracts only
 verified fork replay baselines. `working_tokens` is input minus cached input plus

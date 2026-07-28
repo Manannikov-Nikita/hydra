@@ -1,4 +1,4 @@
-import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseDisplayName, phaseFigure} from "../dom.js";
+import {copyRefButton, dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseDisplayName, phaseFigure, referenceIdentity, referenceLabel, taskDisplay} from "../dom.js";
 
 function filterButton(label, pressed, select) {
   const button = el("button", {class: "button ghost", type: "button", "aria-pressed": pressed, text: label});
@@ -22,11 +22,11 @@ function caveatText(values) {
   return Array.isArray(values) && values.length ? values.join(", ") : "None reported";
 }
 
-function renderDetail(task) {
+function renderDetail(task, actions) {
   if (!task) return el("div", {class: "empty-state"}, [
     el("h2", {text: "Select a task"}), el("p", {text: "Choose one task to inspect its evidence."}),
   ]);
-  const heading = el("h2", {id: "task-detail-heading", tabindex: "-1", text: task.task_ref});
+  const heading = el("h2", {id: "task-detail-heading", tabindex: "-1", text: taskDisplay(task)});
   const timeline = task.semantic && task.semantic.annotations && Array.isArray(task.semantic.annotations.timeline)
     ? task.semantic.annotations.timeline : [];
   const testRows = task.semantic && task.semantic.annotations && task.semantic.annotations.test_evidence
@@ -37,7 +37,10 @@ function renderDetail(task) {
   const trend = task.trend && task.trend.result ? task.trend.result : {};
   return el("article", {"aria-labelledby": "task-detail-heading"}, [
     heading,
-    el("p", {class: "muted", text: `${task.task_family} · ${task.status} · ${task.last_activity_at}`}),
+    referenceIdentity(
+      taskDisplay(task), task.task_ref, "task", actions.copyReference,
+    ),
+    el("p", {class: "muted", text: `${task.status} · ${task.last_activity_at}`}),
     el("div", {class: "metric-grid"}, [
       metricCard("Working tokens", task.deduplicated_tokens && task.deduplicated_tokens.working),
       metricCard("Full context", task.deduplicated_tokens && task.deduplicated_tokens.full_context),
@@ -80,9 +83,17 @@ export function renderTasks(state, actions) {
     (state.taskFamily === "all" || item.task_family === state.taskFamily)
     && (state.taskStatus === "all" || item.status === state.taskStatus));
   const listRows = visible.map(task => {
-    const button = el("button", {class: "row-button mono", type: "button", "aria-pressed": task.task_ref === state.taskRef, text: task.task_ref});
+    const displayName = taskDisplay(task);
+    const button = el("button", {class: "row-button", type: "button", "aria-pressed": task.task_ref === state.taskRef});
+    button.replaceChildren(referenceLabel(displayName, task.task_ref));
     button.addEventListener("click", () => actions.selectTask(task.task_ref));
-    return [button, task.task_family || "Unclassified", task.status, factSummaryText(task.deduplicated_tokens && task.deduplicated_tokens.working)];
+    return [
+      button,
+      copyRefButton(task.task_ref, "task", actions.copyReference, displayName),
+      task.task_family || "Unclassified",
+      task.status,
+      factSummaryText(task.deduplicated_tokens && task.deduplicated_tokens.working),
+    ];
   });
   return el("div", {}, [
     pageHeader("Tasks", "Browse reconciled tasks, then inspect one evidence record in context."),
@@ -91,10 +102,10 @@ export function renderTasks(state, actions) {
     el("div", {class: "tasks-layout"}, [
       el("section", {"aria-labelledby": "task-list-heading"}, [
         el("h2", {id: "task-list-heading", text: "Task list"}),
-        dataTable("Tasks after loaded-page filters", ["Task", "Family", "Status", "Working tokens"], listRows),
+        dataTable("Tasks after loaded-page filters", ["Task", "Reference", "Family", "Status", "Working tokens"], listRows),
         state.cursor ? (() => { const more = el("button", {class: "button ghost", type: "button", text: "Load more"}); more.addEventListener("click", actions.loadMore); return more; })() : el("span", {class: "muted", text: "All loaded"}),
       ]),
-      renderDetail(selectedTask(state)),
+      renderDetail(selectedTask(state), actions),
     ]),
   ]);
 }

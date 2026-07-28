@@ -40,6 +40,7 @@ def _annotation_payload(model: ModelAnnotationInput) -> dict[str, object]:
         "task_family": model.task_family,
         "confidence": model.confidence,
         "note": model.note,
+        "task_label": model.task_label,
         "outcome": None if model.outcome is None else model.outcome.value,
     }
 

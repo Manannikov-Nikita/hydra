@@ -20,7 +20,13 @@ from hydra_codex.contracts import (
     TurnRecord,
     materialize_annotation,
 )
-from hydra_codex.storage import MIGRATIONS, HydraStore, StorageUnavailable, default_database_path
+from hydra_codex.storage import (
+    MIGRATIONS,
+    HydraStore,
+    StorageUnavailable,
+    ValidatedStoreProvider,
+    default_database_path,
+)
 
 
 SECRET_FORM_MATRIX = (
@@ -98,6 +104,141 @@ class SQLiteStorageTests(unittest.TestCase):
         self.addCleanup(reopened.close)
         self.assertEqual(reopened.schema_version(), MIGRATIONS[-1][0])
         self.assertEqual(reopened.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+
+    def test_current_schema_open_skips_repeat_whole_database_validation(self) -> None:
+        with patch.object(
+            HydraStore,
+            "_validate_schema",
+            side_effect=AssertionError("hot open repeated the full database audit"),
+        ):
+            first = HydraStore.open_current(self.database)
+            second = HydraStore.open_current(self.database)
+        first.close()
+        second.close()
+
+    def test_bounded_writer_open_checks_schema_without_scanning_database(self) -> None:
+        with patch.object(
+            HydraStore,
+            "_validate_database_integrity",
+            side_effect=AssertionError(
+                "bounded writer open scanned the whole database",
+            ),
+        ):
+            store = HydraStore.open_bounded_writer(self.database)
+        store.close()
+
+        self.store.connection.execute(
+            "DROP TRIGGER sync_queue_eligibility_insert",
+        )
+        self.store.connection.commit()
+        with self.assertRaisesRegex(
+            StorageUnavailable, "bounded sync-work trigger",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_schema_change_before_first_write(self) -> None:
+        bounded = HydraStore.open_bounded_writer(self.database)
+        self.addCleanup(bounded.close)
+        other = sqlite3.connect(self.database)
+        try:
+            other.execute(
+                "DROP TRIGGER sync_queue_eligibility_insert",
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "after bounded writer validation",
+        ):
+            with bounded.rollout_transaction() as connection:
+                connection.execute(
+                    """INSERT INTO sync_worker_leases(
+                           lease_name,owner_key,acquired_at,expires_at
+                       ) VALUES (
+                           'ingest','unsafe',
+                           '2026-07-27T00:00:00Z',
+                           '2026-07-27T00:01:00Z'
+                       )""",
+                )
+        self.assertIsNone(
+            bounded.connection.execute(
+                """SELECT owner_key FROM sync_worker_leases
+                    WHERE lease_name='ingest'""",
+            ).fetchone(),
+        )
+
+    def test_bounded_writer_rejects_schema_change_during_validation(self) -> None:
+        validate = HydraStore._validate_schema
+
+        def tamper_after_validation(store, latest, *, full_validation=True):
+            validate(store, latest, full_validation=full_validation)
+            other = sqlite3.connect(self.database)
+            try:
+                other.execute(
+                    "DROP TRIGGER sync_queue_eligibility_insert",
+                )
+                other.commit()
+            finally:
+                other.close()
+
+        with (
+            patch.object(
+                HydraStore, "_validate_schema",
+                new=tamper_after_validation,
+            ),
+            self.assertRaisesRegex(
+                StorageUnavailable,
+                "changed during bounded writer validation",
+            ),
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_constructor_closes_connection_when_storage_validation_fails(self) -> None:
+        database = Path(self.temporary_directory.name) / "failed-open.sqlite3"
+        failed = HydraStore.__new__(HydraStore)
+
+        with patch.object(
+            HydraStore,
+            "_migrate",
+            side_effect=StorageUnavailable("forced validation failure"),
+        ), self.assertRaisesRegex(StorageUnavailable, "forced validation failure"):
+            failed.__init__(database)
+
+        self.assertIsNone(failed.connection)
+
+    def test_validated_provider_bootstraps_once_and_reopens_per_caller(self) -> None:
+        bootstrap_calls = 0
+
+        def bootstrap() -> HydraStore:
+            nonlocal bootstrap_calls
+            bootstrap_calls += 1
+            return HydraStore.open_current(self.database)
+
+        provider = ValidatedStoreProvider(bootstrap)
+        first = provider.open()
+        second = provider.open()
+        try:
+            self.assertIsNot(first.connection, second.connection)
+            self.assertEqual(bootstrap_calls, 1)
+        finally:
+            first.close()
+            second.close()
+
+    def test_validated_reopener_rejects_in_place_schema_change(self) -> None:
+        reopen = self.store.validated_reopener()
+        other = sqlite3.connect(self.database)
+        try:
+            other.execute("CREATE TABLE unexpected_schema_drift(value TEXT)")
+            other.commit()
+        finally:
+            other.close()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable,
+            "schema changed after startup validation",
+        ):
+            reopen()
 
     def test_migrates_version_eleven_tool_spans_without_losing_existing_rows(self) -> None:
         legacy_path = Path(self.temporary_directory.name) / "version-eleven.sqlite3"

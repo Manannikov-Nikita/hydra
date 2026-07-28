@@ -71,15 +71,15 @@ def insert_annotation(
         """INSERT INTO annotations(
                annotation_id,project_id,session_id,turn_id,sequence,observed_at,kind,
                phase,cause,scope_change,task_family,confidence,outcome,provenance,
-               note_redacted,note_hash,note_length)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               note_redacted,note_hash,note_length,task_label)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             annotation_id, binding["project_id"], binding["session_key"], binding["turn_key"],
             context.sequence, context.observed_at, model.kind.value, model.phase.value,
             model.cause.value, model.scope_change.value, model.task_family, model.confidence,
             None if model.outcome is None else model.outcome.value, provenance.value,
             redact_note(model.note), keys.digest("diagnostic", "annotation-note/" + model.note),
-            len(model.note),
+            len(model.note), model.task_label,
         ),
     )
     connection.execute(

@@ -1,6 +1,6 @@
 {
   "name": "hydra-codex",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Privacy-safe local telemetry and task-cost reports for Codex.",
   "author": {
     "name": "Hydra"
@@ -14,7 +14,7 @@
     "category": "Productivity",
     "capabilities": ["Local telemetry", "Task reports"],
     "defaultPrompt": [
-      "Use $hydra-report to reconcile local Codex telemetry and summarize the latest task report."
+      "Use $hydra-report to read materialized local Codex telemetry and summarize the latest task report."
     ]
   },
   "mcpServers": "./.mcp.json"

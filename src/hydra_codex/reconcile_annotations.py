@@ -151,7 +151,7 @@ def _annotation_rows(
     placeholders = ",".join("?" for _ in sessions)
     return list(connection.execute(
         f"""SELECT annotation_id,observed_at,sequence,kind,phase,cause,scope_change,
-                   task_family,confidence,outcome,provenance,note_redacted
+                   task_family,confidence,outcome,provenance,note_redacted,task_label
               FROM annotations
              WHERE project_id=? AND session_id IN ({placeholders})""",
         (project_id, *sessions),
@@ -276,6 +276,7 @@ def build_annotation_facts(
     fingerprint = hashlib.sha256(json.dumps(
         {
             "markers": [marker.fingerprint() for marker in markers],
+            "task_labels": [row[12] for _observed, row in model if row[12] is not None],
             "test_evidence": [item.fingerprint() for item in test_evidence],
             "invalid_interval_timestamps": invalid_intervals,
         },

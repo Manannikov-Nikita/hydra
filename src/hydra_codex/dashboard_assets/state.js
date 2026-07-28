@@ -2,6 +2,14 @@ export const ROUTES = Object.freeze(["overview", "tasks", "compare", "health", "
 
 const freeze = value => Object.freeze(value);
 
+export async function runSerializedPoll(wait, poll, shouldContinue) {
+  while (shouldContinue()) {
+    await wait(1000);
+    if (!shouldContinue()) return;
+    await poll();
+  }
+}
+
 export function initialState() {
   return freeze({
     route: "overview",

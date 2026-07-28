@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from hydra_codex.annotation_spool import _record_transport
+from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.metrics import aggregate_project, aggregate_project_facts
+from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout_identity import Pseudonymizer
+from hydra_codex.services import LocalCommandServices
 from hydra_codex.storage import MIGRATIONS, V2_TRIGGER_STATEMENTS, HydraStore, StorageUnavailable
 from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 from hydra_codex.token_selection import refresh_token_source_selection
+from tests.test_audit_builder import public_report
 
 
 def seed_rollout_rows(connection: sqlite3.Connection, version: int) -> None:
@@ -163,7 +169,327 @@ def replace_empty_table(path: Path, table: str, create_statement: str) -> None:
         connection.close()
 
 
+def seed_legacy_reconciliation(path: Path) -> None:
+    """Persist the populated report state shipped by the supported v38 schema."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """INSERT INTO reconciliation_runs(
+                   run_id,project_id,started_at,outcome,provenance,
+                   reconciliation_version,input_digest,completed_at,task_count)
+               VALUES (
+                   'legacy-run','preserved-project','2026-07-21T00:00:00Z',
+                   'success','derived',6,'legacy-digest',
+                   '2026-07-21T00:00:01Z',1
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO reconciled_tasks(
+                   project_id,root_key,public_ref,status,cutoff_at,
+                   last_activity_at,task_family,reconciliation_version,input_digest)
+               VALUES (
+                   'preserved-project','legacy-root','task_abc123','complete',
+                   '2026-07-21T00:00:01Z','2026-07-21T00:00:01Z',
+                   'unclassified',6,'legacy-digest'
+               )"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class MigrationMatrixB2Tests(unittest.TestCase):
+    @staticmethod
+    def _legacy_environment(root: Path, database: Path) -> tuple[dict[str, str], Path]:
+        project = root / "project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text(
+            'project_id = "preserved-project"\ntelemetry = "hybrid"\n',
+            encoding="utf-8",
+        )
+        return {
+            "HOME": str(root),
+            "HYDRA_DATABASE_PATH": str(database),
+            "HYDRA_INSTALLATION_KEY_PATH": str(root / "installation.key"),
+        }, project
+
+    def test_v38_populated_reports_are_queued_and_never_claim_current_before_materialization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "v38-populated.sqlite3"
+            build_schema(database, 38)
+            seed_legacy_reconciliation(database)
+            environ, project = self._legacy_environment(root, database)
+
+            store = HydraStore.open_current(database)
+            try:
+                dirty = tuple(
+                    tuple(row)
+                    for row in store.connection.execute(
+                        """SELECT project_id,root_key,root_kind
+                             FROM sync_dirty_roots ORDER BY project_id"""
+                    )
+                )
+            finally:
+                store.close()
+            payload = json.loads(
+                LocalCommandServices(environ=environ).report(
+                    10, "json", database, project,
+                )
+            )
+
+        self.assertEqual(
+            dirty,
+            (("preserved-project", "preserved-project", "project"),),
+        )
+        self.assertEqual(payload["reports"], [])
+        self.assertEqual(payload["sync_freshness"]["state"], "reconcile_required")
+
+    def test_v38_dirty_materialization_survives_restart_and_normal_sync_resumes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "v38-resume.sqlite3"
+            build_schema(database, 38)
+            seed_legacy_reconciliation(database)
+            environ, project = self._legacy_environment(root, database)
+
+            HydraStore.open_current(database).close()
+            restarted = HydraStore.open_current(database)
+            try:
+                self.assertEqual(
+                    restarted.connection.execute(
+                        "SELECT COUNT(*) FROM sync_dirty_roots"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                restarted.close()
+
+            service = LocalCommandServices(environ=environ)
+            sync = service.sync(database, project)
+            payload = json.loads(service.report(10, "json", database, project))
+            verified = HydraStore.open_current(database)
+            try:
+                counts = (
+                    verified.connection.execute(
+                        "SELECT COUNT(*) FROM sync_dirty_roots"
+                    ).fetchone()[0],
+                    verified.connection.execute(
+                        """SELECT COUNT(*) FROM materialized_report_snapshots
+                            WHERE project_id='preserved-project'"""
+                    ).fetchone()[0],
+                    verified.connection.execute(
+                        """SELECT report_count FROM materialized_project_stats
+                            WHERE project_id='preserved-project'"""
+                    ).fetchone()[0],
+                )
+            finally:
+                verified.close()
+
+        self.assertEqual(sync["claimed"], 0)
+        self.assertEqual(counts, (0, 1, 1))
+        self.assertEqual(len(payload["reports"]), 1)
+        self.assertEqual(payload["sync_freshness"]["state"], "current")
+
+    def test_v43_backfills_project_stats_and_exact_sync_job_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v43-project-stats.sqlite3"
+            build_schema(database, 43)
+            report = public_report("migration-stats", second=2)
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       reconciled_at,data_revision,last_activity_at,
+                       last_activity_epoch_ns)
+                   VALUES ('hprj_migration',?,?,?,?,'2026-07-21T09:00:00Z',7,?,?)""",
+                (
+                    report.task_ref, render_json(report).rstrip("\n"),
+                    "markdown", "html", report.last_activity_at,
+                    require_exact_timestamp(
+                        report.last_activity_at,
+                    ).epoch_nanoseconds,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO sync_jobs(
+                       job_id,job_kind,state,sources_discovered,sources_completed,
+                       bytes_processed,created_at,updated_at,completed_at)
+                   VALUES ('sync_00000000000000000000000000000044',
+                           'sync','queued',0,0,0,
+                           '2026-07-21T09:00:00Z',
+                           '2026-07-21T09:00:00.000001Z',NULL)""",
+            )
+            connection.commit()
+            connection.close()
+
+            store = HydraStore(database)
+            try:
+                stats = tuple(store.connection.execute(
+                    """SELECT report_count,first_activity_at,
+                              last_activity_epoch_ns,data_revision
+                         FROM materialized_project_stats
+                        WHERE project_id='hprj_migration'""",
+                ).fetchone())
+                job_epoch = store.connection.execute(
+                    """SELECT updated_epoch_ns FROM sync_jobs
+                        WHERE job_id='sync_00000000000000000000000000000044'""",
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+        self.assertEqual(stats, (
+            1,
+            report.last_activity_at,
+            require_exact_timestamp(
+                report.last_activity_at,
+            ).epoch_nanoseconds,
+            7,
+        ))
+        self.assertEqual(
+            job_epoch,
+            require_exact_timestamp(
+                "2026-07-21T09:00:00.000001Z",
+            ).epoch_nanoseconds,
+        )
+
+    def test_v38_hot_open_runs_bounded_upgrade_without_full_database_audit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v38-hot-open.sqlite3"
+            build_schema(database, 38)
+
+            with patch.object(
+                HydraStore,
+                "_validate_database_integrity",
+                side_effect=AssertionError(
+                    "bounded hot upgrade ran a whole-database audit",
+                ),
+            ):
+                store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT revision FROM sync_data_revision WHERE singleton=1",
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                store.close()
+
+    def test_v42_materialized_activity_backfills_exact_sort_key_and_recent_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v42-materialized.sqlite3"
+            build_schema(database, 42)
+            reports = (
+                replace(
+                    public_report("migration-older", second=1),
+                    last_activity_at="2026-07-21T10:00:00.123456+02:00",
+                ),
+                replace(
+                    public_report("migration-newer", second=2),
+                    last_activity_at="2026-07-21T08:30:00.000000001Z",
+                ),
+            )
+            legacy_json: list[str] = []
+            for report in reports:
+                payload = json.loads(render_json(report))
+                payload.pop("sync_freshness")
+                legacy_json.append(json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ))
+            connection = sqlite3.connect(database)
+            connection.executemany(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       reconciled_at,data_revision)
+                   VALUES ('hprj_migration',?,?,?,?,'2026-07-21T09:00:00Z',7)""",
+                (
+                    (report.task_ref, serialized, "markdown", "html")
+                    for report, serialized in zip(reports, legacy_json, strict=True)
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = HydraStore(database)
+            try:
+                rows = tuple(store.connection.execute(
+                    """SELECT task_ref,last_activity_at,last_activity_epoch_ns
+                         FROM materialized_report_snapshots
+                        WHERE project_id='hprj_migration'
+                        ORDER BY last_activity_epoch_ns DESC,task_ref""",
+                ))
+                plan = "\n".join(str(row[3]) for row in store.connection.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT task_ref FROM materialized_report_snapshots
+                        WHERE project_id=?
+                        ORDER BY last_activity_epoch_ns DESC,task_ref LIMIT 10""",
+                    ("hprj_migration",),
+                ))
+            finally:
+                store.close()
+
+        self.assertEqual(
+            tuple(row[0] for row in rows),
+            (reports[1].task_ref, reports[0].task_ref),
+        )
+        self.assertEqual(
+            tuple(row[1] for row in rows),
+            (reports[1].last_activity_at, reports[0].last_activity_at),
+        )
+        self.assertEqual(
+            tuple(row[2] for row in rows),
+            tuple(
+                require_exact_timestamp(report.last_activity_at).epoch_nanoseconds
+                for report in reversed(reports)
+            ),
+        )
+        self.assertIn("materialized_report_snapshots_recent", plan)
+
+    def test_invalid_v42_materialized_activity_rolls_back_v43_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v42-invalid-materialized.sqlite3"
+            build_schema(database, 42)
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """INSERT INTO materialized_report_snapshots(
+                       project_id,task_ref,report_json,report_markdown,report_html,
+                       reconciled_at,data_revision)
+                   VALUES ('hprj_migration','task_invalid','{}','markdown','html',
+                           '2026-07-21T09:00:00Z',7)""",
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(
+                StorageUnavailable, "cannot migrate Hydra database",
+            ):
+                HydraStore(database)
+            connection = sqlite3.connect(database)
+            try:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(materialized_report_snapshots)",
+                    )
+                }
+                version = int(
+                    connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(version, 42)
+        self.assertNotIn("last_activity_epoch_ns", columns)
+
     def test_schema_38_adds_partial_token_snapshot_task_lookup_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "token-index.sqlite3"
@@ -181,7 +507,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     )
                 }
 
-                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertIsNotNone(index)
                 self.assertIn(
                     "ON token_snapshots(project_id,session_key)",
@@ -247,7 +573,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                            AND name='token_snapshots_project_session_valid'""",
                 ).fetchone()
 
-                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(tuple(preserved), (10, 2, 3))
                 self.assertIsNotNone(index)
             finally:
@@ -264,9 +590,12 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                 }
                 self.assertEqual(
                     columns,
-                    {"project_id", "display_name", "first_seen_at", "last_seen_at"},
+                    {
+                        "project_id", "display_name", "first_seen_at",
+                        "last_seen_at", "display_name_provenance",
+                    },
                 )
-                self.assertEqual(store.schema_version(), 38)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
             finally:
                 store.close()
 
@@ -282,7 +611,8 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     project_id TEXT PRIMARY KEY,
                     display_name TEXT,
                     first_seen_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL
+                    last_seen_at TEXT NOT NULL,
+                    display_name_provenance TEXT
                 ) WITHOUT ROWID""",
             )
 

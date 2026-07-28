@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .contracts import AnnotationCause, AnnotationKind, Outcome, ScopeChange
+from .contracts import AnnotationCause, AnnotationKind, Outcome, ScopeChange, normalize_task_label
 from .diagnostics import DOCTOR_SCHEMA
 from .redaction import redact_note
 from .report_semantics import (
@@ -19,7 +19,7 @@ from .report_semantics import (
     TEST_SEMANTIC_CAUSES,
     TEST_SEMANTIC_PHASES,
 )
-from .reporting import REPORT_SCHEMA
+from .reporting import REPORT_SCHEMA, normalize_sync_freshness
 from .dashboard_validation import (
     array as _array,
     fact_value,
@@ -196,19 +196,32 @@ def _validate_annotations(value: object) -> None:
     safe_codes(annotations["caveats"], "semantic annotation caveats")
 
 
-def validate_task_report(value: object) -> None:
-    report = _object(value, {
-        "schema_version", "task_ref", "status", "last_activity_at", "task_family",
+def validate_task_report(
+    value: object, *, allow_legacy_without_sync_freshness: bool = False,
+) -> None:
+    keys = {
+        "schema_version", "task_ref", "status", "last_activity_at", "task_family", "display_name",
         "recorded_tokens", "deduplicated_tokens", "timing", "counts", "semantic",
-        "instrumentation_overhead", "pilot_health", "trend",
-    }, "task report")
+        "instrumentation_overhead", "pilot_health", "trend", "sync_freshness",
+    }
+    if (
+        allow_legacy_without_sync_freshness
+        and isinstance(value, Mapping)
+        and "sync_freshness" not in value
+    ):
+        keys.remove("sync_freshness")
+    report = _object(value, keys, "task report")
     if report["schema_version"] != REPORT_SCHEMA:
         raise ValueError("task report schema is invalid")
+    if "sync_freshness" in report:
+        normalize_sync_freshness(report["sync_freshness"])  # type: ignore[arg-type]
     _task_ref(report["task_ref"], "task report task_ref")
     if report["status"] not in {"complete", "incomplete"}:
         raise ValueError("task report status is invalid")
     _timestamp(report["last_activity_at"], "task report last_activity_at")
     _task_family(report["task_family"], "task family")
+    if normalize_task_label(report["display_name"]) != report["display_name"]:
+        raise ValueError("task display name is invalid")
     _validate_fact_group(
         report["recorded_tokens"], TOKEN_KEYS, "tokens",
         integer=True, nonnegative=True,
@@ -428,8 +441,10 @@ def validate_project_payload(value: object) -> None:
     if len(recent_tasks) > 10:
         raise ValueError("dashboard recent tasks are not bounded")
     for item in recent_tasks:
-        recent = _object(item, {"task_ref", "status", "last_activity_at", "task_family", "headline"}, "recent task")
+        recent = _object(item, {"task_ref", "display_name", "status", "last_activity_at", "task_family", "headline"}, "recent task")
         _task_ref(recent["task_ref"], "recent task task_ref")
+        if normalize_task_label(recent["display_name"]) != recent["display_name"]:
+            raise ValueError("recent task display name is invalid")
         if recent["status"] not in {"complete", "incomplete"}:
             raise ValueError("recent task status is invalid")
         _timestamp(recent["last_activity_at"], "recent task last_activity_at")

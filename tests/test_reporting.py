@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from hydra_codex import report_operations
+from hydra_codex.dashboard_contract import validate_task_report
 from hydra_codex.report_renderers import (
     render_html,
     render_json,
@@ -109,10 +110,16 @@ class PublicReportContractTests(unittest.TestCase):
         )
         payload = json.loads(render_json(report))
 
-        self.assertEqual(REPORT_SCHEMA, "hydra.report/v3")
+        self.assertEqual(REPORT_SCHEMA, "hydra.report/v4")
         self.assertEqual(payload["schema_version"], REPORT_SCHEMA)
         self.assertEqual(payload["task_ref"], public_ref)
         self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["sync_freshness"], {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "unknown",
+            "data_revision": 0,
+        })
+        validate_task_report(payload)
         self.assertEqual(report.recorded_tokens.working.value, 90)
         self.assertEqual(report.deduplicated_tokens.working.value, 90)
         self.assertEqual(report.wall_clock.value, 10_000)
@@ -235,7 +242,7 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertNotIn("Infinity", payload)
 
     def test_markdown_and_standalone_html_escape_all_dynamic_text(self) -> None:
-        report = self.report("escape", 10, task_family="quiz_report")
+        report = replace(self.report("escape", 10, task_family="quiz_report"), display_name="Label <safe>")
         malicious = self.report(
             "malicious", 10, task_family="[click](https://example.invalid) `code`",
         )
@@ -246,6 +253,8 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertIn(r"quiz\_report", markdown)
         self.assertTrue(html.startswith("<!doctype html>"))
         self.assertIn("<style>", html)
+        self.assertIn("Label &lt;safe&gt;", html)
+        self.assertIn(f"<code>{report.task_ref}</code>", html)
         self.assertNotIn("https://", html)
         self.assertNotIn("file://", html)
         self.assertIsNone(malicious.task_family)
@@ -372,7 +381,10 @@ class CompareAndRendererTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_recent_report_collection_is_versioned_deterministic_and_safe_in_all_formats(self) -> None:
-        reports = (self.report("latest-private-root", 20), self.report("older-private-root", 10))
+        reports = (
+            replace(self.report("latest-private-root", 20), display_name="Latest label"),
+            replace(self.report("older-private-root", 10), display_name="Older label"),
+        )
 
         rendered = {
             output_format: render_report_collection(reports, output_format)
@@ -380,12 +392,19 @@ class CompareAndRendererTests(unittest.TestCase):
         }
 
         payload = json.loads(rendered["json"])
-        self.assertEqual(payload["schema_version"], "hydra.report-list/v1")
+        self.assertEqual(payload["schema_version"], "hydra.report-list/v2")
+        self.assertEqual(payload["sync_freshness"]["state"], "unknown")
+        self.assertTrue(all(
+            item["sync_freshness"] == payload["sync_freshness"]
+            for item in payload["reports"]
+        ))
         self.assertEqual(
             [item["task_ref"] for item in payload["reports"]],
             [item.task_ref for item in reports],
         )
         self.assertEqual(rendered["html"].count("<!doctype html>"), 1)
+        self.assertIn("Latest label", rendered["html"])
+        self.assertIn(f"<code>{reports[0].task_ref}</code>", rendered["html"])
         self.assertIn("Hydra task reports", rendered["markdown"])
         for artifact in rendered.values():
             self.assertNotIn("latest-private-root", artifact)
@@ -394,12 +413,47 @@ class CompareAndRendererTests(unittest.TestCase):
     def test_empty_report_collection_is_valid_in_all_formats(self) -> None:
         self.assertEqual(
             json.loads(render_report_collection((), "json")),
-            {"reports": [], "schema_version": "hydra.report-list/v1"},
+            {
+                "reports": [], "schema_version": "hydra.report-list/v2",
+                "sync_freshness": {
+                    "schema_version": "hydra.sync-freshness/v1", "state": "unknown",
+                    "data_revision": 0,
+                },
+            },
         )
         self.assertIn("No reconciled tasks", render_report_collection((), "markdown"))
         self.assertIn("0 reconciled tasks", render_report_collection((), "html"))
         with self.assertRaisesRegex(ValueError, "format"):
             render_report_collection((), "xml")
+
+    def test_task_report_rejects_missing_or_malformed_sync_freshness(self) -> None:
+        payload = self.report("freshness-contract", 10).as_dict()
+        payload.pop("sync_freshness", None)
+        with self.assertRaisesRegex(ValueError, "task report"):
+            validate_task_report(payload)
+
+        for malformed in (
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "private-state",
+                "data_revision": 1,
+            },
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "current",
+                "data_revision": True,
+            },
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "current",
+                "data_revision": 1,
+                "source_path": "/private/source.jsonl",
+            },
+        ):
+            candidate = self.report("freshness-contract", 10).as_dict()
+            candidate["sync_freshness"] = malformed
+            with self.assertRaisesRegex(ValueError, "freshness"):
+                validate_task_report(candidate)
 
 
 if __name__ == "__main__":

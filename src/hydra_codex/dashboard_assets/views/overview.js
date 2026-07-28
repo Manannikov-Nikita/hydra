@@ -1,11 +1,11 @@
-import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseFigure} from "../dom.js";
+import {dataTable, el, factPercent, factSummaryText, factText, metricCard, pageHeader, phaseFigure, referenceIdentity, taskDisplay} from "../dom.js";
 
 function basisText(project, overview) {
   if (overview.basis && overview.basis.task_ref) {
-    return `Basis: latest task ${overview.basis.task_ref}`;
+    return `Basis: latest task ${taskDisplay(overview.basis)}`;
   }
   if (project.freshness_state === "stale" && overview.basis && overview.basis.kind === "latest_task") {
-    return "Latest validated task unavailable — Refresh required";
+    return "Latest validated task unavailable — Sync required";
   }
   return "No validated task evidence is available.";
 }
@@ -16,7 +16,7 @@ function readinessText(value) {
 
 function absentPilotText(project) {
   return project.freshness_state === "stale"
-    ? "Unavailable until Refresh"
+    ? "Unavailable until Sync"
     : "Not started";
 }
 
@@ -24,7 +24,7 @@ export function renderOverview(snapshot, actions) {
   const project = snapshot && snapshot.project;
   if (!project) return el("div", {class: "empty-state"}, [
     el("h1", {text: "No projects yet"}),
-    el("p", {text: "Run Refresh after Codex telemetry is available."}),
+    el("p", {text: "Run Sync now after Codex telemetry is available."}),
   ]);
   const overview = project.overview || {};
   const headline = overview.headline || {};
@@ -41,7 +41,9 @@ export function renderOverview(snapshot, actions) {
   const unclassified = Number(phase && phase.unclassified && phase.unclassified.working && phase.unclassified.working.value) || 0;
   const classifiedShare = classified + unclassified > 0 ? classified / (classified + unclassified) * 100 : null;
   const rows = recent.map(task => [
-    task.task_ref,
+    referenceIdentity(
+      taskDisplay(task), task.task_ref, "task", actions.copyReference,
+    ),
     task.task_family || "Unclassified",
     task.status,
     factSummaryText(task.headline && task.headline.working_tokens),
@@ -55,6 +57,9 @@ export function renderOverview(snapshot, actions) {
   systemButton.addEventListener("click", () => actions.navigate("health"));
   return el("div", {}, [
     pageHeader(project.display_name, `${project.freshness_state} · ${project.last_activity_at}`),
+    referenceIdentity(
+      project.display_name, project.project_ref, "project", actions.copyReference,
+    ),
     el("p", {class: "muted", text: basisText(project, overview)}),
     cards,
     el("section", {class: "section", "aria-labelledby": "overview-phases"}, [
@@ -66,7 +71,7 @@ export function renderOverview(snapshot, actions) {
       el("h2", {id: "recent-tasks", text: "Recent tasks"}),
       rows.length ? dataTable("Recent reconciled tasks", ["Task", "Family", "Status", "Working tokens", "Last activity"], rows)
         : el("p", {class: "muted", text: project.freshness_state === "stale"
-          ? "Recent task evidence requires Refresh." : "No reconciled tasks are available."}),
+          ? "Recent task evidence requires Sync." : "No reconciled tasks are available."}),
     ]),
     el("section", {class: "section", "aria-labelledby": "pilot-heading"}, [
       el("h2", {id: "pilot-heading", text: "Pilot"}),

@@ -579,8 +579,8 @@ class StandaloneBuildTests(unittest.TestCase):
             '"$HYDRA" upgrade',
             "CODEX_FAIL_REFRESH",
             '"$HYDRA" report --last 1 --format json --cwd "$PROJECT"',
-            "hydra.report-list/v1",
-            "hydra.report/v3",
+            "hydra.report-list/v2",
+            "hydra.report/v4",
             "dashboard --no-open",
             "/assets/views/evidence.js",
             "uninstall -y",
@@ -590,6 +590,14 @@ class StandaloneBuildTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, script)
         self.assertEqual(script.count('"$SOURCE_ROOT/install.sh"'), 1)
+        self.assertIn(
+            'if ! "$HOST_PYTHON" - "$TEMP_ROOT/report.json" <<\'PY\'\n',
+            script,
+        )
+        self.assertIn(
+            'PY\nthen\n    fail "synthetic report failed"\nfi\n',
+            script,
+        )
         self.assertNotIn("HYDRA_VERSION_OVERRIDE", script)
 
     def test_acceptance_loopback_server_never_resolves_a_hostname(self) -> None:

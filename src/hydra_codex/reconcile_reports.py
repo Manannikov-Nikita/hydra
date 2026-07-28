@@ -226,6 +226,7 @@ def list_reconciled_reports(
             schema_diagnostics=NumericFact(
                 task.semantic.schema_diagnostics, "count", "derived",
             ),
+            display_name=task.display_name,
         )
         if any(
             task.semantic.annotations.scope_change_counts.get(scope, 0) > 0

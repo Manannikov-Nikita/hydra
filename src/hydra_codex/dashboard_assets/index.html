@@ -14,7 +14,8 @@
     <div class="brand">Hydra</div>
     <div class="topbar-actions">
       <span id="freshness-label" class="muted">Opening evidence desk</span>
-      <button id="refresh-button" class="button primary" type="button">Refresh</button>
+      <button id="sync-button" class="button primary" type="button">Sync now</button>
+      <button id="repair-button" class="button ghost" type="button" aria-expanded="false" aria-controls="repair-confirmation">Repair history</button>
       <button id="theme-button" class="button ghost" type="button" aria-label="Switch theme">Theme</button>
     </div>
   </header>
@@ -31,7 +32,8 @@
         <select id="project-select"></select>
       </div>
       <p id="route-status" class="route-status"></p>
-      <div id="async-status" class="async-status"></div>
+      <p id="repair-confirmation" class="route-status" hidden>Repair history walks all trusted telemetry files and may take a while. <button id="repair-confirm-button" class="button ghost" type="button">Start full repair</button></p>
+      <div id="async-status" class="async-status" tabindex="-1"></div>
       <div id="route-view"></div>
     </main>
   </div>

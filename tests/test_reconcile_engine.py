@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+from hydra_codex.contracts import AnnotationContext, ModelAnnotationInput, materialize_annotation
+from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.reconcile_engine import (
     ReconciliationStale,
     get_reconciled_task,
@@ -13,9 +16,11 @@ from hydra_codex.reconcile_engine import (
     list_reconciled_tasks,
     list_reconciled_reports,
     reconcile_project,
+    render_materialized_report_collection,
 )
 from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout import ingest_rollouts
+from hydra_codex.public_refs import project_public_references
 from hydra_codex.storage import HydraStore
 
 
@@ -238,6 +243,232 @@ class ReconcileEngineTests(unittest.TestCase):
             "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?", (PROJECT,),
         ).fetchone()[0], 2)
 
+    def test_reconcile_uses_the_latest_trusted_task_label_at_the_cutoff(self) -> None:
+        self.session("label-root", 0)
+        self.token("label-root", 1, 2, 10, 1, 1, 0)
+        self.semantic_interval(
+            "label-root", start=1, end=None, phase="implement", cause="plan",
+            family="telemetry", sequence=1,
+        )
+        self.complete("label-root", 5)
+        label = materialize_annotation(
+            ModelAnnotationInput.from_mapping({
+                "kind": "phase", "phase": "implement", "cause": "plan", "scope_change": "none",
+                "task_family": "telemetry", "confidence": 1.0, "note": "", "task_label": "Initial label",
+            }),
+            AnnotationContext(
+                annotation_id="materialized-label", project_id=PROJECT, session_id="label-root",
+                turn_id="turn-label-root", sequence=2, observed_at=stamp(2),
+            ),
+        )
+        self.connection.commit()
+        self.assertTrue(self.store.write_annotation(label).inserted)
+        self.connection.execute(
+            """INSERT INTO annotations(annotation_id,project_id,session_id,turn_id,sequence,observed_at,
+                  kind,phase,cause,scope_change,task_family,confidence,outcome,provenance,note_redacted,
+                  note_hash,note_length,task_label)
+                 VALUES ('later-label',?,'label-root','turn-label-root',9,?,'phase','review','plan',
+                         'none','telemetry',1,NULL,'model_reported','safe','later',4,'Too late')""",
+            (PROJECT, stamp(6)),
+        )
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"l" * 32)
+        report = list_reconciled_reports(self.store, PROJECT)[0]
+        self.assertEqual(report.display_name, "Initial label")
+        self.assertNotIn("Too late", render_json(report))
+
+    def test_reconcile_orders_equivalent_fractional_label_timestamps_by_sequence(self) -> None:
+        self.session("fractional-label-root", 0)
+        self.token("fractional-label-root", 1, 2, 10, 1, 1, 0)
+        self.semantic_interval(
+            "fractional-label-root",
+            start=1,
+            end=None,
+            phase="implement",
+            cause="plan",
+            family="telemetry",
+            sequence=1,
+        )
+        self.complete("fractional-label-root", 5)
+        for annotation_id, sequence, observed_at, task_label in (
+            ("fractional-short", 2, "2026-07-21T00:00:04.1Z", "Older label"),
+            ("fractional-long", 3, "2026-07-21T00:00:04.100000Z", "Latest label"),
+        ):
+            self.connection.execute(
+                """INSERT INTO annotations(
+                       annotation_id,project_id,session_id,turn_id,sequence,observed_at,
+                       kind,phase,cause,scope_change,task_family,confidence,outcome,
+                       provenance,note_redacted,note_hash,note_length,task_label)
+                   VALUES (?,?,'fractional-label-root','turn-fractional-label-root',?,?,
+                           'phase','implement','plan','none','telemetry',1,NULL,
+                           'model_reported','safe','label',4,?)""",
+                (annotation_id, PROJECT, sequence, observed_at, task_label),
+            )
+        self.connection.commit()
+
+        reconcile_project(self.store, PROJECT, b"f" * 32)
+
+        self.assertEqual(
+            list_reconciled_reports(self.store, PROJECT)[0].display_name,
+            "Latest label",
+        )
+
+    def test_materialized_snapshot_change_bumps_revision_atomically_and_idempotently(self) -> None:
+        self.session("revision-root", 0)
+        self.token("revision-root", 1, 2, 10, 1, 1, 0)
+        self.complete("revision-root", 5)
+        self.connection.commit()
+        initial_revision = self.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
+
+        reconcile_project(self.store, PROJECT, b"v" * 32)
+
+        first_revision = self.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
+        snapshot_revision = self.connection.execute(
+            """SELECT data_revision FROM materialized_report_snapshots
+                 WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone()[0]
+        self.assertGreater(first_revision, initial_revision)
+        self.assertEqual(snapshot_revision, first_revision)
+
+        reconcile_project(self.store, PROJECT, b"v" * 32)
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+            first_revision,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT data_revision FROM materialized_report_snapshots
+                     WHERE project_id=?""",
+                (PROJECT,),
+            ).fetchone()[0],
+            first_revision,
+        )
+
+    def test_materialized_snapshot_publication_persists_exact_project_stats(self) -> None:
+        self.session("stats-older", 0)
+        self.token("stats-older", 1, 2, 10, 1, 1, 0)
+        self.complete("stats-older", 5)
+        self.session("stats-newer", 0)
+        self.token("stats-newer", 1, 2, 10, 1, 1, 0)
+        self.complete("stats-newer", 10)
+        self.connection.commit()
+
+        reconcile_project(self.store, PROJECT, b"m" * 32)
+
+        row = self.connection.execute(
+            """SELECT report_count,first_reconciled_at,last_reconciled_at,
+                      first_activity_at,first_activity_epoch_ns,
+                      last_activity_at,last_activity_epoch_ns,data_revision
+                 FROM materialized_project_stats WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone()
+        revision = self.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1",
+        ).fetchone()[0]
+        self.assertEqual(tuple(row), (
+            2,
+            require_exact_timestamp(stamp(10)).canonical,
+            require_exact_timestamp(stamp(10)).canonical,
+            require_exact_timestamp(stamp(5)).canonical,
+            require_exact_timestamp(stamp(5)).epoch_nanoseconds,
+            require_exact_timestamp(stamp(10)).canonical,
+            require_exact_timestamp(stamp(10)).epoch_nanoseconds,
+            revision,
+        ))
+
+    def test_materialized_report_reads_snapshot_without_reassembling_or_writing(self) -> None:
+        self.session("snapshot-root", 0)
+        self.token("snapshot-root", 1, 2, 10, 1, 1, 0)
+        self.complete("snapshot-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"s" * 32)
+        serialized = json.loads(str(self.connection.execute(
+            """SELECT report_json FROM materialized_report_snapshots
+                 WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone()[0]))
+        serialized.pop("sync_freshness")
+        self.connection.execute(
+            """UPDATE materialized_report_snapshots SET report_json=?
+                 WHERE project_id=?""",
+            (
+                json.dumps(
+                    serialized, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                PROJECT,
+            ),
+        )
+        self.connection.commit()
+        statements: list[str] = []
+        self.connection.set_trace_callback(statements.append)
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=AssertionError("report must not reassemble"),
+            ):
+                rendered = render_materialized_report_collection(
+                    self.store, PROJECT, 1, "json",
+                    {
+                        "schema_version": "hydra.sync-freshness/v1",
+                        "state": "current",
+                        "data_revision": 7,
+                    },
+                )
+        finally:
+            self.connection.set_trace_callback(None)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["reports"][0]["schema_version"], "hydra.report/v4")
+        self.assertEqual(
+            payload["reports"][0]["sync_freshness"],
+            payload["sync_freshness"],
+        )
+        self.assertFalse(any(
+            statement.lstrip().upper().startswith(("BEGIN IMMEDIATE", "INSERT", "UPDATE", "DELETE"))
+            for statement in statements
+        ), statements)
+
+    def test_materialized_report_limit_orders_by_report_activity_not_shared_reconcile_time(self) -> None:
+        key = b"r" * 32
+        roots = ("activity-a", "activity-b")
+        references = project_public_references(
+            roots, key,
+        )
+        older_root, newer_root = (
+            root
+            for root in sorted(roots, key=lambda item: references[item])
+        )
+        self.session(older_root, 0)
+        self.token(older_root, 1, 1, 10, 1, 1, 0)
+        self.complete(older_root, 5)
+        self.session(newer_root, 0)
+        self.token(newer_root, 1, 1, 10, 1, 1, 0)
+        self.complete(newer_root, 10)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, key)
+
+        rendered = render_materialized_report_collection(
+            self.store, PROJECT, 1, "json",
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "current",
+                "data_revision": 0,
+            },
+        )
+
+        self.assertEqual(
+            json.loads(rendered)["reports"][0]["task_ref"],
+            references[newer_root],
+        )
+
     def test_reconcile_deduplicates_fork_replay_then_attributes_exact_deltas_to_intervals(self) -> None:
         self.session("root", 0)
         self.session("child", 2, parent="root")
@@ -317,7 +548,7 @@ class ReconcileEngineTests(unittest.TestCase):
             self.store, project_id=PROJECT, public_ref=task.public_ref,
         )
         self.assertEqual(report.semantic_coverage.value, 1.0)
-        self.assertEqual(report.schema_version, "hydra.report/v3")
+        self.assertEqual(report.schema_version, "hydra.report/v4")
         self.assertEqual(report.semantic_breakdown.phases["understand"].working.value, 90)
         self.assertEqual(report.semantic_breakdown.phases["understand"].full_context.value, 110)
         self.assertEqual(report.semantic_breakdown.phases["understand"].reasoning.value, 5)

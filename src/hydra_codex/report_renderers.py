@@ -6,11 +6,16 @@ from html import escape
 import json
 import re
 
-from .reporting import ComparisonReport, NumericFact, TaskReport
+from .reporting import (
+    ComparisonReport,
+    NumericFact,
+    TaskReport,
+    normalize_sync_freshness,
+)
 
 
 Renderable = TaskReport | ComparisonReport
-REPORT_LIST_SCHEMA = "hydra.report-list/v1"
+REPORT_LIST_SCHEMA = "hydra.report-list/v2"
 
 
 def _number(value: int | float | None) -> str:
@@ -98,10 +103,12 @@ def _semantic_markdown(report: TaskReport) -> list[str]:
 
 def _report_markdown(report: TaskReport) -> str:
     family = report.task_family if report.task_family is not None else "unavailable"
+    display_name = report.display_name if report.display_name is not None else "unavailable"
     lines = [
         "# Hydra task report",
         "",
         f"- Task: `{_md(report.task_ref)}`",
+        f"- Display name: {_md(display_name)}",
         f"- Status: {_md(report.status)}",
         f"- Last activity: {_md(report.last_activity_at)}",
         f"- Task family: {_md(family)}",
@@ -210,8 +217,9 @@ def _semantic_html(report: TaskReport) -> str:
 
 def _report_html(report: TaskReport) -> str:
     family = report.task_family if report.task_family is not None else "unavailable"
+    display_name = report.display_name if report.display_name is not None else "unavailable"
     summary = (
-        f"<p>Task <code>{escape(report.task_ref)}</code>; status {escape(report.status)}; "
+        f"<p>Task {escape(display_name)} <code>{escape(report.task_ref)}</code>; status {escape(report.status)}; "
         f"last activity {escape(report.last_activity_at)}; family {escape(family)}.</p>"
         f"<p>{escape(_trend_text(report))}</p>"
         f"<p>{escape(_pilot_text(report))}</p>{_semantic_html(report)}"
@@ -251,15 +259,23 @@ def render_html(value: Renderable) -> str:
     return _report_html(value) if isinstance(value, TaskReport) else _comparison_html(value)
 
 
-def render_report_collection(reports: tuple[TaskReport, ...], output_format: str) -> str:
+def render_report_collection(
+    reports: tuple[TaskReport, ...], output_format: str, *,
+    sync_freshness: dict[str, object] | None = None,
+) -> str:
     """Render recent reports in caller-supplied deterministic order."""
     if not isinstance(reports, tuple) or any(not isinstance(item, TaskReport) for item in reports):
         raise ValueError("reports must be a tuple of TaskReport values")
+    freshness = normalize_sync_freshness(sync_freshness)
     if output_format == "json":
+        payloads = [item.as_dict() for item in reports]
+        for payload in payloads:
+            payload["sync_freshness"] = dict(freshness)
         return json.dumps(
             {
                 "schema_version": REPORT_LIST_SCHEMA,
-                "reports": [item.as_dict() for item in reports],
+                "reports": payloads,
+                "sync_freshness": freshness,
             },
             ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
         ) + "\n"
@@ -273,7 +289,7 @@ def render_report_collection(reports: tuple[TaskReport, ...], output_format: str
     if output_format == "html":
         rows = [
             (
-                f"<code>{escape(report.task_ref)}</code>", escape(report.status),
+                f"{escape(report.display_name or 'unavailable')} <code>{escape(report.task_ref)}</code>", escape(report.status),
                 escape(name), _html_fact(fact),
             )
             for report in reports

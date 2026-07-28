@@ -373,13 +373,13 @@ grep -q '"status":"ok"' "$TEMP_ROOT/reconcile.json" ||
     fail "synthetic reconcile failed"
 "$HYDRA" report --last 1 --format json --cwd "$PROJECT" \
     > "$TEMP_ROOT/report.json"
-"$HOST_PYTHON" - "$TEMP_ROOT/report.json" <<'PY'
+if ! "$HOST_PYTHON" - "$TEMP_ROOT/report.json" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if payload.get("schema_version") != "hydra.report-list/v1":
+if payload.get("schema_version") != "hydra.report-list/v2":
     raise SystemExit(1)
 reports = payload.get("reports")
 if not isinstance(reports, list) or len(reports) != 1:
@@ -387,12 +387,15 @@ if not isinstance(reports, list) or len(reports) != 1:
 report = reports[0]
 if (
     not isinstance(report, dict)
-    or report.get("schema_version") != "hydra.report/v3"
+    or report.get("schema_version") != "hydra.report/v4"
     or not isinstance(report.get("task_ref"), str)
     or not report["task_ref"].startswith("task_")
 ):
     raise SystemExit(1)
 PY
+then
+    fail "synthetic report failed"
+fi
 
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"acceptance","turn_id":"turn-a","cwd":"%s","prompt":"acceptance"}\n' \
     "$PROJECT" | "$HYDRA" hook > "$TEMP_ROOT/hook.json"

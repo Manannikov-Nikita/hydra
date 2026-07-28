@@ -1,4 +1,4 @@
-import {dataTable, el, factText, pageHeader} from "../dom.js";
+import {dataTable, el, factText, pageHeader, referenceIdentity, shortRef, taskDisplay} from "../dom.js";
 
 export function renderCompare(state, actions) {
   const comparison = state.comparison;
@@ -10,7 +10,11 @@ export function renderCompare(state, actions) {
   for (const taskRef of [baselineRef, currentRef]) {
     if (taskRef && !taskRefs.includes(taskRef)) taskRefs.push(taskRef);
   }
-  const options = taskRefs.map(taskRef => el("option", {value: taskRef, text: taskRef}));
+  const taskByRef = new Map(state.tasks.map(task => [task.task_ref, task]));
+  const taskName = taskRef => taskDisplay(taskByRef.get(taskRef) || {task_ref: taskRef});
+  const options = taskRefs.map(taskRef => el("option", {
+    value: taskRef, text: `${taskName(taskRef)} · ${shortRef(taskRef)}`,
+  }));
   const left = el("select", {id: "compare-left", name: "left"}, options.map(option => option.cloneNode(true)));
   const right = el("select", {id: "compare-right", name: "right"}, options.map(option => option.cloneNode(true)));
   if (baselineRef) left.value = baselineRef;
@@ -26,6 +30,9 @@ export function renderCompare(state, actions) {
     return [name, factText(metric.baseline), factText(metric.current), factText(metric.delta), factText(metric.percent_change), interpretation];
   }) : [];
   const caveats = comparison && Array.isArray(comparison.caveats) ? comparison.caveats : [];
+  const comparisonReferenceLabel = comparison
+    ? `Baseline ${comparison.baseline_ref} · Current ${comparison.current_ref}`
+    : "";
   return el("div", {}, [
     pageHeader("Compare", "Compare two tasks from the selected project without inferring quality."),
     el("div", {class: "control-row"}, [
@@ -35,7 +42,24 @@ export function renderCompare(state, actions) {
     ]),
     comparison ? el("section", {class: "section", "aria-labelledby": "comparison-heading"}, [
       el("h2", {id: "comparison-heading", text: comparable ? "Comparable evidence" : "Not comparable"}),
-      el("p", {class: "muted mono", text: `Baseline ${comparison.baseline_ref} · Current ${comparison.current_ref}`}),
+      el("div", {
+        class: "comparison-references", "aria-label": comparisonReferenceLabel,
+      }, [
+        el("div", {}, [
+          el("span", {class: "muted", text: "Baseline"}),
+          referenceIdentity(
+            taskName(comparison.baseline_ref), comparison.baseline_ref,
+            "task", actions.copyReference,
+          ),
+        ]),
+        el("div", {}, [
+          el("span", {class: "muted", text: "Current"}),
+          referenceIdentity(
+            taskName(comparison.current_ref), comparison.current_ref,
+            "task", actions.copyReference,
+          ),
+        ]),
+      ]),
       el("p", {class: "muted", text: comparable ? "Directional wording describes magnitude only." : (comparison.reasons || []).join(", ") || "Comparison evidence is incomplete."}),
       dataTable("Complete comparison metrics", ["Metric", "Baseline", "Current", "Delta", "Percent", "Interpretation"], rows),
       el("h3", {class: "comparison-caveats-heading", text: "Comparison caveats"}),

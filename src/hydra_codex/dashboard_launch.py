@@ -19,17 +19,19 @@ from .dashboard_queries import (
 )
 from .dashboard_refresh import (
     DashboardSnapshotCache,
-    GlobalRefreshRunner,
     RefreshController,
 )
+from .dashboard_refresh_state import RefreshResult
 from .dashboard_server import DashboardApplication, DashboardAsset, create_dashboard_server
+from .dashboard_sync import DashboardSyncController
+from .incremental_sync import TrustedSourceRoots
 from .diagnostics import DoctorCheck, DoctorReport
 from .exact_time import public_timestamp
 from .project import resolve_project
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .services import configured_database_path, configured_installation_key_path
 from .platform_paths import default_database_path
-from .storage import MIGRATIONS, HydraStore
+from .storage import MIGRATIONS, HydraStore, ValidatedStoreProvider
 
 
 _ASSETS = MappingProxyType({
@@ -70,6 +72,25 @@ def _trusted_roots(environ: Mapping[str, str]) -> tuple[RolloutRoot, ...]:
     return tuple(
         RolloutRoot(path, label) for path, label in candidates if path.is_dir()
     )
+
+
+def _sync_roots(environ: Mapping[str, str]) -> TrustedSourceRoots:
+    home_value = environ.get("HOME")
+    home = Path(home_value).expanduser() if home_value else Path.home()
+    return TrustedSourceRoots(
+        sessions=home / ".codex" / "sessions",
+        archived_sessions=home / ".codex" / "archived_sessions",
+    )
+
+
+class _DisabledRefreshRunner:
+    """Compatibility seam: dashboard refresh endpoints are now durable sync aliases."""
+
+    def __init__(self, store_factory) -> None:
+        self._store_factory = store_factory
+
+    def run(self, _progress) -> RefreshResult:
+        return RefreshResult({}, False, ("internal_failure",), 0, 0, 0)
 
 
 _DOCTOR_CODES = (
@@ -196,7 +217,10 @@ def run_dashboard(
     key_path = configured_installation_key_path(environ, installation_key_path)
     key = Pseudonymizer.installation_key(key_path).key
     now = lambda: datetime.now(timezone.utc)
-    store_factory = lambda: HydraStore(selected_database)
+    store_provider = ValidatedStoreProvider(
+        lambda: HydraStore.open_current(selected_database),
+    )
+    store_factory = store_provider.open
     bootstrap_connection, database_state = _bootstrap_database(actual_database)
     doctor = _bootstrap_doctor(
         cwd=cwd, database_path=actual_database, database_state=database_state,
@@ -228,15 +252,17 @@ def run_dashboard(
         generated_at=public_timestamp(now()), doctor=doctor,
     )
     cache = DashboardSnapshotCache(initial_snapshots)
-    runner = GlobalRefreshRunner(
-        store_factory, key, query, roots=_trusted_roots(environ),
+    controller = RefreshController(cache, _DisabledRefreshRunner(store_factory), clock=now)
+    sync_controller = DashboardSyncController(
+        store_factory=store_factory, roots=_sync_roots(environ),
+        installation_key=key, clock=now, auto_activate=False,
     )
-    controller = RefreshController(cache, runner, clock=now)
     token = secrets.token_urlsafe(32)
     application = DashboardApplication(
         token=token,
         query_service=query,
         refresh_controller=controller,
+        sync_controller=sync_controller,
         snapshot_cache=cache,
         assets=load_dashboard_assets(),
         fallback_snapshot=fallback_snapshot,
@@ -261,6 +287,7 @@ def run_dashboard(
         except KeyboardInterrupt:
             pass
     finally:
+        sync_controller.close()
         controller.close()
         if server is not None:
             server.server_close()

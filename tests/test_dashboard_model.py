@@ -144,10 +144,41 @@ class DashboardModelTests(unittest.TestCase):
     def test_snapshot_is_immutable_and_canonical(self) -> None:
         snapshot = self.snapshot()
 
-        self.assertEqual(snapshot.as_dict()["schema_version"], "hydra.dashboard/v1")
+        self.assertEqual(snapshot.as_dict()["schema_version"], "hydra.dashboard/v2")
         self.assertEqual(snapshot.as_dict()["project"]["display_name"], "Hydra <Core>")
         with self.assertRaises(FrozenInstanceError):
             snapshot.generated_at = "changed"  # type: ignore[misc]
+
+    def test_snapshot_rejects_malformed_sync_summary(self) -> None:
+        baseline = self.snapshot()
+        valid = {
+            "schema_version": "hydra.dashboard-sync/v1",
+            "sync_ref": "sync_0123456789abcdef0123456789abcdef",
+            "kind": "sync",
+            "state": "queued",
+            "started_at": "2026-07-22T12:00:00Z",
+            "finished_at": None,
+            "progress": {
+                "sources_queued": 0,
+                "sources_processed": 0,
+                "new_bytes": 0,
+            },
+        }
+        cases = (
+            {"schema_version": "wrong"},
+            {**valid, "unexpected": "field"},
+            {**valid, "sync_ref": "sync_private/path"},
+            {**valid, "state": "unknown"},
+            {**valid, "progress": {"sources_queued": -1, "sources_processed": 0, "new_bytes": 0}},
+            {**valid, "progress": {"sources_queued": True, "sources_processed": 0, "new_bytes": 0}},
+            {**valid, "started_at": "2026-07-22T12:00:00"},
+            {**valid, "finished_at": "2026-07-22T12:01:00Z", "state": "succeeded", "progress": {"sources_queued": 1, "sources_processed": 2, "new_bytes": 0}},
+        )
+        for sync in cases:
+            with self.subTest(sync=sync), self.assertRaises(ValueError):
+                DashboardSnapshot(baseline.generated_at, baseline.freshness, baseline.projects,
+                                  baseline.selected_project_ref, baseline.project_json,
+                                  baseline.selected_task_json, baseline.refresh, 0, sync)
 
     def test_snapshot_keeps_strict_validation_for_external_project_tuples(self) -> None:
         snapshot = self.snapshot()

@@ -25,6 +25,8 @@ from .project import ProjectResolution, resolve_project
 from .rollout_identity import Pseudonymizer
 from .platform_paths import default_installation_key_path
 from .storage import HydraStore, StorageUnavailable
+from .incremental_sync import RepairRequired, TrustedSourceRoots
+from .sync_state import SyncStateRepository, validate_root_relative_locator
 from .runtime_entrypoint import runtime_command_prefix
 
 
@@ -54,7 +56,12 @@ def _observed_at(clock: Clock) -> tuple[datetime, str]:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError("hook clock must return an aware datetime")
     utc = value.astimezone(timezone.utc)
-    return utc, utc.isoformat().replace("+00:00", "Z")
+    rendered = utc.isoformat().replace("+00:00", "Z")
+    if "." in rendered:
+        whole, fraction = rendered[:-1].split(".", 1)
+        fraction = fraction.rstrip("0")
+        rendered = f"{whole}.{fraction}Z" if fraction else f"{whole}Z"
+    return utc, rendered
 
 
 def _database_path(environ: Mapping[str, str]) -> Path | None:
@@ -69,6 +76,91 @@ def _key_path(environ: Mapping[str, str]) -> Path:
     home_value = environ.get("HOME")
     home = Path(home_value).expanduser() if isinstance(home_value, str) and home_value else Path.home()
     return default_installation_key_path(home, environ=environ)
+
+
+def _trusted_source_roots(environ: Mapping[str, str]) -> TrustedSourceRoots:
+    home_value = environ.get("HOME")
+    home = Path(home_value).expanduser() if isinstance(home_value, str) and home_value else Path.home()
+    return TrustedSourceRoots(
+        sessions=home / ".codex" / "sessions",
+        archived_sessions=home / ".codex" / "archived_sessions",
+    )
+
+
+def _trusted_transcript_locator(
+    payload: Mapping[str, Any], roots: TrustedSourceRoots,
+) -> tuple[str, str] | None:
+    """Convert only a verified trusted-root transcript path to a private locator."""
+    raw = payload.get("transcript_path")
+    if not isinstance(raw, str) or not raw or len(raw) > 4096:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        return None
+    for root_kind in ("sessions", "archived_sessions"):
+        try:
+            root = roots.root_for(root_kind)
+            locator = validate_root_relative_locator(candidate.relative_to(root).as_posix())
+            roots.resolve(root_kind, locator)
+            return root_kind, locator
+        except (ValueError, OSError, RepairRequired):
+            continue
+    return None
+
+
+def _enqueue_hook_source(
+    payload: Mapping[str, Any], project: ProjectResolution, store: HydraStore,
+    keys: Pseudonymizer, environ: Mapping[str, str], observed_at: str,
+) -> tuple[str, str] | None:
+    """Find one trusted transcript, never retaining a caller-controlled path."""
+    repository = SyncStateRepository(store)
+    session_key = keys.digest("identity", _required_text(payload, "session_id"))
+    roots = _trusted_source_roots(environ)
+    located = _trusted_transcript_locator(payload, roots)
+    if located is not None:
+        return located
+    # Some hook envelopes omit a path.  A prior repair/tail registration can
+    # still bind the private session digest to exactly one trusted locator.
+    matches = [
+        source for source in repository.list_sources() if source.session_key == session_key
+    ]
+    if len(matches) == 1:
+        return matches[0].root_kind, matches[0].source_locator
+    return None
+
+
+def _hook_safe_fact(payload: Mapping[str, Any], event: str) -> tuple[str, str | None, str | None, int | None]:
+    event_kind = {"UserPromptSubmit": "prompt", "PostToolUse": "post_tool", "Stop": "stop"}[event]
+    if event != "PostToolUse":
+        return event_kind, None, None, None
+    raw_category = payload.get("tool_category")
+    category = raw_category if raw_category in {"shell", "read", "write", "search", "browser"} else "other"
+    raw_status = payload.get("tool_status")
+    status = raw_status if raw_status in {"success", "failure"} else "unknown"
+    duration = payload.get("duration_ms")
+    safe_duration = duration if isinstance(duration, int) and not isinstance(duration, bool) and 0 <= duration <= 86_400_000 else None
+    return event_kind, category, status, safe_duration
+
+
+def _private_tool_event_identity(
+    payload: Mapping[str, Any], keys: Pseudonymizer, session_key: str, turn_key: str,
+    category: str | None, status: str | None, duration: int | None,
+) -> str:
+    """Return a non-reversible tool identity; id-less identical facts coalesce."""
+    for field in ("tool_use_id", "tool_call_id", "call_id"):
+        value = payload.get(field)
+        if (
+            isinstance(value, str) and 1 <= len(value) <= 512
+            and not any(character in value for character in ("\0", "\r", "\n"))
+        ):
+            return keys.digest(
+                "event", f"hook-tool-call-id/v1/{session_key}/{turn_key}/{value}",
+            )
+    # Without a stable hook call id, do not use arbitrary payload values.
+    # This intentionally coalesces retries and indistinguishable safe facts.
+    return keys.digest(
+        "event", f"hook-tool-fallback/v1/{session_key}/{turn_key}/{category}/{status}/{duration}",
+    )
 
 
 def _open_store(factory: StoreFactory, path: Path | None) -> HydraStore:
@@ -241,7 +333,7 @@ def handle_event(
     *,
     environ: Mapping[str, str] | None = None,
     clock: Clock | None = None,
-    store_factory: StoreFactory = HydraStore,
+    store_factory: StoreFactory = HydraStore.open_current,
     key_loader: KeyLoader = Pseudonymizer.installation_key,
     project_resolver: ProjectResolver = resolve_project,
     annotation_command: str | None = None,
@@ -288,6 +380,12 @@ def handle_event(
         keys = key_loader(_key_path(environment))
         store = _open_store(store_factory, _database_path(environment))
         try:
+            SyncStateRepository(store).observe_project(
+                project_id=project.project_id,
+                display_name=project.display_name,
+                display_name_provenance=project.display_name_provenance,
+                observed_at=observed_at,
+            )
             drain_annotations(
                 environment,
                 store,
@@ -297,6 +395,24 @@ def handle_event(
                 turn_id=_required_text(payload, "turn_id"),
                 observed_at=observed_at,
                 allow_session_turns=event == "UserPromptSubmit",
+            )
+            source = _enqueue_hook_source(payload, project, store, keys, environment, observed_at)
+            event_kind, category, status, duration = _hook_safe_fact(payload, event)
+            session_key = keys.digest("identity", _required_text(payload, "session_id"))
+            turn_key = keys.digest("turn", _required_text(payload, "turn_id"))
+            event_identity = (
+                _private_tool_event_identity(
+                    payload, keys, session_key, turn_key, category, status, duration,
+                )
+                if event == "PostToolUse" else turn_key
+            )
+            event_key = keys.digest(
+                "event", f"hook-outbox/v1/{event_kind}/{session_key}/{event_identity}",
+            )
+            SyncStateRepository(store).record_hook_event_and_enqueue(
+                event_key=event_key, project_id=project.project_id, session_key=session_key,
+                turn_key=turn_key, event_kind=event_kind, observed_at=observed_at,
+                tool_category=category, tool_status=status, duration_ms=duration, source=source,
             )
             if event == "PostToolUse":
                 return {}

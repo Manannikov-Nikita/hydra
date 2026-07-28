@@ -390,6 +390,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("git/tags/", verify["run"])
         self.assertIn("releases/latest", verify["run"])
         self.assertIn("current_version <= latest_version", verify["run"])
+        self.assertNotIn("immutable-releases", verify["run"])
         self.assertNotIn("gh release download", verify["run"])
         self.assertNotIn("gh release upload", verify["run"])
         self.assertNotIn("gh release edit", verify["run"])

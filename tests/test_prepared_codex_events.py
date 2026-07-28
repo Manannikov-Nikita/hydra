@@ -622,6 +622,18 @@ class PreparedCodexEventPersistenceTests(unittest.TestCase):
         prepared_store = HydraStore(self.root / "prepared.sqlite3")
         self.addCleanup(legacy.close)
         self.addCleanup(prepared_store.close)
+        self.assertEqual(
+            tuple(legacy.connection.execute(
+                "SELECT revision,updated_at FROM sync_data_revision WHERE singleton=1",
+            ).fetchone()),
+            (0, "1970-01-01T00:00:00Z"),
+        )
+        self.assertEqual(
+            tuple(prepared_store.connection.execute(
+                "SELECT revision,updated_at FROM sync_data_revision WHERE singleton=1",
+            ).fetchone()),
+            (0, "1970-01-01T00:00:00Z"),
+        )
 
         ingest_codex_events(
             legacy,

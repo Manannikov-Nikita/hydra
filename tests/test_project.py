@@ -44,6 +44,12 @@ class ProjectResolutionTests(unittest.TestCase):
         normalized = self.project("project-b", display_name=" Cafe\u0301 ")
         self.assertEqual(resolve_project(normalized).display_name, "Café")
 
+    def test_legacy_project_uses_a_validated_repo_basename_with_provenance(self) -> None:
+        root = self.project("project-a")
+        resolved = resolve_project(root)
+        self.assertEqual(resolved.display_name, "project-a")
+        self.assertEqual(resolved.display_name_provenance, "repo_basename")
+
     def test_project_config_rejects_control_bidi_and_overlong_names(self) -> None:
         for value in ("Hydra\nCore", "Hydra\u202eCore", "Hydra\ud800", "x" * 81):
             with self.subTest(value=repr(value)), self.assertRaises(ValueError):

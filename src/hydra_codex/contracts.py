@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import Any, Mapping
+import unicodedata
 
 from .redaction import validate_task_family
 
@@ -90,6 +92,38 @@ def _task_family(value: str) -> str:
     return validate_task_family(value)
 
 
+_LABEL_UUID = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", re.IGNORECASE)
+_LABEL_REF = re.compile(r"(?:task|hprj|hcap|hann|hreq|hpay|hpilot)_v?[0-9a-f]{8,}|task_[0-9a-f]{8,}", re.IGNORECASE)
+_LABEL_SECRET = re.compile(r"(?:api[_-]?key|secret|password|token|authorization)\s*[:=]", re.IGNORECASE)
+
+
+def normalize_task_label(value: object) -> str | None:
+    """Validate a small, presentation-only model label without retaining identifiers."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("task_label must be text")
+    normalized = unicodedata.normalize("NFC", value)
+    if not 1 <= len(normalized) <= 80:
+        raise ValueError("task_label must contain 1 to 80 characters")
+    if any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.bidirectional(character) in {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
+        for character in normalized
+    ):
+        raise ValueError("task_label contains unsafe characters")
+    collapsed = " ".join(normalized.split())
+    lowered = collapsed.casefold()
+    if (
+        not collapsed or "/" in collapsed or "\\" in collapsed or ".." in collapsed
+        or "://" in lowered or lowered.startswith(("file:", "http:", "https:"))
+        or "@" in collapsed or _LABEL_UUID.search(collapsed) is not None
+        or _LABEL_REF.search(collapsed) is not None or _LABEL_SECRET.search(collapsed) is not None
+    ):
+        raise ValueError("task_label is not privacy-safe")
+    return collapsed
+
+
 def _non_negative_integer(value: int, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
@@ -122,6 +156,7 @@ class ModelAnnotationInput:
     confidence: float
     note: str
     outcome: Outcome | None = None
+    task_label: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", _enum(self.kind, AnnotationKind, "kind"))
@@ -133,11 +168,12 @@ class ModelAnnotationInput:
         if self.outcome is not None:
             object.__setattr__(self, "outcome", _enum(self.outcome, Outcome, "outcome"))
         object.__setattr__(self, "note", _note(self.note))
+        object.__setattr__(self, "task_label", normalize_task_label(self.task_label))
         _outcome_for_kind(self.kind, self.outcome)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ModelAnnotationInput":
-        allowed = {"kind", "phase", "cause", "scope_change", "task_family", "confidence", "note", "outcome"}
+        allowed = {"kind", "phase", "cause", "scope_change", "task_family", "confidence", "note", "outcome", "task_label"}
         forbidden = {
             "tokens", "token_count", "input_tokens", "output_tokens",
             "duration_ms", "elapsed_ms", "timing", "file_count", "files_changed",
@@ -151,7 +187,7 @@ class ModelAnnotationInput:
         unexpected = fields - allowed
         if unexpected:
             raise ValueError(f"model annotation contains unexpected fields: {sorted(unexpected)!r}")
-        missing = allowed - {"outcome"} - fields
+        missing = allowed - {"outcome", "task_label"} - fields
         if missing:
             raise ValueError(f"model annotation is missing fields: {sorted(missing)!r}")
         return cls(**dict(payload))
@@ -222,6 +258,7 @@ class AnnotationRecord:
     note: str
     outcome: Outcome | None = None
     provenance: Provenance = Provenance.MODEL_REPORTED
+    task_label: str | None = None
 
     def __post_init__(self) -> None:
         for field in ("annotation_id", "project_id", "session_id", "turn_id", "observed_at"):
@@ -237,6 +274,7 @@ class AnnotationRecord:
         object.__setattr__(self, "task_family", _task_family(self.task_family))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "note", _note(self.note))
+        object.__setattr__(self, "task_label", normalize_task_label(self.task_label))
         _outcome_for_kind(self.kind, self.outcome)
 
 
@@ -259,6 +297,7 @@ def materialize_annotation(model: ModelAnnotationInput, context: AnnotationConte
         confidence=model.confidence,
         outcome=model.outcome,
         note=model.note,
+        task_label=model.task_label,
     )
 
 

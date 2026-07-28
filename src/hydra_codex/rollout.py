@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -42,6 +43,7 @@ from .rollout_sources import (
     SourceChanged,
     SourceScan,
     SourceStat,
+    SourceOpener,
     line_fingerprint,
     located_lineage,
     open_source,
@@ -214,6 +216,7 @@ def _parse_source(
     model_causes: dict[str, str], *, logical_source: str | None = None,
     line_fingerprints: tuple[str, ...] = (), authoritative_identity: str | None = None,
     expected_source_stat: SourceStat | None = None,
+    source_opener: SourceOpener | None = None,
 ) -> int:
     diagnostics = 0
     session_key: str | None = None
@@ -222,7 +225,8 @@ def _parse_source(
     seen_session = False
     with (
         store.rollout_transaction() as connection,
-        open_source(path, expected_source_stat) as handle,
+        (source_opener(path, expected_source_stat) if source_opener is not None
+         else open_source(path, expected_source_stat)) as handle,
     ):
         logical_binding = (
             connection.execute(
@@ -677,6 +681,7 @@ class _IngestSource:
     label: str
     scan: SourceScan | None = field(default=None, repr=False)
     trusted: TrustedRolloutCandidate | None = field(default=None, repr=False)
+    opener: SourceOpener | None = field(default=None, repr=False)
 
 
 def _prepared_sources(
@@ -736,6 +741,16 @@ def _prepared_sources(
 def _verified_source_stat(
     source: _IngestSource, expected: SourceStat | None = None,
 ) -> SourceStat:
+    if source.opener is not None:
+        # The lexical path is only an opaque label for descriptor-relative
+        # openers.  Never restat it through the pathname.
+        with source.opener(source.path, expected) as handle:
+            details = os.fstat(handle.fileno())
+            current = SourceStat(
+                int(details.st_dev), int(details.st_ino), int(details.st_size),
+                int(details.st_mtime_ns), int(details.st_ctime_ns),
+            )
+        return current
     current = (
         revalidate_trusted_rollout(source.trusted)
         if source.trusted is not None
@@ -761,6 +776,7 @@ def ingest_rollouts(
     model_causes: dict[str, str] | None = None, hash_key: bytes | None = None,
     progress: Callable[[str, int, int], None] | None = None,
     prepared_scans: Mapping[Path, SourceScan] | None = None,
+    source_opener: SourceOpener | None = None,
 ) -> IngestReport:
     """Ingest explicit v1 JSONL roots idempotently, storing only normalized safe facts."""
     root = Path(project_root)
@@ -788,8 +804,22 @@ def ingest_rollouts(
                 )
                 for path in files
             )
-        else:
+        elif source_opener is None:
             sources = _prepared_sources(root_specs, prepared_scans)
+        else:
+            # This narrow seam is for descriptor-relative repair only.  Its
+            # opener, rather than Path.resolve(), authenticates every scan and
+            # parser re-open; retain normal callers' strict canonical checks.
+            entries: list[_IngestSource] = []
+            for item in root_specs:
+                if not isinstance(item, RolloutRoot) or item.label not in {"active", "archived"}:
+                    raise ValueError("prepared roots must be direct active or archived files")
+                path = Path(item.path)
+                scan = prepared_scans.get(path)
+                if scan is None or scan.path != path:
+                    raise ValueError("prepared scans must match trusted opener paths")
+                entries.append(_IngestSource(path, item.label, scan, None, source_opener))
+            sources = tuple(entries)
         diagnostics = 0
         unique: set[str] = set()
         total_sources = len(sources)
@@ -827,7 +857,7 @@ def ingest_rollouts(
                     before_stat = after_candidate_stat
             if scan is None:
                 _emit_ingest_progress(progress, "scan", index, total_sources)
-                scan = scan_source(path, hasher.key, opaque)
+                scan = scan_source(path, hasher.key, opaque, opener=ingest_source.opener)
                 before_stat = scan.source_stat
             digest = opaque("source", f"revision/{project_id}/{scan.revision_digest}")
             unique.add(digest)
@@ -920,6 +950,7 @@ def ingest_rollouts(
                         logical_source=logical, line_fingerprints=scan.line_fingerprints,
                         authoritative_identity=scan.identity,
                         expected_source_stat=scan.source_stat,
+                        source_opener=ingest_source.opener,
                     )
                     _verified_source_stat(ingest_source, scan.source_stat)
                     bound = connection.execute(

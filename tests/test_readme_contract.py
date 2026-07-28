@@ -146,6 +146,8 @@ class ReadmeContractTests(unittest.TestCase):
 
         for command in (
             "hydra-codex ingest",
+            "hydra-codex sync",
+            "hydra-codex repair --all",
             "hydra-codex annotate",
             "hydra-codex reconcile",
             "hydra-codex report",
@@ -159,7 +161,7 @@ class ReadmeContractTests(unittest.TestCase):
         self.assertIn("~/library/application support/hydra/hydra.sqlite3", normalized)
         self.assertIn("working_tokens = input_tokens - cached_input_tokens + output_tokens", normalized)
         self.assertIn("full_context = input_tokens + output_tokens", normalized)
-        self.assertIn("hydra.report/v3", normalized)
+        self.assertIn("hydra.report/v4", normalized)
         self.assertIn("--event-source app-server-v2=", normalized)
         self.assertIn("--event-source otel-v1=", normalized)
         self.assertIn("five subsequent real codex tasks", normalized)

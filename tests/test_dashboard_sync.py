@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -168,6 +169,68 @@ class DashboardSyncControllerTests(unittest.TestCase):
             root_kind="sessions", source_locator=name, project_id="project-a",
             observed_at="2026-07-27T10:00:00Z",
         )
+
+    def test_start_sync_reuses_active_job_without_a_writer_transaction(self) -> None:
+        job_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            job_id, state="running", sources_discovered=1,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        self.assertTrue(self.repository.acquire_lease(
+            "existing-worker", "2026-07-27T10:00:00Z",
+            "2026-07-27T10:05:00Z",
+        ))
+        controller = self.controller()
+        try:
+            with mock.patch.object(
+                SyncStateRepository, "get_or_create_active_job",
+                side_effect=AssertionError(
+                    "active job reuse must remain read-only",
+                ),
+            ):
+                started, reused = controller.start_sync()
+        finally:
+            controller.close()
+            self.repository.release_lease(
+                "existing-worker", "2026-07-27T10:00:01Z",
+            )
+
+        self.assertTrue(reused)
+        self.assertEqual(started["sync_ref"], job_id)
+        self.assertEqual(started["state"], "running")
+
+    def test_start_sync_reuses_active_job_while_database_writer_is_busy(self) -> None:
+        job_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            job_id, state="running", sources_discovered=1,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        self.assertTrue(self.repository.acquire_lease(
+            "existing-worker", "2026-07-27T10:00:00Z",
+            "2026-07-27T10:05:00Z",
+        ))
+        writer = sqlite3.connect(self.database)
+        writer.execute("BEGIN IMMEDIATE")
+        controller = self.controller()
+        try:
+            started, reused = controller.start_sync()
+        finally:
+            writer.rollback()
+            writer.close()
+            controller.close()
+            self.repository.release_lease(
+                "existing-worker", "2026-07-27T10:00:01Z",
+            )
+
+        self.assertTrue(reused)
+        self.assertEqual(started["sync_ref"], job_id)
+        self.assertEqual(started["state"], "running")
 
     def test_controller_drains_more_than_one_thousand_real_queued_sources(self) -> None:
         for number in range(1_001):

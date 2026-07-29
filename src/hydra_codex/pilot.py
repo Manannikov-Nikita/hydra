@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -24,6 +25,7 @@ from .project_schema import project_event_schema_counts
 from .redaction import project_task_family, validate_task_family
 from .reconcile_engine import RECONCILIATION_VERSION, list_reconciled_tasks
 from .reconcile_facts import discover_task_plans
+from .reconcile_types import ReconciledTask
 from .storage import HydraStore
 
 
@@ -343,11 +345,15 @@ def pilot_status(
     pilot_id: str,
     *,
     _window_end: datetime | None = None,
+    _tasks: tuple[ReconciledTask, ...] | None = None,
+    _sessions_by_ref: Mapping[str, tuple[str, ...]] | None = None,
 ) -> PilotStatus:
     """Build and persist one atomic deterministic cohort snapshot."""
     return _build_pilot_status(
         store, project_id, pilot_id, enroll=not _READ_ONLY_STATUS.get(),
         _window_end=_window_end,
+        _tasks=_tasks,
+        _sessions_by_ref=_sessions_by_ref,
     )
 
 
@@ -377,11 +383,15 @@ def _build_pilot_status(
     *,
     enroll: bool,
     _window_end: datetime | None = None,
+    _tasks: tuple[ReconciledTask, ...] | None = None,
+    _sessions_by_ref: Mapping[str, tuple[str, ...]] | None = None,
 ) -> PilotStatus:
     with store.rollout_transaction():
         return _pilot_status_snapshot(
             store, project_id, pilot_id, enroll=enroll,
             _window_end=_window_end,
+            _tasks=_tasks,
+            _sessions_by_ref=_sessions_by_ref,
         )
 
 
@@ -392,14 +402,24 @@ def _pilot_status_snapshot(
     *,
     enroll: bool,
     _window_end: datetime | None = None,
+    _tasks: tuple[ReconciledTask, ...] | None = None,
+    _sessions_by_ref: Mapping[str, tuple[str, ...]] | None = None,
 ) -> PilotStatus:
     run = _pilot_run(store, project_id, pilot_id)
     if _window_end is not None:
         _iso(_window_end)
         if run.closed_at is not None and _window_end != run.closed_at:
             raise ValueError("closed pilot window cannot be overridden")
-    tasks = list_reconciled_tasks(store, project_id)
-    sessions_by_ref = _task_sessions(store, project_id)
+    tasks = (
+        list_reconciled_tasks(store, project_id)
+        if _tasks is None
+        else _tasks
+    )
+    sessions_by_ref = (
+        _task_sessions(store, project_id)
+        if _sessions_by_ref is None
+        else dict(_sessions_by_ref)
+    )
     window_end = (
         run.closed_instant
         if run.closed_instant is not None

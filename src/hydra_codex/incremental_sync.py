@@ -42,7 +42,7 @@ from .sync_state import (
     validate_root_relative_locator,
 )
 from .test_evidence import reconcile_test_evidence
-from .token_selection import refresh_token_source_selection
+from .token_selection import refresh_token_session_selection
 
 
 _PREFIX_BYTES = 256
@@ -914,10 +914,10 @@ class IncrementalSyncWorker:
                 # legacy ingest batch before exposing the project as dirty.
                 reconcile_test_evidence(connection)
                 if result.session_key is not None:
-                    refresh_token_source_selection(
+                    refresh_token_session_selection(
                         connection,
                         result.project_id,
-                        session_keys=(result.session_key,),
+                        result.session_key,
                     )
                 diagnose = lambda _source, _ordinal, _kind: None
                 reconcile_token_epochs(connection, result.project_id, diagnose)

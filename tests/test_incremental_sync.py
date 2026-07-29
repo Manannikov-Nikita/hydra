@@ -1081,7 +1081,7 @@ class IncrementalWorkerTests(unittest.TestCase):
     def test_incremental_token_selection_is_scoped_to_the_materialized_session(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
         from hydra_codex.token_selection import (
-            refresh_token_source_selection as real_refresh,
+            refresh_token_session_selection as real_refresh,
         )
 
         self.path.write_bytes(
@@ -1106,7 +1106,7 @@ class IncrementalWorkerTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "hydra_codex.incremental_sync.refresh_token_source_selection",
+            "hydra_codex.incremental_sync.refresh_token_session_selection",
             wraps=real_refresh,
         ) as refresh:
             report = worker.sync_once(
@@ -1119,7 +1119,7 @@ class IncrementalWorkerTests(unittest.TestCase):
         refresh.assert_called_once_with(
             self.store.connection,
             "hprj_safe",
-            session_keys=("session-safe",),
+            "session-safe",
         )
 
     def test_default_materializer_rejects_a_trusted_session_owned_by_another_project(self) -> None:

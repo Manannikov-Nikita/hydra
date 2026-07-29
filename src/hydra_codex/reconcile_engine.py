@@ -218,10 +218,11 @@ def _assemble_project(
     return plans, tuple(assembled), hashlib.sha256(payload).hexdigest()
 
 
-def _persist_task(
-    connection: sqlite3.Connection, project_id: str, public_ref: str,
-    plan: TaskPlan, input_digest: str, deltas: Iterable[DeltaFact], semantic: SemanticAssembly,
-) -> None:
+def _task_display_name(
+    connection: sqlite3.Connection,
+    project_id: str,
+    plan: TaskPlan,
+) -> str | None:
     placeholders = ",".join("?" for _ in plan.session_ids)
     label_rows = connection.execute(
         f"""SELECT task_label,observed_at,sequence,annotation_id FROM annotations
@@ -245,7 +246,56 @@ def _persist_task(
         key=lambda row: (row[0].epoch_nanoseconds, row[1], row[2]),
         default=None,
     )
-    display_name = None if label_row is None else normalize_task_label(label_row[3])
+    return None if label_row is None else normalize_task_label(label_row[3])
+
+
+def _reconciled_tasks_from_assembly(
+    connection: sqlite3.Connection,
+    project_id: str,
+    assembled: tuple[
+        tuple[TaskPlan, TaskTreeMetrics, tuple[DeltaFact, ...], SemanticAssembly],
+        ...,
+    ],
+    references: dict[str, str],
+    display_names: dict[str, str | None],
+) -> tuple[tuple[ReconciledTask, ...], dict[str, tuple[str, ...]]]:
+    """Adapt one trusted project assembly for reports and pilot readiness."""
+    tasks: list[ReconciledTask] = []
+    sessions_by_ref: dict[str, tuple[str, ...]] = {}
+    for plan, metrics, _deltas, semantic in assembled:
+        public_ref = references[plan.root_key]
+        semantic_facts = _semantic_from_store(
+            connection,
+            project_id,
+            plan.root_key,
+            semantic.task_family,
+            semantic.annotations,
+        )
+        tasks.append(ReconciledTask(
+            public_ref,
+            plan.status,
+            plan.cutoff_at,
+            replace(metrics, semantic_coverage=semantic_facts.coverage),
+            semantic_facts,
+            _plan_instant(plan),
+            display_names[public_ref],
+        ))
+        sessions_by_ref[public_ref] = plan.session_ids
+
+    def recent_first(item: ReconciledTask) -> tuple[int, str]:
+        if item.last_activity_instant is None:
+            raise RuntimeError("assembled task exact activity is unavailable")
+        return -item.last_activity_instant.epoch_nanoseconds, item.public_ref
+
+    tasks.sort(key=recent_first)
+    return tuple(tasks), sessions_by_ref
+
+
+def _persist_task(
+    connection: sqlite3.Connection, project_id: str, public_ref: str,
+    plan: TaskPlan, input_digest: str, deltas: Iterable[DeltaFact],
+    semantic: SemanticAssembly, display_name: str | None,
+) -> None:
     connection.execute(
         """INSERT INTO reconciled_tasks(
                project_id,root_key,public_ref,status,cutoff_at,last_activity_at,task_family,
@@ -345,6 +395,9 @@ def reconcile_project(
         materialize_test_evidence(connection)
         reconcile_test_retries(connection)
         reconcile_turn_attempts(connection)
+    baseline_data_version = int(
+        store.connection.execute("PRAGMA data_version").fetchone()[0]
+    )
     plans, assembled, input_digest = _assemble_project(store, project_id)
     references = project_public_references((item.root_key for item in plans), installation_key)
     run_id = "hrec_v1_" + _digest(
@@ -356,12 +409,25 @@ def reconcile_project(
         default=require_exact_timestamp("1970-01-01T00:00:00Z"),
     )
     with store.rollout_transaction() as connection:
+        if int(connection.execute("PRAGMA data_version").fetchone()[0]) != baseline_data_version:
+            raise ReconciliationStale(
+                "source facts changed during reconciliation; run reconcile again"
+            )
+        display_names = {
+            references[plan.root_key]: _task_display_name(connection, project_id, plan)
+            for plan in plans
+        }
         connection.execute("DELETE FROM reconciled_tasks WHERE project_id=?", (project_id,))
         for plan, _metrics, deltas, semantic in assembled:
+            public_ref = references[plan.root_key]
             _persist_task(
-                connection, project_id, references[plan.root_key], plan,
+                connection, project_id, public_ref, plan,
                 input_digest, deltas, semantic,
+                display_names[public_ref],
             )
+        tasks, sessions_by_ref = _reconciled_tasks_from_assembly(
+            connection, project_id, assembled, references, display_names,
+        )
         connection.execute(
             """INSERT INTO reconciliation_runs(
                    run_id,project_id,started_at,outcome,provenance,reconciliation_version,
@@ -375,16 +441,24 @@ def reconcile_project(
                 completed_instant.canonical, len(plans),
             ),
         )
-    # Building report views is intentionally part of explicit reconciliation.
-    # The read path below uses only these materialized, public-safe snapshots.
-    from .pilot import read_only_pilot_statuses
-    from .reconcile_reports import list_reconciled_reports as build_reports
 
-    with read_only_pilot_statuses():
-        _persist_report_snapshots(
-            store, project_id, build_reports(store, project_id),
-            completed_instant.canonical,
-        )
+        # Building report views is intentionally part of explicit reconciliation.
+        # The read path below uses only these materialized, public-safe snapshots.
+        from .pilot import read_only_pilot_statuses
+        from .reconcile_reports import list_reconciled_reports as build_reports
+
+        with read_only_pilot_statuses():
+            _persist_report_snapshots(
+                store,
+                project_id,
+                build_reports(
+                    store,
+                    project_id,
+                    reconciled_tasks=tasks,
+                    sessions_by_ref=sessions_by_ref,
+                ),
+                completed_instant.canonical,
+            )
     complete_count = sum(item.status == "complete" for item in plans)
     return ReconciliationSummary(
         run_id, project_id, RECONCILIATION_VERSION, len(plans),

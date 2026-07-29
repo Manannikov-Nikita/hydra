@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 from .project_schema import project_event_schema_counts
@@ -204,13 +205,30 @@ def _semantic_breakdown(task: ReconciledTask) -> SemanticBreakdown:
 
 
 def list_reconciled_reports(
-    store: HydraStore, project_id: str, limit: int | None = None,
+    store: HydraStore,
+    project_id: str,
+    limit: int | None = None,
+    *,
+    reconciled_tasks: tuple[ReconciledTask, ...] | None = None,
+    sessions_by_ref: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[TaskReport, ...]:
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("limit must be a positive integer")
     from .reconcile_engine import list_reconciled_tasks
 
-    tasks = list_reconciled_tasks(store, project_id=project_id)
+    tasks = (
+        list_reconciled_tasks(store, project_id=project_id)
+        if reconciled_tasks is None
+        else reconciled_tasks
+    )
+    task_sessions = (
+        {
+            task.public_ref: task.metrics.session_ids
+            for task in tasks
+        }
+        if sessions_by_ref is None
+        else dict(sessions_by_ref)
+    )
     pilot = _project_pilot_health(store, project_id, tasks)
     reports = []
     for task in tasks:
@@ -248,7 +266,13 @@ def list_reconciled_reports(
 
         readiness: dict[str, bool] = {}
         for (pilot_id,) in pilot_rows:
-            status = pilot_status(store, project_id, str(pilot_id)).as_dict()
+            status = pilot_status(
+                store,
+                project_id,
+                str(pilot_id),
+                _tasks=tasks,
+                _sessions_by_ref=task_sessions,
+            ).as_dict()
             ready = bool(status["trend_ready"])
             for item in status["tasks"]:
                 task_ref = str(item["task_ref"])

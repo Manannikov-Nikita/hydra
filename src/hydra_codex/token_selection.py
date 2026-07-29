@@ -170,3 +170,16 @@ def refresh_token_source_selection(
                     for source_digest, line_number in selected_app_rows
                 ),
             )
+
+
+def refresh_token_session_selection(
+    connection: sqlite3.Connection,
+    project_id: str,
+    session_key: str,
+) -> None:
+    """Refresh one independent session without walking unrelated project history."""
+    refresh_token_source_selection(
+        connection,
+        project_id,
+        session_keys=(session_key,),
+    )

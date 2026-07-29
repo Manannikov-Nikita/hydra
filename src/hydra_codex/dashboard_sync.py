@@ -188,9 +188,13 @@ class DashboardSyncController:
         now = self._now()
         store, repository = self._repository()
         try:
-            job_id, reused = repository.get_or_create_active_job(kind, now)
-            job = repository.get_job(job_id)
-            assert job is not None
+            job = repository.current_job(kind)
+            if job is not None:
+                job_id, reused = job.job_id, True
+            else:
+                job_id, reused = repository.get_or_create_active_job(kind, now)
+                job = repository.get_job(job_id)
+                assert job is not None
         finally:
             store.close()
         self._ensure_thread(job.job_kind, job_id)

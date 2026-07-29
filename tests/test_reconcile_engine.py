@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
+import hydra_codex.reconcile_engine as reconcile_engine_module
 from hydra_codex.contracts import AnnotationContext, ModelAnnotationInput, materialize_annotation
 from hydra_codex.exact_time import require_exact_timestamp
+from hydra_codex.pilot import start_pilot
 from hydra_codex.reconcile_engine import (
     ReconciliationStale,
     get_reconciled_task,
@@ -242,6 +245,121 @@ class ReconcileEngineTests(unittest.TestCase):
         self.assertEqual(self.connection.execute(
             "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?", (PROJECT,),
         ).fetchone()[0], 2)
+
+    def test_reconcile_assembles_project_once_for_reports_and_pilot_readiness(self) -> None:
+        start_pilot(
+            self.store,
+            project_id=PROJECT,
+            target=5,
+            task_family="telemetry",
+            now=moment(0),
+        )
+        self.session("single-root", 1)
+        self.token("single-root", 1, 2, 10, 1, 1, 0)
+        self.complete("single-root", 5)
+        self.connection.commit()
+
+        with mock.patch(
+            "hydra_codex.reconcile_engine._assemble_project",
+            wraps=reconcile_engine_module._assemble_project,
+        ) as assemble:
+            reconcile_project(self.store, PROJECT, b"a" * 32)
+
+        self.assertEqual(assemble.call_count, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM materialized_report_snapshots WHERE project_id=?",
+                (PROJECT,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_reconcile_rejects_source_changes_after_assembly_without_publishing(self) -> None:
+        self.session("stale-root", 0)
+        self.token("stale-root", 1, 2, 10, 1, 1, 0)
+        self.complete("stale-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"s" * 32)
+        before = {
+            "tasks": tuple(map(tuple, self.connection.execute(
+                """SELECT root_key,input_digest FROM reconciled_tasks
+                    WHERE project_id=? ORDER BY root_key""",
+                (PROJECT,),
+            ))),
+            "runs": self.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?",
+                (PROJECT,),
+            ).fetchone()[0],
+            "snapshots": tuple(map(tuple, self.connection.execute(
+                """SELECT task_ref,report_json,data_revision
+                    FROM materialized_report_snapshots
+                    WHERE project_id=? ORDER BY task_ref""",
+                (PROJECT,),
+            ))),
+            "revision": self.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+        }
+        self.connection.execute(
+            """UPDATE token_snapshots SET input_tokens=20
+                WHERE source_digest='source-stale-root' AND line_number=1"""
+        )
+        self.connection.commit()
+
+        external = sqlite3.connect(Path(self.temporary.name) / "hydra.sqlite3")
+        real_assemble = reconcile_engine_module._assemble_project
+
+        def assemble_then_mutate(store: HydraStore, project_id: str):
+            assembled = real_assemble(store, project_id)
+            external.execute(
+                """INSERT INTO token_snapshots(
+                       source_digest,line_number,session_key,project_id,epoch,input_tokens,
+                       cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,
+                       completeness,observed_at)
+                   VALUES ('source-stale-root',2,'stale-root',?,0,30,1,1,0,0,'complete',?)""",
+                (PROJECT, stamp(3)),
+            )
+            external.commit()
+            return assembled
+
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=assemble_then_mutate,
+            ):
+                with self.assertRaisesRegex(ReconciliationStale, "source facts changed"):
+                    reconcile_project(self.store, PROJECT, b"s" * 32)
+        finally:
+            external.close()
+
+        after = {
+            "tasks": tuple(map(tuple, self.connection.execute(
+                """SELECT root_key,input_digest FROM reconciled_tasks
+                    WHERE project_id=? ORDER BY root_key""",
+                (PROJECT,),
+            ))),
+            "runs": self.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?",
+                (PROJECT,),
+            ).fetchone()[0],
+            "snapshots": tuple(map(tuple, self.connection.execute(
+                """SELECT task_ref,report_json,data_revision
+                    FROM materialized_report_snapshots
+                    WHERE project_id=? ORDER BY task_ref""",
+                (PROJECT,),
+            ))),
+            "revision": self.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT input_tokens FROM token_snapshots
+                    WHERE source_digest='source-stale-root' AND line_number=2"""
+            ).fetchone()[0],
+            30,
+        )
 
     def test_reconcile_uses_the_latest_trusted_task_label_at_the_cutoff(self) -> None:
         self.session("label-root", 0)
@@ -815,6 +933,28 @@ class ReconcileEngineTests(unittest.TestCase):
         self.assertIsNone(phase.reasoning.value)
         self.assertEqual(phase.reasoning.lower_bound, 0)
         self.assertEqual(phase.reasoning.provenance, "estimated")
+
+    def test_materialized_partial_phase_report_matches_post_persist_report(self) -> None:
+        self.session("root", 0)
+        self.token("root", 1, 5, 100, 20, 7, None)
+        self.complete("root", 10)
+        self.semantic_interval(
+            "root", start=1, end=9, phase="understand", cause="prompt",
+            family="quiz", sequence=0,
+        )
+        self.connection.commit()
+
+        reconcile_project(self.store, PROJECT, b"p" * 32)
+
+        snapshot_json = self.connection.execute(
+            """SELECT report_json FROM materialized_report_snapshots
+                WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone()[0]
+        ordinary_json = render_json(
+            list_reconciled_reports(self.store, PROJECT)[0]
+        ).rstrip("\n")
+        self.assertEqual(snapshot_json, ordinary_json)
 
     def test_post_completion_legacy_facts_require_trusted_source_order(self) -> None:
         self.session("root", 0)

@@ -97,6 +97,68 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_hook_session_identity_does_not_override_transcript_session_metadata(self) -> None:
+        source = self.root / ".codex" / "sessions" / "2026" / "rollout.jsonl"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            json.dumps({
+                "timestamp": "2026-07-21T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "rollout-session",
+                    "session_id": "rollout-session",
+                    "cwd": str(self.project),
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        handle_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "hook-session",
+                "turn_id": "hook-turn",
+                "cwd": str(self.project),
+                "transcript_path": str(source),
+            },
+            environ=self.environ,
+            clock=lambda: NOW,
+        )
+
+        result = LocalCommandServices(
+            environ=self.environ,
+            clock=lambda: NOW,
+        ).sync(self.database, self.project)
+
+        self.assertEqual(
+            (
+                result["status"],
+                result["completed"],
+                result["repair_required"],
+            ),
+            ("ok", 1, 0),
+        )
+        keys = Pseudonymizer.installation_key(self.key)
+        store = HydraStore(self.database)
+        try:
+            registered = SyncStateRepository(store).source_for(
+                "sessions",
+                "2026/rollout.jsonl",
+            )
+            hook_session = store.connection.execute(
+                "SELECT session_key FROM hook_event_outbox",
+            ).fetchone()[0]
+        finally:
+            store.close()
+        self.assertEqual(
+            registered.session_key,
+            keys.digest("identity", "rollout-session"),
+        )
+        self.assertEqual(
+            hook_session,
+            keys.digest("identity", "hook-session"),
+        )
+        self.assertNotEqual(registered.session_key, hook_session)
+
     def test_hook_does_not_enqueue_an_untrusted_transcript_path(self) -> None:
         payload = {
             "hook_event_name": "UserPromptSubmit", "session_id": "private-session",

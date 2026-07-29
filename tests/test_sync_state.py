@@ -370,6 +370,56 @@ class DurableSyncStateTests(unittest.TestCase):
         ).fetchone()[0], 0)
         self.assertIsNone(repository.source_for("sessions", locator))
 
+    def test_hook_identity_is_not_written_as_a_new_source_session_binding(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/hook-session.jsonl"
+
+        repository.record_hook_event_and_enqueue(
+            event_key="hook-event",
+            project_id="hprj_safe",
+            session_key="hook-session",
+            turn_key="hook-turn",
+            event_kind="prompt",
+            observed_at="2026-07-26T00:00:00Z",
+            source=("sessions", locator),
+        )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT session_key FROM hook_event_outbox",
+            ).fetchone()[0],
+            "hook-session",
+        )
+        self.assertIsNone(
+            repository.source_for("sessions", locator).session_key,
+        )
+
+    def test_hook_wakeup_preserves_an_existing_source_session_binding(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/existing-session.jsonl"
+        repository.register_source(
+            root_kind="sessions",
+            source_locator=locator,
+            project_id="hprj_safe",
+            session_key="transcript-session",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+
+        repository.record_hook_event_and_enqueue(
+            event_key="hook-event",
+            project_id="hprj_safe",
+            session_key="different-hook-session",
+            turn_key="hook-turn",
+            event_kind="prompt",
+            observed_at="2026-07-26T00:00:01Z",
+            source=("sessions", locator),
+        )
+
+        self.assertEqual(
+            repository.source_for("sessions", locator).session_key,
+            "transcript-session",
+        )
+
     def test_only_one_worker_holds_the_expiring_lease(self) -> None:
         repository = self._repository()
         self.assertTrue(repository.acquire_lease("worker-a", "2026-07-26T00:00:00Z", "2026-07-26T00:00:10Z"))
@@ -561,6 +611,80 @@ class DurableSyncStateTests(unittest.TestCase):
         ))
         second = repository.claim_next("worker", "2026-07-26T00:00:04Z", "2026-07-26T00:01:00Z")
         self.assertEqual(second.source_locator, locator)
+
+    def test_quarantine_claim_discards_a_concurrent_requeue(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/rejected.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator=locator,
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker", "2026-07-26T00:00:00Z", "2026-07-26T00:10:00Z",
+        ))
+        claimed = repository.claim_next(
+            "worker", "2026-07-26T00:00:01Z", "2026-07-26T00:01:00Z",
+        )
+        self.assertEqual(claimed.source_locator, locator)
+        self.assertFalse(repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator=locator,
+            observed_at="2026-07-26T00:00:02Z",
+        ))
+
+        self.assertTrue(repository.quarantine_claim(
+            "worker", "sessions", locator, "2026-07-26T00:00:03Z",
+        ))
+
+        self.assertEqual(repository.list_queue(), ())
+        self.assertEqual(
+            repository.source_for("sessions", locator).source_state,
+            "repair_required",
+        )
+
+    def test_stale_owner_cannot_quarantine_a_successor_claim(self) -> None:
+        repository = self._repository()
+        locator = "2026/07/26/successor.jsonl"
+        repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator=locator,
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker-a", "2026-07-26T00:00:00Z", "2026-07-26T00:00:02Z",
+        ))
+        first = repository.claim_next(
+            "worker-a", "2026-07-26T00:00:01Z", "2026-07-26T00:00:02Z",
+        )
+        self.assertEqual(first.source_locator, locator)
+        self.assertTrue(repository.acquire_lease(
+            "worker-b", "2026-07-26T00:00:03Z", "2026-07-26T00:10:00Z",
+        ))
+        successor = repository.claim_next(
+            "worker-b", "2026-07-26T00:00:03Z", "2026-07-26T00:01:00Z",
+        )
+        self.assertEqual(successor.source_locator, locator)
+
+        self.assertFalse(repository.quarantine_claim(
+            "worker-a", "sessions", locator, "2026-07-26T00:00:04Z",
+        ))
+
+        self.assertEqual(
+            repository.source_for("sessions", locator).source_state,
+            "ready",
+        )
+        queue = repository.list_queue()
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0].queue_state, "claimed")
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT claimed_by FROM sync_ingest_queue
+                    WHERE root_kind='sessions' AND source_locator=?""",
+                (locator,),
+            ).fetchone()[0],
+            "worker-b",
+        )
 
     def test_sync_timestamps_are_canonical_utc_rfc3339(self) -> None:
         repository = self._repository()

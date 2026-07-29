@@ -373,13 +373,7 @@ class DashboardSyncController:
         try:
             store, repository = self._repository()
             try:
-                job = repository.get_job(job_id)
-                if job is not None and job.state not in _TERMINAL:
-                    repository.update_job(
-                        job_id, state="failed", sources_discovered=job.sources_discovered,
-                        sources_completed=job.sources_completed, bytes_processed=job.bytes_processed,
-                        updated_at=self._now(), completed_at=self._now(),
-                    )
+                repository.fail_job_if_unleased(job_id, self._now())
             finally:
                 store.close()
         except Exception:

@@ -334,7 +334,11 @@ class SyncStateRepository:
                 root, locator = prepared
                 self._register(
                     connection, root_kind=root, source_locator=locator, project_id=project,
-                    logical_source_key=None, session_key=session, observed_at=now,
+                    # Hook and transcript session identifiers are not the same
+                    # namespace for every Codex worker/segment.  Preserve the
+                    # hook identity in the outbox, but let verified transcript
+                    # metadata or canonical lineage bind the source itself.
+                    logical_source_key=None, session_key=None, observed_at=now,
                 )
                 result = connection.execute(
                     """INSERT INTO sync_ingest_queue(
@@ -801,6 +805,48 @@ class SyncStateRepository:
             if changed or requeued:
                 self._bump_revision(connection, observed_at)
             return changed or requeued
+
+    def quarantine_claim(
+        self,
+        owner_key: str,
+        root_kind: str,
+        source_locator: str,
+        observed_at: str,
+    ) -> bool:
+        """Mark and discard only a source claim still owned at this instant."""
+        observed_at = _timestamp(observed_at)
+        root = self._validate_root(root_kind)
+        locator = validate_root_relative_locator(source_locator)
+        with self._store.rollout_transaction() as connection:
+            owned = connection.execute(
+                """SELECT 1 FROM sync_ingest_queue
+                     WHERE root_kind=? AND source_locator=?
+                       AND queue_state='claimed' AND claimed_by=?
+                       AND hydra_rfc3339_micros(claim_expires_at)
+                           >hydra_rfc3339_micros(?)""",
+                (root, locator, owner_key, observed_at),
+            ).fetchone()
+            if owned is None:
+                return False
+            if connection.execute(
+                """UPDATE sync_source_registry
+                      SET source_state='repair_required',last_seen_at=?
+                    WHERE root_kind=? AND source_locator=?""",
+                (observed_at, root, locator),
+            ).rowcount != 1:
+                raise KeyError("source is unknown")
+            deleted = connection.execute(
+                """DELETE FROM sync_ingest_queue
+                     WHERE root_kind=? AND source_locator=?
+                       AND queue_state='claimed' AND claimed_by=?
+                       AND hydra_rfc3339_micros(claim_expires_at)
+                           >hydra_rfc3339_micros(?)""",
+                (root, locator, owner_key, observed_at),
+            ).rowcount
+            if deleted != 1:
+                raise RuntimeError("source claim changed during quarantine")
+            self._bump_revision(connection, observed_at)
+            return True
 
     def save_checkpoint(
         self, root_kind: str, source_locator: str, *, byte_offset: int, line_number: int,
@@ -1326,6 +1372,32 @@ class SyncStateRepository:
                 job_id, str(previous[7]), "running", discovered, completed,
                 processed, str(previous[4]), updated_at, None,
             )
+
+    def fail_job_if_unleased(self, job_id: str, observed_at: str) -> bool:
+        """Atomically fail an active job only when no ingest worker lease is live."""
+        observed_at = _timestamp(observed_at)
+        observed_epoch_ns = _epoch_nanoseconds(observed_at)
+        with self._store.rollout_transaction() as connection:
+            changed = connection.execute(
+                """UPDATE sync_jobs
+                      SET state='failed',updated_at=?,completed_at=?,updated_epoch_ns=?
+                    WHERE job_id=?
+                      AND state IN ('queued','running')
+                      AND updated_epoch_ns<=?
+                      AND NOT EXISTS(
+                          SELECT 1 FROM sync_worker_leases
+                           WHERE lease_name='ingest'
+                             AND hydra_rfc3339_micros(expires_at)
+                                 >hydra_rfc3339_micros(?)
+                      )""",
+                (
+                    observed_at, observed_at, observed_epoch_ns, job_id,
+                    observed_epoch_ns, observed_at,
+                ),
+            ).rowcount == 1
+            if changed:
+                self._bump_revision(connection, observed_at)
+            return changed
 
     def finish_job_if_idle(
         self, job_id: str, *, updated_at: str,

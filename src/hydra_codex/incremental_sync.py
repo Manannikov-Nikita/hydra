@@ -53,6 +53,10 @@ class RepairRequired(RuntimeError):
     """One registered source no longer has an append-only relationship."""
 
 
+class _MaterializationRejected(RuntimeError):
+    """A deterministic materializer validation rejected one source."""
+
+
 @dataclass(frozen=True)
 class TrustedSourceRoots:
     sessions: Path
@@ -488,10 +492,19 @@ def rollout_tail_materializer(store: HydraStore) -> Materializer:
         if (
             session_key is not None
             and canonical_session is not None
-            and canonical_session != session_key
+            and session_key != canonical_session
+            and canonical[0] is None
         ):
-            raise ValueError("canonical logical source belongs to another session")
-        if session_key is None:
+            raise ValueError(
+                "provisional logical source belongs to another session"
+            )
+        if canonical_session is not None and (
+            session_key is None or canonical[0] is not None
+        ):
+            # A canonical legacy lineage is stronger than a source-registry
+            # hint. Older hook runtimes wrote their own session namespace into
+            # the registry and could poison an otherwise valid source binding.
+            # Completing this tail heals that hint atomically at commit.
             session_key = canonical_session
         if session_key is not None:
             # Hooks can bind a source to a safe opaque session before the
@@ -873,7 +886,10 @@ class IncrementalSyncWorker:
             ).fetchone()
             if owned is None:
                 raise RepairRequired("queue claim expired")
-            result = self.materialize(item, tail, connection)
+            try:
+                result = self.materialize(item, tail, connection)
+            except ValueError as error:
+                raise _MaterializationRejected from error
             if ownership_lost is not None and ownership_lost.is_set():
                 # The materializer's writes are still inside this transaction;
                 # raising here rolls them back before a successor can observe
@@ -1023,6 +1039,32 @@ class IncrementalSyncWorker:
         def current_time() -> str:
             return lease_window()[0]
 
+        def quarantine_for_repair(item: QueueItem) -> bool:
+            repair_at, _ = lease_window()
+            with self.store.rollout_transaction() as connection:
+                quarantined = self.repository.quarantine_claim(
+                    owner_key,
+                    item.root_kind,
+                    item.source_locator,
+                    repair_at,
+                )
+                if not quarantined:
+                    return False
+                if job_id is not None:
+                    remaining_sources = int(connection.execute(
+                        """SELECT ingest_total FROM sync_work_summary
+                            WHERE singleton=1""",
+                    ).fetchone()[0])
+                    self.repository.advance_job(
+                        job_id,
+                        sources_completed_delta=0,
+                        bytes_processed_delta=0,
+                        repair_required_delta=1,
+                        remaining_sources=remaining_sources,
+                        updated_at=repair_at,
+                    )
+                return True
+
         lease_now, active_expiry = lease_window()
         if not self.repository.acquire_lease(
             owner_key, lease_now, active_expiry,
@@ -1056,29 +1098,7 @@ class IncrementalSyncWorker:
                 )
                 continue
             except RepairRequired:
-                repair_at, _ = lease_window()
-                with self.store.rollout_transaction() as connection:
-                    self.repository.mark_repair_required(
-                        item.root_kind, item.source_locator, repair_at,
-                    )
-                    self.repository.acknowledge_claim(
-                        owner_key, item.root_kind,
-                        item.source_locator, repair_at,
-                    )
-                    if job_id is not None:
-                        remaining_sources = int(connection.execute(
-                            """SELECT ingest_total FROM sync_work_summary
-                                WHERE singleton=1""",
-                        ).fetchone()[0])
-                        self.repository.advance_job(
-                            job_id,
-                            sources_completed_delta=0,
-                            bytes_processed_delta=0,
-                            repair_required_delta=1,
-                            remaining_sources=remaining_sources,
-                            updated_at=repair_at,
-                        )
-                repairs += 1
+                repairs += int(quarantine_for_repair(item))
                 continue
             if item.project_id is None:
                 # Without a trusted project binding, advancing the durable
@@ -1133,6 +1153,12 @@ class IncrementalSyncWorker:
                         item, tail, MaterializedSource(),
                         owner_key, current_time, lost, job_id,
                     )
+            except _MaterializationRejected:
+                # Trusted identity/lineage validation is deterministic for this
+                # binding. Retrying the same bytes would hot-loop, so quarantine
+                # only this source and leave explicit repair to re-establish it.
+                repairs += int(quarantine_for_repair(item))
+                continue
             except RepairRequired:
                 retry_at, retry_expiry = lease_window()
                 self.repository.retry_claim(

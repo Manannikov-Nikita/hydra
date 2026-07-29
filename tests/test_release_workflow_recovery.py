@@ -424,6 +424,104 @@ class ReleaseWorkflowRecoveryTests(unittest.TestCase):
             ))
             self.assertFalse(any("--clobber" in call for call in gh_calls + curl_calls))
 
+    def test_reconcile_retries_until_a_created_draft_becomes_visible(self) -> None:
+        workflow = _document()
+        script = _step(
+            workflow["jobs"]["publish"],
+            "Reconcile draft release assets",
+        )["run"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin, gh_log, curl_log = self._write_release_fakes(root)
+            dist = root / "dist"
+            dist.mkdir()
+            for name in self._release_asset_names():
+                (dist / name).write_bytes(f"local:{name}".encode())
+            assets = root / "assets"
+            assets.mkdir()
+            release = self._release_fixture(
+                draft=True,
+                immutable=False,
+                assets=[],
+            )
+            create_marker = root / "release-created"
+            lookup_counter = root / "post-create-lookups"
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                f"#!{Path(os.sys.executable).resolve()}\n"
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "\n"
+                "args = sys.argv[1:]\n"
+                "with Path(os.environ['FAKE_GH_LOG']).open('a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps(args) + '\\n')\n"
+                "marker = Path(os.environ['FAKE_CREATE_MARKER'])\n"
+                "counter = Path(os.environ['FAKE_LOOKUP_COUNTER'])\n"
+                "if args[:2] == ['release', 'create']:\n"
+                "    marker.write_text('created', encoding='ascii')\n"
+                "    raise SystemExit(0)\n"
+                "if not args or args[0] != 'api':\n"
+                "    raise SystemExit(64)\n"
+                "if '--include' in args:\n"
+                "    print('HTTP/1.1 404 fake\\n')\n"
+                "    raise SystemExit(1)\n"
+                "if '--paginate' in args and '--slurp' in args:\n"
+                "    if not marker.exists():\n"
+                "        print(json.dumps([[]]))\n"
+                "        raise SystemExit(0)\n"
+                "    attempt = int(counter.read_text() or '0') + 1 if counter.exists() else 1\n"
+                "    counter.write_text(str(attempt), encoding='ascii')\n"
+                "    release = json.loads(os.environ['FAKE_RELEASE_JSON'])\n"
+                "    print(json.dumps([[release]] if attempt >= 3 else [[]]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(62)\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            fake_sleep = fake_bin / "sleep"
+            fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_sleep.chmod(0o755)
+            state = self._write_release_state(
+                root,
+                release=release,
+                latest_status=404,
+                tag_status=404,
+            )
+            environment = self._release_env(
+                root, fake_bin, gh_log, curl_log, state, assets,
+            )
+            environment.update({
+                "FAKE_CREATE_MARKER": str(create_marker),
+                "FAKE_LOOKUP_COUNTER": str(lookup_counter),
+                "FAKE_RELEASE_JSON": json.dumps(release),
+            })
+
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [
+                json.loads(line)
+                for line in gh_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                sum(call[:2] == ["release", "create"] for call in calls),
+                1,
+            )
+            self.assertEqual(lookup_counter.read_text(encoding="ascii"), "3")
+            self.assertEqual(
+                len(curl_log.read_text(encoding="utf-8").splitlines()),
+                4,
+            )
+
     def test_reconcile_rejects_untrusted_upload_url_before_curl(self) -> None:
         workflow = _document()
         script = _step(

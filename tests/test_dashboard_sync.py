@@ -543,6 +543,105 @@ class DashboardSyncControllerTests(unittest.TestCase):
             "SELECT owner_key FROM sync_worker_leases WHERE lease_name='ingest'",
         ).fetchone())
 
+    def test_contender_failure_cannot_fail_a_job_with_a_live_worker_lease(self) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+
+        job_id = self.repository.create_job(
+            "repair",
+            "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            job_id,
+            state="running",
+            sources_discovered=4,
+            sources_completed=2,
+            bytes_processed=128,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        self.assertTrue(self.repository.acquire_lease(
+            "repair-owner",
+            "2026-07-27T10:00:00Z",
+            "2026-07-27T10:05:00Z",
+        ))
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=None,
+            installation_key=b"k" * 32,
+            clock=lambda: self.now,
+            auto_activate=False,
+        )
+        try:
+            controller._fail(job_id)
+            protected = self.repository.get_job(job_id)
+            self.assertEqual(protected.state, "running")
+
+            self.assertTrue(self.repository.release_lease(
+                "repair-owner",
+                "2026-07-27T10:00:01Z",
+            ))
+            controller._fail(job_id)
+            terminal = self.repository.get_job(job_id)
+        finally:
+            controller.close()
+
+        self.assertEqual(terminal.state, "failed")
+
+    def test_worker_acquiring_at_failure_boundary_keeps_job_running(self) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+
+        job_id = self.repository.create_job(
+            "repair",
+            "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            job_id,
+            state="running",
+            sources_discovered=4,
+            sources_completed=2,
+            bytes_processed=128,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=None,
+            installation_key=b"k" * 32,
+            clock=lambda: self.now,
+            auto_activate=False,
+        )
+        original = SyncStateRepository.fail_job_if_unleased
+
+        def acquire_then_fail(
+            repository: SyncStateRepository,
+            selected_job: str,
+            observed_at: str,
+        ) -> bool:
+            self.assertTrue(repository.acquire_lease(
+                "new-worker",
+                observed_at,
+                "2026-07-27T10:05:00Z",
+            ))
+            return original(repository, selected_job, observed_at)
+
+        try:
+            with mock.patch.object(
+                SyncStateRepository,
+                "fail_job_if_unleased",
+                autospec=True,
+                side_effect=acquire_then_fail,
+            ):
+                controller._fail(job_id)
+        finally:
+            controller.close()
+
+        self.assertEqual(self.repository.get_job(job_id).state, "running")
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT owner_key FROM sync_worker_leases
+                    WHERE lease_name='ingest'""",
+            ).fetchone()[0],
+            "new-worker",
+        )
+
     def test_held_lease_is_retried_by_the_same_controller_until_it_can_drain(self) -> None:
         self.enqueue_source("leased.jsonl")
         self.assertTrue(self.repository.acquire_lease(

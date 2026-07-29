@@ -357,6 +357,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("gh release create", reconcile["run"])
         self.assertIn("--draft", reconcile["run"])
         self.assertIn("--verify-tag", reconcile["run"])
+        self.assertIn(
+            "for attempt in 1 2 3 4 5 6 7 8",
+            reconcile["run"],
+        )
+        self.assertIn('sleep 1', reconcile["run"])
         self.assertNotIn("gh release upload", reconcile["run"])
         self.assertNotIn("gh release download", reconcile["run"])
         self.assertIn("releases/assets/$asset_id", reconcile["run"])

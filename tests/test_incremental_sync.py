@@ -488,6 +488,179 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").byte_offset, 0)
         self.assertEqual(self.repository.list_queue()[0].reason_code, "transient_failure")
 
+    def test_materializer_validation_quarantines_source_and_releases_claim_and_lease(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+
+        def reject(*_args):
+            raise ValueError("trusted source binding is inconsistent")
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            materialize=reject,
+        )
+
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
+
+        self.assertEqual(
+            (report.claimed, report.completed, report.repair_required),
+            (1, 0, 1),
+        )
+        self.assertEqual(
+            self.repository.checkpoint_for(
+                "sessions",
+                "rollout.jsonl",
+            ).byte_offset,
+            0,
+        )
+        self.assertEqual(self.repository.list_queue(), ())
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
+        self.assertFalse(
+            self.repository.lease_owned(
+                "worker",
+                "2026-07-26T00:00:01Z",
+            ),
+        )
+
+    def test_materializer_rejection_discards_an_enqueue_racing_the_claim(self) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        observed = now.isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(minutes=1)).isoformat().replace(
+            "+00:00", "Z",
+        )
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            observed_at=observed,
+        )
+
+        def reject(*_args):
+            raise ValueError("trusted source binding is inconsistent")
+
+        class EnqueueAfterRollback:
+            def __enter__(inner_self):
+                return threading.Event()
+
+            def __exit__(inner_self, *_error):
+                self.repository.register_and_enqueue(
+                    root_kind="sessions",
+                    source_locator="rollout.jsonl",
+                    project_id="hprj_safe",
+                    observed_at=observed,
+                )
+                return False
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            materialize=reject,
+            clock=lambda: now,
+        )
+        worker._lease_heartbeat = lambda *_args, **_kwargs: EnqueueAfterRollback()
+
+        report = worker.sync_once(
+            "worker",
+            observed,
+            expires,
+            maximum_sources=2,
+        )
+
+        self.assertEqual(
+            (report.claimed, report.completed, report.repair_required),
+            (1, 0, 1),
+        )
+        self.assertEqual(self.repository.list_queue(), ())
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
+
+    def test_reader_repair_discards_an_enqueue_racing_the_claim(self) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            RepairRequired,
+            TrustedSourceRoots,
+        )
+
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+
+        def reject(*_args, **_kwargs):
+            self.repository.register_and_enqueue(
+                root_kind="sessions",
+                source_locator="rollout.jsonl",
+                project_id="hprj_safe",
+                observed_at="2026-07-26T00:00:01Z",
+            )
+            raise RepairRequired("source identity changed")
+
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+        with mock.patch(
+            "hydra_codex.incremental_sync.read_incremental_source",
+            side_effect=reject,
+        ):
+            report = worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+                maximum_sources=2,
+            )
+
+        self.assertEqual(
+            (report.claimed, report.completed, report.repair_required),
+            (1, 0, 1),
+        )
+        self.assertEqual(self.repository.list_queue(), ())
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
+
     def test_heartbeat_keeps_short_lease_during_slow_materializer(self) -> None:
         from datetime import datetime, timedelta, timezone
         from hydra_codex.incremental_sync import IncrementalSyncWorker, MaterializedSource, TrustedSourceRoots
@@ -775,6 +948,136 @@ class IncrementalWorkerTests(unittest.TestCase):
             ("session-safe", "hprj_safe", 10, 3),
         )
 
+    def test_canonical_lineage_repairs_a_stale_hook_session_binding(self) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_sessions(
+                   session_key,project_id,path_key,resume_segments,
+                   conversation_key)
+               VALUES ('canonical-session','hprj_safe','safe',1,
+                       'canonical-conversation')"""
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES ('canonical-logical','hprj_safe','canonical-session',
+                       ?,'clean')""",
+            ("a" * 64,),
+        )
+        self.store.connection.commit()
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            logical_source_key="canonical-logical",
+            session_key="stale-hook-session",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
+
+        self.assertEqual(
+            (report.completed, report.repair_required),
+            (1, 0),
+        )
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).session_key,
+            "canonical-session",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT session_key FROM token_snapshots",
+            ).fetchone()[0],
+            "canonical-session",
+        )
+
+    def test_provisional_lineage_cannot_override_a_conflicting_registry_session(self) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_sessions(
+                   session_key,project_id,path_key,resume_segments,
+                   conversation_key)
+               VALUES ('provisional-session','hprj_safe','safe',1,
+                       'provisional-conversation')"""
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES ('provisional-logical','hprj_safe',
+                       'provisional-session',NULL,'clean')"""
+        )
+        self.store.connection.commit()
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            logical_source_key="provisional-logical",
+            session_key="registry-session",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
+
+        self.assertEqual(
+            (report.completed, report.repair_required),
+            (0, 1),
+        )
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
+        self.assertEqual(self.store.count("token_snapshots"), 0)
+
     def test_incremental_token_selection_is_scoped_to_the_materialized_session(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
         from hydra_codex.token_selection import (
@@ -851,13 +1154,23 @@ class IncrementalWorkerTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "another project"):
-            worker.sync_once(
-                "worker",
-                "2026-07-26T00:00:00Z",
-                "2026-07-26T00:01:00Z",
-            )
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
 
+        self.assertEqual(
+            (report.completed, report.repair_required),
+            (0, 1),
+        )
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
         self.assertEqual(
             self.store.connection.execute(
                 """SELECT project_id FROM rollout_sessions
@@ -901,13 +1214,23 @@ class IncrementalWorkerTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "another project"):
-            worker.sync_once(
-                "worker",
-                "2026-07-26T00:00:00Z",
-                "2026-07-26T00:01:00Z",
-            )
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
 
+        self.assertEqual(
+            (report.completed, report.repair_required),
+            (0, 1),
+        )
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
         self.assertEqual(
             tuple(self.store.connection.execute(
                 """SELECT project_id,session_key FROM rollout_logical_sources
@@ -942,13 +1265,23 @@ class IncrementalWorkerTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "trusted binding"):
-            worker.sync_once(
-                "worker",
-                "2026-07-26T00:00:00Z",
-                "2026-07-26T00:01:00Z",
-            )
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
 
+        self.assertEqual(
+            (report.completed, report.repair_required),
+            (0, 1),
+        )
+        self.assertEqual(
+            self.repository.source_for(
+                "sessions",
+                "rollout.jsonl",
+            ).source_state,
+            "repair_required",
+        )
         self.assertEqual(self.store.count("rollout_sessions"), 0)
         self.assertEqual(self.store.count("rollout_logical_sources"), 0)
         self.assertEqual(self.store.count("rollout_session_segments"), 0)

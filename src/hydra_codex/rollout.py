@@ -393,11 +393,16 @@ def _parse_source(
                 payload_time = canonical_timestamp(payload.get("timestamp"))
                 if not seen_session:
                     session_meta_at = payload_time.text or observed_at
+                conversation_key = (
+                    opaque("conversation", conversation)
+                    if conversation
+                    else next_key
+                )
                 connection.execute(
                     """INSERT INTO rollout_sessions(
                            session_key,project_id,path_key,resume_segments,conversation_key,started_at,last_activity_at)
                        VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_key) DO NOTHING""",
-                    (session_key, project_id, session_path, 1, opaque("conversation", conversation) if conversation else next_key,
+                    (session_key, project_id, session_path, 1, conversation_key,
                      session_meta_at, observed_at),
                 )
                 assert_session_project(
@@ -405,6 +410,14 @@ def _parse_source(
                 )
                 connection.execute(
                     """UPDATE rollout_sessions SET
+                         path_key=CASE WHEN EXISTS (
+                           SELECT 1 FROM incremental_session_placeholders marker
+                            WHERE marker.session_key=rollout_sessions.session_key)
+                           THEN ? ELSE path_key END,
+                         conversation_key=CASE WHEN EXISTS (
+                           SELECT 1 FROM incremental_session_placeholders marker
+                            WHERE marker.session_key=rollout_sessions.session_key)
+                           THEN ? ELSE conversation_key END,
                          started_at=CASE WHEN started_at IS NULL
                                               OR julianday(?) < julianday(started_at)
                                          THEN ? ELSE started_at END,
@@ -413,9 +426,15 @@ def _parse_source(
                                               THEN ? ELSE last_activity_at END
                        WHERE session_key=?""",
                     (
+                        session_path, conversation_key,
                         session_meta_at, session_meta_at,
                         observed_at, observed_at, session_key,
                     ),
+                )
+                connection.execute(
+                    """DELETE FROM incremental_session_placeholders
+                        WHERE session_key=?""",
+                    (session_key,),
                 )
                 if not seen_session:
                     persisted_start = connection.execute(

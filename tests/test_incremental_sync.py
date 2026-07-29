@@ -712,6 +712,508 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(self.store.connection.execute("SELECT event_kind FROM turn_lifecycle_events").fetchone()[0], "completed")
         self.assertEqual(self.repository.checkpoint_for("sessions", "rollout.jsonl").line_number, 4)
 
+    def test_default_materializer_bootstraps_a_trusted_hook_session_before_an_appended_token(self) -> None:
+        """A hook-bound append must not require session_meta inside the new byte range."""
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            session_key="session-safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        report = worker.sync_once(
+            "worker",
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:01:00Z",
+        )
+
+        self.assertEqual(
+            (report.claimed, report.completed, report.repair_required),
+            (1, 1, 0),
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT session_key,project_id,path_key,resume_segments,
+                          conversation_key
+                     FROM rollout_sessions"""
+            ).fetchone()),
+            ("session-safe", "hprj_safe", "incremental", 1, "session-safe"),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM rollout_session_segments"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM incremental_session_placeholders",
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT session_key,project_id,input_tokens,output_tokens
+                     FROM token_snapshots"""
+            ).fetchone()),
+            ("session-safe", "hprj_safe", 10, 3),
+        )
+
+    def test_incremental_token_selection_is_scoped_to_the_materialized_session(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+        from hydra_codex.token_selection import (
+            refresh_token_source_selection as real_refresh,
+        )
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            session_key="session-safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        with mock.patch(
+            "hydra_codex.incremental_sync.refresh_token_source_selection",
+            wraps=real_refresh,
+        ) as refresh:
+            report = worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            )
+
+        self.assertEqual(report.completed, 1)
+        refresh.assert_called_once_with(
+            self.store.connection,
+            "hprj_safe",
+            session_keys=("session-safe",),
+        )
+
+    def test_default_materializer_rejects_a_trusted_session_owned_by_another_project(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_sessions(
+                   session_key,project_id,path_key,resume_segments,
+                   conversation_key)
+               VALUES ('session-shared','hprj_foreign','safe',1,
+                       'conversation-foreign')"""
+        )
+        self.store.connection.commit()
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            session_key="session-shared",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "another project"):
+            worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT project_id FROM rollout_sessions
+                     WHERE session_key='session-shared'"""
+            ).fetchone()[0],
+            "hprj_foreign",
+        )
+        self.assertEqual(self.store.count("token_snapshots"), 0)
+        self.assertEqual(self.store.count("rollout_session_segments"), 0)
+
+    def test_default_materializer_rejects_a_logical_source_owned_by_another_project(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES ('logical-shared','hprj_foreign',NULL,
+                       NULL,'clean')"""
+        )
+        self.store.connection.commit()
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            logical_source_key="logical-shared",
+            session_key="local-session",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "another project"):
+            worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            )
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT project_id,session_key FROM rollout_logical_sources
+                     WHERE logical_source_key='logical-shared'"""
+            ).fetchone()),
+            ("hprj_foreign", None),
+        )
+        self.assertEqual(self.store.count("token_snapshots"), 0)
+        self.assertEqual(self.store.count("rollout_session_segments"), 0)
+
+    def test_default_materializer_rejects_session_metadata_that_disagrees_with_the_hook(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        hasher = Pseudonymizer.installation(self.database.parent)
+        trusted_session = hasher.digest("identity", "trusted-thread")
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"session_meta",'
+            b'"payload":{"id":"different-thread","cwd":"safe"}}\n'
+        )
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            session_key=trusted_session,
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "trusted binding"):
+            worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            )
+
+        self.assertEqual(self.store.count("rollout_sessions"), 0)
+        self.assertEqual(self.store.count("rollout_logical_sources"), 0)
+        self.assertEqual(self.store.count("rollout_session_segments"), 0)
+
+    def test_matching_session_metadata_completes_incremental_placeholder_timing(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        hasher = Pseudonymizer.installation(self.database.parent)
+        session_key = hasher.digest("identity", "trusted-thread")
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"session_meta",'
+            b'"payload":{"id":"trusted-thread",'
+            b'"session_id":"trusted-conversation","cwd":"safe"}}\n'
+        )
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            session_key=session_key,
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        self.assertEqual(
+            worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            ).completed,
+            1,
+        )
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT started_at,last_activity_at,path_key,
+                          conversation_key,resume_segments
+                     FROM rollout_sessions WHERE session_key=?""",
+                (session_key,),
+            ).fetchone()),
+            (
+                "2026-07-26T00:00:01Z",
+                "2026-07-26T00:00:01Z",
+                "incremental",
+                hasher.digest("conversation", "trusted-conversation"),
+                1,
+            ),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM incremental_session_placeholders",
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_default_materializer_binds_an_unbound_same_project_logical_source(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.store.connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES ('logical-unbound','hprj_safe',NULL,NULL,'clean')"""
+        )
+        self.store.connection.commit()
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            logical_source_key="logical-unbound",
+            session_key="local-session",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        self.assertEqual(
+            worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            ).completed,
+            1,
+        )
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT project_id,session_key
+                     FROM rollout_logical_sources
+                    WHERE logical_source_key='logical-unbound'"""
+            ).fetchone()),
+            ("hprj_safe", "local-session"),
+        )
+        self.assertEqual(self.store.count("token_snapshots"), 1)
+        self.assertEqual(self.store.count("rollout_session_segments"), 1)
+
+    def test_full_ingest_canonicalizes_incremental_session_metadata_and_segment_count(self) -> None:
+        from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
+        from hydra_codex.rollout import ingest_rollouts
+
+        hasher = Pseudonymizer.installation(self.database.parent)
+        session_key = hasher.digest("identity", "thread-real")
+        self.path.write_bytes(
+            b'{"timestamp":"2026-07-26T00:00:01Z","type":"event_msg",'
+            b'"payload":{"type":"token_count","info":{"total_token_usage":'
+            b'{"input_tokens":10,"cached_input_tokens":1,"output_tokens":3,'
+            b'"reasoning_output_tokens":2},"model_context_window":100}}}\n'
+        )
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            session_key=session_key,
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+        self.assertEqual(
+            worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            ).completed,
+            1,
+        )
+        with self.path.open("ab") as source:
+            source.write(
+                (
+                    '{"timestamp":"2026-07-26T00:00:02Z",'
+                    '"type":"session_meta","payload":{'
+                    '"id":"thread-real","session_id":"conversation-real",'
+                    f'"cwd":{json.dumps(str(self.root / "worktree"))}'
+                    "}}\n"
+                ).encode("utf-8")
+            )
+        (self.root / ".hydra").mkdir()
+        (self.root / ".hydra" / "project.toml").write_text(
+            'project_id = "hprj_safe"\n',
+            encoding="utf-8",
+        )
+
+        ingest_rollouts(
+            self.store,
+            (self.path,),
+            self.root,
+            "hprj_safe",
+            hash_key=hasher.key,
+        )
+
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT project_id,path_key,resume_segments,conversation_key
+                     FROM rollout_sessions WHERE session_key=?""",
+                (session_key,),
+            ).fetchone()),
+            (
+                "hprj_safe",
+                "worktree",
+                2,
+                hasher.digest("conversation", "conversation-real"),
+            ),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM rollout_session_segments
+                     WHERE session_key=?""",
+                (session_key,),
+            ).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM incremental_session_placeholders",
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_full_ingest_never_treats_a_real_incremental_path_as_placeholder(self) -> None:
+        from hydra_codex.rollout import ingest_rollouts
+
+        hasher = Pseudonymizer.installation(self.database.parent)
+        (self.root / ".hydra").mkdir()
+        (self.root / ".hydra" / "project.toml").write_text(
+            'project_id = "hprj_safe"\n',
+            encoding="utf-8",
+        )
+        first_cwd = self.root / "incremental"
+        second_cwd = self.root / "other"
+        first_cwd.mkdir()
+        second_cwd.mkdir()
+        self.path.write_text(
+            json.dumps({
+                "timestamp": "2026-07-26T00:00:01Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "real-thread",
+                    "session_id": "first-conversation",
+                    "cwd": str(first_cwd),
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        second = self.root / "second.jsonl"
+        second.write_text(
+            json.dumps({
+                "timestamp": "2026-07-26T00:00:02Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "real-thread",
+                    "session_id": "second-conversation",
+                    "cwd": str(second_cwd),
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        ingest_rollouts(
+            self.store,
+            (self.path, second),
+            self.root,
+            "hprj_safe",
+            hash_key=hasher.key,
+        )
+
+        session_key = hasher.digest("identity", "real-thread")
+        self.assertEqual(
+            tuple(self.store.connection.execute(
+                """SELECT path_key,conversation_key,resume_segments
+                     FROM rollout_sessions WHERE session_key=?""",
+                (session_key,),
+            ).fetchone()),
+            (
+                "incremental",
+                hasher.digest("conversation", "first-conversation"),
+                2,
+            ),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM incremental_session_placeholders",
+            ).fetchone()[0],
+            0,
+        )
+
     def test_reconcile_claims_only_dirty_projects_and_acks_after_success(self) -> None:
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
 
@@ -743,6 +1245,36 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertEqual(
             [source.source_locator for source in self.repository.list_sources()],
             ["nested/one.jsonl", "rollout.jsonl"],
+        )
+
+    def test_resumable_repair_does_not_report_a_lease_for_an_unrelated_job(self) -> None:
+        from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots
+
+        job_id = self.repository.create_job(
+            "sync",
+            "2026-07-26T00:00:00Z",
+        )
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+
+        result = repair.run_batch(
+            job_id,
+            "2026-07-26T00:00:01Z",
+            directory_limit=1,
+        )
+
+        self.assertFalse(result.completed)
+        self.assertFalse(result.lease_acquired)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM sync_worker_leases"
+            ).fetchone()[0],
+            0,
         )
 
     def test_backfill_recovers_job_progress_from_a_durable_file_frontier(self) -> None:

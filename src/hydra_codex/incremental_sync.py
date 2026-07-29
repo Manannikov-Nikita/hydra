@@ -23,6 +23,7 @@ import threading
 import uuid
 from typing import BinaryIO, Iterator
 
+from .lineage import assert_session_project
 from .project import ProjectNotFound, resolve_project
 from .reconcile_engine import reconcile_project
 from .rollout import ingest_rollouts
@@ -469,24 +470,77 @@ def rollout_tail_materializer(store: HydraStore) -> Materializer:
         # repair has established the canonical legacy lineage.
         logical = item.logical_source_key or hasher.digest("source", f"pending/{item.root_kind}/{item.source_locator}")
         canonical = connection.execute(
-            "SELECT canonical_revision_digest FROM rollout_logical_sources WHERE logical_source_key=?", (logical,),
+            """SELECT canonical_revision_digest,project_id,session_key
+                 FROM rollout_logical_sources WHERE logical_source_key=?""",
+            (logical,),
         ).fetchone()
+        if canonical is not None and canonical[1] != item.project_id:
+            raise ValueError("canonical logical source belongs to another project")
         source_digest = str(canonical[0]) if canonical is not None and canonical[0] is not None else hasher.digest(
             "source", f"incremental/{item.root_kind}/{item.source_locator}",
         )
         session_key = item.session_key
-        row = connection.execute(
-            "SELECT session_key FROM rollout_logical_sources WHERE logical_source_key=?", (logical,),
-        ).fetchone()
-        if session_key is None and row is not None and row[0] is not None:
-            session_key = str(row[0])
+        canonical_session = (
+            None
+            if canonical is None or canonical[2] is None
+            else str(canonical[2])
+        )
+        if (
+            session_key is not None
+            and canonical_session is not None
+            and canonical_session != session_key
+        ):
+            raise ValueError("canonical logical source belongs to another session")
+        if session_key is None:
+            session_key = canonical_session
+        if session_key is not None:
+            # Hooks can bind a source to a safe opaque session before the
+            # incremental byte range contains (or still contains) session_meta.
+            # Establish the foreign-key parent from that trusted binding so an
+            # appended token/lifecycle fact never requires a full-history read.
+            inserted_session = connection.execute(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,
+                       conversation_key)
+                   VALUES (?,?,'incremental',1,?)
+                   ON CONFLICT(session_key) DO NOTHING""",
+                (session_key, item.project_id, session_key),
+            )
+            if inserted_session.rowcount:
+                connection.execute(
+                    """INSERT INTO incremental_session_placeholders(session_key)
+                       VALUES (?) ON CONFLICT DO NOTHING""",
+                    (session_key,),
+                )
+            assert_session_project(
+                connection,
+                session_key=session_key,
+                project_id=item.project_id,
+            )
         connection.execute(
             """INSERT INTO rollout_logical_sources(
                    logical_source_key,project_id,session_key,canonical_revision_digest,lineage_state)
                VALUES (?,?,?,NULL,'clean') ON CONFLICT(logical_source_key) DO UPDATE SET
-                 project_id=excluded.project_id""",
+                 project_id=excluded.project_id,
+                 session_key=COALESCE(
+                   rollout_logical_sources.session_key,
+                   excluded.session_key)""",
             (logical, item.project_id, session_key),
         )
+        if session_key is not None:
+            connection.execute(
+                """INSERT INTO rollout_session_segments(
+                       session_key,logical_source_key)
+                   VALUES (?,?) ON CONFLICT DO NOTHING""",
+                (session_key, logical),
+            )
+            connection.execute(
+                """UPDATE rollout_sessions SET resume_segments=(
+                       SELECT COUNT(*) FROM rollout_session_segments
+                        WHERE session_key=?)
+                     WHERE session_key=?""",
+                (session_key, session_key),
+            )
         connection.execute(
             """INSERT INTO rollout_sources(
                    source_digest,source_type,logical_source_key,relation,line_count,byte_count,chain_digest,materialized)
@@ -522,22 +576,80 @@ def rollout_tail_materializer(store: HydraStore) -> Materializer:
             if kind == "session_meta":
                 identity = nonempty_string(payload.get("id"), payload.get("session_id"))
                 if identity is not None:
-                    session_key = hasher.digest("identity", identity)
+                    parsed_session_key = hasher.digest("identity", identity)
+                    if (
+                        session_key is not None
+                        and parsed_session_key != session_key
+                    ):
+                        raise ValueError(
+                            "session metadata does not match trusted binding"
+                        )
+                    session_key = parsed_session_key
                     conversation = nonempty_string(payload.get("session_id"), identity)
-                    connection.execute(
+                    inserted_session = connection.execute(
                         """INSERT INTO rollout_sessions(
                                session_key,project_id,path_key,resume_segments,conversation_key,started_at,last_activity_at)
-                           VALUES (?,?, 'incremental',1,?,?,?) ON CONFLICT(session_key) DO UPDATE SET
-                             last_activity_at=COALESCE(excluded.last_activity_at,rollout_sessions.last_activity_at)""",
+                           VALUES (?,?, 'incremental',1,?,?,?)
+                           ON CONFLICT(session_key) DO NOTHING""",
                         (session_key, item.project_id, hasher.digest("conversation", conversation) if conversation else session_key,
                          observed.text, observed.text),
                     )
+                    if inserted_session.rowcount:
+                        connection.execute(
+                            """INSERT INTO incremental_session_placeholders(
+                                   session_key)
+                               VALUES (?) ON CONFLICT DO NOTHING""",
+                            (session_key,),
+                        )
+                    assert_session_project(
+                        connection,
+                        session_key=session_key,
+                        project_id=item.project_id,
+                    )
+                    conversation_key = (
+                        hasher.digest("conversation", conversation)
+                        if conversation else session_key
+                    )
                     connection.execute(
-                        "UPDATE rollout_logical_sources SET session_key=? WHERE logical_source_key=?", (session_key, logical),
+                        """UPDATE rollout_sessions SET
+                             conversation_key=CASE WHEN EXISTS (
+                               SELECT 1
+                                 FROM incremental_session_placeholders marker
+                                WHERE marker.session_key=
+                                      rollout_sessions.session_key)
+                               THEN ? ELSE conversation_key END,
+                             started_at=CASE
+                               WHEN started_at IS NULL
+                                    OR julianday(?) < julianday(started_at)
+                               THEN ? ELSE started_at END,
+                             last_activity_at=CASE
+                               WHEN last_activity_at IS NULL
+                                    OR julianday(?) > julianday(last_activity_at)
+                               THEN ? ELSE last_activity_at END
+                           WHERE session_key=?""",
+                        (
+                            conversation_key,
+                            observed.text, observed.text,
+                            observed.text, observed.text,
+                            session_key,
+                        ),
+                    )
+                    connection.execute(
+                        """UPDATE rollout_logical_sources
+                              SET session_key=?,project_id=?
+                            WHERE logical_source_key=?""",
+                        (session_key, item.project_id, logical),
                     )
                     connection.execute(
                         """INSERT INTO rollout_session_segments(session_key,logical_source_key)
                            VALUES (?,?) ON CONFLICT DO NOTHING""", (session_key, logical),
+                    )
+                    connection.execute(
+                        """UPDATE rollout_sessions SET resume_segments=(
+                               SELECT COUNT(*) FROM rollout_session_segments
+                                WHERE session_key=?)
+                             WHERE session_key=?""",
+                        (session_key, session_key),
                     )
             if kind == "turn_context" and isinstance(payload.get("turn_id"), str):
                 current_turn = hasher.digest("turn", payload["turn_id"])
@@ -785,7 +897,12 @@ class IncrementalSyncWorker:
                 # Keep incremental facts in the same derived-state shape as a
                 # legacy ingest batch before exposing the project as dirty.
                 reconcile_test_evidence(connection)
-                refresh_token_source_selection(connection, result.project_id)
+                if result.session_key is not None:
+                    refresh_token_source_selection(
+                        connection,
+                        result.project_id,
+                        session_keys=(result.session_key,),
+                    )
                 diagnose = lambda _source, _ordinal, _kind: None
                 reconcile_token_epochs(connection, result.project_id, diagnose)
                 reconcile_fork_baselines(connection, result.project_id)
@@ -1075,6 +1192,7 @@ class RepairRun:
     discovered: int
     directories_scanned: int
     completed: bool
+    lease_acquired: bool = True
 
 
 class ResumableRepair:
@@ -1286,7 +1404,7 @@ class ResumableRepair:
             raise KeyError("repair job is unknown")
         if job.job_kind not in {"repair", "backfill"}:
             if job.state in {"queued", "running"}:
-                return RepairRun(0, 0, False)
+                return RepairRun(0, 0, False, lease_acquired=False)
             raise KeyError("repair job is unknown")
         # A job identifies durable work, not a process.  An invocation needs a
         # fresh lease identity so a second dashboard/MCP call cannot renew the
@@ -1298,7 +1416,7 @@ class ResumableRepair:
         if not self.repository.acquire_lease(
             owner, lease_observed_at, expiry,
         ):
-            return RepairRun(0, 0, False)
+            return RepairRun(0, 0, False, lease_acquired=False)
         if job.state in {"succeeded", "partial", "failed"}:
             self.repository.release_lease(owner, lease_observed_at)
             return RepairRun(0, 0, True)

@@ -233,6 +233,19 @@ class LocalCommandServices:
                     if job.state == "partial":
                         payload["diagnostic"] = "repair_required"
                     return payload
+                if not result.lease_acquired:
+                    return {
+                        "command": "repair",
+                        "status": (
+                            job.state
+                            if job.state in {"queued", "running"}
+                            else "queued"
+                        ),
+                        "diagnostic": "lease_busy",
+                        "directories_scanned": directories_scanned,
+                        "sources_discovered": sources_discovered,
+                        "batches": batches,
+                    }
                 if self._repair_progress(store, job_id) == before:
                     # Another process may hold the singleton lease.  Leave the
                     # durable frontier active for a later invocation instead

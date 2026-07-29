@@ -105,6 +105,12 @@ class AnnotationCapabilitySchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "upgrade.sqlite3"
             connection = sqlite3.connect(database)
+            connection.create_function(
+                "hydra_rfc3339_nanos",
+                1,
+                lambda _value: 0,
+                deterministic=True,
+            )
             for version, statements in MIGRATIONS[:-1]:
                 for statement in statements:
                     connection.execute(statement)

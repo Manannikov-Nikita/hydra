@@ -348,6 +348,53 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertEqual(payload["diagnostic"], "no_progress")
         self.assertEqual(payload["batches"], 1)
 
+    def test_cli_repair_all_reports_queued_when_the_ingest_lease_is_busy(self) -> None:
+        (self.root / ".codex" / "sessions").mkdir(parents=True)
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            sync_job = repository.create_job(
+                "sync", "2026-07-21T00:00:00Z",
+            )
+            repository.update_job(
+                sync_job,
+                state="running",
+                sources_discovered=1,
+                sources_completed=0,
+                bytes_processed=0,
+                updated_at="2026-07-21T00:00:01Z",
+            )
+            self.assertTrue(repository.acquire_lease(
+                "sync-worker",
+                "2026-07-21T00:00:01Z",
+                "2099-01-01T00:00:00Z",
+            ))
+        finally:
+            store.close()
+
+        code, stdout, stderr = invoke(
+            [
+                "repair", "--all", "--db", str(self.database),
+                "--cwd", str(self.project),
+            ],
+            environ=self.environ,
+        )
+
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(payload["diagnostic"], "lease_busy")
+        self.assertEqual(payload["batches"], 1)
+        store = HydraStore(self.database)
+        try:
+            states = {
+                job.job_kind: job.state
+                for job in SyncStateRepository(store).list_jobs()
+            }
+        finally:
+            store.close()
+        self.assertEqual(states, {"repair": "queued", "sync": "running"})
+
     def test_sync_freshness_prioritizes_any_repair_required_source_over_queue_order(self) -> None:
         store = HydraStore(self.database)
         try:

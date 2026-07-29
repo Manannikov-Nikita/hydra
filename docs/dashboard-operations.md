@@ -138,9 +138,11 @@ visible until the new materialized snapshots are ready.
 Use **Repair history** (or `hydra-codex repair --all`) only for the initial
 backfill or a source marked `repair_required`. Repair is the explicit expensive
 directory walk. The CLI runs successive bounded batches until completion; its
-frontier and progress survive interruption or restart. A `partial` /
-`no_progress` result means the durable frontier is still safe to resume, most
-commonly because another Hydra worker owns the singleton lease.
+frontier and progress survive interruption or restart. If another Hydra worker
+owns the singleton lease, the command returns `queued` or `running` with the
+`lease_busy` diagnostic; the durable frontier remains safe for that worker or a
+later invocation to resume. A `partial` / `no_progress` result is reserved for
+an acquired batch that made no durable progress.
 
 ## 7. Recover from common states
 

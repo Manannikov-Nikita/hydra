@@ -319,9 +319,11 @@ lease-coordinated worker processes new JSONL bytes from durable checkpoints and
 reconciles only dirty projects. `hydra-codex sync` performs the same bounded
 queue drain explicitly; `hydra-codex repair --all` is the separate resumable,
 potentially expensive history walk. One repair invocation continues through
-bounded batches until the persisted frontier is complete; if it cannot make
-progress (for example, another worker owns the lease), it exits with a
-privacy-safe `partial` diagnostic and a later invocation resumes that frontier.
+bounded batches until the persisted frontier is complete. If another worker
+owns the lease, it exits with `queued` or `running` plus the privacy-safe
+`lease_busy` diagnostic and that worker or a later invocation resumes the
+frontier. `partial` / `no_progress` is reserved for an acquired batch that made
+no durable progress.
 
 `hydra.report` reads materialized SQLite state and never starts ingest or
 reconciliation. The `hydra.report-list/v2` wrapper and every contained

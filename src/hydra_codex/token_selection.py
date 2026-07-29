@@ -66,14 +66,32 @@ def _selected_app_rows(
     return selected
 
 
-def refresh_token_source_selection(connection: sqlite3.Connection, project_id: str) -> None:
+def refresh_token_source_selection(
+    connection: sqlite3.Connection,
+    project_id: str,
+    *,
+    session_keys: tuple[str, ...] | None = None,
+) -> None:
     """Choose rollout > App cumulative > OTel calls without deleting fallback facts."""
+    parameters: tuple[object, ...] = (project_id,)
+    session_filter = ""
+    if session_keys is not None:
+        sessions = tuple(dict.fromkeys(session_keys))
+        if not sessions:
+            return
+        session_filter = (
+            " AND session_key IN ("
+            + ",".join("?" for _session in sessions)
+            + ")"
+        )
+        parameters += sessions
     rows = connection.execute(
         """SELECT session_key,source_family,observed_at,event_key,input_tokens,
                   cached_input_tokens,output_tokens,reasoning_tokens,
                   source_digest,line_number
-             FROM token_snapshots WHERE project_id=? AND vector_valid=1""",
-        (project_id,),
+             FROM token_snapshots WHERE project_id=? AND vector_valid=1"""
+        + session_filter,
+        parameters,
     )
     by_session: dict[str, list[tuple[object, ...]]] = {}
     for row in rows:

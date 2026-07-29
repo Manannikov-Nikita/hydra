@@ -86,6 +86,11 @@ from .migrations_ab28 import (
     AB28_REQUIRED_TRIGGER_SQL,
     AB28_SYNC_DIRTY_ROOTS_TABLE_SQL,
 )
+from .migrations_ac29 import (
+    AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL,
+    AC29_MIGRATIONS,
+    AC29_REQUIRED_SCHEMA,
+)
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -355,7 +360,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -936,6 +941,7 @@ class HydraStore:
         required.update(Z26_REQUIRED_SCHEMA)
         required.update(AA27_REQUIRED_SCHEMA)
         required.update(AB28_REQUIRED_SCHEMA)
+        required.update(AC29_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -968,6 +974,8 @@ class HydraStore:
             "materialized_project_stats":
                 Z26_MATERIALIZED_PROJECT_STATS_TABLE_SQL,
             "sync_work_summary": AA27_SYNC_WORK_SUMMARY_TABLE_SQL,
+            "incremental_session_placeholders":
+                AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL,
         }.items():
             if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
                 raise StorageUnavailable("Hydra schema has altered materialized report trust constraints")

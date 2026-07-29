@@ -136,6 +136,14 @@ def seed_rollout_rows(connection: sqlite3.Connection, version: int) -> None:
 
 def build_schema(path: Path, version: int) -> None:
     connection = sqlite3.connect(path)
+    connection.create_function(
+        "hydra_rfc3339_nanos",
+        1,
+        lambda value: require_exact_timestamp(
+            value, "migration fixture timestamp",
+        ).epoch_nanoseconds,
+        deterministic=True,
+    )
     for migration, statements in MIGRATIONS:
         if migration > version:
             break
@@ -490,7 +498,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
         self.assertEqual(version, 42)
         self.assertNotIn("last_activity_epoch_ns", columns)
 
-    def test_schema_38_adds_partial_token_snapshot_task_lookup_index(self) -> None:
+    def test_latest_schema_adds_session_bounded_token_snapshot_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "token-index.sqlite3"
             store = HydraStore(database)
@@ -514,9 +522,10 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     str(index[0]),
                 )
                 self.assertIn(
-                    "WHERE contributes_total=1 AND vector_valid=1",
+                    "WHERE vector_valid=1",
                     str(index[0]),
                 )
+                self.assertNotIn("contributes_total=1", str(index[0]))
                 self.assertEqual(
                     listed["token_snapshots_project_session_valid"], 1,
                 )
@@ -551,6 +560,123 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     "token_snapshots_project_session_valid", details,
                 )
                 self.assertNotIn("SCAN t", details)
+            finally:
+                store.close()
+
+    def test_session_selection_query_plans_use_bounded_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "token-selection-plan.sqlite3"
+            store = HydraStore(database)
+            try:
+                statements = (
+                    (
+                        """SELECT session_key,source_family,observed_at,event_key,
+                                  input_tokens,cached_input_tokens,output_tokens,
+                                  reasoning_tokens,source_digest,line_number
+                             FROM token_snapshots
+                            WHERE project_id=? AND vector_valid=1
+                              AND session_key IN (?)""",
+                        ("project-a", "session-a"),
+                    ),
+                    (
+                        """UPDATE token_snapshots
+                              SET contributes_total=0,
+                                  selection_provenance='derived',
+                                  selection_caveat=NULL
+                            WHERE project_id=? AND session_key=?
+                              AND vector_valid=1""",
+                        ("project-a", "session-a"),
+                    ),
+                    (
+                        """UPDATE token_snapshots
+                              SET contributes_total=1,
+                                  selection_provenance=?,
+                                  selection_caveat=?
+                            WHERE project_id=? AND session_key=?
+                              AND source_family=? AND vector_valid=1""",
+                        ("exact", None, "project-a", "session-a", "rollout"),
+                    ),
+                )
+                for statement, parameters in statements:
+                    with self.subTest(statement=statement.split()[0]):
+                        plan = tuple(store.connection.execute(
+                            "EXPLAIN QUERY PLAN " + statement,
+                            parameters,
+                        ))
+                        details = "\n".join(str(row[3]) for row in plan)
+                        self.assertIn(
+                            "token_snapshots_project_session_valid", details,
+                        )
+                        self.assertNotIn("SCAN token_snapshots", details)
+            finally:
+                store.close()
+
+    def test_v46_legacy_token_index_is_rebuilt_without_changing_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v46-legacy-token-index.sqlite3"
+            build_schema(database, 46)
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "DROP INDEX token_snapshots_project_session_valid",
+            )
+            connection.execute(
+                """CREATE INDEX token_snapshots_project_session_valid
+                     ON token_snapshots(project_id,session_key)
+                  WHERE contributes_total=1 AND vector_valid=1""",
+            )
+            connection.execute(
+                """INSERT INTO rollout_sessions(
+                       session_key,project_id,path_key,resume_segments,
+                       conversation_key)
+                   VALUES ('pending-session','pending-project','incremental',
+                           1,'pending-conversation')""",
+            )
+            connection.execute(
+                """INSERT INTO rollout_logical_sources(
+                       logical_source_key,project_id,session_key,
+                       canonical_revision_digest,lineage_state)
+                   VALUES ('pending-logical','pending-project',
+                           'pending-session',NULL,'clean')""",
+            )
+            connection.execute(
+                """INSERT INTO rollout_sources(
+                       source_digest,source_type,logical_source_key,relation,
+                       line_count,byte_count,chain_digest,materialized)
+                   VALUES ('pending-source','jsonl','pending-logical','append',
+                           0,0,'',1)""",
+            )
+            connection.execute(
+                """UPDATE rollout_sessions SET path_key='incremental'
+                    WHERE session_key='legacy-rollout-session'""",
+            )
+            connection.commit()
+            connection.close()
+
+            store = HydraStore.open_current(database)
+            try:
+                preserved = store.connection.execute(
+                    """SELECT input_tokens,cached_input_tokens,output_tokens
+                         FROM token_snapshots
+                        WHERE project_id='preserved-project'
+                          AND session_key='legacy-rollout-session'""",
+                ).fetchone()
+                index_sql = store.connection.execute(
+                    """SELECT sql FROM sqlite_master
+                         WHERE type='index'
+                           AND name='token_snapshots_project_session_valid'""",
+                ).fetchone()
+
+                self.assertEqual(tuple(preserved), (10, 2, 3))
+                self.assertIn("WHERE vector_valid=1", str(index_sql[0]))
+                self.assertNotIn("contributes_total=1", str(index_sql[0]))
+                marked = {
+                    str(row[0])
+                    for row in store.connection.execute(
+                        """SELECT session_key
+                             FROM incremental_session_placeholders""",
+                    )
+                }
+                self.assertEqual(marked, {"pending-session"})
             finally:
                 store.close()
 

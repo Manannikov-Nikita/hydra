@@ -507,6 +507,128 @@ process.stdout.write(JSON.stringify(await ({expression})));
         self.assertIn("announce(`Sync ${stage}`)", app)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_job_status_polling_retries_a_temporary_failure_until_terminal(self) -> None:
+        observed = self.evaluate_app(
+            """(async () => {
+              const replies = [new Error("busy"), {state: "running"}, {state: "succeeded"}];
+              const waits = [];
+              const states = [];
+              const result = await subject.pollJobStatus(
+                async () => {
+                  const reply = replies.shift();
+                  if (reply instanceof Error) throw reply;
+                  return reply;
+                },
+                async current => {
+                  states.push(current.state);
+                  return current.state === "succeeded";
+                },
+                async delay => { waits.push(delay); },
+                5,
+              );
+              return {state: result.state, states, waits};
+            })()"""
+        )
+        self.assertEqual(observed, {
+            "state": "succeeded",
+            "states": ["running", "succeeded"],
+            "waits": [1000, 1000, 1000],
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_job_status_polling_stops_after_five_consecutive_failures(self) -> None:
+        observed = self.evaluate_app(
+            """(async () => {
+              const waits = [];
+              let attempts = 0;
+              try {
+                await subject.pollJobStatus(
+                  async () => { attempts += 1; throw new Error("busy"); },
+                  async () => false,
+                  async delay => { waits.push(delay); },
+                  5,
+                );
+              } catch (error) {
+                return {message: error.message, attempts, waits};
+              }
+            })()"""
+        )
+        self.assertEqual(observed, {
+            "message": "busy",
+            "attempts": 5,
+            "waits": [1000, 1000, 1000, 1000, 1000],
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_job_status_polling_resets_failures_after_a_successful_read(self) -> None:
+        observed = self.evaluate_app(
+            """(async () => {
+              const replies = [
+                new Error("busy"), new Error("busy"), new Error("busy"), new Error("busy"),
+                {state: "running"},
+                new Error("busy"), new Error("busy"), new Error("busy"), new Error("busy"),
+                {state: "succeeded"},
+              ];
+              const waits = [];
+              const states = [];
+              const result = await subject.pollJobStatus(
+                async () => {
+                  const reply = replies.shift();
+                  if (reply instanceof Error) throw reply;
+                  return reply;
+                },
+                async current => {
+                  states.push(current.state);
+                  return current.state === "succeeded";
+                },
+                async delay => { waits.push(delay); },
+                5,
+              );
+              return {state: result.state, states, waits};
+            })()"""
+        )
+        self.assertEqual(observed, {
+            "state": "succeeded",
+            "states": ["running", "succeeded"],
+            "waits": [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_job_status_polling_immediately_propagates_reopen_dashboard(self) -> None:
+        api_uri = json.dumps((ASSET_ROOT / "api.js").as_uri())
+        observed = self.evaluate_app(
+            f"""(async () => {{
+              const {{ApiError}} = await import({api_uri});
+              const waits = [];
+              let attempts = 0;
+              try {{
+                await subject.pollJobStatus(
+                  async () => {{ attempts += 1; throw new ApiError("reopen_dashboard", 401); }},
+                  async () => false,
+                  async delay => {{ waits.push(delay); }},
+                  5,
+                );
+              }} catch (error) {{
+                return {{code: error.code, attempts, waits}};
+              }}
+            }})()"""
+        )
+        self.assertEqual(observed, {
+            "code": "reopen_dashboard",
+            "attempts": 1,
+            "waits": [1000],
+        })
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_status_unavailable_title_distinguishes_sync_and_repair(self) -> None:
+        self.assertEqual(
+            self.evaluate_app(
+                "['sync', 'repair'].map(subject.statusUnavailableTitle)"
+            ),
+            ["Sync status unavailable", "Repair status unavailable"],
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
     def test_change_polling_is_serial_and_keeps_exact_cadence(self) -> None:
         observed = self.evaluate_module(
             "state.js",

@@ -405,38 +405,66 @@ function announceRefresh(current) {
   }
 }
 
-async function pollRefresh(refreshRef, jobKind, retry) {
-  for (;;) {
-    await new Promise(resolve => window.setTimeout(resolve, 1000));
-    const current = await api.syncStatus(refreshRef);
-    if (jobKind === "repair") {
-      showAsyncState("loading", "Repairing history", refreshProgressDetail(current));
-    } else {
-      showAsyncState("loading", "Syncing evidence", refreshProgressDetail(current));
-    }
-    announceRefresh(current);
-    if (!TERMINAL_REFRESH.has(current.state)) continue;
+export function statusUnavailableTitle(jobKind) {
+  return jobKind === "repair" ? "Repair status unavailable" : "Sync status unavailable";
+}
 
-    const reloaded = await reloadAfterRefresh();
-    if (!reloaded) return current;
-    if (current.state === "partial" || current.state === "failed") {
-      const partial = current.state === "partial";
-      const title = jobKind === "repair"
-        ? partial ? "Repair needs another pass" : "Repair history failed"
-        : partial ? "Sync needs another pass" : "Sync failed";
-      const detail = refreshDiagnosticDetail(current);
-      showAsyncState(
-        partial ? "notice" : "error", title, detail, retry,
-        partial ? jobKind === "repair" ? "Repair again" : "Sync again" : "Retry",
-      );
-      routeStatus.textContent = "";
-      announceRefreshOutcome(`${title}. ${detail}`);
-    } else {
-      clearAsyncState(true);
-      announce(jobKind === "repair" ? "Repair complete" : "Sync complete");
+export async function pollJobStatus(
+  readStatus,
+  observeStatus,
+  wait = delay => new Promise(resolve => window.setTimeout(resolve, delay)),
+  maxFailures = 5,
+) {
+  let consecutiveFailures = 0;
+  for (;;) {
+    await wait(1000);
+    let current;
+    try {
+      current = await readStatus();
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "reopen_dashboard") throw error;
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= maxFailures) throw error;
+      continue;
     }
-    return current;
+    consecutiveFailures = 0;
+    if (await observeStatus(current)) return current;
   }
+}
+
+async function pollRefresh(refreshRef, jobKind, retry) {
+  const current = await pollJobStatus(
+    () => api.syncStatus(refreshRef),
+    async current => {
+      if (jobKind === "repair") {
+        showAsyncState("loading", "Repairing history", refreshProgressDetail(current));
+      } else {
+        showAsyncState("loading", "Syncing evidence", refreshProgressDetail(current));
+      }
+      announceRefresh(current);
+      return TERMINAL_REFRESH.has(current.state);
+    },
+  );
+
+  const reloaded = await reloadAfterRefresh();
+  if (!reloaded) return current;
+  if (current.state === "partial" || current.state === "failed") {
+    const partial = current.state === "partial";
+    const title = jobKind === "repair"
+      ? partial ? "Repair needs another pass" : "Repair history failed"
+      : partial ? "Sync needs another pass" : "Sync failed";
+    const detail = refreshDiagnosticDetail(current);
+    showAsyncState(
+      partial ? "notice" : "error", title, detail, retry,
+      partial ? jobKind === "repair" ? "Repair again" : "Sync again" : "Retry",
+    );
+    routeStatus.textContent = "";
+    announceRefreshOutcome(`${title}. ${detail}`);
+  } else {
+    clearAsyncState(true);
+    announce(jobKind === "repair" ? "Repair complete" : "Sync complete");
+  }
+  return current;
 }
 
 function announceRefreshOutcome(message) {
@@ -512,7 +540,7 @@ function runActiveJob(requestedKind, start) {
   })().catch(error => {
     failed = true;
     const code = error instanceof ApiError ? error.code : "internal_failure";
-    const title = jobKind === "repair" ? "Repair history failed" : "Sync failed";
+    const title = statusUnavailableTitle(jobKind);
     showAsyncState("error", title, errorMessage(code), retry);
     routeStatus.textContent = "";
     announceRefreshOutcome(title);

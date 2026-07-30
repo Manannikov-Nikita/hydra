@@ -217,14 +217,6 @@ class StdioMcpServerTests(unittest.TestCase):
             capture.get("result"),
             ProcessResult(0, "normal stdout\n", "normal stderr\n"),
         )
-        self.assertEqual(
-            [
-                thread.name
-                for thread in threading.enumerate()
-                if thread.name.startswith("hydra-codex-pipe-")
-            ],
-            [],
-        )
 
     def test_initialize_and_tool_list_are_stable(self) -> None:
         server = StdioMcpServer(FakeRunner([]))

@@ -53,6 +53,59 @@ class DurableSyncStateTests(unittest.TestCase):
             self.store.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000,
         )
 
+    def test_project_observation_bumps_revision_only_for_material_catalog_changes(self) -> None:
+        repository = self._repository()
+
+        repository.observe_project(
+            project_id="hprj_current",
+            display_name="hydra",
+            display_name_provenance="repo_basename",
+            observed_at="2026-07-30T10:00:00Z",
+        )
+        inserted_revision = repository.data_revision()
+        self.assertEqual(inserted_revision, 1)
+
+        for observed_at in (
+            "2026-07-30T10:00:00Z",
+            "2026-07-30T09:59:59Z",
+        ):
+            repository.observe_project(
+                project_id="hprj_current",
+                display_name="hydra",
+                display_name_provenance="repo_basename",
+                observed_at=observed_at,
+            )
+        self.assertEqual(repository.data_revision(), inserted_revision)
+
+        repository.observe_project(
+            project_id="hprj_current",
+            display_name="hydra",
+            display_name_provenance="repo_basename",
+            observed_at="2026-07-30T10:00:01Z",
+        )
+        self.assertEqual(repository.data_revision(), inserted_revision + 1)
+
+        repository.observe_project(
+            project_id="hprj_current",
+            display_name="Hydra Core",
+            display_name_provenance="config",
+            observed_at="2026-07-30T10:00:01Z",
+        )
+        self.assertEqual(repository.data_revision(), inserted_revision + 2)
+        row = self.store.connection.execute(
+            """SELECT display_name,display_name_provenance,first_seen_at,last_seen_at
+                 FROM dashboard_projects WHERE project_id='hprj_current'""",
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            (
+                "Hydra Core",
+                "config",
+                "2026-07-30T10:00:00Z",
+                "2026-07-30T10:00:01Z",
+            ),
+        )
+
     def test_schema_46_releases_legacy_dirty_claims_and_requires_a_generation_token(self) -> None:
         legacy = sqlite3.connect(":memory:")
         self.addCleanup(legacy.close)
@@ -1134,6 +1187,58 @@ class DurableSyncStateTests(unittest.TestCase):
                 job_id, state="succeeded", sources_discovered=5, sources_completed=5,
                 bytes_processed=512, updated_at="2026-07-26T00:00:04Z",
             )
+
+    def test_lease_owned_job_floor_and_completion_keep_nanosecond_precision(
+        self,
+    ) -> None:
+        repository = self._repository()
+        job_id = repository.create_job(
+            "backfill",
+            "2026-07-26T00:00:00Z",
+        )
+        owner = "nanosecond-owner"
+        self.assertTrue(repository.acquire_lease(
+            owner,
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:00:02Z",
+        ))
+        newer = "2026-07-26T00:00:01.000000002Z"
+        older = "2026-07-26T00:00:01.000000001Z"
+        repository.update_job(
+            job_id,
+            state="running",
+            sources_discovered=0,
+            sources_completed=0,
+            bytes_processed=0,
+            updated_at=newer,
+        )
+
+        terminal = repository.refresh_job_from_frontier_if_owned(
+            job_id,
+            owner_key=owner,
+            lease_observed_at=older,
+            state="succeeded",
+            updated_at=older,
+            completed_at=older,
+        )
+
+        self.assertIsNotNone(terminal)
+        self.assertEqual(terminal.state, "succeeded")
+        self.assertEqual(terminal.updated_at, newer)
+        self.assertEqual(terminal.completed_at, newer)
+        row = self.store.connection.execute(
+            """SELECT updated_at,completed_at,updated_epoch_ns
+                 FROM sync_jobs WHERE job_id=?""",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(row),
+            (
+                newer,
+                newer,
+                require_exact_timestamp(newer).epoch_nanoseconds,
+            ),
+        )
 
     def test_job_batch_progress_is_additive_across_worker_lease_handoff(self) -> None:
         repository = self._repository()

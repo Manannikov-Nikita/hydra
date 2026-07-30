@@ -365,28 +365,13 @@ class DashboardSyncController:
         assert self._roots is not None
         store, repository = self._repository()
         try:
-            current = repository.get_job(job_id)
-            assert current is not None
-            repository.update_job(
-                job_id, state="running",
-                sources_discovered=current.sources_discovered,
-                sources_completed=current.sources_completed,
-                bytes_processed=current.bytes_processed, updated_at=self._now(),
-            )
+            # Observing a persisted repair must remain read-only until this
+            # process owns its lease. ``run_batch`` atomically acquires that
+            # lease and refreshes the job; writing a newer timestamp here can
+            # invalidate the active owner's still-running batch.
             repair = ResumableRepair(
                 store, self._roots, clock=self._clock,
             )
-            if not repository.list_frontier(job_id):
-                now = self._now()
-                for root_kind in ("sessions", "archived_sessions"):
-                    try:
-                        self._roots.root_for(root_kind)
-                    except Exception:
-                        continue
-                    repository.save_frontier(
-                        job_id=job_id, root_kind=root_kind, directory_locator="@root",
-                        state="pending", discovered_count=0, updated_at=now,
-                    )
             while not self._closed.is_set():
                 now = self._now()
                 result = repair.run_batch(job_id, now)

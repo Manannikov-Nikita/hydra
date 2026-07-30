@@ -390,15 +390,10 @@ class DashboardSyncControllerTests(unittest.TestCase):
             self.assertFalse(repair_reused)
             self.assertNotEqual(sync["sync_ref"], repair["sync_ref"])
             self.assertEqual((sync["kind"], repair["kind"]), ("sync", "repair"))
-            deadline = time.monotonic() + 2
-            while (
-                time.monotonic() < deadline
-                and not self.repository.list_frontier(repair["sync_ref"])
-            ):
-                time.sleep(0.01)
-            self.assertTrue(self.repository.list_frontier(
-                repair["sync_ref"],
-            ))
+            self.assertEqual(
+                self.repository.list_frontier(repair["sync_ref"]),
+                (),
+            )
             self.assertTrue(self.repository.release_lease(
                 "held-before-both", "2026-07-27T10:00:01Z",
             ))
@@ -415,6 +410,9 @@ class DashboardSyncControllerTests(unittest.TestCase):
 
         self.assertIn(sync_terminal["state"], {"succeeded", "partial"})
         self.assertIn(repair_terminal["state"], {"succeeded", "partial"})
+        self.assertTrue(self.repository.list_frontier(
+            repair["sync_ref"],
+        ))
 
     def test_explicit_repair_blocks_sync_before_its_next_lease_attempt(
         self,

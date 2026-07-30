@@ -307,7 +307,9 @@ class DashboardQueryService:
     @staticmethod
     def _display_name(item: CatalogProject, project_ref: str) -> str:
         if item.display_name and is_safe_dashboard_display_name(
-            item.display_name, item.project_id,
+            item.display_name,
+            item.project_id,
+            allow_slug=item.display_name_provenance == "repo_basename",
         ):
             return item.display_name
         return f"Project {project_ref.removeprefix('project_')[:8]}"
@@ -511,13 +513,19 @@ class DashboardQueryService:
         connection: sqlite3.Connection,
         *,
         refresh: DashboardRefreshView,
+        preferred_project_id: str | None = None,
     ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
         """Build launch DTOs from a caller-owned, bounded read-only connection."""
         if not isinstance(connection, sqlite3.Connection):
             raise TypeError("dashboard bootstrap requires a SQLite connection")
+        if preferred_project_id is not None and (
+            not isinstance(preferred_project_id, str) or not preferred_project_id
+        ):
+            raise ValueError("preferred project identity is invalid")
         with _consistent_read(connection):
             return self._materialized_bootstrap_from_connection(
                 connection, refresh=refresh,
+                selected_project_id=preferred_project_id,
             )
 
     @staticmethod
@@ -603,10 +611,13 @@ class DashboardQueryService:
         *,
         refresh: DashboardRefreshView,
         selected_project_ref: str | None = None,
+        selected_project_id: str | None = None,
         selected_task_ref: str | None = None,
         require_materialized: bool = False,
     ) -> tuple[dict[str, DashboardSnapshot], DashboardSnapshot | None]:
         """Serve one warm project plus the full catalog with constant query count."""
+        if selected_project_ref is not None and selected_project_id is not None:
+            raise ValueError("dashboard project selection is ambiguous")
         store = _BootstrapStore(connection)
         revision, sync_freshness = self._materialized_state(connection)
         storage_schema_version = int(
@@ -725,6 +736,11 @@ class DashboardQueryService:
             (item.project_id for item in catalog_items), self._installation_key,
         )
         by_id = {item.project_id: item for item in catalog_items}
+        if selected_project_id is not None:
+            try:
+                selected_project_ref = projection[selected_project_id]
+            except KeyError:
+                raise self._unknown() from None
         for row in rows:
             item = by_id[str(row["project_id"])]
             stats = self._validated_project_stats_row(row)

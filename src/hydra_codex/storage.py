@@ -103,6 +103,10 @@ from .migrations_ad30 import (
     migrate_v50_source_fact_revisions,
     validate_v49_source_fact_revision_shape,
 )
+from .migrations_ae31 import (
+    AE31_MIGRATIONS,
+    AE31_REQUIRED_TRIGGER_SQL,
+)
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -372,7 +376,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS + AD30_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS + AD30_MIGRATIONS + AE31_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -645,7 +649,7 @@ class HydraStore:
             raise
 
     def _validate_current_schema_sentinel(self, latest: int) -> None:
-        """Validate only the exact v50 compatibility boundary."""
+        """Validate only the exact current compatibility boundary."""
         versions = [
             int(row[0])
             for row in self.connection.execute(
@@ -766,6 +770,21 @@ class HydraStore:
             raise StorageUnavailable(
                 "Hydra schema has altered source-fact revision trigger inventory"
             )
+        all_triggers = {
+            name: sql
+            for object_type, name, _table, sql in objects
+            if object_type == "trigger" and sql is not None
+        }
+        for name, statement in AE31_REQUIRED_TRIGGER_SQL.items():
+            if (
+                name not in all_triggers
+                or _normalized_schema_sql(all_triggers[name])
+                != _normalized_schema_sql(statement)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered repair-frontier "
+                    f"fencing trigger: {name}"
+                )
 
         fallback = self.connection.execute(
             """SELECT singleton,revision,typeof(revision)
@@ -1367,6 +1386,17 @@ class HydraStore:
             ):
                 raise StorageUnavailable(
                     "Hydra schema has missing or altered dirty-claim "
+                    f"fencing trigger: {name}"
+                )
+        for name, expected_sql in AE31_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered repair-frontier "
                     f"fencing trigger: {name}"
                 )
         for name, expected_sql in AD30_REQUIRED_TRIGGER_SQL.items():

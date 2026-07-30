@@ -16,6 +16,7 @@ import webbrowser
 from .dashboard_model import DashboardRefreshView, DashboardSnapshot
 from .dashboard_queries import (
     DashboardQueryService,
+    observe_resolved_project,
 )
 from .dashboard_refresh import (
     DashboardSnapshotCache,
@@ -27,7 +28,7 @@ from .dashboard_sync import DashboardSyncController
 from .incremental_sync import TrustedSourceRoots
 from .diagnostics import DoctorCheck, DoctorReport
 from .exact_time import public_timestamp
-from .project import resolve_project
+from .project import ProjectResolution, resolve_project
 from .rollout_identity import Pseudonymizer, RolloutRoot
 from .services import configured_database_path, configured_installation_key_path
 from .platform_paths import default_database_path
@@ -198,6 +199,36 @@ def _unavailable_snapshot(
     )
 
 
+def _observe_launch_project(
+    *,
+    store_factory: Callable[[], HydraStore],
+    query: DashboardQueryService,
+    cache: DashboardSnapshotCache,
+    resolution: ProjectResolution,
+    observed_at: str,
+) -> None:
+    """Best-effort post-bind catalog observation and atomic cache publication."""
+    try:
+        store = store_factory()
+    except Exception:
+        return
+    try:
+        observe_resolved_project(store, resolution, observed_at)
+        snapshots, _fallback = query.bootstrap_snapshots_from_connection(
+            store.connection,
+            refresh=_idle_refresh(),
+            preferred_project_id=resolution.project_id,
+        )
+        cache.replace_all(snapshots)
+    except Exception:
+        return
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
+
+
 def run_dashboard(
     *,
     port: int,
@@ -222,6 +253,10 @@ def run_dashboard(
     )
     store_factory = store_provider.open
     bootstrap_connection, database_state = _bootstrap_database(actual_database)
+    try:
+        launch_project = resolve_project(cwd)
+    except Exception:
+        launch_project = None
     doctor = _bootstrap_doctor(
         cwd=cwd, database_path=actual_database, database_state=database_state,
     )
@@ -273,6 +308,14 @@ def run_dashboard(
     server = None
     try:
         server = create_dashboard_server(port=port, application=application)
+        if database_state == "current" and launch_project is not None:
+            _observe_launch_project(
+                store_factory=store_factory,
+                query=query,
+                cache=cache,
+                resolution=launch_project,
+                observed_at=public_timestamp(now()),
+            )
         host, actual_port = server.server_address
         authority = f"http://{host}:{actual_port}/"
         handoff = f"{authority}#token={token}"

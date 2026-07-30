@@ -531,7 +531,7 @@ class SyncStateRepository:
         if (display_name is None) != (display_name_provenance is None):
             raise ValueError("project display name provenance is inconsistent")
         with self._store.rollout_transaction() as connection:
-            connection.execute(
+            changed = connection.execute(
                 """INSERT INTO dashboard_projects(
                        project_id,display_name,first_seen_at,last_seen_at,
                        display_name_provenance)
@@ -547,12 +547,35 @@ class SyncStateRepository:
                              excluded.display_name_provenance
                          )
                      END,
-                     last_seen_at=MAX(last_seen_at,excluded.last_seen_at)""",
+                     last_seen_at=MAX(last_seen_at,excluded.last_seen_at)
+                   WHERE dashboard_projects.display_name IS NOT
+                         CASE WHEN excluded.display_name_provenance='config'
+                           THEN excluded.display_name
+                           ELSE COALESCE(
+                               dashboard_projects.display_name,
+                               excluded.display_name
+                           )
+                         END
+                      OR dashboard_projects.display_name_provenance IS NOT
+                         CASE WHEN excluded.display_name_provenance='config'
+                           THEN 'config'
+                           ELSE COALESCE(
+                               dashboard_projects.display_name_provenance,
+                               excluded.display_name_provenance
+                           )
+                         END
+                      OR dashboard_projects.last_seen_at IS NOT
+                         MAX(
+                             dashboard_projects.last_seen_at,
+                             excluded.last_seen_at
+                         )""",
                 (
                     project_id, display_name, observed_at, observed_at,
                     display_name_provenance,
                 ),
             )
+            if changed.rowcount == 1:
+                self._bump_revision(connection, observed_at)
 
     def list_queue(self, limit: int = 100) -> tuple[QueueItem, ...]:
         if not 1 <= limit <= 1000:
@@ -1639,6 +1662,26 @@ class SyncStateRepository:
             completed, processed, current.created_at, updated_at, completed_at,
         )
 
+    @staticmethod
+    def _lease_owned_job_timestamp(
+        connection,
+        job_id: str,
+        requested_at: str,
+    ) -> str:
+        """Floor an owner's write at the newest durable observer timestamp."""
+        row = connection.execute(
+            "SELECT updated_at FROM sync_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError("sync job is unknown")
+        current = _timestamp(str(row[0]))
+        return (
+            current
+            if _epoch_nanoseconds(current) > _epoch_nanoseconds(requested_at)
+            else requested_at
+        )
+
     def refresh_job_from_frontier_if_owned(
         self, job_id: str, *, owner_key: str, lease_observed_at: str,
         state: str, updated_at: str, completed_at: str | None = None,
@@ -1646,17 +1689,82 @@ class SyncStateRepository:
         """Refresh repair progress and state under the same live-lease write."""
         lease_observed_at = _timestamp(lease_observed_at)
         updated_at = _timestamp(updated_at)
+        completed_at = (
+            None if completed_at is None else _timestamp(completed_at)
+        )
         with self._store.rollout_transaction() as connection:
             if not self._lease_owned_in(
                 connection, owner_key, lease_observed_at,
             ):
                 return None
-            result = self._refresh_job_from_frontier(
-                connection, job_id, updated_at, state=state,
-                completed_at=completed_at,
+            effective_state = state
+            effective_completed_at = completed_at
+            if (
+                state in {"succeeded", "partial"}
+                and connection.execute(
+                    """SELECT 1 FROM sync_backfill_frontier
+                        WHERE job_id=? AND state='pending' LIMIT 1""",
+                    (job_id,),
+                ).fetchone()
+                is not None
+            ):
+                # This read and the terminal job update share BEGIN IMMEDIATE.
+                # A pre-v51 writer either lands before us and keeps the job
+                # running, or waits until commit and is ignored by the terminal
+                # frontier trigger.
+                effective_state = "running"
+                effective_completed_at = None
+            effective_updated_at = self._lease_owned_job_timestamp(
+                connection,
+                job_id,
+                updated_at,
             )
-            self._bump_revision(connection, updated_at)
+            if (
+                effective_completed_at is not None
+                and _epoch_nanoseconds(effective_completed_at)
+                < _epoch_nanoseconds(effective_updated_at)
+            ):
+                effective_completed_at = effective_updated_at
+            result = self._refresh_job_from_frontier(
+                connection,
+                job_id,
+                effective_updated_at,
+                state=effective_state,
+                completed_at=effective_completed_at,
+            )
+            self._bump_revision(connection, effective_updated_at)
             return result
+
+    def ensure_root_frontier_if_owned(
+        self, *, job_id: str, root_kind: str, updated_at: str,
+        owner_key: str, lease_observed_at: str,
+    ) -> bool:
+        """Insert one missing root sentinel iff the caller owns the live lease."""
+        updated_at = _timestamp(updated_at)
+        lease_observed_at = _timestamp(lease_observed_at)
+        root = self._validate_root(root_kind)
+        with self._store.rollout_transaction() as connection:
+            if not self._lease_owned_in(
+                connection, owner_key, lease_observed_at,
+            ):
+                return False
+            effective_updated_at = self._lease_owned_job_timestamp(
+                connection,
+                job_id,
+                updated_at,
+            )
+            inserted = connection.execute(
+                """INSERT INTO sync_backfill_frontier(
+                       job_id,root_kind,directory_locator,state,
+                       discovered_count,updated_at)
+                   VALUES (?,?,'@root','pending',0,?)
+                   ON CONFLICT(job_id,root_kind,directory_locator)
+                   DO NOTHING""",
+                (job_id, root, effective_updated_at),
+            ).rowcount
+            if inserted:
+                self._bump_revision(connection, effective_updated_at)
+            return True
 
     def save_frontier(self, *, job_id: str, root_kind: str, directory_locator: str, state: str,
                       discovered_count: int, updated_at: str) -> int:
@@ -1698,6 +1806,11 @@ class SyncStateRepository:
                 connection, owner_key, lease_observed_at,
             ):
                 return False
+            effective_updated_at = self._lease_owned_job_timestamp(
+                connection,
+                job_id,
+                updated_at,
+            )
             connection.execute(
                 """INSERT INTO sync_backfill_frontier(
                        job_id,root_kind,directory_locator,state,
@@ -1707,12 +1820,21 @@ class SyncStateRepository:
                      state=excluded.state,
                      discovered_count=excluded.discovered_count,
                      updated_at=excluded.updated_at""",
-                (job_id, root, locator, state, discovered_count, updated_at),
+                (
+                    job_id,
+                    root,
+                    locator,
+                    state,
+                    discovered_count,
+                    effective_updated_at,
+                ),
             )
             self._refresh_job_from_frontier(
-                connection, job_id, updated_at,
+                connection,
+                job_id,
+                effective_updated_at,
             )
-            self._bump_revision(connection, updated_at)
+            self._bump_revision(connection, effective_updated_at)
             return True
 
     def list_frontier(self, job_id: str, state: str | None = None) -> tuple[BackfillFrontier, ...]:

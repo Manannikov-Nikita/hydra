@@ -77,6 +77,11 @@ class DashboardSnapshotCache:
         with self._lock:
             return tuple(self._snapshots)
 
+    def replace_all(self, snapshots: Mapping[str, DashboardSnapshot]) -> None:
+        """Atomically publish one fully rebuilt launch or refresh cache."""
+        with self._lock:
+            self._publish_locked(snapshots, True)
+
     def _publish_locked(
         self, snapshots: Mapping[str, DashboardSnapshot], replace_all: bool,
     ) -> None:

@@ -17,6 +17,8 @@ from hydra_codex.dashboard_launch import (
 from hydra_codex.dashboard_refresh import RefreshController
 from hydra_codex.dashboard_queries import DashboardQueryService
 from hydra_codex.dashboard_server import DashboardRequest
+from hydra_codex.public_refs import project_catalog_references
+from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.storage import HydraStore
 
 
@@ -224,6 +226,136 @@ class DashboardDistributionTests(unittest.TestCase):
 
             self.assertEqual((server.served, server.closed), (1, 1))
 
+    def test_launch_observes_basename_and_defaults_to_the_cwd_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project_root = root / "hydra-fixture"
+            config = project_root / ".hydra" / "project.toml"
+            config.parent.mkdir(parents=True)
+            current_project_id = "hprj_4db8fca38ef042f3"
+            config.write_text(
+                f'project_id = "{current_project_id}"\n',
+                encoding="utf-8",
+            )
+            database = root / "hydra.sqlite3"
+            key_path = root / "rollout-hmac.key"
+            key = Pseudonymizer.installation_key(key_path).key
+            other_project_id = ""
+            current_ref = ""
+            other_ref = ""
+            for index in range(1000):
+                candidate = f"hprj_other_{index:04d}"
+                projection = project_catalog_references(
+                    (current_project_id, candidate), key,
+                )
+                if projection[candidate] < projection[current_project_id]:
+                    other_project_id = candidate
+                    current_ref = projection[current_project_id]
+                    other_ref = projection[candidate]
+                    break
+            self.assertTrue(other_project_id)
+            self.assertLess(other_ref, current_ref)
+
+            store = HydraStore(database)
+            try:
+                store.connection.executemany(
+                    """INSERT INTO dashboard_projects(
+                           project_id,display_name,first_seen_at,last_seen_at,
+                           display_name_provenance)
+                       VALUES (?,?,?,?,?)""",
+                    (
+                        (
+                            current_project_id, None,
+                            "2026-07-29T00:00:00Z",
+                            "2026-07-29T01:00:00Z",
+                            None,
+                        ),
+                        (
+                            other_project_id, "Other Project",
+                            "2026-07-29T00:00:00Z",
+                            "2026-07-29T01:00:00Z",
+                            "config",
+                        ),
+                    ),
+                )
+                store.connection.commit()
+            finally:
+                store.close()
+
+            captured: dict[str, object] = {}
+
+            class ProbeServer(FakeServer):
+                def serve_forever(self) -> None:
+                    self.served += 1
+                    application = captured["application"].bound_to(
+                        "127.0.0.1:43125",
+                    )
+                    response = application.handle(DashboardRequest(
+                        "GET",
+                        "/api/v1/snapshot",
+                        (
+                            ("Host", "127.0.0.1:43125"),
+                            ("Authorization", f"Bearer {TOKEN}"),
+                        ),
+                    ))
+                    captured["response"] = response
+                    raise KeyboardInterrupt
+
+            server = ProbeServer()
+
+            def create(**kwargs):
+                application = kwargs["application"]
+                application._sync_controller = None
+                captured["application"] = application
+                return server
+
+            with patch(
+                "hydra_codex.dashboard_launch.secrets.token_urlsafe",
+                return_value=TOKEN,
+            ), patch(
+                "hydra_codex.dashboard_launch.create_dashboard_server",
+                side_effect=create,
+            ):
+                run_dashboard(
+                    port=0,
+                    no_open=True,
+                    database_path=database,
+                    environ={"HOME": str(root)},
+                    installation_key_path=key_path,
+                    cwd=project_root,
+                    stdout=io.StringIO(),
+                )
+
+            response = captured["response"]
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.body)
+            self.assertEqual(payload["selected_project_ref"], current_ref)
+            self.assertEqual(payload["project"]["display_name"], "hydra-fixture")
+            self.assertEqual(payload["data_revision"], 1)
+            serialized = json.dumps(payload, sort_keys=True)
+            for private in (
+                current_project_id,
+                other_project_id,
+                str(root),
+                str(project_root),
+            ):
+                self.assertNotIn(private, serialized)
+            reopened = HydraStore.open_current(database)
+            try:
+                row = reopened.connection.execute(
+                    """SELECT display_name,display_name_provenance
+                         FROM dashboard_projects WHERE project_id=?""",
+                    (current_project_id,),
+                ).fetchone()
+                revision = reopened.connection.execute(
+                    "SELECT revision FROM sync_data_revision WHERE singleton=1",
+                ).fetchone()[0]
+            finally:
+                reopened.close()
+            self.assertEqual(tuple(row), ("hydra-fixture", "repo_basename"))
+            self.assertEqual(revision, 1)
+            self.assertEqual((server.served, server.closed), (1, 1))
+
     def test_corrupt_database_still_serves_truthful_unavailable_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -262,6 +394,7 @@ class DashboardDistributionTests(unittest.TestCase):
             self.assertEqual(response.status, 503)
             payload = json.loads(response.body)
             self.assertEqual(payload["error"]["code"], "storage_unavailable")
+            self.assertEqual(database.read_bytes(), b"not a sqlite database")
 
     def test_bootstrap_metadata_failure_is_categorical_storage_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

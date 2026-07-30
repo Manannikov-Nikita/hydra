@@ -79,6 +79,14 @@ def _has_public_title_grammar(value: str) -> bool:
     return all(_is_public_title_token(token) for token in value.split())
 
 
+def _has_public_slug_grammar(value: str) -> bool:
+    """Allow a trusted repository basename without accepting path syntax."""
+    return bool(value) and all(
+        character.isalnum() or character in _TITLE_TOKEN_PUNCTUATION
+        for character in value
+    )
+
+
 def _contains_opaque_long_token(value: str) -> bool:
     if _HEX_IDENTIFIER_FRAGMENT.search(value) is not None:
         return True
@@ -96,7 +104,12 @@ def _redaction_probe(value: str) -> str:
     )
 
 
-def is_safe_dashboard_display_name(value: object, private_project_id: str) -> bool:
+def is_safe_dashboard_display_name(
+    value: object,
+    private_project_id: str,
+    *,
+    allow_slug: bool = False,
+) -> bool:
     """Validate the one trusted browser text field against private fragments."""
     try:
         normalized = normalize_project_display_name(value)
@@ -107,7 +120,10 @@ def is_safe_dashboard_display_name(value: object, private_project_id: str) -> bo
         or normalized != value
         or not isinstance(private_project_id, str)
         or not private_project_id
-        or not _has_public_title_grammar(value)
+        or not (
+            _has_public_title_grammar(value)
+            or allow_slug and _has_public_slug_grammar(value)
+        )
         or redact_note(_redaction_probe(value)) != _redaction_probe(value)
         or _contains_opaque_long_token(value)
         or re.search(

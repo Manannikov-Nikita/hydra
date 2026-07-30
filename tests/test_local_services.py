@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import io
 import json
@@ -456,6 +457,118 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
         self.assertEqual(states, {"repair": "queued", "sync": "running"})
+
+    def test_dashboard_resume_does_not_invalidate_an_active_cli_repair_batch(
+        self,
+    ) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+        from hydra_codex.incremental_sync import (
+            RepairRun,
+            ResumableRepair,
+            TrustedSourceRoots,
+        )
+
+        sessions = self.root / ".codex" / "sessions"
+        archived = self.root / ".codex" / "archived_sessions"
+        (sessions / "slow-batch").mkdir(parents=True)
+        archived.mkdir(parents=True)
+        cli_now = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+        dashboard_now = datetime(2026, 7, 21, 0, 0, 1, tzinfo=timezone.utc)
+        dashboard_jobs: list[str] = []
+        original_directory = ResumableRepair._directory
+        original_run_batch = ResumableRepair.run_batch
+
+        def dashboard_clock() -> datetime:
+            return dashboard_now
+
+        def run_dashboard_inline(
+            controller: DashboardSyncController,
+            kind: str,
+            job_id: str,
+        ) -> bool:
+            controller._run(kind, job_id)
+            return True
+
+        @contextmanager
+        def activate_dashboard_during_cli_directory(
+            repair: ResumableRepair,
+            root_kind: str,
+            locator: str,
+        ):
+            with original_directory(repair, root_kind, locator) as directory:
+                if not dashboard_jobs:
+                    controller = DashboardSyncController(
+                        store_factory=lambda: HydraStore(self.database),
+                        roots=TrustedSourceRoots(
+                            sessions=sessions,
+                            archived_sessions=archived,
+                        ),
+                        installation_key=b"k" * 32,
+                        clock=dashboard_clock,
+                    )
+                    controller.close()
+                yield directory
+
+        def observe_dashboard_batch(
+            repair: ResumableRepair,
+            job_id: str,
+            observed_at: str,
+            *,
+            directory_limit: int = 100,
+        ):
+            if repair.clock is dashboard_clock:
+                dashboard_jobs.append(job_id)
+                lease = repair.store.connection.execute(
+                    """SELECT owner_key FROM sync_worker_leases
+                        WHERE lease_name='ingest'"""
+                ).fetchone()
+                self.assertIsNotNone(lease)
+                self.assertTrue(str(lease[0]).startswith("repair-"))
+                return RepairRun(
+                    0, 0, True, lease_acquired=False,
+                )
+            return original_run_batch(
+                repair,
+                job_id,
+                observed_at,
+                directory_limit=directory_limit,
+            )
+
+        service = LocalCommandServices(
+            environ=self.environ,
+            clock=lambda: cli_now,
+        )
+        with (
+            mock.patch.object(
+                ResumableRepair,
+                "_directory",
+                new=activate_dashboard_during_cli_directory,
+            ),
+            mock.patch.object(
+                ResumableRepair,
+                "run_batch",
+                new=observe_dashboard_batch,
+            ),
+            mock.patch.object(
+                DashboardSyncController,
+                "_ensure_thread",
+                new=run_dashboard_inline,
+            ),
+        ):
+            result = service.repair(
+                self.database,
+                self.project,
+            )
+
+        self.assertEqual(len(dashboard_jobs), 1)
+        self.assertEqual(result["status"], "complete")
+        store = HydraStore(self.database)
+        try:
+            jobs = SyncStateRepository(store).list_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].state, "succeeded")
+        finally:
+            store.close()
 
     def test_sync_freshness_prioritizes_any_repair_required_source_over_queue_order(self) -> None:
         store = HydraStore(self.database)

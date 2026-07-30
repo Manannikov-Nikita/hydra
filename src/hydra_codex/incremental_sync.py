@@ -1266,22 +1266,9 @@ class ResumableRepair:
         """Start or resume the explicit full-history path, never normal sync."""
         if job_kind not in {"backfill", "repair"}:
             raise ValueError("backfill job kind is invalid")
-        job_id, reused = self.repository.get_or_create_active_job(
+        job_id, _reused = self.repository.get_or_create_active_job(
             job_kind, observed_at,
         )
-        job = self.repository.get_job(job_id)
-        assert job is not None
-        if reused:
-            return job_id
-        for root_kind in ("sessions", "archived_sessions"):
-            try:
-                self.roots.root_for(root_kind)
-            except RepairRequired:
-                continue
-            self.repository.save_frontier(
-                job_id=job_id, root_kind=root_kind, directory_locator=self._ROOT_MARKER,
-                state="pending", discovered_count=0, updated_at=observed_at,
-            )
         return job_id
 
     def start(self, observed_at: str) -> str:
@@ -1448,13 +1435,33 @@ class ResumableRepair:
             owner, lease_observed_at, expiry,
         ):
             return RepairRun(0, 0, False, lease_acquired=False)
+        job = self.repository.get_job(job_id)
+        if job is None:
+            self.repository.release_lease(owner, lease_observed_at)
+            raise KeyError("repair job is unknown")
         if job.state in {"succeeded", "partial", "failed"}:
             self.repository.release_lease(owner, lease_observed_at)
             return RepairRun(0, 0, True)
-        pending = self.repository.resume_frontier(job_id)[:directory_limit]
         discovered = directories = 0
         lease_lost = False
         try:
+            for root_kind in ("sessions", "archived_sessions"):
+                try:
+                    self.roots.root_for(root_kind)
+                except RepairRequired:
+                    continue
+                if not self.repository.ensure_root_frontier_if_owned(
+                    job_id=job_id,
+                    root_kind=root_kind,
+                    updated_at=observed_at,
+                    owner_key=owner,
+                    lease_observed_at=lease_observed_at,
+                ):
+                    lease_lost = True
+                    break
+            if lease_lost:
+                return RepairRun(discovered, directories, False)
+            pending = self.repository.resume_frontier(job_id)[:directory_limit]
             started = self.repository.refresh_job_from_frontier_if_owned(
                 job_id, owner_key=owner,
                 lease_observed_at=lease_observed_at, state="running",
@@ -1670,7 +1677,11 @@ class ResumableRepair:
             )
             if persisted is None:
                 return RepairRun(discovered, directories, False)
-            return RepairRun(discovered, directories, finished)
+            return RepairRun(
+                discovered,
+                directories,
+                persisted.state in {"succeeded", "partial"},
+            )
         finally:
             released_at, _ = self._lease_window()
             self.repository.release_lease(owner, released_at)

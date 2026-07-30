@@ -1808,6 +1808,15 @@ class IncrementalWorkerTests(unittest.TestCase):
             directory_locator="@file/rollout.jsonl", state="pending",
             discovered_count=1, updated_at="2026-07-26T00:00:00Z",
         )
+        for root_kind in ("sessions", "archived_sessions"):
+            self.repository.save_frontier(
+                job_id=job_id,
+                root_kind=root_kind,
+                directory_locator="@root",
+                state="scanned",
+                discovered_count=0,
+                updated_at="2026-07-26T00:00:00Z",
+            )
         self.repository.update_job(
             job_id, state="running", sources_discovered=1,
             sources_completed=0, bytes_processed=0,
@@ -1849,6 +1858,15 @@ class IncrementalWorkerTests(unittest.TestCase):
                 job_id=job_id, root_kind="sessions",
                 directory_locator=locator, state="pending",
                 discovered_count=1, updated_at="2026-07-26T00:00:00Z",
+            )
+        for root_kind in ("sessions", "archived_sessions"):
+            self.repository.save_frontier(
+                job_id=job_id,
+                root_kind=root_kind,
+                directory_locator="@root",
+                state="scanned",
+                discovered_count=0,
+                updated_at="2026-07-26T00:00:00Z",
             )
         self.repository.update_job(
             job_id, state="running", sources_discovered=2,
@@ -2143,6 +2161,14 @@ class IncrementalWorkerTests(unittest.TestCase):
             "hprj_slow", "hprj_slow", "project", observed_at,
         )
         job_id = self.repository.create_job("backfill", observed_at)
+        self.repository.save_frontier(
+            job_id=job_id,
+            root_kind="sessions",
+            directory_locator="@root",
+            state="scanned",
+            discovered_count=0,
+            updated_at=observed_at,
+        )
         repair = ResumableRepair(
             self.store,
             TrustedSourceRoots(
@@ -2257,6 +2283,410 @@ class IncrementalWorkerTests(unittest.TestCase):
         self.assertFalse(contender.completed)
         self.assertEqual(expansions, ["@root"])
         self.assertEqual(len(first_result), 1)
+
+    def test_two_resumers_initialize_an_empty_frontier_once_under_the_lease(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            ResumableRepair,
+            TrustedSourceRoots,
+        )
+
+        archive = Path(self.temporary.name) / "resumer-archive"
+        archive.mkdir()
+        roots = TrustedSourceRoots(
+            sessions=self.root,
+            archived_sessions=archive,
+        )
+        first = ResumableRepair(self.store, roots)
+        second_store = HydraStore(self.database)
+        self.addCleanup(second_store.close)
+        second = ResumableRepair(second_store, roots)
+        expansions: list[tuple[str, str, str]] = []
+        contender_results: list[object] = []
+        first_directory = first._directory
+        second_directory = second._directory
+
+        def first_with_contender(root_kind: str, locator: str):
+            expansions.append(("first", root_kind, locator))
+            contender_results.append(second.run_batch(
+                job_id,
+                "2026-07-26T00:00:01Z",
+                directory_limit=1,
+            ))
+            return first_directory(root_kind, locator)
+
+        def second_after_handoff(root_kind: str, locator: str):
+            expansions.append(("second", root_kind, locator))
+            return second_directory(root_kind, locator)
+
+        with mock.patch.object(
+            SyncStateRepository,
+            "save_frontier",
+            side_effect=AssertionError(
+                "frontier initialization must require the worker lease",
+            ),
+        ):
+            job_id = first.start_backfill("2026-07-26T00:00:00Z")
+            self.assertEqual(self.repository.list_frontier(job_id), ())
+            with mock.patch.object(
+                first,
+                "_directory",
+                side_effect=first_with_contender,
+            ):
+                first_result = first.run_batch(
+                    job_id,
+                    "2026-07-26T00:00:01Z",
+                    directory_limit=1,
+                )
+            with mock.patch.object(
+                second,
+                "_directory",
+                side_effect=second_after_handoff,
+            ):
+                second_result = second.run_batch(
+                    job_id,
+                    "2026-07-26T00:00:02Z",
+                    directory_limit=1,
+                )
+
+        self.assertFalse(first_result.completed)
+        self.assertFalse(second_result.completed)
+        self.assertEqual(len(contender_results), 1)
+        self.assertFalse(contender_results[0].lease_acquired)
+        self.assertEqual(
+            expansions,
+            [
+                ("first", "archived_sessions", "@root"),
+                ("second", "sessions", "@root"),
+            ],
+        )
+        root_states = {
+            (frontier.root_kind, frontier.directory_locator): frontier.state
+            for frontier in self.repository.list_frontier(job_id)
+            if frontier.directory_locator == "@root"
+        }
+        self.assertEqual(root_states, {
+            ("archived_sessions", "@root"): "scanned",
+            ("sessions", "@root"): "scanned",
+        })
+
+    def test_partial_root_seed_resume_discovers_archive_before_success(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            ResumableRepair,
+            TrustedSourceRoots,
+        )
+
+        self.path.unlink()
+        archive = Path(self.temporary.name) / "archived-only-root"
+        archive.mkdir()
+        project = Path(self.temporary.name) / "archive-project"
+        (project / ".hydra").mkdir(parents=True)
+        (project / ".hydra" / "project.toml").write_text(
+            'project_id = "hprj_archive_resume"\ntelemetry = "hybrid"\n',
+            encoding="utf-8",
+        )
+        archived_source = archive / "archive-only.jsonl"
+        archived_source.write_text(
+            '{"type":"session_meta","payload":{"id":"archive-only",'
+            '"session_id":"archive-only",'
+            f'"cwd":"{project}"}}}}\n',
+            encoding="utf-8",
+        )
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=archive,
+            ),
+        )
+        job_id = repair.start_backfill("2026-07-26T00:00:00Z")
+        # Exact crash image: the first owner persisted only the sessions
+        # sentinel and died before creating the archive sentinel.
+        self.repository.save_frontier(
+            job_id=job_id,
+            root_kind="sessions",
+            directory_locator="@root",
+            state="pending",
+            discovered_count=0,
+            updated_at="2026-07-26T00:00:00Z",
+        )
+
+        first = repair.run_batch(
+            job_id,
+            "2026-07-26T00:00:01Z",
+            directory_limit=1,
+        )
+
+        self.assertFalse(first.completed)
+        self.assertEqual(self.repository.get_job(job_id).state, "running")
+        archive_root = self.store.connection.execute(
+            """SELECT state FROM sync_backfill_frontier
+                WHERE job_id=? AND root_kind='archived_sessions'
+                  AND directory_locator='@root'""",
+            (job_id,),
+        ).fetchone()
+        self.assertIsNotNone(archive_root)
+        self.assertEqual(archive_root[0], "pending")
+
+        second = repair.run_batch(
+            job_id,
+            "2026-07-26T00:00:02Z",
+            directory_limit=1,
+        )
+        self.assertFalse(second.completed)
+        self.assertEqual(second.discovered, 1)
+        self.assertEqual(
+            self.repository.get_job(job_id).sources_discovered,
+            1,
+        )
+
+        third = repair.run_batch(
+            job_id,
+            "2026-07-26T00:00:03Z",
+            directory_limit=1,
+        )
+        self.assertTrue(third.completed)
+        self.assertEqual(self.repository.get_job(job_id).state, "succeeded")
+        source = self.repository.source_for(
+            "archived_sessions",
+            "archive-only.jsonl",
+        )
+        self.assertIsNotNone(source)
+        self.assertEqual(source.source_state, "ready")
+
+    def test_terminal_handoff_after_initial_read_is_observed_under_the_lease(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            ResumableRepair,
+            TrustedSourceRoots,
+        )
+
+        job_id = self.repository.create_job(
+            "backfill",
+            "2026-07-26T00:00:00Z",
+        )
+        self.repository.save_frontier(
+            job_id=job_id,
+            root_kind="sessions",
+            directory_locator="@root",
+            state="scanned",
+            discovered_count=0,
+            updated_at="2026-07-26T00:00:00Z",
+        )
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+        )
+        external = HydraStore(self.database)
+        self.addCleanup(external.close)
+        external_repository = SyncStateRepository(external)
+        acquire = repair.repository.acquire_lease
+        handed_off = False
+
+        def finish_then_handoff(
+            owner_key: str,
+            observed_at: str,
+            expires_at: str,
+        ) -> bool:
+            nonlocal handed_off
+            if not handed_off:
+                handed_off = True
+                self.assertTrue(external_repository.acquire_lease(
+                    "terminal-owner",
+                    observed_at,
+                    expires_at,
+                ))
+                terminal = external_repository.refresh_job_from_frontier_if_owned(
+                    job_id,
+                    owner_key="terminal-owner",
+                    lease_observed_at=observed_at,
+                    state="succeeded",
+                    updated_at=observed_at,
+                    completed_at=observed_at,
+                )
+                self.assertIsNotNone(terminal)
+                self.assertTrue(external_repository.release_lease(
+                    "terminal-owner",
+                    observed_at,
+                ))
+            return acquire(owner_key, observed_at, expires_at)
+
+        with mock.patch.object(
+            repair.repository,
+            "acquire_lease",
+            side_effect=finish_then_handoff,
+        ):
+            result = repair.run_batch(
+                job_id,
+                "2026-07-26T00:00:01Z",
+                directory_limit=1,
+            )
+
+        self.assertTrue(result.completed)
+        self.assertTrue(handed_off)
+        self.assertEqual(self.repository.get_job(job_id).state, "succeeded")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM sync_worker_leases",
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_pending_insert_before_terminal_refresh_keeps_job_running(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            ResumableRepair,
+            TrustedSourceRoots,
+        )
+
+        archive = Path(self.temporary.name) / "finalize-race-archive"
+        archive.mkdir()
+        job_id = self.repository.create_job(
+            "backfill",
+            "2026-07-26T00:00:00Z",
+        )
+        for root_kind in ("sessions", "archived_sessions"):
+            self.repository.save_frontier(
+                job_id=job_id,
+                root_kind=root_kind,
+                directory_locator="@root",
+                state="scanned",
+                discovered_count=0,
+                updated_at="2026-07-26T00:00:00Z",
+            )
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=archive,
+            ),
+        )
+        legacy_store = HydraStore(self.database)
+        self.addCleanup(legacy_store.close)
+        legacy = SyncStateRepository(legacy_store)
+        refresh = repair.repository.refresh_job_from_frontier_if_owned
+        inserted = False
+
+        def insert_pending_before_terminal(*args, **kwargs):
+            nonlocal inserted
+            if (
+                not inserted
+                and kwargs.get("state") in {"succeeded", "partial"}
+            ):
+                inserted = True
+                legacy.save_frontier(
+                    job_id=job_id,
+                    root_kind="sessions",
+                    directory_locator="@file/late.jsonl",
+                    state="pending",
+                    discovered_count=1,
+                    updated_at="2026-07-26T00:00:01Z",
+                )
+            return refresh(*args, **kwargs)
+
+        with mock.patch.object(
+            repair.repository,
+            "refresh_job_from_frontier_if_owned",
+            side_effect=insert_pending_before_terminal,
+        ):
+            result = repair.run_batch(
+                job_id,
+                "2026-07-26T00:00:01Z",
+                directory_limit=1,
+            )
+
+        self.assertTrue(inserted)
+        self.assertFalse(result.completed)
+        self.assertEqual(self.repository.get_job(job_id).state, "running")
+        self.assertEqual(
+            [
+                frontier.directory_locator
+                for frontier in self.repository.resume_frontier(job_id)
+            ],
+            ["@file/late.jsonl"],
+        )
+
+    def test_lease_owner_tolerates_newer_unowned_observer_timestamp(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            ResumableRepair,
+            TrustedSourceRoots,
+        )
+
+        self.path.unlink()
+        archive = Path(self.temporary.name) / "observer-archive"
+        archive.mkdir()
+        job_id = self.repository.create_job(
+            "backfill",
+            "2026-07-26T00:00:00Z",
+        )
+        for root_kind, state in (
+            ("sessions", "pending"),
+            ("archived_sessions", "scanned"),
+        ):
+            self.repository.save_frontier(
+                job_id=job_id,
+                root_kind=root_kind,
+                directory_locator="@root",
+                state=state,
+                discovered_count=0,
+                updated_at="2026-07-26T00:00:00Z",
+            )
+        repair = ResumableRepair(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=archive,
+            ),
+        )
+        external = HydraStore(self.database)
+        self.addCleanup(external.close)
+        external_repository = SyncStateRepository(external)
+        directory = repair._directory
+        observed = False
+
+        def observe_with_newer_timestamp(root_kind: str, locator: str):
+            nonlocal observed
+            if not observed:
+                observed = True
+                current = external_repository.get_job(job_id)
+                self.assertIsNotNone(current)
+                external_repository.update_job(
+                    job_id,
+                    state="running",
+                    sources_discovered=current.sources_discovered,
+                    sources_completed=current.sources_completed,
+                    bytes_processed=current.bytes_processed,
+                    updated_at="2026-07-26T00:00:02Z",
+                )
+            return directory(root_kind, locator)
+
+        with mock.patch.object(
+            repair,
+            "_directory",
+            side_effect=observe_with_newer_timestamp,
+        ):
+            result = repair.run_batch(
+                job_id,
+                "2026-07-26T00:00:01Z",
+                directory_limit=1,
+            )
+
+        self.assertTrue(observed)
+        self.assertTrue(result.completed)
+        job = self.repository.get_job(job_id)
+        self.assertEqual(job.state, "succeeded")
+        self.assertEqual(job.updated_at, "2026-07-26T00:00:02Z")
+        self.assertEqual(job.completed_at, "2026-07-26T00:00:02Z")
 
     def test_backfill_heartbeat_keeps_slow_full_materialize_exclusive_past_ttl(self) -> None:
         from hydra_codex.incremental_sync import ResumableRepair, TrustedSourceRoots

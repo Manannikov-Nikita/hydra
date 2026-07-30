@@ -1279,7 +1279,9 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             store = HydraStore(self.database)
             try:
                 store.connection.execute(
-                    "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
+                    """UPDATE dashboard_projects
+                          SET display_name=?,display_name_provenance='repo_basename'
+                        WHERE project_id='project-a'""",
                     (display_name,),
                 )
                 store.connection.commit()
@@ -1304,7 +1306,9 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             store = HydraStore(self.database)
             try:
                 store.connection.execute(
-                    "UPDATE dashboard_projects SET display_name=? WHERE project_id='project-a'",
+                    """UPDATE dashboard_projects
+                          SET display_name=?,display_name_provenance='config'
+                        WHERE project_id='project-a'""",
                     (display_name,),
                 )
                 store.connection.commit()

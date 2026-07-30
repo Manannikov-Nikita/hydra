@@ -22,6 +22,7 @@ from hydra_codex.migrations_ad30 import (
     AD30_REQUIRED_TRIGGER_SQL,
     migrate_v50_source_fact_revisions,
 )
+from hydra_codex.migrations_ae31 import AE31_REQUIRED_TRIGGER_SQL
 from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.services import LocalCommandServices
@@ -488,12 +489,12 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                 HydraStore,
                 "_validate_database_integrity",
                 side_effect=AssertionError(
-                    "v47 to v50 ran a whole-database audit",
+                    "bounded current-schema migration ran a whole-database audit",
                 ),
             ):
                 store = HydraStore.open_current(database)
             try:
-                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM token_snapshots",
@@ -567,7 +568,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             reopened = HydraStore.open_current(database)
             try:
-                self.assertEqual(reopened.schema_version(), 50)
+                self.assertEqual(reopened.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     reopened.connection.execute(
                         """SELECT revision FROM sync_data_revision
@@ -678,7 +679,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             store = HydraStore.open_current(database)
             try:
-                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     tuple(
                         tuple(row)
@@ -799,7 +800,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             store = HydraStore.open_current(database)
             try:
-                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     tuple(
                         tuple(row)
@@ -891,7 +892,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             reopened = HydraStore.open_current(database)
             try:
-                self.assertEqual(reopened.schema_version(), 50)
+                self.assertEqual(reopened.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     reopened.connection.execute(
                         """SELECT revision FROM sync_data_revision
@@ -1464,7 +1465,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             store = HydraStore.open_current(database)
             try:
-                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     tuple(
                         ("project", str(row[0]), int(row[1]))
@@ -1681,7 +1682,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             store = HydraStore.open_current(database)
             try:
-                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
                 self.assertEqual(
                     [
                         tuple(row)
@@ -1762,7 +1763,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
             ):
                 store = HydraStore.open_current(database)
             try:
-                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
             finally:
                 store.close()
 
@@ -2819,6 +2820,327 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                 self.assertEqual(store.schema_version(), MIGRATIONS[-1][0])
             finally:
                 store.close()
+
+    def test_v52_fences_an_already_open_v50_writer_from_terminal_frontier(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v50-open-writer.sqlite3"
+            build_schema(database, 50)
+            legacy = sqlite3.connect(database)
+            legacy.execute("PRAGMA foreign_keys=ON")
+            self.addCleanup(legacy.close)
+            job_id = "sync_" + "5" * 32
+            observed_at = "2026-07-30T10:00:00Z"
+            legacy.execute(
+                """INSERT INTO sync_jobs(
+                       job_id,job_kind,state,sources_discovered,
+                       sources_completed,bytes_processed,created_at,updated_at,
+                       completed_at,updated_epoch_ns)
+                   VALUES (?, 'repair', 'queued', 0, 0, 0, ?, ?, NULL, 1)""",
+                (job_id, observed_at, observed_at),
+            )
+            legacy.commit()
+            self.assertIsNone(legacy.execute(
+                "SELECT 1 FROM sync_backfill_frontier WHERE job_id=?",
+                (job_id,),
+            ).fetchone())
+
+            current = HydraStore.open_current(database)
+            try:
+                self.assertEqual(current.schema_version(), 52)
+                trigger_names = {
+                    str(row[0])
+                    for row in current.connection.execute(
+                        """SELECT name FROM sqlite_master
+                            WHERE type='trigger'
+                              AND name LIKE 'sync_backfill_frontier_%'""",
+                    )
+                }
+                self.assertTrue(
+                    set(AE31_REQUIRED_TRIGGER_SQL).issubset(trigger_names),
+                )
+                current.connection.execute(
+                    """INSERT INTO sync_backfill_frontier(
+                           job_id,root_kind,directory_locator,state,
+                           discovered_count,updated_at)
+                       VALUES (?,'sessions','@root','pending',0,?)""",
+                    (job_id, observed_at),
+                )
+                current.connection.execute(
+                    """UPDATE sync_backfill_frontier
+                          SET state='scanned',discovered_count=4
+                        WHERE job_id=? AND root_kind='sessions'
+                          AND directory_locator='@root'""",
+                    (job_id,),
+                )
+                current.connection.execute(
+                    """UPDATE sync_jobs
+                          SET state='succeeded',sources_discovered=4,
+                              sources_completed=4,completed_at=?
+                        WHERE job_id=?""",
+                    (observed_at, job_id),
+                )
+                current.connection.commit()
+
+                for stale_state in ("pending", "repair_required"):
+                    legacy.execute(
+                        """INSERT INTO sync_backfill_frontier(
+                               job_id,root_kind,directory_locator,state,
+                               discovered_count,updated_at)
+                           VALUES (?,'sessions','@root',?,0,?)
+                           ON CONFLICT(
+                               job_id,root_kind,directory_locator
+                           ) DO UPDATE SET
+                               state=excluded.state,
+                               discovered_count=excluded.discovered_count,
+                               updated_at=excluded.updated_at""",
+                        (job_id, stale_state, observed_at),
+                    )
+                legacy.execute(
+                    """UPDATE sync_backfill_frontier
+                          SET state='pending',discovered_count=0
+                        WHERE job_id=? AND root_kind='sessions'
+                          AND directory_locator='@root'""",
+                    (job_id,),
+                )
+                legacy.execute(
+                    """INSERT INTO sync_backfill_frontier(
+                           job_id,root_kind,directory_locator,state,
+                           discovered_count,updated_at)
+                       VALUES (
+                           ?,'archived_sessions','@root','pending',0,?
+                       )""",
+                    (job_id, observed_at),
+                )
+                legacy.commit()
+
+                rows = current.connection.execute(
+                    """SELECT root_kind,directory_locator,state,discovered_count
+                         FROM sync_backfill_frontier
+                        WHERE job_id=?
+                        ORDER BY root_kind,directory_locator""",
+                    (job_id,),
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in rows],
+                    [("sessions", "@root", "scanned", 4)],
+                )
+                self.assertEqual(
+                    current.connection.execute(
+                        "SELECT state FROM sync_jobs WHERE job_id=?",
+                        (job_id,),
+                    ).fetchone()[0],
+                    "succeeded",
+                )
+            finally:
+                current.close()
+
+    def test_v52_frontier_states_are_monotonic_for_active_maintenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v52-frontier-monotonic.sqlite3"
+            store = HydraStore(database)
+            try:
+                connection = store.connection
+                observed_at = "2026-07-30T10:00:00Z"
+
+                def create_job(job_id: str, kind: str) -> None:
+                    connection.execute(
+                        """INSERT INTO sync_jobs(
+                               job_id,job_kind,state,sources_discovered,
+                               sources_completed,bytes_processed,created_at,
+                               updated_at,completed_at,updated_epoch_ns)
+                           VALUES (?,?,'queued',0,0,0,?,?,NULL,1)""",
+                        (job_id, kind, observed_at, observed_at),
+                    )
+
+                repair = "sync_" + "6" * 32
+                create_job(repair, "repair")
+                connection.execute(
+                    """INSERT INTO sync_backfill_frontier(
+                           job_id,root_kind,directory_locator,state,
+                           discovered_count,updated_at)
+                       VALUES (?,'sessions','@root','pending',0,?)""",
+                    (repair, observed_at),
+                )
+                connection.execute(
+                    """UPDATE sync_backfill_frontier
+                          SET state='scanned',discovered_count=1
+                        WHERE job_id=?""",
+                    (repair,),
+                )
+                for stale_state in ("pending", "repair_required"):
+                    connection.execute(
+                        """UPDATE sync_backfill_frontier
+                              SET state=?,discovered_count=0
+                            WHERE job_id=?""",
+                        (stale_state, repair),
+                    )
+                connection.execute(
+                    """UPDATE sync_backfill_frontier
+                          SET state='scanned',discovered_count=2
+                        WHERE job_id=?""",
+                    (repair,),
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        """SELECT state,discovered_count
+                             FROM sync_backfill_frontier WHERE job_id=?""",
+                        (repair,),
+                    ).fetchone()),
+                    ("scanned", 2),
+                )
+
+                quarantined = "sync_" + "7" * 32
+                create_job(quarantined, "backfill")
+                connection.execute(
+                    """INSERT INTO sync_backfill_frontier(
+                           job_id,root_kind,directory_locator,state,
+                           discovered_count,updated_at)
+                       VALUES (
+                           ?,'archived_sessions','@root',
+                           'repair_required',1,?
+                       )""",
+                    (quarantined, observed_at),
+                )
+                for stale_state in ("pending", "scanned"):
+                    connection.execute(
+                        """UPDATE sync_backfill_frontier
+                              SET state=?,discovered_count=0
+                            WHERE job_id=?""",
+                        (stale_state, quarantined),
+                    )
+                connection.execute(
+                    """UPDATE sync_backfill_frontier
+                          SET state='repair_required',discovered_count=3
+                        WHERE job_id=?""",
+                    (quarantined,),
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        """SELECT state,discovered_count
+                             FROM sync_backfill_frontier WHERE job_id=?""",
+                        (quarantined,),
+                    ).fetchone()),
+                    ("repair_required", 3),
+                )
+
+                normal_sync = "sync_" + "8" * 32
+                create_job(normal_sync, "sync")
+                connection.execute(
+                    """INSERT INTO sync_backfill_frontier(
+                           job_id,root_kind,directory_locator,state,
+                           discovered_count,updated_at)
+                       VALUES (?,'sessions','@root','pending',0,?)""",
+                    (normal_sync, observed_at),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM sync_backfill_frontier
+                            WHERE job_id=?""",
+                        (normal_sync,),
+                    ).fetchone()[0],
+                    0,
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """INSERT INTO sync_backfill_frontier(
+                               job_id,root_kind,directory_locator,state,
+                               discovered_count,updated_at)
+                           VALUES (
+                               'missing-parent','sessions','@root','pending',0,?
+                           )""",
+                        (observed_at,),
+                    )
+                connection.commit()
+            finally:
+                store.close()
+
+    def test_v52_converges_the_early_v51_frontier_trigger_draft(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "early-v51-frontier-fence.sqlite3"
+            build_schema(database, 51)
+            legacy = sqlite3.connect(database)
+            legacy.execute("PRAGMA foreign_keys=ON")
+            try:
+                early = {
+                    str(row[0]): str(row[1])
+                    for row in legacy.execute(
+                        """SELECT name,sql FROM sqlite_master
+                            WHERE type='trigger'
+                              AND name LIKE 'sync_backfill_frontier_%'""",
+                    )
+                    if str(row[0]) in AE31_REQUIRED_TRIGGER_SQL
+                }
+                self.assertEqual(
+                    set(early),
+                    set(AE31_REQUIRED_TRIGGER_SQL),
+                )
+                self.assertNotEqual(
+                    " ".join(early[
+                        "sync_backfill_frontier_active_parent_insert"
+                    ].casefold().split()),
+                    " ".join(AE31_REQUIRED_TRIGGER_SQL[
+                        "sync_backfill_frontier_active_parent_insert"
+                    ].casefold().split()),
+                )
+
+                current = HydraStore.open_current(database)
+                try:
+                    self.assertEqual(current.schema_version(), 52)
+                    final = {
+                        str(row[0]): str(row[1])
+                        for row in current.connection.execute(
+                            """SELECT name,sql FROM sqlite_master
+                                WHERE type='trigger'
+                                  AND name LIKE 'sync_backfill_frontier_%'""",
+                        )
+                        if str(row[0]) in AE31_REQUIRED_TRIGGER_SQL
+                    }
+                    self.assertEqual(set(final), set(AE31_REQUIRED_TRIGGER_SQL))
+                    for name, expected in AE31_REQUIRED_TRIGGER_SQL.items():
+                        self.assertEqual(
+                            " ".join(final[name].casefold().split()),
+                            " ".join(expected.casefold().split()),
+                        )
+
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        legacy.execute(
+                            """INSERT INTO sync_backfill_frontier(
+                                   job_id,root_kind,directory_locator,state,
+                                   discovered_count,updated_at)
+                               VALUES (
+                                   'missing-parent','sessions','@root',
+                                   'pending',0,'2026-07-30T10:00:00Z'
+                               )""",
+                        )
+                finally:
+                    current.close()
+            finally:
+                legacy.close()
+
+    def test_current_schema_open_rejects_missing_v52_frontier_fence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v51-missing-fence.sqlite3"
+            store = HydraStore(database)
+            store.close()
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "DROP TRIGGER sync_backfill_frontier_monotonic_update",
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(StorageUnavailable):
+                HydraStore.open_current(database)
 
 
 if __name__ == "__main__":

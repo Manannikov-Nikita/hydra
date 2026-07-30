@@ -791,6 +791,16 @@ process.stdout.write(JSON.stringify(await ({expression})));
             ready,
         )
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_partial_repair_requires_fresh_confirmation_before_retry(self) -> None:
+        self.assertEqual(
+            self.evaluate_app(
+                "['repair', 'sync'].map(kind => "
+                "subject.retryAfterTerminal(kind, 'partial', 'retry'))"
+            ),
+            [None, "retry"],
+        )
+
     def test_repair_confirmation_transfers_and_restores_focus(self) -> None:
         app = self.asset("app.js")
         html = self.asset("index.html")
@@ -844,7 +854,16 @@ process.stdout.write(JSON.stringify(await ({expression})));
         dom = self.asset("dom.js")
         tasks = self.asset("views/tasks.js")
 
-        for marker in ("Sync now", "Repair history", "Start full repair", "startChangePolling", "runSerializedPoll"):
+        for marker in (
+            "Sync now",
+            "Repair history",
+            "Start global repair",
+            "across every Hydra project",
+            "may inspect thousands of files",
+            "not required to view the current report",
+            "startChangePolling",
+            "runSerializedPoll",
+        ):
             self.assertIn(marker, html + app)
         self.assertIn("/api/v1/changes?after=", api)
         self.assertIn("startSync", api)

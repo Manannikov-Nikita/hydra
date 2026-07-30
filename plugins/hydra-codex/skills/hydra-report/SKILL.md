@@ -19,11 +19,14 @@ raw prompts or turn an agent's prose summary into an exact measurement.
    `hydra-codex report --last N --format json`. Inspect `sync_freshness`: if
    work is `queued` or `running`, wait for the MCP/dashboard worker or run
    `hydra-codex sync`, then read the report again. Never imply that a report
-   call starts ingest or reconciliation. If state is `repair_required`, explain
-   that the operator must explicitly run the expensive
-   `hydra-codex repair --all` backfill. `reconcile_required` means no valid
-   materialized report exists yet; run sync, then repair only if sync reports
-   that a source requires it.
+   call starts ingest or reconciliation. A `repair_required` report remains
+   readable and sendable; repair is optional historical recovery, never a
+   prerequisite for reporting. Mention `hydra-codex repair --all` only when
+   the user explicitly asks to recover missing history or run a global repair,
+   and warn before they start that it scans every Hydra project, may inspect
+   thousands of files, may take a long time, and may still finish partial.
+   `reconcile_required` means no valid materialized report exists yet; run sync
+   and read the report again without automatically escalating to repair.
 3. For a requested pair, run
    `hydra-codex compare THREAD_A THREAD_B --format json`. Accept only opaque
    public references printed by Hydra, never internal session identifiers.

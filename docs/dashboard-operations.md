@@ -135,14 +135,21 @@ explicitly. A second request reuses the active persisted job.
 **Sync now never walks the rollout roots.** Existing valid evidence remains
 visible until the new materialized snapshots are ready.
 
-Use **Repair history** (or `hydra-codex repair --all`) only for the initial
-backfill or a source marked `repair_required`. Repair is the explicit expensive
-directory walk. The CLI runs successive bounded batches until completion; its
-frontier and progress survive interruption or restart. If another Hydra worker
-owns the singleton lease, the command returns `queued` or `running` with the
-`lease_busy` diagnostic; the durable frontier remains safe for that worker or a
-later invocation to resume. A `partial` / `no_progress` result is reserved for
-an acquired batch that made no durable progress.
+**Repair history** (or `hydra-codex repair --all`) is optional historical
+recovery, not a prerequisite for viewing or sharing the current report. Use it
+only when an operator deliberately wants an initial backfill or missing history
+from a source marked `repair_required`.
+
+Repair is global: it scans telemetry history across every Hydra project, may
+inspect thousands of files, may take a long time, and may still finish
+`partial`. The dashboard therefore requires explicit confirmation before each
+start and does not offer a one-click retry after a partial result. The CLI runs
+successive bounded batches until completion; its frontier and progress survive
+interruption or restart. If another Hydra worker owns the singleton lease, the
+command returns `queued` or `running` with the `lease_busy` diagnostic; the
+durable frontier remains safe for that worker or a later invocation to resume.
+A `partial` / `no_progress` result is reserved for an acquired batch that made
+no durable progress.
 
 ## 7. Recover from common states
 
@@ -154,7 +161,10 @@ checkpoint.
 1. Leave the previous dashboard snapshot in place; Hydra already retains it.
 2. Finish or pause the task that is writing the source.
 3. Wait until the rollout is stable.
-4. Run **Repair history** once.
+4. Run **Sync now** and keep using the current report.
+5. If missing historical evidence matters, open **Repair history**, review the
+   global-scan warning, and start it once. A partial result requires a fresh
+   confirmation rather than an automatic retry.
 
 ### `database_busy`
 
@@ -169,8 +179,10 @@ The observations changed after the last materialized snapshot. Run:
 .venv/bin/hydra-codex sync
 ```
 
-If sync reports `repair_required`, follow with
-`.venv/bin/hydra-codex repair --all`.
+If sync reports `repair_required`, the current report remains usable. Run
+`.venv/bin/hydra-codex repair --all` only when deliberately recovering missing
+history, after accounting for its global scope and potentially long or partial
+execution.
 
 ### `storage_unavailable`
 

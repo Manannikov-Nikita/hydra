@@ -42,6 +42,10 @@ export function syncJobKind(kind) {
   return kind === "repair" || kind === "backfill" ? "repair" : "sync";
 }
 
+export function retryAfterTerminal(jobKind, terminalState, retry) {
+  return jobKind === "repair" && terminalState === "partial" ? null : retry;
+}
+
 function dispatch(action) {
   state = reduce(state, action);
 }
@@ -461,8 +465,11 @@ async function pollRefresh(refreshRef, jobKind, retry) {
       : partial ? "Sync needs another pass" : "Sync failed";
     const detail = refreshDiagnosticDetail(current);
     showAsyncState(
-      partial ? "notice" : "error", title, detail, retry,
-      partial ? jobKind === "repair" ? "Repair again" : "Sync again" : "Retry",
+      partial ? "notice" : "error",
+      title,
+      detail,
+      retryAfterTerminal(jobKind, current.state, retry),
+      partial ? "Sync again" : "Retry",
     );
     routeStatus.textContent = "";
     announceRefreshOutcome(`${title}. ${detail}`);

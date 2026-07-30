@@ -20,8 +20,9 @@ compatibility. It contains a monotonic `data_revision` and one state:
 - `current`: materialized reports match all processed durable work;
 - `queued` or `running`: wait for the worker, or explicitly run
   `hydra-codex sync`;
-- `repair_required`: an operator must explicitly run
-  `hydra-codex repair --all`;
+- `repair_required`: a source attributed to the selected project may need
+  optional historical recovery; the current report remains readable and a
+  global `hydra-codex repair --all` is not required for reporting;
 - `reconcile_required`: no valid materialized report exists yet;
 - `unknown`: freshness was not supplied by the calling surface.
 

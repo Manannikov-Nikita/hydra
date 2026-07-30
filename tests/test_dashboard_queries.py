@@ -1588,6 +1588,70 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             "data_revision": revision,
         })
 
+    def test_task_page_freshness_ignores_foreign_and_unattributed_repair(
+        self,
+    ) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            for locator, project_id in (
+                ("foreign-repair.jsonl", "project-b"),
+                ("unattributed-repair.jsonl", None),
+            ):
+                repository.register_source(
+                    root_kind="sessions",
+                    source_locator=locator,
+                    project_id=project_id,
+                    observed_at="2026-07-22T11:20:00Z",
+                )
+                repository.mark_repair_required(
+                    "sessions",
+                    locator,
+                    "2026-07-22T11:21:00Z",
+                )
+        finally:
+            store.close()
+        self.materialize("project-a", self.reports["project-a"])
+
+        page = self.service.tasks(
+            self.catalog_refs()["project-a"], cursor=None, limit=1,
+        ).as_dict()
+
+        self.assertEqual(page["items"][0]["sync_freshness"], {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "current",
+            "data_revision": 7,
+        })
+
+    def test_task_page_freshness_reports_owned_repair(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_source(
+                root_kind="sessions",
+                source_locator="owned-repair.jsonl",
+                project_id="project-a",
+                observed_at="2026-07-22T11:20:00Z",
+            )
+            repository.mark_repair_required(
+                "sessions",
+                "owned-repair.jsonl",
+                "2026-07-22T11:21:00Z",
+            )
+        finally:
+            store.close()
+        self.materialize("project-a", self.reports["project-a"])
+
+        page = self.service.tasks(
+            self.catalog_refs()["project-a"], cursor=None, limit=1,
+        ).as_dict()
+
+        self.assertEqual(page["items"][0]["sync_freshness"], {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "repair_required",
+            "data_revision": 7,
+        })
+
     def test_materialized_reads_reject_swapped_index_epochs(self) -> None:
         latest, first = self.reports["project-a"]
         self.materialize("project-a", (latest, first))

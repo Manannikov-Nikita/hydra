@@ -207,44 +207,55 @@ class DashboardQueryService:
     @staticmethod
     def _materialized_state(
         connection: sqlite3.Connection,
+        project_id: str,
     ) -> tuple[int, dict[str, object]]:
-        """Read the revision and safe worker state in one bounded query."""
+        """Read the revision and project-owned worker state in one bounded query."""
         row = connection.execute(
             """SELECT revision,
                       CASE
                         WHEN EXISTS(
                             SELECT 1 FROM sync_source_registry
                              WHERE source_state='repair_required'
+                               AND project_id=:project_id
                         ) THEN 'repair_required'
                         WHEN EXISTS(
-                            SELECT 1 FROM sync_ingest_queue
-                             WHERE queue_state='queued'
+                            SELECT 1 FROM sync_ingest_queue AS queue
+                              JOIN sync_source_registry AS source
+                                ON source.root_kind=queue.root_kind
+                               AND source.source_locator=queue.source_locator
+                             WHERE queue.queue_state='queued'
+                               AND source.project_id=:project_id
                         ) OR EXISTS(
                             SELECT 1 FROM hook_event_outbox
                              WHERE acknowledged_at IS NULL
                                AND claimed_by IS NULL
+                               AND project_id=:project_id
                         ) OR EXISTS(
                             SELECT 1 FROM sync_dirty_roots
                              WHERE claim_owner IS NULL
-                        ) OR EXISTS(
-                            SELECT 1 FROM sync_jobs WHERE state='queued'
+                               AND project_id=:project_id
                         ) THEN 'queued'
                         WHEN EXISTS(
-                            SELECT 1 FROM sync_ingest_queue
-                             WHERE queue_state='claimed'
+                            SELECT 1 FROM sync_ingest_queue AS queue
+                              JOIN sync_source_registry AS source
+                                ON source.root_kind=queue.root_kind
+                               AND source.source_locator=queue.source_locator
+                             WHERE queue.queue_state='claimed'
+                               AND source.project_id=:project_id
                         ) OR EXISTS(
                             SELECT 1 FROM hook_event_outbox
                              WHERE acknowledged_at IS NULL
                                AND claimed_by IS NOT NULL
+                               AND project_id=:project_id
                         ) OR EXISTS(
                             SELECT 1 FROM sync_dirty_roots
                              WHERE claim_owner IS NOT NULL
-                        ) OR EXISTS(
-                            SELECT 1 FROM sync_jobs WHERE state='running'
+                               AND project_id=:project_id
                         ) THEN 'running'
                         ELSE 'current'
                       END AS sync_state
                  FROM sync_data_revision WHERE singleton=1""",
+            {"project_id": project_id},
         ).fetchone()
         if row is None:
             raise ValueError("materialized sync state is unavailable")
@@ -619,7 +630,6 @@ class DashboardQueryService:
         if selected_project_ref is not None and selected_project_id is not None:
             raise ValueError("dashboard project selection is ambiguous")
         store = _BootstrapStore(connection)
-        revision, sync_freshness = self._materialized_state(connection)
         storage_schema_version = int(
             connection.execute("PRAGMA user_version").fetchone()[0],
         )
@@ -634,7 +644,9 @@ class DashboardQueryService:
                           last_activity_epoch_ns,
                           data_revision AS stats_data_revision
                      FROM materialized_project_stats
-                    WHERE data_revision<=?
+                    WHERE data_revision<=(
+                        SELECT revision FROM sync_data_revision WHERE singleton=1
+                    )
                ),
                catalog AS (
                    SELECT projects.project_id,projects.display_name,
@@ -699,6 +711,10 @@ class DashboardQueryService:
                       )
                )
                SELECT catalog.*,
+                      (
+                          SELECT revision FROM sync_data_revision
+                           WHERE singleton=1
+                      ) AS current_data_revision,
                       EXISTS(
                           SELECT 1 FROM pending
                            WHERE pending.project_id=catalog.project_id
@@ -710,12 +726,20 @@ class DashboardQueryService:
                  FROM catalog
                 ORDER BY project_id""",
             (
-                revision,
                 storage_schema_version,
                 storage_schema_cookie,
                 RECONCILIATION_VERSION,
             ),
         ).fetchall()
+        if rows:
+            revision = int(rows[0]["current_data_revision"])
+        else:
+            revision_row = connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1",
+            ).fetchone()
+            if revision_row is None:
+                raise ValueError("materialized sync state is unavailable")
+            revision = int(revision_row["revision"])
         prepared: list[tuple[CatalogProject, int, str, str]] = []
         stats_by_project: dict[str, tuple[object, ...] | None] = {}
         catalog_items = tuple(
@@ -786,6 +810,11 @@ class DashboardQueryService:
         else:
             selected_item = self._resolve_project(catalog, selected_project_ref)
             selected_ref = selected_project_ref
+        state_revision, sync_freshness = self._materialized_state(
+            connection, selected_item.project_id,
+        )
+        if state_revision != revision:
+            raise ValueError("materialized sync state is incoherent")
         selected_count = next(
             report_count
             for item, report_count, _state, _last_reconciled_at in prepared
@@ -1128,10 +1157,10 @@ class DashboardQueryService:
         store = self._store_factory()
         try:
             with _consistent_read(store.connection):
-                revision, sync_freshness = self._materialized_state(
-                    store.connection,
-                )
                 item = self._resolve_project(self._catalog(store), project_ref)
+                revision, sync_freshness = self._materialized_state(
+                    store.connection, item.project_id,
+                )
                 require_source_fact_fence_current(
                     store.connection, item.project_id,
                 )

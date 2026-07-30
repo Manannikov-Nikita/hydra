@@ -370,6 +370,55 @@ class DurableSyncStateTests(unittest.TestCase):
         ).fetchone()[0], 0)
         self.assertIsNone(repository.source_for("sessions", locator))
 
+    def test_hook_fact_replay_does_not_advance_an_unchanged_dirty_generation(
+        self,
+    ) -> None:
+        repository = self._repository()
+        repository.record_hook_event_and_enqueue(
+            event_key="replayed-event",
+            project_id="hprj_safe",
+            session_key="session-safe",
+            turn_key="turn-safe",
+            event_kind="post_tool",
+            tool_category="shell",
+            tool_status="success",
+            duration_ms=1,
+            observed_at="2026-07-26T00:00:00.0000001Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker-a",
+            "2026-07-26T00:00:00.0000001Z",
+            "2026-07-26T00:00:10Z",
+        ))
+        first = repository.claim_hook_events(
+            "worker-a",
+            "2026-07-26T00:00:00.0000001Z",
+            "2026-07-26T00:00:10Z",
+        )
+        self.assertEqual(len(first), 1)
+        original = repository.list_dirty_roots()
+        self.assertEqual(original[0].observed_at, "2026-07-26T00:00:00.0000001Z")
+
+        self.assertTrue(repository.acquire_lease(
+            "worker-b",
+            "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z",
+        ))
+        replayed = repository.claim_hook_events(
+            "worker-b",
+            "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z",
+        )
+
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(repository.list_dirty_roots(), original)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM hook_safe_facts"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_hook_identity_is_not_written_as_a_new_source_session_binding(self) -> None:
         repository = self._repository()
         locator = "2026/07/26/hook-session.jsonl"
@@ -807,6 +856,200 @@ class DurableSyncStateTests(unittest.TestCase):
                 "reused-owner", successor, "2026-07-26T00:00:11Z",
             ),
             1,
+        )
+
+    def test_dirty_mutation_preserves_live_claim_and_cannot_be_acknowledged_away(
+        self,
+    ) -> None:
+        repository = self._repository()
+        repository.mark_dirty(
+            "hprj_safe", "hprj_safe", "project",
+            "2026-07-26T00:00:00Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker", "2026-07-26T00:00:00Z",
+            "2026-07-26T00:00:10Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "worker", "2026-07-26T00:00:01Z",
+            "2026-07-26T00:00:10Z", 10,
+        )
+        self.assertEqual(len(claimed), 1)
+
+        with self.store.rollout_transaction() as connection:
+            repository.mark_dirty_in_transaction(
+                connection,
+                "hprj_safe",
+                "hprj_safe",
+                "project",
+                "2026-07-26T00:00:02Z",
+            )
+
+        row = self.store.connection.execute(
+            """SELECT observed_at,claim_owner,claim_expires_at,
+                      claim_token,eligible_epoch_ns
+                 FROM sync_dirty_roots
+                WHERE project_id='hprj_safe'
+                  AND root_key='hprj_safe'
+                  AND root_kind='project'"""
+        ).fetchone()
+        self.assertEqual(
+            tuple(row[:4]),
+            (
+                "2026-07-26T00:00:02Z",
+                "worker",
+                "2026-07-26T00:00:10Z",
+                claimed[0].claim_token,
+            ),
+        )
+        self.assertEqual(
+            row[4],
+            require_exact_timestamp(
+                "2026-07-26T00:00:10Z",
+                "test dirty claim expiry",
+            ).epoch_nanoseconds,
+        )
+        self.assertFalse(repository.renew_dirty_claims(
+            "worker",
+            claimed,
+            "2026-07-26T00:00:03Z",
+            "2026-07-26T00:00:10Z",
+        ))
+        self.assertEqual(
+            repository.acknowledge_dirty_roots(
+                "worker", claimed, "2026-07-26T00:00:03Z",
+            ),
+            0,
+        )
+
+        self.assertTrue(repository.acquire_lease(
+            "successor", "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z",
+        ))
+        successor = repository.claim_dirty_roots(
+            "successor", "2026-07-26T00:00:10Z",
+            "2026-07-26T00:00:20Z", 10,
+        )
+        self.assertEqual(
+            [(root.project_id, root.observed_at) for root in successor],
+            [("hprj_safe", "2026-07-26T00:00:02Z")],
+        )
+        self.assertEqual(
+            repository.acknowledge_dirty_roots(
+                "successor", successor, "2026-07-26T00:00:11Z",
+            ),
+            1,
+        )
+
+    def test_same_instant_dirty_generation_is_immediately_eligible(
+        self,
+    ) -> None:
+        repository = self._repository()
+        observed_at = "2026-07-26T00:00:00.0000001Z"
+        repository.mark_dirty(
+            "hprj_safe",
+            "hprj_safe",
+            "project",
+            observed_at,
+        )
+
+        with self.store.rollout_transaction() as connection:
+            repository.mark_dirty_in_transaction(
+                connection,
+                "hprj_safe",
+                "hprj_safe",
+                "project",
+                observed_at,
+            )
+
+        row = self.store.connection.execute(
+            """SELECT observed_at,eligible_epoch_ns
+                 FROM sync_dirty_roots
+                WHERE project_id='hprj_safe'
+                  AND root_key='hprj_safe'
+                  AND root_kind='project'"""
+        ).fetchone()
+        self.assertEqual(row[0], observed_at)
+        self.assertEqual(
+            row[1],
+            require_exact_timestamp(
+                observed_at,
+                "test dirty eligibility",
+            ).epoch_nanoseconds,
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker",
+            observed_at,
+            "2026-07-26T00:00:10Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "worker",
+            observed_at,
+            "2026-07-26T00:00:10Z",
+            10,
+        )
+        self.assertEqual(len(claimed), 1)
+
+    def test_same_instant_dirty_mutation_advances_a_live_claim_generation(
+        self,
+    ) -> None:
+        repository = self._repository()
+        observed_at = "2026-07-26T00:00:00.0000001Z"
+        repository.mark_dirty(
+            "hprj_safe",
+            "hprj_safe",
+            "project",
+            observed_at,
+        )
+        self.assertTrue(repository.acquire_lease(
+            "worker",
+            observed_at,
+            "2026-07-26T00:00:10Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "worker",
+            observed_at,
+            "2026-07-26T00:00:10Z",
+            10,
+        )
+        self.assertEqual(len(claimed), 1)
+
+        with self.store.rollout_transaction() as connection:
+            repository.mark_dirty_in_transaction(
+                connection,
+                "hprj_safe",
+                "hprj_safe",
+                "project",
+                observed_at,
+            )
+
+        row = self.store.connection.execute(
+            """SELECT observed_at,claim_owner,claim_expires_at,claim_token,
+                      eligible_epoch_ns
+                 FROM sync_dirty_roots
+                WHERE project_id='hprj_safe'
+                  AND root_key='hprj_safe'
+                  AND root_kind='project'"""
+        ).fetchone()
+        self.assertEqual(row[0], "2026-07-26T00:00:00.000001Z")
+        self.assertEqual(
+            tuple(row[1:4]),
+            ("worker", "2026-07-26T00:00:10Z", claimed[0].claim_token),
+        )
+        self.assertEqual(
+            row[4],
+            require_exact_timestamp(
+                "2026-07-26T00:00:10Z",
+                "test dirty claim expiry",
+            ).epoch_nanoseconds,
+        )
+        self.assertEqual(
+            repository.acknowledge_dirty_roots(
+                "worker",
+                claimed,
+                "2026-07-26T00:00:01Z",
+            ),
+            0,
         )
 
     def test_dirty_roots_jobs_frontier_and_revision_survive_store_reopen(self) -> None:

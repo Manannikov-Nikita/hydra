@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from .migrations_v22 import V22_TOKEN_SNAPSHOT_QUERY_INDEX_SQL
 
 
@@ -52,3 +54,19 @@ AC29_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
 AC29_REQUIRED_SCHEMA = {
     "incremental_session_placeholders": {"session_key"},
 }
+
+
+def recover_missing_incremental_session_placeholders(
+    connection: sqlite3.Connection,
+) -> None:
+    """Rebuild the one derived AC29 table when a recorded v47 lacks it."""
+    existing = connection.execute(
+        """SELECT type FROM sqlite_master
+            WHERE name='incremental_session_placeholders'"""
+    ).fetchone()
+    if existing is not None:
+        raise sqlite3.IntegrityError(
+            "incremental session placeholder recovery requires a missing object"
+        )
+    connection.execute(AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL)
+    connection.execute(AC29_BACKFILL_INCREMENTAL_SESSION_PLACEHOLDERS_SQL)

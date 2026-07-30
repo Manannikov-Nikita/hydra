@@ -110,11 +110,25 @@ def _deduplicated_lifecycle_events(
 def reconcile_turn_attempts(
     connection: sqlite3.Connection,
     diagnose: Callable[[str, int, str], None] | None = None,
+    *,
+    project_id: str | None = None,
 ) -> None:
+    project_filter = (
+        ""
+        if project_id is None
+        else """ WHERE session_key IN (
+                    SELECT session_key FROM rollout_sessions
+                     WHERE project_id=?
+                )"""
+    )
+    parameters: tuple[object, ...] = (
+        () if project_id is None else (project_id,)
+    )
     rows = list(connection.execute(
-        """SELECT event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
+        f"""SELECT event_key,session_key,turn_key,event_kind,observed_at,timestamp_epoch,
                   emitted_duration_ms,source_digest,logical_source_key,source_ordinal
-             FROM turn_lifecycle_events"""
+             FROM turn_lifecycle_events{project_filter}""",
+        parameters,
     ))
     groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
@@ -210,12 +224,53 @@ def reconcile_turn_attempts(
             target.terminal_event = event
             if target is active:
                 active = None
-        connection.execute("DELETE FROM turn_attempts WHERE session_key=? AND turn_key=?", (session, turn))
+        desired: list[tuple[object, ...]] = []
         for ordinal, attempt in enumerate(attempts, start=1):
             wall = None
             if attempt.started_epoch is not None and attempt.finished_epoch is not None and attempt.finished_epoch >= attempt.started_epoch:
                 wall = int(round((attempt.finished_epoch - attempt.started_epoch) * 1000))
             provenance = "derived" if wall is not None else "estimated"
+            desired.append(
+                (
+                    session, turn, ordinal, attempt.state,
+                    attempt.emitted_duration_ms, wall,
+                    attempt.started_at, attempt.finished_at, provenance,
+                    attempt.started_event.event_key
+                    if attempt.started_event else None,
+                    attempt.terminal_event.event_key
+                    if attempt.terminal_event else None,
+                    attempt.started_event.logical_source_key
+                    if attempt.started_event else None,
+                    attempt.terminal_event.logical_source_key
+                    if attempt.terminal_event else None,
+                    attempt.started_event.source_ordinal
+                    if attempt.started_event else None,
+                    attempt.terminal_event.source_ordinal
+                    if attempt.terminal_event else None,
+                )
+            )
+        existing = [
+            tuple(row)
+            for row in connection.execute(
+                """SELECT session_key,turn_key,attempt_ordinal,state,
+                          emitted_duration_ms,wall_duration_ms,started_at,
+                          finished_at,timing_provenance,started_event_key,
+                          terminal_event_key,started_logical_source_key,
+                          terminal_logical_source_key,started_source_ordinal,
+                          terminal_source_ordinal
+                     FROM turn_attempts
+                    WHERE session_key=? AND turn_key=?
+                    ORDER BY attempt_ordinal""",
+                (session, turn),
+            )
+        ]
+        if existing == desired:
+            continue
+        connection.execute(
+            "DELETE FROM turn_attempts WHERE session_key=? AND turn_key=?",
+            (session, turn),
+        )
+        for values in desired:
             connection.execute(
                 """INSERT INTO turn_attempts(
                        session_key,turn_key,attempt_ordinal,state,emitted_duration_ms,wall_duration_ms,
@@ -224,14 +279,7 @@ def reconcile_turn_attempts(
                        started_logical_source_key,terminal_logical_source_key,
                        started_source_ordinal,terminal_source_ordinal)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (session, turn, ordinal, attempt.state, attempt.emitted_duration_ms, wall,
-                 attempt.started_at, attempt.finished_at, provenance,
-                 attempt.started_event.event_key if attempt.started_event else None,
-                 attempt.terminal_event.event_key if attempt.terminal_event else None,
-                 attempt.started_event.logical_source_key if attempt.started_event else None,
-                 attempt.terminal_event.logical_source_key if attempt.terminal_event else None,
-                 attempt.started_event.source_ordinal if attempt.started_event else None,
-                 attempt.terminal_event.source_ordinal if attempt.terminal_event else None),
+                values,
             )
 
 

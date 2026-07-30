@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
 import tempfile
+from threading import Event, Thread
 import unittest
 from unittest import mock
 
@@ -20,11 +22,13 @@ from hydra_codex.reconcile_engine import (
     list_reconciled_reports,
     reconcile_project,
     render_materialized_report_collection,
+    source_fact_fence_current,
 )
 from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.public_refs import project_public_references
 from hydra_codex.storage import HydraStore
+from hydra_codex.sync_state import SyncStateRepository
 
 
 PROJECT = "hprj_reconcile"
@@ -52,6 +56,7 @@ class ReconcileEngineTests(unittest.TestCase):
     def session(
         self, key: str, started: int, *, parent: str | None = None,
         confidence: str = "confirmed", score: float = 1.0,
+        project_id: str = PROJECT,
     ) -> None:
         logical = f"logical-{key}"
         source = f"source-{key}"
@@ -59,13 +64,13 @@ class ReconcileEngineTests(unittest.TestCase):
             """INSERT INTO rollout_sessions(
                    session_key,project_id,path_key,resume_segments,conversation_key,started_at,last_activity_at)
                VALUES (?,?,?,1,'',?,?)""",
-            (key, PROJECT, "shared-worktree", stamp(started), stamp(started)),
+            (key, project_id, "shared-worktree", stamp(started), stamp(started)),
         )
         self.connection.execute(
             """INSERT INTO rollout_logical_sources(
                    logical_source_key,project_id,session_key,canonical_revision_digest,lineage_state)
                VALUES (?,?,?,?,'clean')""",
-            (logical, PROJECT, key, source),
+            (logical, project_id, key, source),
         )
         self.connection.execute(
             """INSERT INTO rollout_sources(
@@ -85,6 +90,7 @@ class ReconcileEngineTests(unittest.TestCase):
     def token(
         self, session: str, line: int, second: int,
         input_tokens: int, cached: int | None, output: int, reasoning: int | None,
+        *, project_id: str = PROJECT,
     ) -> None:
         self.connection.execute(
             """INSERT INTO token_snapshots(
@@ -92,7 +98,10 @@ class ReconcileEngineTests(unittest.TestCase):
                    cached_input_tokens,output_tokens,reasoning_tokens,cache_write_tokens,
                    completeness,observed_at)
                VALUES (?,?,?,?,0,?,?,?,?,0,'complete',?)""",
-            (f"source-{session}", line, session, PROJECT, input_tokens, cached, output, reasoning, stamp(second)),
+            (
+                f"source-{session}", line, session, project_id,
+                input_tokens, cached, output, reasoning, stamp(second),
+            ),
         )
 
     def complete(self, session: str, second: int, ordinal: int = 100) -> None:
@@ -280,6 +289,9 @@ class ReconcileEngineTests(unittest.TestCase):
         self.complete("stale-root", 5)
         self.connection.commit()
         reconcile_project(self.store, PROJECT, b"s" * 32)
+        before_revision = self.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
         before = {
             "tasks": tuple(map(tuple, self.connection.execute(
                 """SELECT root_key,input_digest FROM reconciled_tasks
@@ -296,9 +308,6 @@ class ReconcileEngineTests(unittest.TestCase):
                     WHERE project_id=? ORDER BY task_ref""",
                 (PROJECT,),
             ))),
-            "revision": self.connection.execute(
-                "SELECT revision FROM sync_data_revision WHERE singleton=1"
-            ).fetchone()[0],
         }
         self.connection.execute(
             """UPDATE token_snapshots SET input_tokens=20
@@ -332,6 +341,9 @@ class ReconcileEngineTests(unittest.TestCase):
         finally:
             external.close()
 
+        after_revision = self.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
         after = {
             "tasks": tuple(map(tuple, self.connection.execute(
                 """SELECT root_key,input_digest FROM reconciled_tasks
@@ -348,17 +360,452 @@ class ReconcileEngineTests(unittest.TestCase):
                     WHERE project_id=? ORDER BY task_ref""",
                 (PROJECT,),
             ))),
-            "revision": self.connection.execute(
-                "SELECT revision FROM sync_data_revision WHERE singleton=1"
-            ).fetchone()[0],
         }
         self.assertEqual(after, before)
+        self.assertGreater(after_revision, before_revision)
         self.assertEqual(
             self.connection.execute(
                 """SELECT input_tokens FROM token_snapshots
                     WHERE source_digest='source-stale-root' AND line_number=2"""
             ).fetchone()[0],
             30,
+        )
+
+    def test_reconcile_rejects_source_commit_after_preprocessing_before_assembly(
+        self,
+    ) -> None:
+        self.session("preprocess-gap-root", 0)
+        self.token("preprocess-gap-root", 1, 2, 10, 1, 1, 0)
+        self.complete("preprocess-gap-root", 5)
+        self.connection.commit()
+        repository = SyncStateRepository(self.store)
+        repository.mark_dirty(
+            PROJECT, "preprocess-gap-root", "task",
+            "2026-07-21T00:00:06Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "preprocess-gap-worker",
+            "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "preprocess-gap-worker",
+            "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        )
+        self.assertEqual(len(claimed), 1)
+
+        external = HydraStore(Path(self.temporary.name) / "hydra.sqlite3")
+        original_transaction = self.store.rollout_transaction
+        transaction_count = 0
+
+        @contextmanager
+        def transaction_with_commit_gap():
+            nonlocal transaction_count
+            transaction_count += 1
+            with original_transaction() as connection:
+                yield connection
+            if transaction_count == 1:
+                external.connection.execute(
+                    """INSERT INTO test_evidence_candidates(
+                           candidate_key,candidate_kind,evidence_key,
+                           source_digest,line_number,session_key,observed_at,
+                           tool_call_key,command_hash,runner,scope,exit_status,
+                           outcome,failure_cause,provenance,completeness)
+                       VALUES (
+                           'candidate-preprocess-gap','evidence',
+                           'test-preprocess-gap',
+                           'source-preprocess-gap-root',2,
+                           'preprocess-gap-root',?,'call-preprocess-gap',
+                           'command-preprocess-gap','pytest','targeted',1,
+                           'failed','assertion','derived','complete'
+                       )""",
+                    (stamp(3),),
+                )
+                external.connection.commit()
+
+        try:
+            with mock.patch.object(
+                self.store,
+                "rollout_transaction",
+                new=transaction_with_commit_gap,
+            ):
+                with self.assertRaisesRegex(
+                    ReconciliationStale, "source facts changed",
+                ):
+                    reconcile_project(
+                        self.store,
+                        PROJECT,
+                        b"g" * 32,
+                        expected_dirty_roots=claimed,
+                    )
+        finally:
+            external.close()
+
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM test_evidence_candidates
+                    WHERE candidate_key='candidate-preprocess-gap'"""
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM rollout_test_runs
+                    WHERE evidence_key='test-preprocess-gap'"""
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?",
+                (PROJECT,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(self.connection.execute(
+            """SELECT 1 FROM sync_project_reconcile_fences
+                WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone())
+        remaining = repository.list_dirty_roots()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].claim_token, claimed[0].claim_token)
+
+    def test_claim_fenced_reconcile_ignores_unrelated_control_commit(self) -> None:
+        self.session("claimed-root", 0)
+        self.token("claimed-root", 1, 2, 10, 1, 1, 0)
+        self.complete("claimed-root", 5)
+        self.connection.commit()
+        repository = SyncStateRepository(self.store)
+        repository.mark_dirty(
+            PROJECT, "claimed-root", "task",
+            "2026-07-21T00:00:06Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "claimed-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "claimed-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        )
+        self.assertEqual(len(claimed), 1)
+        external = HydraStore(Path(self.temporary.name) / "hydra.sqlite3")
+        external_repository = SyncStateRepository(external)
+        real_assemble = reconcile_engine_module._assemble_project
+
+        def assemble_then_update_control_state(
+            store: HydraStore, project_id: str,
+        ):
+            assembled = real_assemble(store, project_id)
+            external_repository.create_job(
+                "sync", "2026-07-21T00:00:08Z",
+            )
+            self.assertTrue(external_repository.renew_dirty_claims(
+                "claimed-worker",
+                claimed,
+                "2026-07-21T00:00:08Z",
+                "2026-07-21T00:01:30Z",
+            ))
+            return assembled
+
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=assemble_then_update_control_state,
+            ):
+                try:
+                    summary = reconcile_project(
+                        self.store, PROJECT, b"c" * 32,
+                        expected_dirty_roots=claimed,
+                    )
+                except ReconciliationStale as error:
+                    self.fail(
+                        "claim-fenced reconciliation treated unrelated "
+                        f"control state as source facts: {error}"
+                    )
+        finally:
+            external.close()
+
+        self.assertEqual(summary.task_count, 1)
+        self.assertEqual(
+            list_reconciled_reports(self.store, PROJECT)[0].status,
+            "complete",
+        )
+
+    def test_claim_fenced_reconcile_ignores_other_project_source_commit(
+        self,
+    ) -> None:
+        self.session("isolated-root", 0)
+        self.token("isolated-root", 1, 2, 10, 1, 1, 0)
+        self.complete("isolated-root", 5)
+        self.connection.commit()
+        repository = SyncStateRepository(self.store)
+        repository.mark_dirty(
+            PROJECT, "isolated-root", "task",
+            "2026-07-21T00:00:06Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "isolated-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "isolated-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        )
+        self.assertEqual(len(claimed), 1)
+        external = HydraStore(Path(self.temporary.name) / "hydra.sqlite3")
+        real_assemble = reconcile_engine_module._assemble_project
+
+        def assemble_then_update_other_project(
+            store: HydraStore, project_id: str,
+        ):
+            assembled = real_assemble(store, project_id)
+            external.connection.execute(
+                """INSERT INTO hook_safe_facts(
+                       event_key,project_id,session_key,turn_key,event_kind,
+                       tool_category,tool_status,duration_ms,observed_at)
+                   VALUES (
+                       'other-event','other-project','other-session',
+                       'other-turn','prompt',NULL,NULL,NULL,?
+                   )""",
+                (stamp(8),),
+            )
+            external.connection.commit()
+            return assembled
+
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=assemble_then_update_other_project,
+            ):
+                summary = reconcile_project(
+                    self.store,
+                    PROJECT,
+                    b"i" * 32,
+                    expected_dirty_roots=claimed,
+                )
+        finally:
+            external.close()
+
+        self.assertEqual(summary.task_count, 1)
+
+    def test_claim_fenced_reconcile_rejects_source_commit_without_redirty(
+        self,
+    ) -> None:
+        self.session("claimed-source-root", 0)
+        self.token("claimed-source-root", 1, 2, 10, 1, 1, 0)
+        self.complete("claimed-source-root", 5)
+        self.connection.commit()
+        repository = SyncStateRepository(self.store)
+        repository.mark_dirty(
+            PROJECT, "claimed-source-root", "task",
+            "2026-07-21T00:00:06Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "claimed-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "claimed-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        )
+        self.assertEqual(len(claimed), 1)
+        external = HydraStore(Path(self.temporary.name) / "hydra.sqlite3")
+        real_assemble = reconcile_engine_module._assemble_project
+
+        def assemble_then_insert_source_fact(
+            store: HydraStore, project_id: str,
+        ):
+            assembled = real_assemble(store, project_id)
+            external.connection.execute(
+                """INSERT INTO token_snapshots(
+                       source_digest,line_number,session_key,project_id,epoch,
+                       input_tokens,cached_input_tokens,output_tokens,
+                       reasoning_tokens,cache_write_tokens,completeness,
+                       observed_at)
+                   VALUES (
+                       'source-claimed-source-root',2,'claimed-source-root',?,
+                       0,20,1,2,0,0,'complete',?
+                   )""",
+                (PROJECT, stamp(3)),
+            )
+            external.connection.commit()
+            return assembled
+
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=assemble_then_insert_source_fact,
+            ):
+                with self.assertRaisesRegex(
+                    ReconciliationStale, "source facts changed",
+                ):
+                    reconcile_project(
+                        self.store, PROJECT, b"c" * 32,
+                        expected_dirty_roots=claimed,
+                    )
+        finally:
+            external.close()
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?",
+                (PROJECT,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_reconcile_rejects_claim_replaced_before_its_baseline(self) -> None:
+        self.session("replaced-root", 0)
+        self.token("replaced-root", 1, 2, 10, 1, 1, 0)
+        self.complete("replaced-root", 5)
+        self.connection.commit()
+        repository = SyncStateRepository(self.store)
+        repository.mark_dirty(
+            PROJECT, "replaced-root", "task",
+            "2026-07-21T00:00:06Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "original-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "original-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        )
+        self.assertEqual(len(claimed), 1)
+        self.connection.execute(
+            """UPDATE sync_dirty_roots
+                  SET claim_owner='successor-worker',
+                      claim_token='0123456789abcdef0123456789abcdef'
+                WHERE project_id=? AND root_key='replaced-root'
+                  AND root_kind='task'""",
+            (PROJECT,),
+        )
+        self.connection.commit()
+
+        with self.assertRaisesRegex(
+            ReconciliationStale, "dirty claim changed",
+        ):
+            reconcile_project(
+                self.store,
+                PROJECT,
+                b"x" * 32,
+                expected_dirty_roots=claimed,
+            )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_runs WHERE project_id=?",
+                (PROJECT,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_claim_fenced_reconcile_rejects_same_project_redirty(self) -> None:
+        self.session("redirty-root", 0)
+        self.token("redirty-root", 1, 2, 10, 1, 1, 0)
+        self.complete("redirty-root", 5)
+        self.connection.commit()
+        repository = SyncStateRepository(self.store)
+        repository.mark_dirty(
+            PROJECT, "redirty-root", "task",
+            "2026-07-21T00:00:06Z",
+        )
+        self.assertTrue(repository.acquire_lease(
+            "claimed-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        ))
+        claimed = repository.claim_dirty_roots(
+            "claimed-worker", "2026-07-21T00:00:07Z",
+            "2026-07-21T00:00:59Z",
+        )
+        self.assertEqual(len(claimed), 1)
+        external = HydraStore(Path(self.temporary.name) / "hydra.sqlite3")
+        external_repository = SyncStateRepository(external)
+        real_assemble = reconcile_engine_module._assemble_project
+
+        def assemble_then_redirty(
+            store: HydraStore, project_id: str,
+        ):
+            assembled = real_assemble(store, project_id)
+            external_repository.mark_dirty(
+                PROJECT, "redirty-root", "task",
+                "2026-07-21T00:00:08Z",
+            )
+            return assembled
+
+        try:
+            with mock.patch(
+                "hydra_codex.reconcile_engine._assemble_project",
+                side_effect=assemble_then_redirty,
+            ):
+                with self.assertRaisesRegex(
+                    ReconciliationStale, "dirty claim changed",
+                ):
+                    reconcile_project(
+                        self.store, PROJECT, b"c" * 32,
+                        expected_dirty_roots=claimed,
+                    )
+        finally:
+            external.close()
+
+    def test_one_worker_batch_keeps_every_project_source_fence_current(
+        self,
+    ) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+
+        projects = ("hprj_batch_a", "hprj_batch_b")
+        for index, project_id in enumerate(projects):
+            root = f"batch-root-{index}"
+            self.session(root, 0, project_id=project_id)
+            self.token(
+                root, 1, 2, 10, 1, 1, 0,
+                project_id=project_id,
+            )
+            self.complete(root, 5)
+        self.connection.commit()
+
+        repository = SyncStateRepository(self.store)
+        observed_at = "2026-07-21T00:00:06Z"
+        expires_at = "2026-07-21T00:00:59Z"
+        for project_id in projects:
+            repository.mark_dirty(
+                project_id, project_id, "project", observed_at,
+            )
+        self.assertTrue(repository.acquire_lease(
+            "batch-worker", observed_at, expires_at,
+        ))
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=Path(self.temporary.name) / "sessions",
+                archived_sessions=Path(self.temporary.name) / "archived",
+            ),
+            reconcile=lambda project_id, roots: reconcile_project(
+                self.store,
+                project_id,
+                b"m" * 32,
+                expected_dirty_roots=roots,
+            ),
+        )
+
+        completed = worker.reconcile_dirty(
+            "batch-worker", observed_at, expires_at,
+        )
+
+        self.assertEqual(completed, 2)
+        self.assertEqual(repository.list_dirty_roots(), ())
+        self.assertEqual(
+            tuple(
+                source_fact_fence_current(self.connection, project_id)
+                for project_id in projects
+            ),
+            (True, True),
         )
 
     def test_reconcile_uses_the_latest_trusted_task_label_at_the_cutoff(self) -> None:
@@ -553,6 +1000,268 @@ class ReconcileEngineTests(unittest.TestCase):
             statement.lstrip().upper().startswith(("BEGIN IMMEDIATE", "INSERT", "UPDATE", "DELETE"))
             for statement in statements
         ), statements)
+
+    def test_materialized_report_requires_current_project_source_fence(self) -> None:
+        self.session("fenced-snapshot-root", 0)
+        self.token("fenced-snapshot-root", 1, 2, 10, 1, 1, 0)
+        self.complete("fenced-snapshot-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"z" * 32)
+        freshness = {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "current",
+            "data_revision": 7,
+        }
+
+        fence = self.connection.execute(
+            """SELECT project_revision,unattributed_revision,
+                      storage_schema_version,storage_schema_cookie,
+                      reconciliation_version,input_digest
+                 FROM sync_project_reconcile_fences WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone()
+        self.assertIsNotNone(fence)
+        self.assertEqual(fence[2], self.store.schema_version())
+        self.assertEqual(fence[4], reconcile_engine_module.RECONCILIATION_VERSION)
+        self.assertEqual(len(str(fence[5])), 64)
+
+        self.connection.execute(
+            """INSERT INTO hook_safe_facts(
+                   event_key,project_id,session_key,turn_key,event_kind,
+                   tool_category,tool_status,duration_ms,observed_at)
+               VALUES (
+                   'other-fence-event','other-project','other-session',
+                   'other-turn','prompt',NULL,NULL,NULL,?
+               )""",
+            (stamp(6),),
+        )
+        self.connection.commit()
+        render_materialized_report_collection(
+            self.store, PROJECT, 1, "json", freshness,
+        )
+
+        self.connection.execute(
+            """INSERT INTO hook_safe_facts(
+                   event_key,project_id,session_key,turn_key,event_kind,
+                   tool_category,tool_status,duration_ms,observed_at)
+               VALUES (
+                   'own-fence-event',?,'own-session','own-turn','prompt',
+                   NULL,NULL,NULL,?
+               )""",
+            (PROJECT, stamp(7)),
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(ReconciliationStale, "reconcile_required"):
+            render_materialized_report_collection(
+                self.store, PROJECT, 1, "json", freshness,
+            )
+
+    def test_public_reconciled_report_readers_require_current_source_fence(
+        self,
+    ) -> None:
+        self.session("checked-reader-root", 0)
+        self.token("checked-reader-root", 1, 2, 10, 1, 1, 0)
+        self.complete("checked-reader-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"r" * 32)
+        public_ref = list_reconciled_reports(
+            self.store,
+            PROJECT,
+        )[0].task_ref
+
+        start_pilot(
+            self.store,
+            project_id=PROJECT,
+            target=5,
+            task_family="telemetry-analysis",
+            now=moment(6),
+        )
+
+        self.assertFalse(source_fact_fence_current(self.connection, PROJECT))
+        for read in (
+            lambda: list_reconciled_reports(self.store, PROJECT),
+            lambda: get_reconciled_report(
+                self.store,
+                PROJECT,
+                public_ref,
+            ),
+        ):
+            with self.subTest(read=read):
+                with self.assertRaises(ReconciliationStale) as raised:
+                    read()
+                self.assertEqual(str(raised.exception), "reconcile_required")
+
+    def test_unattributed_source_fact_stales_every_materialized_project(self) -> None:
+        self.session("fallback-fence-root", 0)
+        self.token("fallback-fence-root", 1, 2, 10, 1, 1, 0)
+        self.complete("fallback-fence-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"u" * 32)
+        freshness = {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "current",
+            "data_revision": 7,
+        }
+
+        self.connection.execute(
+            """INSERT INTO file_observations(
+                   source_digest,line_number,session_key,operation,
+                   relative_path,path_hash)
+               VALUES (
+                   'unmapped-after-publish',1,'missing-session','read',
+                   'safe.txt','safe-hash'
+               )"""
+        )
+        self.connection.commit()
+
+        with self.assertRaisesRegex(ReconciliationStale, "reconcile_required"):
+            render_materialized_report_collection(
+                self.store, PROJECT, 1, "json", freshness,
+            )
+
+    def test_materialized_report_fails_closed_on_reconcile_fence_metadata_drift(
+        self,
+    ) -> None:
+        self.session("metadata-fence-root", 0)
+        self.token("metadata-fence-root", 1, 2, 10, 1, 1, 0)
+        self.complete("metadata-fence-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"d" * 32)
+        freshness = {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "current",
+            "data_revision": 7,
+        }
+        original = self.connection.execute(
+            """SELECT project_revision,unattributed_revision,
+                      storage_schema_version,storage_schema_cookie,
+                      reconciliation_version,input_digest
+                 FROM sync_project_reconcile_fences WHERE project_id=?""",
+            (PROJECT,),
+        ).fetchone()
+        mutations = {
+            "project_revision": int(original[0]) + 1,
+            "unattributed_revision": int(original[1]) + 1,
+            "storage_schema_version": int(original[2]) + 1,
+            "storage_schema_cookie": int(original[3]) + 1,
+            "reconciliation_version": int(original[4]) + 1,
+            "input_digest": "b" * 64,
+        }
+        for column, value in mutations.items():
+            with self.subTest(column=column):
+                self.connection.execute(
+                    f"""UPDATE sync_project_reconcile_fences SET {column}=?
+                          WHERE project_id=?""",
+                    (value, PROJECT),
+                )
+                self.connection.commit()
+                with self.assertRaisesRegex(
+                    ReconciliationStale, "reconcile_required",
+                ):
+                    render_materialized_report_collection(
+                        self.store, PROJECT, 1, "json", freshness,
+                    )
+                self.connection.execute(
+                    """UPDATE sync_project_reconcile_fences SET
+                           project_revision=?,unattributed_revision=?,
+                           storage_schema_version=?,storage_schema_cookie=?,
+                           reconciliation_version=?,input_digest=?
+                         WHERE project_id=?""",
+                    (*tuple(original), PROJECT),
+                )
+                self.connection.commit()
+
+    def test_materialized_read_pins_fence_and_rows_to_one_snapshot(self) -> None:
+        self.session("snapshot-race-root", 0)
+        self.token("snapshot-race-root", 1, 2, 10, 1, 1, 0)
+        self.complete("snapshot-race-root", 5)
+        self.connection.commit()
+        reconcile_project(self.store, PROJECT, b"n" * 32)
+        freshness = {
+            "schema_version": "hydra.sync-freshness/v1",
+            "state": "current",
+            "data_revision": 7,
+        }
+        fence_checked = Event()
+        writer_committed = Event()
+        writer_errors: list[BaseException] = []
+        real_fence = reconcile_engine_module.source_fact_fence_current
+
+        def commit_source_fact() -> None:
+            try:
+                if not fence_checked.wait(2):
+                    raise AssertionError("materialized reader did not check fence")
+                external = HydraStore(
+                    Path(self.temporary.name) / "hydra.sqlite3",
+                )
+                try:
+                    external.connection.execute(
+                        """INSERT INTO hook_safe_facts(
+                               event_key,project_id,session_key,turn_key,
+                               event_kind,tool_category,tool_status,duration_ms,
+                               observed_at)
+                           VALUES (
+                               'snapshot-race-event',?,'snapshot-race-session',
+                               'snapshot-race-turn','prompt',NULL,NULL,NULL,?
+                           )""",
+                        (PROJECT, stamp(6)),
+                    )
+                    external.connection.commit()
+                finally:
+                    external.close()
+            except BaseException as error:
+                writer_errors.append(error)
+            finally:
+                writer_committed.set()
+
+        def fence_then_wait(
+            connection: sqlite3.Connection,
+            project_id: str,
+        ) -> bool:
+            current = real_fence(connection, project_id)
+            fence_checked.set()
+            if not writer_committed.wait(2):
+                raise AssertionError("concurrent source fact did not commit")
+            return current
+
+        writer = Thread(target=commit_source_fact, daemon=True)
+        writer.start()
+        with mock.patch(
+            "hydra_codex.reconcile_engine.source_fact_fence_current",
+            side_effect=fence_then_wait,
+        ):
+            rendered = render_materialized_report_collection(
+                self.store, PROJECT, 1, "json", freshness,
+            )
+        writer.join(timeout=2)
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertEqual(len(json.loads(rendered)["reports"]), 1)
+        with self.assertRaisesRegex(ReconciliationStale, "reconcile_required"):
+            render_materialized_report_collection(
+                self.store, PROJECT, 1, "json", freshness,
+            )
+
+    def test_empty_project_reconcile_is_a_current_materialized_report(self) -> None:
+        empty_project = "hprj_empty_reconcile"
+        reconcile_project(self.store, empty_project, b"e" * 32)
+
+        rendered = render_materialized_report_collection(
+            self.store,
+            empty_project,
+            1,
+            "json",
+            {
+                "schema_version": "hydra.sync-freshness/v1",
+                "state": "current",
+                "data_revision": 0,
+            },
+        )
+
+        payload = json.loads(rendered)
+        self.assertEqual(payload["reports"], [])
+        self.assertEqual(payload["sync_freshness"]["state"], "current")
 
     def test_materialized_report_limit_orders_by_report_activity_not_shared_reconcile_time(self) -> None:
         key = b"r" * 32

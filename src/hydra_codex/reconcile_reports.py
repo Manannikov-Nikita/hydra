@@ -262,21 +262,22 @@ def list_reconciled_reports(
         (project_id,),
     ))
     if pilot_rows:
-        from .pilot import pilot_status
+        from .pilot import pilot_status, read_only_pilot_statuses
 
         readiness: dict[str, bool] = {}
-        for (pilot_id,) in pilot_rows:
-            status = pilot_status(
-                store,
-                project_id,
-                str(pilot_id),
-                _tasks=tasks,
-                _sessions_by_ref=task_sessions,
-            ).as_dict()
-            ready = bool(status["trend_ready"])
-            for item in status["tasks"]:
-                task_ref = str(item["task_ref"])
-                readiness[task_ref] = readiness.get(task_ref, False) or ready
+        with read_only_pilot_statuses():
+            for (pilot_id,) in pilot_rows:
+                status = pilot_status(
+                    store,
+                    project_id,
+                    str(pilot_id),
+                    _tasks=tasks,
+                    _sessions_by_ref=task_sessions,
+                ).as_dict()
+                ready = bool(status["trend_ready"])
+                for item in status["tasks"]:
+                    task_ref = str(item["task_ref"])
+                    readiness[task_ref] = readiness.get(task_ref, False) or ready
         evaluated = tuple(
             replace(
                 report,

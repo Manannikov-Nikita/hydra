@@ -121,12 +121,26 @@ class DashboardSyncController:
         return store, SyncStateRepository(store)
 
     @staticmethod
-    def _latest(repository: SyncStateRepository, kind: str | None = None) -> SyncJob | None:
+    def _active_maintenance(
+        repository: SyncStateRepository,
+    ) -> SyncJob | None:
+        for kind in ("repair", "backfill"):
+            active = repository.current_job(kind)
+            if active is not None:
+                return active
+        return None
+
+    @classmethod
+    def _latest(
+        cls, repository: SyncStateRepository, kind: str | None = None,
+    ) -> SyncJob | None:
         if kind is not None:
             active = repository.current_job(kind)
             if active is not None:
                 return active
-        active = repository.latest_active_job()
+        active = cls._active_maintenance(repository)
+        if active is None:
+            active = repository.latest_active_job()
         return active if active is not None else repository.latest_job()
 
     def current(self) -> dict[str, object]:
@@ -204,7 +218,9 @@ class DashboardSyncController:
         try:
             store, repository = self._repository()
             try:
-                active = repository.latest_active_job()
+                active = self._active_maintenance(repository)
+                if active is None:
+                    active = repository.latest_active_job()
             finally:
                 store.close()
         except Exception:
@@ -220,7 +236,9 @@ class DashboardSyncController:
             try:
                 store, repository = self._repository()
                 try:
-                    active = repository.latest_active_job()
+                    active = self._active_maintenance(repository)
+                    if active is None:
+                        active = repository.latest_active_job()
                     if active is None and repository.pending_work(self._now()).total:
                         job_id, _reused = repository.get_or_create_active_job(
                             "sync", self._now(),
@@ -288,7 +306,12 @@ class DashboardSyncController:
             )
             worker = IncrementalSyncWorker(
                 store, self._roots,
-                reconcile=lambda project_id: reconcile_project(store, project_id, self._key),
+                reconcile=lambda project_id, roots: reconcile_project(
+                    store,
+                    project_id,
+                    self._key,
+                    expected_dirty_roots=roots,
+                ),
                 clock=self._clock,
             )
             while not self._closed.is_set():
@@ -296,6 +319,9 @@ class DashboardSyncController:
                 assert current is not None
                 if current.state in _TERMINAL:
                     return
+                if self._active_maintenance(repository) is not None:
+                    self._closed.wait(0.1)
+                    continue
                 now = self._now()
                 pending = repository.pending_work(now)
                 if pending.total and not pending.eligible:

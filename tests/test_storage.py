@@ -27,6 +27,7 @@ from hydra_codex.storage import (
     ValidatedStoreProvider,
     default_database_path,
 )
+from hydra_codex.migrations_ad30 import AD30_REQUIRED_TRIGGER_SQL
 
 
 SECRET_FORM_MATRIX = (
@@ -105,16 +106,144 @@ class SQLiteStorageTests(unittest.TestCase):
         self.assertEqual(reopened.schema_version(), MIGRATIONS[-1][0])
         self.assertEqual(reopened.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
-    def test_current_schema_open_skips_repeat_whole_database_validation(self) -> None:
-        with patch.object(
-            HydraStore,
-            "_validate_schema",
-            side_effect=AssertionError("hot open repeated the full database audit"),
+    def test_current_schema_open_checks_sentinel_without_full_validation(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                HydraStore,
+                "_validate_schema",
+                side_effect=AssertionError(
+                    "current-schema open repeated full schema validation",
+                ),
+            ),
+            patch.object(
+                HydraStore,
+                "_validate_database_integrity",
+                side_effect=AssertionError(
+                    "current-schema open scanned the whole database",
+                ),
+            ),
         ):
             first = HydraStore.open_current(self.database)
             second = HydraStore.open_current(self.database)
         first.close()
         second.close()
+
+    def test_current_schema_open_rejects_missing_required_trigger(self) -> None:
+        self.store.connection.execute(
+            "DROP TRIGGER source_fact_revision_hook_safe_facts_insert",
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "source-fact revision trigger",
+        ):
+            opened = HydraStore.open_current(self.database)
+            opened.close()
+
+    def test_current_schema_open_rejects_altered_required_trigger(self) -> None:
+        trigger = "source_fact_revision_hook_safe_facts_insert"
+        self.store.connection.execute(f"DROP TRIGGER {trigger}")
+        self.store.connection.execute(
+            f"""CREATE TRIGGER {trigger}
+                AFTER INSERT ON hook_safe_facts
+                BEGIN
+                    SELECT 1;
+                END"""
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "source-fact revision trigger",
+        ):
+            opened = HydraStore.open_current(self.database)
+            opened.close()
+
+    def test_current_schema_open_rejects_incomplete_migration_history(self) -> None:
+        self.store.connection.execute(
+            "DELETE FROM schema_migrations WHERE version=?",
+            (MIGRATIONS[-2][0],),
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "migration history",
+        ):
+            opened = HydraStore.open_current(self.database)
+            opened.close()
+
+    def test_current_schema_open_rejects_schema_change_during_validation(
+        self,
+    ) -> None:
+        validate = HydraStore._validate_current_schema_sentinel
+
+        def tamper_after_validation(store, latest):
+            validate(store, latest)
+            other = sqlite3.connect(self.database)
+            try:
+                other.execute(
+                    "CREATE TABLE concurrent_schema_drift(value TEXT)",
+                )
+                other.commit()
+            finally:
+                other.close()
+
+        with (
+            patch.object(
+                HydraStore, "_validate_current_schema_sentinel",
+                new=tamper_after_validation,
+            ),
+            self.assertRaisesRegex(
+                StorageUnavailable,
+                "changed during current-schema validation",
+            ),
+        ):
+            opened = HydraStore.open_current(self.database)
+            opened.close()
+
+    def test_concurrent_migration_winner_is_validated_before_return(self) -> None:
+        latest = MIGRATIONS[-1][0]
+        required_trigger = "source_fact_revision_hook_safe_facts_insert"
+        self.store.connection.execute(f"DROP TRIGGER {required_trigger}")
+        self.store.connection.execute(
+            "DELETE FROM schema_migrations WHERE version=?",
+            (latest,),
+        )
+        self.store.connection.execute(f"PRAGMA user_version={latest - 1}")
+        self.store.connection.commit()
+        self.store.close()
+
+        database = self.database
+
+        class WinningMigration:
+            def __enter__(self):
+                winner = sqlite3.connect(database)
+                try:
+                    winner.execute(
+                        """INSERT INTO schema_migrations(version,applied_at)
+                            VALUES (?,'2026-07-30T00:00:00Z')""",
+                        (latest,),
+                    )
+                    winner.execute(f"PRAGMA user_version={latest}")
+                    winner.commit()
+                finally:
+                    winner.close()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        with (
+            patch(
+                "hydra_codex.storage._database_migration_lock",
+                return_value=WinningMigration(),
+            ),
+            self.assertRaisesRegex(
+                StorageUnavailable, "source-fact revision trigger",
+            ),
+        ):
+            opened = HydraStore.open_current(self.database)
+            opened.close()
 
     def test_bounded_writer_open_checks_schema_without_scanning_database(self) -> None:
         with patch.object(
@@ -133,6 +262,92 @@ class SQLiteStorageTests(unittest.TestCase):
         self.store.connection.commit()
         with self.assertRaisesRegex(
             StorageUnavailable, "bounded sync-work trigger",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_missing_source_fact_revision_trigger(
+        self,
+    ) -> None:
+        self.store.connection.execute(
+            "DROP TRIGGER source_fact_revision_hook_safe_facts_insert",
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "source-fact revision trigger",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_missing_reconcile_fence_lookup_index(
+        self,
+    ) -> None:
+        self.store.connection.execute(
+            "DROP INDEX IF EXISTS reconciliation_runs_source_fence_lookup",
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "reconciliation fence lookup index",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_altered_reconcile_fence_lookup_index(
+        self,
+    ) -> None:
+        self.store.connection.execute(
+            "DROP INDEX reconciliation_runs_source_fence_lookup",
+        )
+        self.store.connection.execute(
+            """CREATE INDEX reconciliation_runs_source_fence_lookup
+                   ON reconciliation_runs(
+                       project_id,input_digest,outcome,reconciliation_version
+                   )"""
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "reconciliation fence lookup index",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_extra_trigger_that_can_mask_revision(
+        self,
+    ) -> None:
+        required = "source_fact_revision_file_observations_insert"
+        self.store.connection.execute(f"DROP TRIGGER {required}")
+        self.store.connection.execute(
+            """CREATE TRIGGER source_fact_revision_extra
+               AFTER INSERT ON file_observations
+               BEGIN
+                   UPDATE sync_unattributed_source_fact_revision
+                      SET revision=0 WHERE singleton=1;
+               END"""
+        )
+        self.store.connection.execute(
+            AD30_REQUIRED_TRIGGER_SQL[required],
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "source-fact revision trigger inventory",
+        ):
+            HydraStore.open_bounded_writer(self.database)
+
+    def test_bounded_writer_rejects_extra_trigger_that_can_mask_changes_polling(
+        self,
+    ) -> None:
+        self.store.connection.execute(
+            """CREATE TRIGGER unrelated_name
+               AFTER INSERT ON file_observations
+               BEGIN
+                   UPDATE sync_data_revision
+                      SET revision=0 WHERE singleton=1;
+               END"""
+        )
+        self.store.connection.commit()
+
+        with self.assertRaisesRegex(
+            StorageUnavailable, "source-fact revision trigger inventory",
         ):
             HydraStore.open_bounded_writer(self.database)
 

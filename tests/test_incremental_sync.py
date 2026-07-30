@@ -253,7 +253,8 @@ class IncrementalWorkerTests(unittest.TestCase):
 
         worker = IncrementalSyncWorker(
             self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
-            materialize=materialize, reconcile=reconciled.append,
+            materialize=materialize,
+            reconcile=lambda project_id, _roots: reconciled.append(project_id),
         )
         with self.assertRaisesRegex(RuntimeError, "outbox consume"):
             worker.sync_once(
@@ -426,7 +427,7 @@ class IncrementalWorkerTests(unittest.TestCase):
             current[0] = started + timedelta(seconds=30)
             return MaterializedSource(project_id="hprj_safe")
 
-        def reconcile(_project_id):
+        def reconcile(_project_id, _roots):
             current[0] = started + timedelta(seconds=45)
 
         worker = IncrementalSyncWorker(
@@ -709,7 +710,7 @@ class IncrementalWorkerTests(unittest.TestCase):
         )
         reconciled: list[str] = []
 
-        def slow_reconcile(project_id: str) -> None:
+        def slow_reconcile(project_id: str, _roots) -> None:
             time.sleep(1.4)
             reconciled.append(project_id)
 
@@ -743,7 +744,7 @@ class IncrementalWorkerTests(unittest.TestCase):
             self.repository.acquire_lease("worker", observed, expires),
         )
 
-        def reconcile(_project_id: str) -> None:
+        def reconcile(_project_id: str, _roots) -> None:
             with self.store.rollout_transaction() as connection:
                 connection.execute(
                     "CREATE TABLE expired_dirty_claim_regression(value INTEGER)",
@@ -1120,6 +1121,146 @@ class IncrementalWorkerTests(unittest.TestCase):
             self.store.connection,
             "hprj_safe",
             "session-safe",
+        )
+
+    def test_incremental_preprocessing_does_not_read_or_mutate_another_project(self) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            MaterializedSource,
+            TrustedSourceRoots,
+        )
+        from hydra_codex.rollout_reconcile import (
+            reconcile_turn_attempts as real_reconcile_turn_attempts,
+        )
+        from hydra_codex.test_evidence import (
+            materialize_test_evidence as real_materialize_test_evidence,
+            reconcile_test_retries as real_reconcile_test_retries,
+        )
+
+        connection = self.store.connection
+        connection.execute(
+            """INSERT INTO rollout_sessions(
+                   session_key,project_id,path_key,resume_segments,
+                   conversation_key)
+               VALUES ('session-foreign','hprj_foreign','safe',1,
+                       'conversation-foreign')"""
+        )
+        connection.execute(
+            """INSERT INTO rollout_logical_sources(
+                   logical_source_key,project_id,session_key,
+                   canonical_revision_digest,lineage_state)
+               VALUES ('logical-foreign','hprj_foreign','session-foreign',
+                       NULL,'clean')"""
+        )
+        connection.execute(
+            """INSERT INTO rollout_sources(
+                   source_digest,source_type,logical_source_key,relation,
+                   line_count,byte_count,chain_digest,materialized)
+               VALUES ('source-foreign','jsonl','logical-foreign','canonical',
+                       1,1,'chain-foreign',1)"""
+        )
+        connection.execute(
+            """UPDATE rollout_logical_sources
+                  SET canonical_revision_digest='source-foreign'
+                WHERE logical_source_key='logical-foreign'"""
+        )
+        connection.execute(
+            """INSERT INTO rollout_events(
+                   event_key,logical_source_key,source_ordinal,envelope_kind,
+                   observed_at,timestamp_quality,fingerprint)
+               VALUES ('event-foreign','logical-foreign',1,'event_msg',
+                       '2026-07-26T00:00:00Z','valid','fingerprint-foreign')"""
+        )
+        connection.execute(
+            """INSERT INTO turn_lifecycle_events(
+                   event_key,session_key,turn_key,event_kind,observed_at,
+                   timestamp_epoch,emitted_duration_ms,source_digest,
+                   logical_source_key,source_ordinal)
+               VALUES ('event-foreign','session-foreign','turn-foreign',
+                       'completed','2026-07-26T00:00:00Z',0,NULL,
+                       'source-foreign','logical-foreign',1)"""
+        )
+        connection.execute(
+            """INSERT INTO turn_attempts(
+                   session_key,turn_key,attempt_ordinal,state,
+                   emitted_duration_ms,wall_duration_ms,started_at,finished_at,
+                   timing_provenance)
+               VALUES ('session-foreign','turn-foreign',1,'open',
+                       NULL,NULL,NULL,NULL,'estimated')"""
+        )
+        connection.execute(
+            """INSERT INTO rollout_test_runs(
+                   evidence_key,source_digest,line_number,session_key,
+                   observed_at,turn_key,tool_call_key,command_hash,runner,scope,
+                   exit_status,outcome,failure_cause,retry_kind,
+                   attempt_ordinal,provenance,completeness)
+               VALUES ('evidence-foreign','source-foreign',1,'session-foreign',
+                       NULL,'turn-foreign','call-foreign','command-foreign',
+                       'pytest','targeted',0,'success','none','none',9,
+                       'derived','complete')"""
+        )
+        connection.commit()
+        self.repository.register_and_enqueue(
+            root_kind="sessions",
+            source_locator="rollout.jsonl",
+            project_id="hprj_safe",
+            observed_at="2026-07-26T00:00:00Z",
+        )
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=self.root / "archive",
+            ),
+            materialize=lambda _item, _tail, _connection: MaterializedSource(
+                project_id="hprj_safe",
+            ),
+        )
+
+        with (
+            mock.patch(
+                "hydra_codex.incremental_sync.materialize_test_evidence",
+                wraps=real_materialize_test_evidence,
+            ) as materialize,
+            mock.patch(
+                "hydra_codex.incremental_sync.reconcile_test_retries",
+                wraps=real_reconcile_test_retries,
+            ) as retries,
+            mock.patch(
+                "hydra_codex.incremental_sync.reconcile_turn_attempts",
+                wraps=real_reconcile_turn_attempts,
+            ) as attempts,
+        ):
+            report = worker.sync_once(
+                "worker",
+                "2026-07-26T00:00:00Z",
+                "2026-07-26T00:01:00Z",
+            )
+
+        self.assertEqual(report.completed, 1)
+        materialize.assert_called_once_with(connection, "hprj_safe")
+        retries.assert_called_once_with(connection, "hprj_safe")
+        attempts.assert_called_once_with(
+            connection,
+            mock.ANY,
+            project_id="hprj_safe",
+        )
+        self.assertEqual(
+            tuple(connection.execute(
+                """SELECT attempt_ordinal,state
+                     FROM turn_attempts
+                    WHERE session_key='session-foreign'
+                      AND turn_key='turn-foreign'"""
+            ).fetchone()),
+            (1, "open"),
+        )
+        self.assertEqual(
+            tuple(connection.execute(
+                """SELECT attempt_ordinal,retry_kind
+                     FROM rollout_test_runs
+                    WHERE evidence_key='evidence-foreign'"""
+            ).fetchone()),
+            (9, "none"),
         )
 
     def test_default_materializer_rejects_a_trusted_session_owned_by_another_project(self) -> None:
@@ -1551,14 +1692,44 @@ class IncrementalWorkerTests(unittest.TestCase):
         from hydra_codex.incremental_sync import IncrementalSyncWorker, TrustedSourceRoots
 
         self.repository.mark_dirty("hprj_one", "task-1", "task", "2026-07-26T00:00:00Z")
+        self.repository.mark_dirty("hprj_one", "task-2", "task", "2026-07-26T00:00:00Z")
         self.repository.mark_dirty("hprj_two", "hprj_two", "project", "2026-07-26T00:00:00Z")
-        reconciled: list[str] = []
+        claimed: list[tuple[object, ...]] = []
+        reconciled: list[tuple[str, tuple[object, ...]]] = []
         worker = IncrementalSyncWorker(
             self.store, TrustedSourceRoots(sessions=self.root, archived_sessions=self.root / "archive"),
-            reconcile=reconciled.append,
+            reconcile=lambda project_id, roots: reconciled.append((project_id, roots)),
         )
+        claim_dirty_roots = worker.repository.claim_dirty_roots
+
+        def capture_claim(*args, **kwargs):
+            roots = claim_dirty_roots(*args, **kwargs)
+            claimed.append(roots)
+            return roots
+
+        worker.repository.claim_dirty_roots = capture_claim
         worker.sync_once("worker", "2026-07-26T00:00:00Z", "2026-07-26T00:01:00Z")
-        self.assertEqual(reconciled, ["hprj_one", "hprj_two"])
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(
+            reconciled,
+            [
+                (
+                    project_id,
+                    tuple(root for root in claimed[0] if root.project_id == project_id),
+                )
+                for project_id in ("hprj_one", "hprj_two")
+            ],
+        )
+        self.assertEqual(
+            [
+                (project_id, tuple(root.root_key for root in roots))
+                for project_id, roots in reconciled
+            ],
+            [
+                ("hprj_one", ("task-1", "task-2")),
+                ("hprj_two", ("hprj_two",)),
+            ],
+        )
         self.assertEqual(self.repository.list_dirty_roots(), ())
 
     def test_resumable_repair_uses_scandir_and_registers_without_following_symlinks(self) -> None:
@@ -1982,8 +2153,14 @@ class IncrementalWorkerTests(unittest.TestCase):
         )
         reconciled: list[str] = []
 
-        def slow_reconcile(store, project_id, _key) -> None:
+        def slow_reconcile(
+            store, project_id, _key, *, expected_dirty_roots,
+        ) -> None:
             reconciled.append(project_id)
+            self.assertEqual(
+                tuple(root.project_id for root in expected_dirty_roots),
+                ("hprj_slow",),
+            )
             with store.rollout_transaction() as connection:
                 connection.execute(
                     "CREATE TABLE slow_backfill_reconcile(value INTEGER)",
@@ -2266,8 +2443,9 @@ class IncrementalParityTests(unittest.TestCase):
             )
             worker = IncrementalSyncWorker(
                 incremental, roots,
-                reconcile=lambda project_id: reconcile_project(
+                reconcile=lambda project_id, dirty_roots: reconcile_project(
                     incremental, project_id, self.key,
+                    expected_dirty_roots=dirty_roots,
                 ),
             )
             self.assertEqual(worker.sync_once(
@@ -2332,7 +2510,10 @@ class IncrementalParityTests(unittest.TestCase):
             SyncStateRepository(incremental).enqueue("sessions", "rollout.jsonl", "2026-07-26T00:00:10Z")
             worker = IncrementalSyncWorker(
                 incremental, roots,
-                reconcile=lambda project_id: reconcile_project(incremental, project_id, self.key),
+                reconcile=lambda project_id, dirty_roots: reconcile_project(
+                    incremental, project_id, self.key,
+                    expected_dirty_roots=dirty_roots,
+                ),
             )
             self.assertEqual(worker.sync_once(
                 "partial-worker", "2026-07-26T00:00:10Z", "2026-07-26T00:01:10Z",

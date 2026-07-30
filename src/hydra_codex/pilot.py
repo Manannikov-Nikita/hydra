@@ -27,6 +27,7 @@ from .reconcile_engine import RECONCILIATION_VERSION, list_reconciled_tasks
 from .reconcile_facts import discover_task_plans
 from .reconcile_types import ReconciledTask
 from .storage import HydraStore
+from .sync_state import SyncStateRepository
 
 
 PILOT_SCHEMA = "hydra.pilot/v1"
@@ -199,6 +200,13 @@ def start_pilot(
                    thresholds_json,state)
                VALUES (?,?,?,NULL,?,?,?,'open')""",
             (pilot_id, project_id, started_at, target, family, thresholds_json),
+        )
+        SyncStateRepository(store).mark_dirty_in_transaction(
+            connection,
+            project_id,
+            project_id,
+            "project",
+            started_at,
         )
         return PilotRun(
             pilot_id, project_id, _timestamp(started_at), None, target, family,
@@ -456,6 +464,7 @@ def _pilot_status_snapshot(
     all_latencies: list[int] = []
     denominators: list[int] = []
     classified = 0
+    changed_at: str | None = None
     with store.rollout_transaction() as connection:
         for task in sorted(
             eligible,
@@ -513,7 +522,7 @@ def _pilot_status_snapshot(
                 }).encode("utf-8")
             ).hexdigest()
             if enroll:
-                connection.execute(
+                changed = connection.execute(
                     """INSERT INTO pilot_tasks(
                        pilot_id,task_ref,completed_at,task_family,scope_change,
                        instrumented,initial_missing,finish_missing,delivery_failures,
@@ -535,7 +544,9 @@ def _pilot_status_snapshot(
                        accepted_transport_events=excluded.accepted_transport_events,
                        staging_latency_p95_ms=excluded.staging_latency_p95_ms,
                        trend_eligible=excluded.trend_eligible,
-                       task_input_digest=excluded.task_input_digest""",
+                       task_input_digest=excluded.task_input_digest
+                   WHERE pilot_tasks.task_input_digest
+                         IS NOT excluded.task_input_digest""",
                     (
                         run.pilot_id, task.public_ref, task_instant.canonical,
                         family, scope,
@@ -546,8 +557,24 @@ def _pilot_status_snapshot(
                         task_digest,
                     ),
                 )
+                if changed.rowcount == 1 and (
+                    changed_at is None
+                    or require_exact_timestamp(
+                        changed_at,
+                        "pilot dirty observation",
+                    ) < task_instant
+                ):
+                    changed_at = task_instant.canonical
             public_tasks.append(task_fact)
             task_cutoffs.append([task.public_ref, task_instant.canonical])
+        if changed_at is not None:
+            SyncStateRepository(store).mark_dirty_in_transaction(
+                connection,
+                project_id,
+                project_id,
+                "project",
+                changed_at,
+            )
 
     eligible_count = len(public_tasks)
     instrumented_count = sum(bool(item["instrumented"]) for item in public_tasks)
@@ -772,6 +799,13 @@ def close_pilot(
                 _canonical(observed_facts), str(live["snapshot_digest"]),
                 audit_sha256,
             ),
+        )
+        SyncStateRepository(store).mark_dirty_in_transaction(
+            connection,
+            project_id,
+            project_id,
+            "project",
+            created_at,
         )
         return PilotReceipt(
             receipt_id, pilot_id, created_at, decision, task_refs,

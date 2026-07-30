@@ -29,6 +29,7 @@ from .annotation_types import (
 from .contracts import AnnotationKind, ModelAnnotationInput, Provenance
 from .rollout_identity import Pseudonymizer
 from .storage import HydraStore
+from .sync_state import SyncStateRepository
 
 
 def _annotation_payload(model: ModelAnnotationInput) -> dict[str, object]:
@@ -95,17 +96,25 @@ def issue_capability(
             raise CapabilityRejected("trusted turn binding is inconsistent")
         if binding is not None and binding["state"] == "finished":
             raise CapabilityRejected("turn is already finished")
-        connection.execute(
+        binding_inserted = connection.execute(
             """INSERT INTO trusted_turn_bindings(turn_key,project_id,session_key,created_at)
                VALUES (?,?,?,?) ON CONFLICT(turn_key) DO NOTHING""",
             (turn_key, context.project_id, session_key, context.observed_at),
-        )
+        ).rowcount == 1
         connection.execute(
             """INSERT INTO turn_capabilities(
                    capability_digest,turn_key,created_at,expires_at)
                VALUES (?,?,?,?)""",
             (digest, turn_key, context.observed_at, expires_at),
         )
+        if binding_inserted:
+            SyncStateRepository(store).mark_dirty_in_transaction(
+                connection,
+                project_id=context.project_id,
+                root_key=context.project_id,
+                root_kind="project",
+                observed_at=context.observed_at,
+            )
     return IssuedCapability(token=token, expires_at=expires_at)
 
 
@@ -242,6 +251,7 @@ def _record_model_annotation(
     result: AnnotationWrite | ConflictDecision
 
     with store.rollout_transaction() as connection:
+        source_changed = False
         binding = binding_for_capability(connection, capability_key)
         _require_observation_after_issue(binding, observed_at)
         request_digest = "hreq_v1_" + keys.digest(
@@ -298,6 +308,7 @@ def _record_model_annotation(
                     if by_sequence is not None
                     else "annotation_request_conflict"
                 )
+                before = connection.total_changes
                 stage_fact(
                     connection,
                     keys,
@@ -307,11 +318,13 @@ def _record_model_annotation(
                     observed_at=context.observed_at,
                     discriminator=payload_digest,
                 )
+                source_changed = connection.total_changes > before
                 result = ConflictDecision("annotation request conflicts with an accepted observation")
             elif (
                 context.sequence != binding["last_sequence"] + 1
                 or (previous is not None and observed < timestamp(previous["observed_at"]))
             ):
+                before = connection.total_changes
                 stage_fact(
                     connection,
                     keys,
@@ -321,6 +334,7 @@ def _record_model_annotation(
                     observed_at=context.observed_at,
                     discriminator=payload_digest,
                 )
+                source_changed = connection.total_changes > before
                 result = ConflictDecision("annotation sequence is out of order")
             else:
                 result = insert_annotation(
@@ -334,6 +348,16 @@ def _record_model_annotation(
                     model,
                     provenance,
                 )
+                source_changed = True
+        if source_changed:
+            project_id = str(binding["project_id"])
+            SyncStateRepository(store).mark_dirty_in_transaction(
+                connection,
+                project_id=project_id,
+                root_key=project_id,
+                root_kind="project",
+                observed_at=observed_at,
+            )
     if isinstance(result, ConflictDecision):
         raise AnnotationConflict(result.message)
     return result
@@ -356,6 +380,7 @@ def observe_stop(
         raise ValueError("stop retry expiry must follow observation")
     capability_key = capability_digest(keys, capability)
     with store.rollout_transaction() as connection:
+        source_changed = False
         binding = binding_for_capability(connection, capability_key)
         _require_observation_after_issue(binding, observed_at)
         latest_annotation = connection.execute(
@@ -395,11 +420,11 @@ def observe_stop(
         if binding["state"] == "finished":
             return StopState.SELF_REPORT_MISSING
         if turn_retry == 0:
-            connection.execute(
+            source_changed = connection.execute(
                 """UPDATE trusted_turn_bindings
                       SET first_stop_at=? WHERE turn_key=? AND first_stop_at IS NULL""",
                 (observed_at, binding["turn_key"]),
-            )
+            ).rowcount == 1
             connection.execute(
                 "UPDATE turn_capabilities SET stop_retry=1 WHERE turn_key=?",
                 (binding["turn_key"],),
@@ -411,12 +436,21 @@ def observe_stop(
                     (retry_expires_at, binding["turn_key"]),
                 )
         if not retry_active:
+            if source_changed:
+                project_id = str(binding["project_id"])
+                SyncStateRepository(store).mark_dirty_in_transaction(
+                    connection,
+                    project_id=project_id,
+                    root_key=project_id,
+                    root_kind="project",
+                    observed_at=observed_at,
+                )
             return StopState.RETRY_REQUIRED
-        connection.execute(
+        source_changed = connection.execute(
             """UPDATE trusted_turn_bindings
                   SET state='finished',finished_at=? WHERE turn_key=?""",
             (observed_at, binding["turn_key"]),
-        )
+        ).rowcount == 1 or source_changed
         connection.execute(
             "UPDATE turn_capabilities SET revoked_at=COALESCE(revoked_at,?) WHERE turn_key=?",
             (observed_at, binding["turn_key"]),
@@ -433,4 +467,13 @@ def observe_stop(
             kind="self_report_missing",
             observed_at=observed_at,
         )
+        if source_changed:
+            project_id = str(binding["project_id"])
+            SyncStateRepository(store).mark_dirty_in_transaction(
+                connection,
+                project_id=project_id,
+                root_key=project_id,
+                root_kind="project",
+                observed_at=observed_at,
+            )
         return StopState.SELF_REPORT_MISSING

@@ -29,6 +29,7 @@ from .reconcile_types import (
 from .storage import HydraStore
 from .contracts import normalize_task_label
 from .rollout_reconcile import reconcile_turn_attempts
+from .sync_state import DirtyRoot
 from .task_tree_storage import (
     StoredProjectObservationIndex,
     aggregate_stored_task_tree,
@@ -218,6 +219,161 @@ def _assemble_project(
     return plans, tuple(assembled), hashlib.sha256(payload).hexdigest()
 
 
+def _source_fact_revision(
+    connection: sqlite3.Connection,
+    project_id: str,
+) -> tuple[int, int]:
+    """Return the project-local and conservative unattributed source revisions."""
+    row = connection.execute(
+        """SELECT COALESCE((
+                       SELECT revision
+                         FROM sync_project_source_fact_revisions
+                        WHERE project_id=?
+                   ),0),
+                  (
+                       SELECT revision
+                         FROM sync_unattributed_source_fact_revision
+                        WHERE singleton=1
+                   )""",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        raise ReconciliationStale("source fact revision unavailable")
+    values = tuple(row)
+    if (
+        len(values) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in values
+        )
+    ):
+        raise ReconciliationStale("source fact revision unavailable")
+    return int(values[0]), int(values[1])
+
+
+def _storage_schema_fence(
+    connection: sqlite3.Connection,
+) -> tuple[int, int]:
+    """Snapshot both the public schema version and SQLite schema cookie."""
+    user_version = connection.execute("PRAGMA user_version").fetchone()
+    schema_cookie = connection.execute("PRAGMA schema_version").fetchone()
+    if user_version is None or schema_cookie is None:
+        raise ReconciliationStale("storage schema fence unavailable")
+    return int(user_version[0]), int(schema_cookie[0])
+
+
+DirtyClaimBasis = tuple[tuple[str, str, str, str, str], ...]
+
+
+def _expected_dirty_basis(
+    project_id: str,
+    roots: tuple[DirtyRoot, ...] | None,
+) -> DirtyClaimBasis | None:
+    if roots is None:
+        return None
+    if not roots:
+        raise ValueError("expected_dirty_roots must not be empty")
+    basis: list[tuple[str, str, str, str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for root in roots:
+        if root.project_id != project_id:
+            raise ValueError("expected dirty root belongs to another project")
+        if root.claim_owner is None or root.claim_token is None:
+            raise ValueError("expected dirty root is not claimed")
+        identity = (root.root_key, root.root_kind)
+        if identity in identities:
+            raise ValueError("expected dirty root is duplicated")
+        identities.add(identity)
+        basis.append((
+            root.root_key,
+            root.root_kind,
+            root.observed_at,
+            root.claim_owner,
+            root.claim_token,
+        ))
+    return tuple(sorted(basis, key=lambda item: (item[1], item[0])))
+
+
+def _current_dirty_basis(
+    connection: sqlite3.Connection,
+    project_id: str,
+    expected: DirtyClaimBasis,
+) -> DirtyClaimBasis | None:
+    basis: list[tuple[str, str, str, str, str]] = []
+    for root_key, root_kind, _observed_at, _owner, _token in expected:
+        row = connection.execute(
+            """SELECT observed_at,claim_owner,claim_token
+                 FROM sync_dirty_roots
+                WHERE project_id=? AND root_key=? AND root_kind=?""",
+            (project_id, root_key, root_kind),
+        ).fetchone()
+        if row is None or row[1] is None or row[2] is None:
+            return None
+        basis.append((
+            root_key,
+            root_kind,
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+        ))
+    return tuple(sorted(basis, key=lambda item: (item[1], item[0])))
+
+
+def source_fact_fence_current(
+    connection: sqlite3.Connection,
+    project_id: str,
+) -> bool:
+    """Check one persisted reconciliation fence using bounded indexed reads."""
+    try:
+        row = connection.execute(
+            """SELECT CASE WHEN
+                       fence.project_id IS NOT NULL
+                       AND fence.project_revision=
+                           COALESCE(project_revision.revision,0)
+                       AND fence.unattributed_revision=
+                           unattributed_revision.revision
+                       AND fence.storage_schema_version=(
+                           SELECT user_version FROM pragma_user_version
+                       )
+                       AND fence.storage_schema_cookie=(
+                           SELECT schema_version FROM pragma_schema_version
+                       )
+                       AND fence.reconciliation_version=?
+                       AND EXISTS (
+                           SELECT 1 FROM reconciliation_runs AS run
+                            WHERE run.project_id=fence.project_id
+                              AND run.outcome='success'
+                              AND run.reconciliation_version=
+                                  fence.reconciliation_version
+                              AND run.input_digest=fence.input_digest
+                       )
+                       THEN 1 ELSE 0 END
+                 FROM sync_unattributed_source_fact_revision
+                      AS unattributed_revision
+                 LEFT JOIN sync_project_source_fact_revisions
+                      AS project_revision
+                   ON project_revision.project_id=?
+                 LEFT JOIN sync_project_reconcile_fences AS fence
+                   ON fence.project_id=?
+                WHERE unattributed_revision.singleton=1""",
+            (RECONCILIATION_VERSION, project_id, project_id),
+        ).fetchone()
+        return row is not None and row[0] == 1
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def require_source_fact_fence_current(
+    connection: sqlite3.Connection,
+    project_id: str,
+) -> None:
+    """Reject a public reconciled read unless its persisted source fence holds."""
+    if not source_fact_fence_current(connection, project_id):
+        raise ReconciliationStale("reconcile_required")
+
+
 def _task_display_name(
     connection: sqlite3.Connection,
     project_id: str,
@@ -385,6 +541,8 @@ def _persist_task(
 
 def reconcile_project(
     store: HydraStore, project_id: str, installation_key: bytes,
+    *,
+    expected_dirty_roots: tuple[DirtyRoot, ...] | None = None,
 ) -> ReconciliationSummary:
     """Rebuild all derived task facts for one project in a single transaction."""
     if not isinstance(project_id, str) or not project_id:
@@ -392,12 +550,25 @@ def reconcile_project(
     if not isinstance(installation_key, bytes) or len(installation_key) < 16:
         raise ValueError("installation_key must contain at least 16 bytes")
     with store.rollout_transaction() as connection:
-        materialize_test_evidence(connection)
-        reconcile_test_retries(connection)
-        reconcile_turn_attempts(connection)
-    baseline_data_version = int(
-        store.connection.execute("PRAGMA data_version").fetchone()[0]
+        materialize_test_evidence(connection, project_id)
+        reconcile_test_retries(connection, project_id)
+        reconcile_turn_attempts(connection, project_id=project_id)
+        baseline_source_revision = _source_fact_revision(
+            connection, project_id,
+        )
+        baseline_schema_fence = _storage_schema_fence(connection)
+    expected_claim_basis = _expected_dirty_basis(
+        project_id, expected_dirty_roots,
     )
+    if (
+        expected_claim_basis is not None
+        and _current_dirty_basis(
+            store.connection, project_id, expected_claim_basis,
+        ) != expected_claim_basis
+    ):
+        raise ReconciliationStale(
+            "dirty claim changed during reconciliation; run reconcile again"
+        )
     plans, assembled, input_digest = _assemble_project(store, project_id)
     references = project_public_references((item.root_key for item in plans), installation_key)
     run_id = "hrec_v1_" + _digest(
@@ -409,9 +580,22 @@ def reconcile_project(
         default=require_exact_timestamp("1970-01-01T00:00:00Z"),
     )
     with store.rollout_transaction() as connection:
-        if int(connection.execute("PRAGMA data_version").fetchone()[0]) != baseline_data_version:
+        if _source_fact_revision(
+            connection, project_id,
+        ) != baseline_source_revision or _storage_schema_fence(
+            connection,
+        ) != baseline_schema_fence:
             raise ReconciliationStale(
                 "source facts changed during reconciliation; run reconcile again"
+            )
+        if (
+            expected_claim_basis is not None
+            and _current_dirty_basis(
+                connection, project_id, expected_claim_basis,
+            ) != expected_claim_basis
+        ):
+            raise ReconciliationStale(
+                "dirty claim changed during reconciliation; run reconcile again"
             )
         display_names = {
             references[plan.root_key]: _task_display_name(connection, project_id, plan)
@@ -459,6 +643,29 @@ def reconcile_project(
                 ),
                 completed_instant.canonical,
             )
+        connection.execute(
+            """INSERT INTO sync_project_reconcile_fences(
+                   project_id,project_revision,unattributed_revision,
+                   storage_schema_version,storage_schema_cookie,
+                   reconciliation_version,input_digest)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(project_id) DO UPDATE SET
+                   project_revision=excluded.project_revision,
+                   unattributed_revision=excluded.unattributed_revision,
+                   storage_schema_version=excluded.storage_schema_version,
+                   storage_schema_cookie=excluded.storage_schema_cookie,
+                   reconciliation_version=excluded.reconciliation_version,
+                   input_digest=excluded.input_digest""",
+            (
+                project_id,
+                baseline_source_revision[0],
+                baseline_source_revision[1],
+                baseline_schema_fence[0],
+                baseline_schema_fence[1],
+                RECONCILIATION_VERSION,
+                input_digest,
+            ),
+        )
     complete_count = sum(item.status == "complete" for item in plans)
     return ReconciliationSummary(
         run_id, project_id, RECONCILIATION_VERSION, len(plans),
@@ -597,6 +804,21 @@ def render_materialized_report_collection(
     store: HydraStore, project_id: str, limit: int, output_format: str,
     sync_freshness: dict[str, object],
 ) -> str:
+    """Read one coherent materialized snapshot without permitting writes."""
+    with store.read_transaction():
+        return _render_materialized_report_collection(
+            store,
+            project_id,
+            limit,
+            output_format,
+            sync_freshness,
+        )
+
+
+def _render_materialized_report_collection(
+    store: HydraStore, project_id: str, limit: int, output_format: str,
+    sync_freshness: dict[str, object],
+) -> str:
     """Read and render precomputed public reports without source reassembly or writes."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer")
@@ -606,6 +828,8 @@ def render_materialized_report_collection(
     from .public_payload import reject_private_fields
     from .reporting import normalize_sync_freshness
     freshness_payload = normalize_sync_freshness(sync_freshness)
+    if not source_fact_fence_current(store.connection, project_id):
+        raise ReconciliationStale("reconcile_required")
     has_reconciliation = store.connection.execute(
         """SELECT 1 FROM reconciliation_runs WHERE project_id=? AND outcome='success'
              ORDER BY completed_at DESC LIMIT 1""",
@@ -835,7 +1059,9 @@ def list_reconciled_reports(
 ):
     from .reconcile_reports import list_reconciled_reports as build_reports
 
-    return build_reports(store, project_id, limit)
+    with store.read_transaction():
+        require_source_fact_fence_current(store.connection, project_id)
+        return build_reports(store, project_id, limit)
 
 
 def get_reconciled_report(
@@ -843,4 +1069,6 @@ def get_reconciled_report(
 ):
     from .reconcile_reports import get_reconciled_report as find_report
 
-    return find_report(store, project_id, public_ref)
+    with store.read_transaction():
+        require_source_fact_fence_current(store.connection, project_id)
+        return find_report(store, project_id, public_ref)

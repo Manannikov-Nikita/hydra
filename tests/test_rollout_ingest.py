@@ -103,7 +103,8 @@ class RolloutIngestTests(unittest.TestCase):
 
         materializations = [
             statement for statement in statements
-            if "DELETE FROM rollout_test_runs" in statement
+            if "FROM test_evidence_candidates" in statement
+            and "SELECT candidate_key,candidate_kind,evidence_key" in statement
         ]
         token_selections = [
             statement for statement in statements

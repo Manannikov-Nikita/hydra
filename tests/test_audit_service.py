@@ -12,7 +12,7 @@ from unittest.mock import patch
 import hydra_codex.audit_service as audit_service_module
 from hydra_codex.audit_service import build_pilot_audit, current_storage_health
 from hydra_codex.pilot import close_pilot, pilot_status, start_pilot
-from hydra_codex.reconcile_engine import reconcile_project
+from hydra_codex.reconcile_engine import ReconciliationStale, reconcile_project
 from hydra_codex.report_renderers import render_report_collection
 from hydra_codex.rollout import ingest_rollouts
 from hydra_codex.services import LocalCommandServices
@@ -112,6 +112,13 @@ class OneShotAuditServiceTests(unittest.TestCase):
                 "hprj_audit_service",
                 self.run.pilot_id,
             )
+            # Enrollment is itself a trusted source fact. Publish a fence that
+            # includes the newly materialized pilot task before testing reads.
+            reconcile_project(
+                store,
+                "hprj_audit_service",
+                b"h" * 32,
+            )
         finally:
             store.close()
 
@@ -184,6 +191,27 @@ class OneShotAuditServiceTests(unittest.TestCase):
         ):
             self.assertNotIn(private, rendered)
 
+    def test_materialized_audit_requires_current_project_source_fence(self) -> None:
+        self._materialize_pilot()
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                "UPDATE pilot_runs SET target=6 WHERE pilot_id=?",
+                (self.run.pilot_id,),
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        with self.assertRaises(ReconciliationStale) as raised:
+            LocalCommandServices(environ=self.environ).audit(
+                self.run.pilot_id,
+                "json",
+                self.database,
+                self.project,
+            )
+        self.assertEqual(str(raised.exception), "reconcile_required")
+
     def test_failed_render_does_not_create_a_storage_baseline(self) -> None:
         self._materialize_pilot()
         with self.assertRaises(ValueError):
@@ -245,7 +273,9 @@ class OneShotAuditServiceTests(unittest.TestCase):
         self._materialize_pilot()
         store = HydraStore(self.database)
         writer = sqlite3.connect(self.database, timeout=0)
-        original = audit_service_module.list_reconciled_reports
+        original = (
+            audit_service_module._list_reconciled_reports_after_refresh
+        )
         interleaving = {"blocked": False}
 
         def attempt_interleaving(active_store, project_id):
@@ -263,7 +293,7 @@ class OneShotAuditServiceTests(unittest.TestCase):
         try:
             with patch.object(
                 audit_service_module,
-                "list_reconciled_reports",
+                "_list_reconciled_reports_after_refresh",
                 side_effect=attempt_interleaving,
             ):
                 build_pilot_audit(

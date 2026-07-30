@@ -31,7 +31,12 @@ from .pilot import read_only_pilot_statuses, read_pilot_status
 from .project import ProjectResolution
 from .public_payload import is_safe_dashboard_display_name, reject_private_fields
 from .public_refs import project_catalog_references
-from .reconcile_engine import ReconciliationStale, list_reconciled_reports
+from .reconcile_engine import (
+    RECONCILIATION_VERSION,
+    ReconciliationStale,
+    list_reconciled_reports,
+    require_source_fact_fence_current,
+)
 from .report_operations import compare_reports
 from .reporting import (
     ComparisonReport,
@@ -604,6 +609,12 @@ class DashboardQueryService:
         """Serve one warm project plus the full catalog with constant query count."""
         store = _BootstrapStore(connection)
         revision, sync_freshness = self._materialized_state(connection)
+        storage_schema_version = int(
+            connection.execute("PRAGMA user_version").fetchone()[0],
+        )
+        storage_schema_cookie = int(
+            connection.execute("PRAGMA schema_version").fetchone()[0],
+        )
         rows = connection.execute(
             """WITH materialized AS (
                    SELECT project_id,report_count,first_reconciled_at,
@@ -654,15 +665,45 @@ class DashboardQueryService:
                    UNION
                    SELECT project_id FROM sync_dirty_roots
                     GROUP BY project_id
+               ),
+               current_fences AS (
+                   SELECT fence.project_id
+                     FROM sync_project_reconcile_fences AS fence
+                     LEFT JOIN sync_project_source_fact_revisions AS revision
+                       ON revision.project_id=fence.project_id
+                     JOIN sync_unattributed_source_fact_revision AS unattributed
+                       ON unattributed.singleton=1
+                    WHERE fence.project_revision=COALESCE(revision.revision,0)
+                      AND fence.unattributed_revision=unattributed.revision
+                      AND fence.storage_schema_version=?
+                      AND fence.storage_schema_cookie=?
+                      AND fence.reconciliation_version=?
+                      AND EXISTS (
+                          SELECT 1 FROM reconciliation_runs AS run
+                           WHERE run.project_id=fence.project_id
+                             AND run.outcome='success'
+                             AND run.reconciliation_version=
+                                 fence.reconciliation_version
+                             AND run.input_digest=fence.input_digest
+                      )
                )
                SELECT catalog.*,
                       EXISTS(
                           SELECT 1 FROM pending
                            WHERE pending.project_id=catalog.project_id
-                      ) AS has_pending_work
+                      ) AS has_pending_work,
+                      EXISTS(
+                          SELECT 1 FROM current_fences
+                           WHERE current_fences.project_id=catalog.project_id
+                      ) AS source_fence_current
                  FROM catalog
                 ORDER BY project_id""",
-            (revision,),
+            (
+                revision,
+                storage_schema_version,
+                storage_schema_cookie,
+                RECONCILIATION_VERSION,
+            ),
         ).fetchall()
         prepared: list[tuple[CatalogProject, int, str, str]] = []
         stats_by_project: dict[str, tuple[object, ...] | None] = {}
@@ -691,7 +732,11 @@ class DashboardQueryService:
             count = int(row["report_count"])
             state = (
                 "current"
-                if count > 0 and not bool(row["has_pending_work"])
+                if (
+                    row["stats_data_revision"] is not None
+                    and not bool(row["has_pending_work"])
+                    and bool(row["source_fence_current"])
+                )
                 else "stale"
             )
             prepared.append((
@@ -730,10 +775,10 @@ class DashboardQueryService:
             for item, report_count, _state, _last_reconciled_at in prepared
             if item.project_id == selected_item.project_id
         )
-        if require_materialized and selected_count == 0:
+        selected_stats = stats_by_project[selected_item.project_id]
+        if require_materialized and selected_stats is None:
             raise ReconciliationStale("reconcile_required")
         reports: list[dict[str, object]] = []
-        selected_stats = stats_by_project[selected_item.project_id]
         expected_revision = (
             None if selected_stats is None else int(selected_stats[7])
         )
@@ -1071,6 +1116,9 @@ class DashboardQueryService:
                     store.connection,
                 )
                 item = self._resolve_project(self._catalog(store), project_ref)
+                require_source_fact_fence_current(
+                    store.connection, item.project_id,
+                )
                 stats = self._project_stats(
                     store.connection, item.project_id, revision,
                 )
@@ -1249,6 +1297,9 @@ class DashboardQueryService:
             with _consistent_read(store.connection):
                 revision = SyncStateRepository(store).data_revision()
                 item = self._resolve_project(self._catalog(store), project_ref)
+                require_source_fact_fence_current(
+                    store.connection, item.project_id,
+                )
                 stats = self._project_stats(
                     store.connection, item.project_id, revision,
                 )

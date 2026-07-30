@@ -52,6 +52,37 @@ class DashboardSyncControllerTests(unittest.TestCase):
         })
         self.assertNotIn("source_locator", repr(summary))
 
+    def test_current_prefers_explicit_repair_over_newer_normal_sync(self) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+
+        repair_id = self.repository.create_job(
+            "repair", "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            repair_id, state="running", sources_discovered=0,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        sync_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:01Z",
+        )
+        self.repository.update_job(
+            sync_id, state="running", sources_discovered=1,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:01Z",
+        )
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=None, installation_key=b"k" * 32, clock=lambda: self.now,
+        )
+        try:
+            summary = controller.current()
+        finally:
+            controller.close()
+
+        self.assertEqual(summary["sync_ref"], repair_id)
+        self.assertEqual(summary["kind"], "repair")
+
     def test_changes_is_monotonic_and_has_no_private_database_fields(self) -> None:
         from hydra_codex.dashboard_sync import DashboardSyncController
 
@@ -384,6 +415,124 @@ class DashboardSyncControllerTests(unittest.TestCase):
 
         self.assertIn(sync_terminal["state"], {"succeeded", "partial"})
         self.assertIn(repair_terminal["state"], {"succeeded", "partial"})
+
+    def test_explicit_repair_blocks_sync_before_its_next_lease_attempt(
+        self,
+    ) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+        from hydra_codex.incremental_sync import TrustedSourceRoots
+
+        self.enqueue_source("repair-priority.jsonl")
+        repair_id = self.repository.create_job(
+            "repair", "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            repair_id, state="running", sources_discovered=0,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        sync_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:00Z",
+        )
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=Path(self.temporary.name) / "archived",
+            ),
+            installation_key=b"k" * 32,
+            clock=lambda: self.now,
+            auto_activate=False,
+        )
+
+        def stop_after_priority_yield(_timeout=None):
+            controller._closed.set()
+            return True
+
+        try:
+            with mock.patch.object(
+                controller._closed, "wait",
+                side_effect=stop_after_priority_yield,
+            ):
+                controller._run_sync(sync_id)
+        finally:
+            controller.close()
+
+        self.assertEqual(len(self.repository.list_queue()), 1)
+        self.assertEqual(self.repository.get_job(sync_id).state, "running")
+        self.assertEqual(self.repository.get_job(repair_id).state, "running")
+
+        self.repository.update_job(
+            repair_id, state="succeeded", sources_discovered=0,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:01Z",
+        )
+        resumed = self.controller()
+        try:
+            terminal = self.wait_for(
+                resumed, sync_id, {"succeeded", "partial", "failed"},
+            )
+        finally:
+            resumed.close()
+
+        self.assertEqual(self.repository.list_queue(), ())
+        self.assertEqual(terminal["state"], "succeeded")
+
+    def test_restart_resumes_explicit_repair_before_newer_normal_sync(
+        self,
+    ) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+        from hydra_codex.incremental_sync import TrustedSourceRoots
+
+        repair_id = self.repository.create_job(
+            "repair", "2026-07-27T10:00:00Z",
+        )
+        self.repository.update_job(
+            repair_id, state="running", sources_discovered=0,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:00Z",
+        )
+        sync_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:01Z",
+        )
+        self.repository.update_job(
+            sync_id, state="running", sources_discovered=0,
+            sources_completed=0, bytes_processed=0,
+            updated_at="2026-07-27T10:00:01Z",
+        )
+        self.assertTrue(self.repository.acquire_lease(
+            "restart-blocker", "2026-07-27T10:00:02Z",
+            "2026-07-27T10:05:00Z",
+        ))
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=Path(self.temporary.name) / "archived",
+            ),
+            installation_key=b"k" * 32,
+            clock=lambda: datetime(
+                2026, 7, 27, 10, 0, 2, tzinfo=timezone.utc,
+            ),
+            auto_activate=False,
+        )
+        try:
+            controller.activate()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                with controller._lock:
+                    active_threads = tuple(controller._threads)
+                if active_threads:
+                    break
+                time.sleep(0.01)
+
+            self.assertIn(repair_id, active_threads)
+            self.assertNotIn(sync_id, active_threads)
+        finally:
+            controller.close()
+            self.repository.release_lease(
+                "restart-blocker", "2026-07-27T10:00:03Z",
+            )
 
     def test_close_stops_after_the_current_batch_without_false_terminal_completion(self) -> None:
         for number in range(1_001):

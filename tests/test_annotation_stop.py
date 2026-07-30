@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from hydra_codex.annotation_core import (
@@ -43,6 +44,38 @@ class AnnotationStopTests(unittest.TestCase):
             expires_at=EXPIRES_AT,
         )
 
+    def sync_dirty_project(self, *, observed_at: str, expires_at: str) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+        from hydra_codex.reconcile_engine import reconcile_project
+
+        sessions = Path(self.temporary.name) / "sessions"
+        archived = Path(self.temporary.name) / "archived-sessions"
+        sessions.mkdir(exist_ok=True)
+        archived.mkdir(exist_ok=True)
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=sessions,
+                archived_sessions=archived,
+            ),
+            reconcile=lambda project_id, roots: reconcile_project(
+                self.store,
+                project_id,
+                b"a" * 32,
+                expected_dirty_roots=roots,
+            ),
+        )
+        result = worker.sync_once(
+            "annotation-stop-sync",
+            observed_at,
+            expires_at,
+            maximum_sources=1,
+        )
+        self.assertEqual(result.claimed, 0)
+
     def test_stop_requests_one_retry_then_stages_missing_finish_without_blocking(self) -> None:
         issued = self.issue()
         record_initial_understand(
@@ -76,6 +109,144 @@ class AnnotationStopTests(unittest.TestCase):
         self.assertEqual(tuple(capability), (1, "2026-07-21T09:02:00Z"))
         self.assertEqual([tuple(row) for row in facts], [("self_report_missing", 1)])
         self.assertEqual(tuple(binding), ("finished", "2026-07-21T09:02:00Z"))
+
+    def test_stop_source_change_syncs_without_later_hook_and_duplicate_does_not_churn(
+        self,
+    ) -> None:
+        from hydra_codex.reconcile_engine import source_fact_fence_current
+        from hydra_codex.sync_state import SyncStateRepository
+
+        issued = self.issue()
+        record_initial_understand(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0),
+            task_family="annotation-core",
+        )
+        self.sync_dirty_project(
+            observed_at="2026-07-21T09:00:30Z",
+            expires_at="2026-07-21T09:00:40Z",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM hook_event_outbox"
+            ).fetchone()[0],
+            0,
+        )
+
+        state = observe_stop(
+            self.store,
+            self.keys,
+            issued.token,
+            observed_at="2026-07-21T09:01:00Z",
+            retry_active=False,
+        )
+
+        repository = SyncStateRepository(self.store)
+        self.assertEqual(state, StopState.RETRY_REQUIRED)
+        self.assertEqual(
+            [
+                (
+                    root.project_id,
+                    root.root_key,
+                    root.root_kind,
+                    root.observed_at,
+                )
+                for root in repository.list_dirty_roots()
+            ],
+            [
+                (
+                    "hprj_annotation_test",
+                    "hprj_annotation_test",
+                    "project",
+                    "2026-07-21T09:01:00Z",
+                )
+            ],
+        )
+        self.sync_dirty_project(
+            observed_at="2026-07-21T09:01:30Z",
+            expires_at="2026-07-21T09:01:40Z",
+        )
+        revision = self.store.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
+
+        duplicate = observe_stop(
+            self.store,
+            self.keys,
+            issued.token,
+            observed_at="2026-07-21T09:02:00Z",
+            retry_active=False,
+        )
+
+        self.assertEqual(duplicate, StopState.RETRY_REQUIRED)
+        self.assertEqual(repository.list_dirty_roots(), ())
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+            revision,
+        )
+        self.assertTrue(
+            source_fact_fence_current(
+                self.store.connection,
+                "hprj_annotation_test",
+            )
+        )
+
+    def test_stop_source_write_rolls_back_when_dirty_enqueue_fails(self) -> None:
+        from hydra_codex.reconcile_engine import source_fact_fence_current
+        from hydra_codex.sync_state import SyncStateRepository
+
+        issued = self.issue()
+        record_initial_understand(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0),
+            task_family="annotation-core",
+        )
+        self.sync_dirty_project(
+            observed_at="2026-07-21T09:00:30Z",
+            expires_at="2026-07-21T09:00:40Z",
+        )
+
+        with mock.patch(
+            "hydra_codex.sync_state.SyncStateRepository.mark_dirty_in_transaction",
+            side_effect=RuntimeError("simulated dirty enqueue failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dirty enqueue"):
+                observe_stop(
+                    self.store,
+                    self.keys,
+                    issued.token,
+                    observed_at="2026-07-21T09:01:00Z",
+                    retry_active=False,
+                )
+
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT first_stop_at,state
+                         FROM trusted_turn_bindings"""
+                ).fetchone()
+            ),
+            (None, "open"),
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT MAX(stop_retry) FROM turn_capabilities"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(SyncStateRepository(self.store).list_dirty_roots(), ())
+        self.assertTrue(
+            source_fact_fence_current(
+                self.store.connection,
+                "hprj_annotation_test",
+            )
+        )
 
     def test_duplicate_hook_callbacks_only_consume_an_active_retry_once(self) -> None:
         issued = self.issue()

@@ -471,7 +471,9 @@ class LocalCommandServiceTests(unittest.TestCase):
             repository.mark_repair_required(
                 "sessions", "z/repair.jsonl", "2026-07-21T00:00:01Z",
             )
-            freshness = LocalCommandServices(environ=self.environ)._sync_freshness(store)
+            freshness = LocalCommandServices(environ=self.environ)._sync_freshness(
+                store, "hprj_local_services",
+            )
         finally:
             store.close()
         self.assertEqual(freshness["state"], "repair_required")
@@ -491,7 +493,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             freshness = LocalCommandServices(
                 environ=self.environ,
                 clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
-            )._sync_freshness(store)
+            )._sync_freshness(store, "hprj_local_services")
         finally:
             store.close()
         self.assertEqual(freshness["state"], "queued")
@@ -512,7 +514,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             freshness = LocalCommandServices(
                 environ=self.environ,
                 clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
-            )._sync_freshness(store)
+            )._sync_freshness(store, "hprj_local_services")
         finally:
             store.close()
         self.assertEqual(freshness["state"], "queued")
@@ -535,7 +537,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             freshness = LocalCommandServices(
                 environ=self.environ,
                 clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
-            )._sync_freshness(store)
+            )._sync_freshness(store, "hprj_local_services")
         finally:
             store.close()
 
@@ -560,7 +562,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             freshness = LocalCommandServices(
                 environ=self.environ,
                 clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
-            )._sync_freshness(store)
+            )._sync_freshness(store, "hprj_local_services")
         finally:
             store.close()
 
@@ -581,7 +583,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             freshness = LocalCommandServices(
                 environ=self.environ,
                 clock=lambda: datetime(2026, 7, 21, 0, 2, tzinfo=timezone.utc),
-            )._sync_freshness(store)
+            )._sync_freshness(store, "hprj_local_services")
         finally:
             store.close()
         self.assertEqual(freshness["state"], "running")
@@ -606,7 +608,7 @@ class LocalCommandServiceTests(unittest.TestCase):
                     2026, 7, 21, 10, 0, 0, 100_000,
                     tzinfo=timezone.utc,
                 ),
-            )._sync_freshness(store)
+            )._sync_freshness(store, "hprj_local_services")
         finally:
             store.close()
 
@@ -981,6 +983,30 @@ class LocalCommandServiceTests(unittest.TestCase):
         self.assertIn(refs[0].replace("_", r"\_"), compared[1])
         self.assertNotIn("task-a", compared[1])
         self.assertNotIn("task-b", compared[1])
+
+        from hydra_codex.pilot import start_pilot
+        from hydra_codex.reconcile_engine import ReconciliationStale
+
+        store = HydraStore(self.database)
+        try:
+            start_pilot(
+                store,
+                project_id="hprj_local_services",
+                target=5,
+                task_family="telemetry-analysis",
+                now=datetime(2026, 7, 21, 0, 1, tzinfo=timezone.utc),
+            )
+        finally:
+            store.close()
+        with self.assertRaises(ReconciliationStale) as raised:
+            LocalCommandServices(environ=self.environ).compare(
+                refs[1],
+                refs[0],
+                "markdown",
+                self.database,
+                self.project,
+            )
+        self.assertEqual(str(raised.exception), "reconcile_required")
 
     def test_report_uses_materialized_snapshot_without_source_assembly(self) -> None:
         self._rollout("snapshot-task", second=10, input_tokens=100)

@@ -28,6 +28,7 @@ from hydra_codex.public_refs import (
     project_catalog_references,
     project_public_references,
 )
+from hydra_codex.reconcile_engine import ReconciliationStale, reconcile_project
 from hydra_codex.report_renderers import render_json
 from hydra_codex.storage import HydraStore
 from hydra_codex.sync_state import SyncStateRepository
@@ -234,9 +235,77 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
                 "UPDATE sync_data_revision SET revision=? WHERE singleton=1",
                 (revision,),
             )
+            self._publish_test_fence(
+                store, project_id, reports, revision=revision,
+            )
             store.connection.commit()
         finally:
             store.close()
+
+    def _publish_test_fence(
+        self,
+        store: HydraStore,
+        project_id: str,
+        reports: tuple[object, ...],
+        *,
+        revision: int,
+    ) -> None:
+        input_digest = f"{revision:064x}"
+        reconciled_at = max(
+            (str(report.last_activity_at) for report in reports),
+            default="1970-01-01T00:00:00Z",
+        )
+        store.connection.execute(
+            """INSERT INTO reconciliation_runs(
+                   run_id,project_id,started_at,outcome,provenance,
+                   reconciliation_version,input_digest,completed_at,task_count)
+               VALUES (?, ?, ?, 'success', 'derived', 1, ?, ?, ?)
+               ON CONFLICT(run_id) DO UPDATE SET
+                   outcome='success',completed_at=excluded.completed_at,
+                   task_count=excluded.task_count""",
+            (
+                f"test-run-{project_id}-{revision}",
+                project_id,
+                reconciled_at,
+                input_digest,
+                reconciled_at,
+                len(reports),
+            ),
+        )
+        project_revision = store.connection.execute(
+            """SELECT revision FROM sync_project_source_fact_revisions
+                WHERE project_id=?""",
+            (project_id,),
+        ).fetchone()
+        unattributed_revision = store.connection.execute(
+            """SELECT revision
+                 FROM sync_unattributed_source_fact_revision
+                WHERE singleton=1"""
+        ).fetchone()[0]
+        store.connection.execute(
+            """INSERT INTO sync_project_reconcile_fences(
+                   project_id,project_revision,unattributed_revision,
+                   storage_schema_version,storage_schema_cookie,
+                   reconciliation_version,input_digest)
+               VALUES (?,?,?,?,?,1,?)
+               ON CONFLICT(project_id) DO UPDATE SET
+                   project_revision=excluded.project_revision,
+                   unattributed_revision=excluded.unattributed_revision,
+                   storage_schema_version=excluded.storage_schema_version,
+                   storage_schema_cookie=excluded.storage_schema_cookie,
+                   reconciliation_version=excluded.reconciliation_version,
+                   input_digest=excluded.input_digest""",
+            (
+                project_id,
+                0 if project_revision is None else int(project_revision[0]),
+                int(unattributed_revision),
+                store.schema_version(),
+                int(store.connection.execute(
+                    "PRAGMA schema_version",
+                ).fetchone()[0]),
+                input_digest,
+            ),
+        )
 
     def test_snapshot_uses_latest_task_and_never_writes(self) -> None:
         project_ref = self.catalog_refs()["project-a"]
@@ -462,6 +531,9 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             store.connection.execute(
                 "UPDATE sync_data_revision SET revision=7 WHERE singleton=1"
             )
+            self._publish_test_fence(
+                store, "project-a", (report,), revision=7,
+            )
             store.connection.commit()
         finally:
             store.close()
@@ -566,6 +638,9 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             )
             store.connection.execute(
                 "UPDATE sync_data_revision SET revision=8 WHERE singleton=1"
+            )
+            self._publish_test_fence(
+                store, "project-c", (report,), revision=8,
             )
             store.connection.commit()
         finally:
@@ -825,6 +900,203 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(states[refs["project-b"]], "stale")
         self.assertEqual(payload["project"]["freshness_state"], "stale")
 
+    def test_connection_bootstrap_scopes_source_revision_freshness_by_project(
+        self,
+    ) -> None:
+        self.materialize("project-a", self.reports["project-a"])
+        self.materialize("project-b", self.reports["project-b"])
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO hook_safe_facts(
+                       event_key,project_id,session_key,turn_key,event_kind,
+                       tool_category,tool_status,duration_ms,observed_at)
+                   VALUES (
+                       'project-b-after-publish','project-b','session-b',
+                       'turn-b','prompt',NULL,NULL,NULL,
+                       '2026-07-23T00:00:02Z'
+                   )"""
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, _empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+        payload = next(iter(snapshots.values())).as_dict()
+        refs = self.catalog_refs()
+        states = {
+            item["project_ref"]: item["freshness_state"]
+            for item in payload["projects"]
+        }
+        self.assertEqual(states[refs["project-a"]], "current")
+        self.assertEqual(states[refs["project-b"]], "stale")
+
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO file_observations(
+                       source_digest,line_number,session_key,operation,
+                       relative_path,path_hash)
+                   VALUES (
+                       'unmapped-dashboard-source',1,'missing-session','read',
+                       'safe.txt','safe-hash'
+                   )"""
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, _empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+        payload = next(iter(snapshots.values())).as_dict()
+        states = {
+            item["project_ref"]: item["freshness_state"]
+            for item in payload["projects"]
+        }
+        self.assertEqual(states[refs["project-a"]], "stale")
+        self.assertEqual(states[refs["project-b"]], "stale")
+
+    def test_source_fact_commit_wakes_polling_and_reload_marks_project_stale(
+        self,
+    ) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+
+        self.materialize("project-a", self.reports["project-a"])
+        self.materialize("project-b", self.reports["project-b"])
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=None,
+            installation_key=b"k" * 32,
+            clock=lambda: datetime(
+                2026, 7, 23, 0, 0, 3, tzinfo=timezone.utc,
+            ),
+        )
+        try:
+            before = controller.changes(0)["data_revision"]
+            store = HydraStore(self.database)
+            try:
+                store.connection.execute(
+                    """INSERT INTO hook_safe_facts(
+                           event_key,project_id,session_key,turn_key,event_kind,
+                           tool_category,tool_status,duration_ms,observed_at)
+                       VALUES (
+                           'project-a-poll-wakeup','project-a','session-a',
+                           'turn-a','prompt',NULL,NULL,NULL,
+                           '2026-07-23T00:00:02Z'
+                       )"""
+                )
+                store.connection.commit()
+            finally:
+                store.close()
+
+            changes = controller.changes(before)
+        finally:
+            controller.close()
+
+        self.assertTrue(changes["changed"])
+        self.assertGreater(changes["data_revision"], before)
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            snapshots, _empty = self.service.bootstrap_snapshots_from_connection(
+                connection, refresh=self.refresh,
+            )
+        finally:
+            connection.close()
+        payload = next(iter(snapshots.values())).as_dict()
+        refs = self.catalog_refs()
+        states = {
+            item["project_ref"]: item["freshness_state"]
+            for item in payload["projects"]
+        }
+        self.assertEqual(states[refs["project-a"]], "stale")
+        self.assertEqual(states[refs["project-b"]], "current")
+
+    def test_reconcile_fence_success_lookup_uses_exact_composite_index(
+        self,
+    ) -> None:
+        store = HydraStore(self.database)
+        try:
+            plan = tuple(
+                str(row[3])
+                for row in store.connection.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT 1 FROM reconciliation_runs
+                        WHERE project_id=?
+                          AND outcome='success'
+                          AND reconciliation_version=?
+                          AND input_digest=?
+                        LIMIT 1""",
+                    ("project-a", 1, "0" * 64),
+                )
+            )
+        finally:
+            store.close()
+
+        self.assertTrue(
+            any(
+                "reconciliation_runs_source_fence_lookup" in step
+                for step in plan
+            ),
+            plan,
+        )
+        self.assertFalse(
+            any("SCAN reconciliation_runs" in step for step in plan),
+            plan,
+        )
+
+    def test_connection_bootstrap_treats_empty_reconciled_project_as_current(
+        self,
+    ) -> None:
+        store = HydraStore(self.database)
+        try:
+            reconcile_project(store, "project-empty", b"k" * 32)
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            with patch(
+                "hydra_codex.dashboard_queries.list_reconciled_reports",
+                side_effect=AssertionError(
+                    "empty materialized project must stay on the bounded path",
+                ),
+            ):
+                snapshots, empty = (
+                    self.service.bootstrap_snapshots_from_connection(
+                        connection, refresh=self.refresh,
+                    )
+                )
+        finally:
+            connection.close()
+
+        self.assertIsNone(empty)
+        payload = next(iter(snapshots.values())).as_dict()
+        refs = project_catalog_references(
+            ("project-a", "project-b", "project-empty"), b"k" * 32,
+        )
+        summary = next(
+            item for item in payload["projects"]
+            if item["project_ref"] == refs["project-empty"]
+        )
+        self.assertEqual(summary["freshness_state"], "current")
+        self.assertEqual(summary["task_count"]["value"], 0)
+
     def test_uncached_project_snapshot_loads_only_its_materialized_top_ten(
         self,
     ) -> None:
@@ -853,6 +1125,10 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             store.connection.execute(
                 "UPDATE sync_data_revision SET revision=4 WHERE singleton=1"
             )
+            for project_id, reports in self.reports.items():
+                self._publish_test_fence(
+                    store, project_id, reports, revision=4,
+                )
             store.connection.commit()
         finally:
             store.close()
@@ -1194,6 +1470,35 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
         self.assertEqual(len(report_reads), 3)
         self.assertTrue(all("LIMIT 2" in statement for statement in report_reads[::2]))
 
+    def test_task_page_rejects_stale_source_fence_before_reading_payloads(
+        self,
+    ) -> None:
+        self.materialize("project-a", self.reports["project-a"])
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO hook_safe_facts(
+                       event_key,project_id,session_key,turn_key,event_kind,
+                       tool_category,tool_status,duration_ms,observed_at)
+                   VALUES (
+                       'task-page-after-publish','project-a','session-a',
+                       'turn-a','prompt',NULL,NULL,NULL,
+                       '2026-07-23T00:00:02Z'
+                   )"""
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        with patch.object(
+            self.service,
+            "_materialized_payload",
+            side_effect=AssertionError("stale task payload must not be read"),
+        ), self.assertRaisesRegex(ReconciliationStale, "reconcile_required"):
+            self.service.tasks(
+                self.catalog_refs()["project-a"], cursor=None, limit=10,
+            )
+
     def test_task_page_orders_full_timestamp_precision_before_task_ref(self) -> None:
         older = replace(
             public_report("nanosecond-older", input_tokens=10, second=5),
@@ -1363,6 +1668,34 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
             (first.task_ref, latest.task_ref),
         )
 
+    def test_compare_rejects_stale_source_fence_before_reading_payloads(
+        self,
+    ) -> None:
+        project_ref = self.catalog_refs()["project-a"]
+        latest, first = self.reports["project-a"]
+        self.materialize("project-a", self.reports["project-a"])
+        store = HydraStore(self.database)
+        try:
+            store.connection.execute(
+                """INSERT INTO hook_safe_facts(
+                       event_key,project_id,session_key,turn_key,event_kind,
+                       tool_category,tool_status,duration_ms,observed_at)
+                   VALUES (
+                       'compare-after-publish','project-a','session-a',
+                       'turn-a','prompt',NULL,NULL,NULL,
+                       '2026-07-23T00:00:02Z'
+                   )"""
+            )
+            store.connection.commit()
+        finally:
+            store.close()
+
+        with patch(
+            "hydra_codex.dashboard_queries.read_materialized_task_reports",
+            side_effect=AssertionError("stale comparison payload must not be read"),
+        ), self.assertRaisesRegex(ReconciliationStale, "reconcile_required"):
+            self.service.compare(project_ref, first.task_ref, latest.task_ref)
+
     def test_evidence_reads_only_latest_selected_project_pilot(self) -> None:
         store = HydraStore(self.database)
         try:
@@ -1376,6 +1709,9 @@ class DashboardPublicQueryServiceTests(unittest.TestCase):
                     ("hpilot_v1_22222222222222222222222222222222", "project-a", "2026-07-22T00:00:00.1Z", None, "open"),
                     ("hpilot_v1_33333333333333333333333333333333", "project-b", "2026-07-23T00:00:00Z", None, "open"),
                 ),
+            )
+            self._publish_test_fence(
+                store, "project-a", (), revision=0,
             )
             store.connection.commit()
         finally:

@@ -22,7 +22,7 @@ from .report_renderers import (
 from .rollout_identity import Pseudonymizer
 from .platform_paths import default_installation_key_path
 from .storage import HydraStore
-from .sync_state import SyncStateRepository
+from .sync_state import DirtyRoot, SyncStateRepository
 
 
 Clock = Callable[[], datetime]
@@ -180,7 +180,9 @@ class LocalCommandServices:
         try:
             result = IncrementalSyncWorker(
                 store, self._sync_roots(),
-                reconcile=lambda project_id: self._reconcile_store(store, project_id),
+                reconcile=lambda project_id, roots: self._reconcile_store(
+                    store, project_id, roots,
+                ),
             ).sync_once("cli-" + uuid.uuid4().hex, now, expiry)
             return {
                 "command": "sync", "status": "ok", "claimed": result.claimed,
@@ -190,10 +192,20 @@ class LocalCommandServices:
         finally:
             store.close()
 
-    def _reconcile_store(self, store: HydraStore, project_id: str) -> object:
+    def _reconcile_store(
+        self,
+        store: HydraStore,
+        project_id: str,
+        expected_dirty_roots: tuple[DirtyRoot, ...],
+    ) -> object:
         from .reconcile_engine import reconcile_project
 
-        return reconcile_project(store, project_id, self._keys().key)
+        return reconcile_project(
+            store,
+            project_id,
+            self._keys().key,
+            expected_dirty_roots=expected_dirty_roots,
+        )
 
     def repair(self, database_path: Path | None, cwd: Path) -> dict[str, object]:
         """Run every bounded batch of the explicit resumable history repair."""
@@ -295,7 +307,7 @@ class LocalCommandServices:
         store = HydraStore.open_current(self._database_path(database_path))
         try:
             with _consistent_read(store.connection):
-                freshness = self._sync_freshness(store)
+                freshness = self._sync_freshness(store, project.project_id)
                 try:
                     return render_materialized_report_collection(
                         store, project.project_id, last, output_format, freshness,
@@ -308,7 +320,13 @@ class LocalCommandServices:
         finally:
             store.close()
 
-    def _sync_freshness(self, store: HydraStore) -> dict[str, object]:
+    def _sync_freshness(
+        self,
+        store: HydraStore,
+        project_id: str,
+    ) -> dict[str, object]:
+        from .reconcile_engine import source_fact_fence_current
+
         repository = SyncStateRepository(store)
         connection = store.connection
         now = _utc_now(self._clock)
@@ -360,6 +378,10 @@ class LocalCommandServices:
         state = (
             "repair_required" if repair else "queued" if queued else "running" if running else "current"
         )
+        if state == "current" and not source_fact_fence_current(
+            connection, project_id,
+        ):
+            state = "reconcile_required"
         return {
             "schema_version": "hydra.sync-freshness/v1",
             "state": state,
@@ -379,9 +401,16 @@ class LocalCommandServices:
         project = self._project(cwd)
         store = HydraStore.open_current(self._database_path(database_path))
         try:
-            baseline = get_reconciled_report(store, project.project_id, left)
-            current = get_reconciled_report(store, project.project_id, right)
-            return _renderer(output_format)(compare_reports(baseline, current))
+            with store.read_transaction():
+                baseline = get_reconciled_report(
+                    store, project.project_id, left,
+                )
+                current = get_reconciled_report(
+                    store, project.project_id, right,
+                )
+                return _renderer(output_format)(
+                    compare_reports(baseline, current),
+                )
         finally:
             store.close()
 

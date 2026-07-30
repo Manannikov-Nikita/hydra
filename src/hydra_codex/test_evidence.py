@@ -218,19 +218,33 @@ def _bound_structural_terminals(
     return list(terminals.values())
 
 
-def materialize_test_evidence(connection: sqlite3.Connection) -> None:
+def materialize_test_evidence(
+    connection: sqlite3.Connection,
+    project_id: str | None = None,
+) -> None:
     """Rebuild one canonical test run per session/tool call from immutable facts."""
+    project_filter = (
+        ""
+        if project_id is None
+        else """ WHERE session_key IN (
+                    SELECT session_key FROM rollout_sessions
+                     WHERE project_id=?
+                )"""
+    )
+    parameters: tuple[object, ...] = (
+        () if project_id is None else (project_id,)
+    )
     rows = list(connection.execute(
-        """SELECT candidate_key,candidate_kind,evidence_key,source_digest,line_number,
+        f"""SELECT candidate_key,candidate_kind,evidence_key,source_digest,line_number,
                   session_key,observed_at,turn_key,tool_call_key,command_hash,runner,
                   scope,exit_status,outcome,failure_cause,provenance,completeness
-             FROM test_evidence_candidates"""
+             FROM test_evidence_candidates{project_filter}""",
+        parameters,
     ))
     groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
         groups.setdefault((str(row[5]), str(row[8])), []).append(row)
-
-    connection.execute("DELETE FROM rollout_test_runs")
+    desired: dict[str, tuple[object, ...]] = {}
     for (session_key, tool_call_key), candidates in sorted(groups.items()):
         canonical_tool = connection.execute(
             "SELECT tool_name FROM tool_spans WHERE session_key=? AND call_key=?",
@@ -296,35 +310,78 @@ def materialize_test_evidence(connection: sqlite3.Connection) -> None:
                 selected[12], selected[13], selected[14], selected[16],
             )
         )
-        connection.execute(
-            """INSERT INTO rollout_test_runs(
-                   evidence_key,source_digest,line_number,session_key,observed_at,
-                   turn_key,tool_call_key,command_hash,runner,scope,exit_status,
-                   outcome,failure_cause,retry_kind,attempt_ordinal,provenance,
-                   completeness)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'none',1,?,?)""",
+        desired[str(description[2])] = (
+            description[2],
+            structural_terminal[0]
+            if not terminal and structural_terminal is not None
+            else selected[3],
+            structural_terminal[1]
+            if not terminal and structural_terminal is not None
+            else selected[4],
+            session_key,
             (
-                description[2],
-                structural_terminal[0]
-                if not terminal and structural_terminal is not None
-                else selected[3],
-                structural_terminal[1]
-                if not terminal and structural_terminal is not None
-                else selected[4],
-                session_key,
-                (
-                    structural_terminal[2]
-                    if not terminal and structural_terminal is not None else selected[6]
-                ) or description[6],
-                (
-                    structural_terminal[3]
-                    if not terminal and structural_terminal is not None else selected[7]
-                ) or description[7],
-                tool_call_key, description[9], description[10], description[11],
-                result.exit_status, result.outcome, result.failure_cause,
-                selected[15], result.completeness,
-            ),
+                structural_terminal[2]
+                if not terminal and structural_terminal is not None else selected[6]
+            ) or description[6],
+            (
+                structural_terminal[3]
+                if not terminal and structural_terminal is not None else selected[7]
+            ) or description[7],
+            tool_call_key, description[9], description[10], description[11],
+            result.exit_status, result.outcome, result.failure_cause,
+            "none", 1, selected[15], result.completeness,
         )
+
+    existing = {
+        str(row[0])
+        for row in connection.execute(
+            f"""SELECT evidence_key
+                  FROM rollout_test_runs{project_filter}""",
+            parameters,
+        )
+    }
+    connection.executemany(
+        "DELETE FROM rollout_test_runs WHERE evidence_key=?",
+        ((key,) for key in sorted(existing - desired.keys())),
+    )
+    connection.executemany(
+        """INSERT INTO rollout_test_runs(
+               evidence_key,source_digest,line_number,session_key,observed_at,
+               turn_key,tool_call_key,command_hash,runner,scope,exit_status,
+               outcome,failure_cause,retry_kind,attempt_ordinal,provenance,
+               completeness)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(evidence_key) DO UPDATE SET
+             source_digest=excluded.source_digest,
+             line_number=excluded.line_number,
+             session_key=excluded.session_key,
+             observed_at=excluded.observed_at,
+             turn_key=excluded.turn_key,
+             tool_call_key=excluded.tool_call_key,
+             command_hash=excluded.command_hash,
+             runner=excluded.runner,
+             scope=excluded.scope,
+             exit_status=excluded.exit_status,
+             outcome=excluded.outcome,
+             failure_cause=excluded.failure_cause,
+             provenance=excluded.provenance,
+             completeness=excluded.completeness
+           WHERE rollout_test_runs.source_digest IS NOT excluded.source_digest
+              OR rollout_test_runs.line_number IS NOT excluded.line_number
+              OR rollout_test_runs.session_key IS NOT excluded.session_key
+              OR rollout_test_runs.observed_at IS NOT excluded.observed_at
+              OR rollout_test_runs.turn_key IS NOT excluded.turn_key
+              OR rollout_test_runs.tool_call_key IS NOT excluded.tool_call_key
+              OR rollout_test_runs.command_hash IS NOT excluded.command_hash
+              OR rollout_test_runs.runner IS NOT excluded.runner
+              OR rollout_test_runs.scope IS NOT excluded.scope
+              OR rollout_test_runs.exit_status IS NOT excluded.exit_status
+              OR rollout_test_runs.outcome IS NOT excluded.outcome
+              OR rollout_test_runs.failure_cause IS NOT excluded.failure_cause
+              OR rollout_test_runs.provenance IS NOT excluded.provenance
+              OR rollout_test_runs.completeness IS NOT excluded.completeness""",
+        tuple(desired[key] for key in sorted(desired)),
+    )
 
 
 def persist_semantic_conflict(
@@ -359,17 +416,42 @@ def _timestamp_key(value: str | None, source: str, line: int) -> tuple[int, floa
     return (1, 0.0, source, line)
 
 
-def reconcile_test_retries(connection: sqlite3.Connection) -> None:
+def reconcile_test_retries(
+    connection: sqlite3.Connection,
+    project_id: str | None = None,
+) -> None:
     """Recompute attempts globally per session/command from stable evidence."""
+    project_filter = (
+        ""
+        if project_id is None
+        else """ WHERE session_key IN (
+                    SELECT session_key FROM rollout_sessions
+                     WHERE project_id=?
+                )"""
+    )
+    parameters: tuple[object, ...] = (
+        () if project_id is None else (project_id,)
+    )
     tests = list(connection.execute(
-        """SELECT evidence_key, source_digest, line_number, session_key, observed_at,
+        f"""SELECT evidence_key, source_digest, line_number, session_key, observed_at,
                   command_hash, outcome, failure_cause
-             FROM rollout_test_runs"""
+             FROM rollout_test_runs{project_filter}""",
+        parameters,
     ))
     writes: dict[str, list[tuple[int, float, str, int]]] = {}
+    write_project_filter = (
+        ""
+        if project_id is None
+        else """ AND session_key IN (
+                    SELECT session_key FROM rollout_sessions
+                     WHERE project_id=?
+                )"""
+    )
     for row in connection.execute(
-        """SELECT session_key, observed_at, source_digest, line_number
-             FROM file_observations WHERE operation = 'write'"""
+        f"""SELECT session_key, observed_at, source_digest, line_number
+             FROM file_observations
+            WHERE operation = 'write'{write_project_filter}""",
+        parameters,
     ):
         writes.setdefault(row[0], []).append(_timestamp_key(row[1], row[2], row[3]))
     groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
@@ -391,8 +473,14 @@ def reconcile_test_retries(connection: sqlite3.Connection) -> None:
                 elif previous[6] != "success":
                     retry_kind = "unknown_recovery"
             connection.execute(
-                "UPDATE rollout_test_runs SET attempt_ordinal = ?, retry_kind = ? WHERE evidence_key = ?",
-                (ordinal, retry_kind, row[0]),
+                """UPDATE rollout_test_runs
+                      SET attempt_ordinal=?,retry_kind=?
+                    WHERE evidence_key=?
+                      AND (
+                          attempt_ordinal IS NOT ?
+                          OR retry_kind IS NOT ?
+                      )""",
+                (ordinal, retry_kind, row[0], ordinal, retry_kind),
             )
             previous, previous_key = row, current_key
 

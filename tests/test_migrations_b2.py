@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -12,6 +13,15 @@ from unittest.mock import patch
 from hydra_codex.annotation_spool import _record_transport
 from hydra_codex.exact_time import require_exact_timestamp
 from hydra_codex.metrics import aggregate_project, aggregate_project_facts
+from hydra_codex.migrations_ac29 import (
+    AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL,
+)
+from hydra_codex.migrations_ad30 import (
+    AD30_LEGACY_REQUIRED_TRIGGER_SQL,
+    AD30_LEGACY_SOURCE_FACT_REVISIONS_TABLE_SQL,
+    AD30_REQUIRED_TRIGGER_SQL,
+    migrate_v50_source_fact_revisions,
+)
 from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.services import LocalCommandServices
@@ -206,6 +216,63 @@ def seed_legacy_reconciliation(path: Path) -> None:
         connection.close()
 
 
+def replace_v48_with_intermediate_source_revisions(
+    path: Path,
+    *,
+    counters: tuple[tuple[str, str, int], ...] = (
+        ("project", "preserved-project", 17),
+        ("project", "second-project", 4),
+        ("unattributed", "", 3),
+    ),
+) -> None:
+    """Build the exact unpublished intermediate v48 found on real installs."""
+    build_schema(path, 47)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(AD30_LEGACY_SOURCE_FACT_REVISIONS_TABLE_SQL)
+        connection.executemany(
+            """INSERT INTO sync_source_fact_revisions(
+                   scope_kind,project_id,revision
+               ) VALUES (?,?,?)""",
+            counters,
+        )
+        for statement in AD30_LEGACY_REQUIRED_TRIGGER_SQL.values():
+            connection.execute(statement)
+        connection.execute(
+            """INSERT INTO schema_migrations(version,applied_at)
+               VALUES (48,'2026-07-29T00:00:00Z')"""
+        )
+        connection.execute("PRAGMA user_version=48")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def configure_migration_connection(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.create_function(
+        "hydra_rfc3339_nanos",
+        1,
+        lambda value: require_exact_timestamp(
+            value, "migration fixture timestamp",
+        ).epoch_nanoseconds,
+        deterministic=True,
+    )
+
+
+def mark_fixture_schema_version(
+    connection: sqlite3.Connection,
+    version: int,
+) -> None:
+    connection.execute(
+        """INSERT INTO schema_migrations(version,applied_at)
+           VALUES (?,'2026-07-30T00:00:00Z')""",
+        (version,),
+    )
+    connection.execute(f"PRAGMA user_version={version}")
+
+
 class MigrationMatrixB2Tests(unittest.TestCase):
     @staticmethod
     def _legacy_environment(root: Path, database: Path) -> tuple[dict[str, str], Path]:
@@ -388,6 +455,1314 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+            finally:
+                store.close()
+
+    def test_v47_to_v49_upgrade_is_bounded_and_preserves_source_facts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v47-source-revision.sqlite3"
+            build_schema(database, 47)
+            seed_legacy_reconciliation(database)
+            before = sqlite3.connect(database)
+            try:
+                before.execute(
+                    """INSERT INTO dashboard_projects(
+                           project_id,display_name,first_seen_at,last_seen_at,
+                           display_name_provenance)
+                       VALUES (
+                           'catalog-only-project','Catalog only',
+                           '2026-07-21T00:00:00Z',
+                           '2026-07-21T00:00:00Z','config'
+                       )"""
+                )
+                before.commit()
+                legacy_tokens = before.execute(
+                    "SELECT COUNT(*) FROM token_snapshots",
+                ).fetchone()[0]
+            finally:
+                before.close()
+
+            with patch.object(
+                HydraStore,
+                "_validate_database_integrity",
+                side_effect=AssertionError(
+                    "v47 to v50 ran a whole-database audit",
+                ),
+            ):
+                store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM token_snapshots",
+                    ).fetchone()[0],
+                    legacy_tokens,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sync_project_source_fact_revisions",
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT revision
+                             FROM sync_unattributed_source_fact_revision
+                            WHERE singleton=1""",
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sync_project_reconcile_fences",
+                    ).fetchone()[0],
+                    0,
+                )
+                trigger_count = store.connection.execute(
+                    """SELECT COUNT(*) FROM sqlite_master
+                        WHERE type='trigger'
+                          AND name LIKE 'source_fact_revision_%'"""
+                ).fetchone()[0]
+                self.assertEqual(
+                    trigger_count,
+                    len(AD30_REQUIRED_TRIGGER_SQL),
+                )
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in store.connection.execute(
+                            """SELECT project_id,root_key,root_kind
+                                 FROM sync_dirty_roots
+                                ORDER BY project_id,root_key,root_kind"""
+                        )
+                    ],
+                    [
+                        (
+                            "catalog-only-project",
+                            "catalog-only-project",
+                            "project",
+                        ),
+                        (
+                            "preserved-project",
+                            "preserved-project",
+                            "project",
+                        ),
+                    ],
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT revision FROM sync_data_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    1,
+                )
+                revision_after_upgrade = store.connection.execute(
+                    """SELECT revision FROM sync_data_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+            reopened = HydraStore.open_current(database)
+            try:
+                self.assertEqual(reopened.schema_version(), 50)
+                self.assertEqual(
+                    reopened.connection.execute(
+                        """SELECT revision FROM sync_data_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    revision_after_upgrade,
+                )
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT COUNT(*) FROM sync_dirty_roots"
+                    ).fetchone()[0],
+                    2,
+                )
+            finally:
+                reopened.close()
+
+    def test_v49_legacy_v48_contract_matches_frozen_real_manifest(
+        self,
+    ) -> None:
+        normalize = lambda sql: " ".join(sql.casefold().split()).rstrip(";")
+        trigger_manifest = "\n".join(
+            f"{name}\0{normalize(statement)}"
+            for name, statement in sorted(
+                AD30_LEGACY_REQUIRED_TRIGGER_SQL.items()
+            )
+        )
+        self.assertEqual(
+            hashlib.sha256(trigger_manifest.encode("utf-8")).hexdigest(),
+            "6361268d745d39c5b01a6f9ff4837207d138db390cbec7245b66bf1f3b64e696",
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                normalize(
+                    AD30_LEGACY_SOURCE_FACT_REVISIONS_TABLE_SQL
+                ).encode("utf-8")
+            ).hexdigest(),
+            "e40e5d27c55d9ff22d0b61b082314899c377bb481623effda539ff97b6fd8f41",
+        )
+
+    def test_v49_accepts_exact_final_v48_and_preserves_rows_and_fences(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "final-v48.sqlite3"
+            build_schema(database, 48)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """INSERT INTO sync_project_source_fact_revisions(
+                           project_id,revision
+                       ) VALUES ('final-project',23)"""
+                )
+                connection.execute(
+                    """UPDATE sync_unattributed_source_fact_revision
+                          SET revision=9
+                        WHERE singleton=1"""
+                )
+                connection.execute(
+                    """INSERT INTO reconciliation_runs(
+                           run_id,project_id,started_at,outcome,provenance,
+                           reconciliation_version,input_digest,completed_at,
+                           task_count
+                       ) VALUES (
+                           'final-v48-run','final-project',
+                           '2026-07-29T00:00:00Z','success','derived',
+                           1,?,'2026-07-29T00:00:01Z',0
+                       )""",
+                    ("b" * 64,),
+                )
+                project_rows = tuple(connection.execute(
+                    """SELECT project_id,revision
+                         FROM sync_project_source_fact_revisions
+                        ORDER BY project_id"""
+                ))
+                fallback = connection.execute(
+                    """SELECT revision
+                         FROM sync_unattributed_source_fact_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+                connection.executemany(
+                    """INSERT INTO sync_project_reconcile_fences(
+                           project_id,project_revision,unattributed_revision,
+                           storage_schema_version,storage_schema_cookie,
+                           reconciliation_version,input_digest
+                       ) VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        (
+                            "final-project", 23, fallback, 48, 99, 1,
+                            "a" * 64,
+                        ),
+                        (
+                            "fence-only-project", 0, fallback, 48, 100, 1,
+                            "c" * 64,
+                        ),
+                    ),
+                )
+                fence_rows = tuple(connection.execute(
+                    """SELECT project_id,project_revision,
+                              unattributed_revision,storage_schema_version,
+                              storage_schema_cookie,reconciliation_version,
+                              input_digest
+                         FROM sync_project_reconcile_fences
+                        ORDER BY project_id"""
+                ))
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(
+                    tuple(
+                        tuple(row)
+                        for row in store.connection.execute(
+                            """SELECT project_id,revision
+                                 FROM sync_project_source_fact_revisions
+                                ORDER BY project_id"""
+                        )
+                    ),
+                    project_rows,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT revision
+                             FROM sync_unattributed_source_fact_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    fallback,
+                )
+                self.assertEqual(
+                    tuple(
+                        tuple(row)
+                        for row in store.connection.execute(
+                            """SELECT project_id,project_revision,
+                                      unattributed_revision,
+                                      storage_schema_version,
+                                      storage_schema_cookie,
+                                      reconciliation_version,input_digest
+                                 FROM sync_project_reconcile_fences
+                                ORDER BY project_id"""
+                        )
+                    ),
+                    fence_rows,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT COUNT(*) FROM sync_dirty_roots
+                            WHERE project_id IN (
+                                'final-project','fence-only-project'
+                            )
+                              AND project_id=root_key
+                              AND root_kind='project'"""
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertIsNone(store.connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name='sync_source_fact_revisions'"""
+                ).fetchone())
+            finally:
+                store.close()
+
+    def test_v49_converts_exact_intermediate_v48_and_preserves_counters(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "intermediate-v48.sqlite3"
+            replace_v48_with_intermediate_source_revisions(database)
+            connection = sqlite3.connect(database)
+            try:
+                connection.create_function(
+                    "hydra_rfc3339_nanos",
+                    1,
+                    lambda value: require_exact_timestamp(
+                        value, "migration fixture timestamp",
+                    ).epoch_nanoseconds,
+                    deterministic=True,
+                )
+                connection.executemany(
+                    """INSERT INTO dashboard_projects(
+                           project_id,display_name,first_seen_at,last_seen_at,
+                           display_name_provenance
+                       ) VALUES (?,?,?,?,?)""",
+                    (
+                        (
+                            "catalog-only-project", "Catalog only",
+                            "2026-07-29T00:00:00Z",
+                            "2026-07-29T00:00:00Z", "config",
+                        ),
+                        (
+                            "new-project", "New project",
+                            "2026-07-29T00:00:00Z",
+                            "2026-07-29T00:00:00Z", "config",
+                        ),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO sync_dirty_roots(
+                           project_id,root_key,root_kind,observed_at,
+                           claim_owner,claim_expires_at,eligible_epoch_ns,
+                           claim_token
+                       ) VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        "catalog-only-project", "catalog-only-project",
+                        "project", "2026-07-29T00:00:00Z",
+                        "worker-v48", "2026-07-30T00:00:00Z",
+                        require_exact_timestamp(
+                            "2026-07-30T00:00:00Z",
+                        ).epoch_nanoseconds,
+                        "c" * 32,
+                    ),
+                )
+                revision_before = connection.execute(
+                    """SELECT revision FROM sync_data_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+                dirty_before = tuple(connection.execute(
+                    """SELECT project_id,root_key,root_kind,observed_at,
+                              claim_owner,claim_expires_at,
+                              eligible_epoch_ns,claim_token
+                         FROM sync_dirty_roots
+                        WHERE project_id='catalog-only-project'"""
+                ).fetchone())
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(
+                    tuple(
+                        tuple(row)
+                        for row in store.connection.execute(
+                            """SELECT project_id,revision
+                                 FROM sync_project_source_fact_revisions
+                                ORDER BY project_id"""
+                        )
+                    ),
+                    (
+                        ("preserved-project", 17),
+                        ("second-project", 4),
+                    ),
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT revision
+                             FROM sync_unattributed_source_fact_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    3,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sync_project_reconcile_fences"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertIsNone(store.connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name='sync_source_fact_revisions'"""
+                ).fetchone())
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT COUNT(*) FROM sqlite_master
+                            WHERE type='trigger'
+                              AND name LIKE 'source_fact_revision_%'"""
+                    ).fetchone()[0],
+                    len(AD30_REQUIRED_TRIGGER_SQL),
+                )
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        """SELECT project_id,root_key,root_kind,observed_at,
+                                  claim_owner,claim_expires_at,
+                                  eligible_epoch_ns,claim_token
+                             FROM sync_dirty_roots
+                            WHERE project_id='catalog-only-project'"""
+                    ).fetchone()),
+                    dirty_before,
+                )
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in store.connection.execute(
+                            """SELECT project_id,root_key,root_kind
+                                 FROM sync_dirty_roots
+                                ORDER BY project_id,root_key,root_kind"""
+                        )
+                    ],
+                    [
+                        (
+                            "catalog-only-project",
+                            "catalog-only-project",
+                            "project",
+                        ),
+                        ("new-project", "new-project", "project"),
+                        (
+                            "preserved-project",
+                            "preserved-project",
+                            "project",
+                        ),
+                        ("second-project", "second-project", "project"),
+                    ],
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """SELECT revision FROM sync_data_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    revision_before + 1,
+                )
+                revision_after_upgrade = store.connection.execute(
+                    """SELECT revision FROM sync_data_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+            reopened = HydraStore.open_current(database)
+            try:
+                self.assertEqual(reopened.schema_version(), 50)
+                self.assertEqual(
+                    reopened.connection.execute(
+                        """SELECT revision FROM sync_data_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    revision_after_upgrade,
+                )
+                self.assertEqual(
+                    tuple(reopened.connection.execute(
+                        """SELECT project_id,root_key,root_kind,observed_at,
+                                  claim_owner,claim_expires_at,
+                                  eligible_epoch_ns,claim_token
+                             FROM sync_dirty_roots
+                            WHERE project_id='catalog-only-project'"""
+                    ).fetchone()),
+                    dirty_before,
+                )
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT COUNT(*) FROM sync_dirty_roots"
+                    ).fetchone()[0],
+                    4,
+                )
+            finally:
+                reopened.close()
+
+    def test_v49_rejects_mixed_altered_and_extra_intermediate_v48_shapes(
+        self,
+    ) -> None:
+        for corruption in (
+            "mixed", "altered", "table", "extra", "extra_index", "shadow",
+        ):
+            with self.subTest(corruption=corruption):
+                with tempfile.TemporaryDirectory() as temporary:
+                    database = Path(temporary) / f"{corruption}-v48.sqlite3"
+                    replace_v48_with_intermediate_source_revisions(database)
+                    connection = sqlite3.connect(database)
+                    try:
+                        if corruption == "mixed":
+                            connection.execute(
+                                """CREATE TABLE
+                                   sync_project_source_fact_revisions (
+                                       project_id TEXT PRIMARY KEY,
+                                       revision INTEGER NOT NULL
+                                   ) WITHOUT ROWID"""
+                            )
+                        elif corruption == "altered":
+                            connection.execute(
+                                "DROP TRIGGER source_fact_revision_annotations_insert"
+                            )
+                            connection.execute(
+                                """CREATE TRIGGER
+                                   source_fact_revision_annotations_insert
+                                   AFTER INSERT ON annotations
+                                   BEGIN SELECT 1; END"""
+                            )
+                        elif corruption == "table":
+                            connection.execute(
+                                """ALTER TABLE sync_source_fact_revisions
+                                   ADD COLUMN unexpected INTEGER"""
+                            )
+                        elif corruption == "extra":
+                            connection.execute(
+                                """CREATE TRIGGER source_fact_revision_extra
+                                   AFTER INSERT ON annotations
+                                   BEGIN SELECT 1; END"""
+                            )
+                        elif corruption == "extra_index":
+                            connection.execute(
+                                """CREATE INDEX legacy_revision_extra
+                                   ON sync_source_fact_revisions(project_id)"""
+                            )
+                        else:
+                            connection.execute(
+                                """CREATE TRIGGER shadow_revision_writer
+                                   AFTER INSERT ON annotations
+                                   BEGIN
+                                       UPDATE sync_data_revision
+                                          SET revision=revision;
+                                   END"""
+                            )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                    with self.assertRaisesRegex(
+                        StorageUnavailable,
+                        "cannot migrate Hydra database",
+                    ):
+                        HydraStore.open_current(database)
+                    rejected = sqlite3.connect(database)
+                    try:
+                        self.assertEqual(
+                            rejected.execute(
+                                "PRAGMA user_version"
+                            ).fetchone()[0],
+                            48,
+                        )
+                        self.assertIsNotNone(rejected.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE type='table'
+                                  AND name='sync_source_fact_revisions'"""
+                        ).fetchone())
+                        self.assertIsNone(rejected.execute(
+                            """SELECT 1 FROM schema_migrations
+                                WHERE version=49"""
+                        ).fetchone())
+                    finally:
+                        rejected.close()
+
+    def test_v49_rejects_incomplete_or_extra_v48_migration_history(
+        self,
+    ) -> None:
+        for corruption in ("missing", "extra"):
+            with self.subTest(corruption=corruption):
+                with tempfile.TemporaryDirectory() as temporary:
+                    database = Path(temporary) / f"history-{corruption}.sqlite3"
+                    replace_v48_with_intermediate_source_revisions(database)
+                    connection = sqlite3.connect(database)
+                    try:
+                        legacy_rows = tuple(connection.execute(
+                            """SELECT scope_kind,project_id,revision
+                                 FROM sync_source_fact_revisions
+                                ORDER BY scope_kind,project_id"""
+                        ))
+                        legacy_triggers = tuple(connection.execute(
+                            """SELECT name,sql FROM sqlite_master
+                                WHERE type='trigger'
+                                  AND name LIKE 'source_fact_revision_%'
+                                ORDER BY name"""
+                        ))
+                        if corruption == "missing":
+                            connection.execute(
+                                "DELETE FROM schema_migrations WHERE version=47"
+                            )
+                        else:
+                            connection.execute(
+                                """INSERT INTO schema_migrations(
+                                       version,applied_at
+                                   ) VALUES (
+                                       99,'2026-07-29T00:00:00Z'
+                                   )"""
+                            )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                    with self.assertRaisesRegex(
+                        StorageUnavailable,
+                        "migration history is inconsistent",
+                    ):
+                        HydraStore.open_current(database)
+                    rejected = sqlite3.connect(database)
+                    try:
+                        self.assertEqual(
+                            rejected.execute(
+                                "PRAGMA user_version"
+                            ).fetchone()[0],
+                            48,
+                        )
+                        self.assertIsNotNone(rejected.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE type='table'
+                                  AND name='sync_source_fact_revisions'"""
+                        ).fetchone())
+                        self.assertIsNone(rejected.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE type='table'
+                                  AND name=
+                                      'sync_project_source_fact_revisions'"""
+                        ).fetchone())
+                        self.assertEqual(
+                            tuple(rejected.execute(
+                                """SELECT scope_kind,project_id,revision
+                                     FROM sync_source_fact_revisions
+                                    ORDER BY scope_kind,project_id"""
+                            )),
+                            legacy_rows,
+                        )
+                        self.assertEqual(
+                            tuple(rejected.execute(
+                                """SELECT name,sql FROM sqlite_master
+                                    WHERE type='trigger'
+                                      AND name LIKE
+                                          'source_fact_revision_%'
+                                    ORDER BY name"""
+                            )),
+                            legacy_triggers,
+                        )
+                    finally:
+                        rejected.close()
+
+    def test_v47_corrupt_history_is_rejected_before_v48_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v47-corrupt-history.sqlite3"
+            build_schema(database, 47)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE version=46"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(
+                StorageUnavailable,
+                "migration history is inconsistent",
+            ):
+                HydraStore.open_current(database)
+            rejected = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    rejected.execute("PRAGMA user_version").fetchone()[0],
+                    47,
+                )
+                self.assertIsNone(rejected.execute(
+                    """SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name='sync_project_source_fact_revisions'"""
+                ).fetchone())
+                self.assertIsNone(rejected.execute(
+                    """SELECT 1 FROM schema_migrations
+                        WHERE version IN (48,49)"""
+                ).fetchone())
+            finally:
+                rejected.close()
+
+    def test_v49_rejects_missing_fallback_in_both_v48_shapes(
+        self,
+    ) -> None:
+        for shape in ("final", "intermediate"):
+            with self.subTest(shape=shape):
+                with tempfile.TemporaryDirectory() as temporary:
+                    database = Path(temporary) / f"{shape}-missing-fallback.sqlite3"
+                    if shape == "final":
+                        build_schema(database, 48)
+                        table = "sync_unattributed_source_fact_revision"
+                    else:
+                        replace_v48_with_intermediate_source_revisions(database)
+                        table = "sync_source_fact_revisions"
+                    connection = sqlite3.connect(database)
+                    try:
+                        if shape == "final":
+                            connection.execute(
+                                """DELETE FROM
+                                   sync_unattributed_source_fact_revision"""
+                            )
+                        else:
+                            connection.execute(
+                                """DELETE FROM sync_source_fact_revisions
+                                    WHERE scope_kind='unattributed'
+                                      AND project_id=''"""
+                            )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                    with self.assertRaisesRegex(
+                        StorageUnavailable,
+                        "cannot migrate Hydra database",
+                    ):
+                        HydraStore.open_current(database)
+                    rejected = sqlite3.connect(database)
+                    try:
+                        self.assertEqual(
+                            rejected.execute(
+                                "PRAGMA user_version"
+                            ).fetchone()[0],
+                            48,
+                        )
+                        self.assertIsNotNone(rejected.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE type='table' AND name=?""",
+                            (table,),
+                        ).fetchone())
+                        self.assertIsNone(rejected.execute(
+                            """SELECT 1 FROM schema_migrations
+                                WHERE version=49"""
+                        ).fetchone())
+                    finally:
+                        rejected.close()
+
+    def test_v49_rejects_mixed_altered_and_extra_final_v48_shapes(
+        self,
+    ) -> None:
+        for corruption in (
+            "mixed", "altered", "table", "extra", "extra_index", "shadow",
+            "index",
+        ):
+            with self.subTest(corruption=corruption):
+                with tempfile.TemporaryDirectory() as temporary:
+                    database = Path(temporary) / f"final-{corruption}-v48.sqlite3"
+                    build_schema(database, 48)
+                    connection = sqlite3.connect(database)
+                    try:
+                        if corruption == "mixed":
+                            connection.execute(
+                                AD30_LEGACY_SOURCE_FACT_REVISIONS_TABLE_SQL
+                            )
+                        elif corruption == "altered":
+                            connection.execute(
+                                "DROP TRIGGER source_fact_revision_annotations_insert"
+                            )
+                            connection.execute(
+                                """CREATE TRIGGER
+                                   source_fact_revision_annotations_insert
+                                   AFTER INSERT ON annotations
+                                   BEGIN SELECT 1; END"""
+                            )
+                        elif corruption == "table":
+                            connection.execute(
+                                """ALTER TABLE
+                                   sync_project_source_fact_revisions
+                                   ADD COLUMN unexpected INTEGER"""
+                            )
+                        elif corruption == "extra":
+                            connection.execute(
+                                """CREATE TRIGGER source_fact_revision_extra
+                                   AFTER INSERT ON annotations
+                                   BEGIN SELECT 1; END"""
+                            )
+                        elif corruption == "extra_index":
+                            connection.execute(
+                                """CREATE INDEX project_revision_extra
+                                   ON sync_project_source_fact_revisions(
+                                       revision
+                                   )"""
+                            )
+                        elif corruption == "shadow":
+                            connection.execute(
+                                """CREATE TRIGGER shadow_revision_writer
+                                   AFTER INSERT ON annotations
+                                   BEGIN
+                                       UPDATE sync_data_revision
+                                          SET revision=revision;
+                                   END"""
+                            )
+                        else:
+                            connection.execute(
+                                "DROP INDEX reconciliation_runs_source_fence_lookup"
+                            )
+                            connection.execute(
+                                """CREATE INDEX
+                                   reconciliation_runs_source_fence_lookup
+                                   ON reconciliation_runs(project_id,outcome)"""
+                            )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                    with self.assertRaisesRegex(
+                        StorageUnavailable,
+                        "cannot migrate Hydra database",
+                    ):
+                        HydraStore.open_current(database)
+                    rejected = sqlite3.connect(database)
+                    try:
+                        self.assertEqual(
+                            rejected.execute(
+                                "PRAGMA user_version"
+                            ).fetchone()[0],
+                            48,
+                        )
+                        self.assertIsNone(rejected.execute(
+                            """SELECT 1 FROM schema_migrations
+                                WHERE version=49"""
+                        ).fetchone())
+                        self.assertIsNotNone(rejected.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE type='table'
+                                  AND name=
+                                      'sync_project_source_fact_revisions'"""
+                        ).fetchone())
+                    finally:
+                        rejected.close()
+
+    def test_v49_dirty_seed_rolls_back_when_data_revision_is_exhausted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "exhausted-data-revision-v48.sqlite3"
+            build_schema(database, 48)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """INSERT INTO dashboard_projects(
+                           project_id,display_name,first_seen_at,last_seen_at,
+                           display_name_provenance
+                       ) VALUES (
+                           'needs-reconcile','Needs reconcile',
+                           '2026-07-29T00:00:00Z',
+                           '2026-07-29T00:00:00Z','config'
+                       )"""
+                )
+                connection.execute(
+                    """UPDATE sync_data_revision
+                          SET revision=9223372036854775807
+                        WHERE singleton=1"""
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(
+                StorageUnavailable,
+                "cannot migrate Hydra database",
+            ):
+                HydraStore.open_current(database)
+            rejected = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    rejected.execute("PRAGMA user_version").fetchone()[0],
+                    48,
+                )
+                self.assertEqual(
+                    rejected.execute(
+                        """SELECT COUNT(*) FROM sync_dirty_roots
+                            WHERE project_id='needs-reconcile'"""
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    rejected.execute(
+                        """SELECT revision FROM sync_data_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    9_223_372_036_854_775_807,
+                )
+            finally:
+                rejected.close()
+
+    def test_v50_converter_recovers_exact_legacy_v49_atomically(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "poisoned-legacy-v49.sqlite3"
+            replace_v48_with_intermediate_source_revisions(database)
+            connection = sqlite3.connect(database)
+            try:
+                configure_migration_connection(connection)
+                connection.execute(
+                    """INSERT INTO dashboard_projects(
+                           project_id,display_name,first_seen_at,last_seen_at,
+                           display_name_provenance
+                       ) VALUES (
+                           'catalog-v49','Catalog v49',
+                           '2026-07-30T00:00:00Z',
+                           '2026-07-30T00:00:00Z','config'
+                       )"""
+                )
+                mark_fixture_schema_version(connection, 49)
+                revision_before = connection.execute(
+                    """SELECT revision FROM sync_data_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+                connection.commit()
+
+                connection.execute("BEGIN IMMEDIATE")
+                migrate_v50_source_fact_revisions(connection)
+                mark_fixture_schema_version(connection, 50)
+                connection.commit()
+
+                self.assertEqual(
+                    connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    50,
+                )
+                self.assertEqual(
+                    [
+                        row[0]
+                        for row in connection.execute(
+                            """SELECT version FROM schema_migrations
+                                ORDER BY version"""
+                        )
+                    ],
+                    list(range(1, 51)),
+                )
+                self.assertIsNone(connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name='sync_source_fact_revisions'"""
+                ).fetchone())
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM sqlite_master
+                            WHERE type='table'
+                              AND name IN (
+                                  'sync_project_source_fact_revisions',
+                                  'sync_unattributed_source_fact_revision',
+                                  'sync_project_reconcile_fences'
+                              )"""
+                    ).fetchone()[0],
+                    3,
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        """SELECT project_id,revision
+                             FROM sync_project_source_fact_revisions
+                            ORDER BY project_id"""
+                    )),
+                    (
+                        ("preserved-project", 17),
+                        ("second-project", 4),
+                    ),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT revision
+                             FROM sync_unattributed_source_fact_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    3,
+                )
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in connection.execute(
+                            """SELECT project_id,root_key,root_kind
+                                 FROM sync_dirty_roots
+                                ORDER BY project_id"""
+                        )
+                    ],
+                    [
+                        ("catalog-v49", "catalog-v49", "project"),
+                        (
+                            "preserved-project",
+                            "preserved-project",
+                            "project",
+                        ),
+                        ("second-project", "second-project", "project"),
+                    ],
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT revision FROM sync_data_revision
+                            WHERE singleton=1"""
+                    ).fetchone()[0],
+                    revision_before + 1,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "PRAGMA quick_check"
+                    ).fetchone()[0],
+                    "ok",
+                )
+            finally:
+                connection.close()
+
+    def test_v50_open_current_recovers_poisoned_legacy_v49(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "open-poisoned-legacy-v49.sqlite3"
+            replace_v48_with_intermediate_source_revisions(database)
+            connection = sqlite3.connect(database)
+            try:
+                mark_fixture_schema_version(connection, 49)
+                counters = tuple(connection.execute(
+                    """SELECT scope_kind,project_id,revision
+                         FROM sync_source_fact_revisions
+                        ORDER BY scope_kind,project_id"""
+                ))
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(
+                    tuple(
+                        ("project", str(row[0]), int(row[1]))
+                        for row in store.connection.execute(
+                            """SELECT project_id,revision
+                                 FROM sync_project_source_fact_revisions
+                                ORDER BY project_id"""
+                        )
+                    )
+                    + (
+                        (
+                            "unattributed", "",
+                            store.connection.execute(
+                                """SELECT revision FROM
+                                   sync_unattributed_source_fact_revision
+                                    WHERE singleton=1"""
+                            ).fetchone()[0],
+                        ),
+                    ),
+                    counters,
+                )
+                self.assertIsNone(store.connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name='sync_source_fact_revisions'"""
+                ).fetchone())
+            finally:
+                store.close()
+
+    def test_v50_converter_accepts_final_v49_and_preserves_fences(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "final-v49.sqlite3"
+            build_schema(database, 48)
+            connection = sqlite3.connect(database)
+            try:
+                configure_migration_connection(connection)
+                connection.execute(
+                    """INSERT INTO sync_project_source_fact_revisions(
+                           project_id,revision
+                       ) VALUES ('final-v49-project',29)"""
+                )
+                fallback = connection.execute(
+                    """SELECT revision
+                         FROM sync_unattributed_source_fact_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+                connection.execute(
+                    """INSERT INTO sync_project_reconcile_fences(
+                           project_id,project_revision,unattributed_revision,
+                           storage_schema_version,storage_schema_cookie,
+                           reconciliation_version,input_digest
+                       ) VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        "final-v49-project", 29, fallback, 49, 101, 1,
+                        "d" * 64,
+                    ),
+                )
+                project_rows = tuple(connection.execute(
+                    """SELECT project_id,revision
+                         FROM sync_project_source_fact_revisions
+                        ORDER BY project_id"""
+                ))
+                fence_rows = tuple(connection.execute(
+                    """SELECT project_id,project_revision,
+                              unattributed_revision,storage_schema_version,
+                              storage_schema_cookie,reconciliation_version,
+                              input_digest
+                         FROM sync_project_reconcile_fences"""
+                ))
+                mark_fixture_schema_version(connection, 49)
+                connection.commit()
+
+                connection.execute("BEGIN IMMEDIATE")
+                migrate_v50_source_fact_revisions(connection)
+                mark_fixture_schema_version(connection, 50)
+                connection.commit()
+
+                self.assertEqual(
+                    tuple(connection.execute(
+                        """SELECT project_id,revision
+                             FROM sync_project_source_fact_revisions
+                            ORDER BY project_id"""
+                    )),
+                    project_rows,
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        """SELECT project_id,project_revision,
+                                  unattributed_revision,
+                                  storage_schema_version,
+                                  storage_schema_cookie,
+                                  reconciliation_version,input_digest
+                             FROM sync_project_reconcile_fences"""
+                    )),
+                    fence_rows,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM sync_dirty_roots
+                            WHERE project_id='final-v49-project'
+                              AND root_key='final-v49-project'
+                              AND root_kind='project'"""
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                connection.close()
+
+    def test_v50_converter_rejects_unknown_legacy_v49_and_rolls_back(
+        self,
+    ) -> None:
+        for corruption in ("mixed", "altered"):
+            with self.subTest(corruption=corruption):
+                with tempfile.TemporaryDirectory() as temporary:
+                    database = Path(temporary) / f"{corruption}-legacy-v49.sqlite3"
+                    replace_v48_with_intermediate_source_revisions(database)
+                    connection = sqlite3.connect(database)
+                    try:
+                        configure_migration_connection(connection)
+                        mark_fixture_schema_version(connection, 49)
+                        if corruption == "mixed":
+                            connection.execute(
+                                """CREATE TABLE
+                                   sync_project_source_fact_revisions (
+                                       project_id TEXT PRIMARY KEY,
+                                       revision INTEGER NOT NULL
+                                   ) WITHOUT ROWID"""
+                            )
+                        else:
+                            connection.execute(
+                                """ALTER TABLE sync_source_fact_revisions
+                                   ADD COLUMN unexpected INTEGER"""
+                            )
+                        counters = tuple(connection.execute(
+                            """SELECT scope_kind,project_id,revision
+                                 FROM sync_source_fact_revisions
+                                ORDER BY scope_kind,project_id"""
+                        ))
+                        connection.commit()
+
+                        connection.execute("BEGIN IMMEDIATE")
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            migrate_v50_source_fact_revisions(connection)
+                        connection.rollback()
+
+                        self.assertEqual(
+                            connection.execute(
+                                "PRAGMA user_version"
+                            ).fetchone()[0],
+                            49,
+                        )
+                        self.assertEqual(
+                            tuple(connection.execute(
+                                """SELECT scope_kind,project_id,revision
+                                     FROM sync_source_fact_revisions
+                                    ORDER BY scope_kind,project_id"""
+                            )),
+                            counters,
+                        )
+                        self.assertIsNone(connection.execute(
+                            """SELECT 1 FROM schema_migrations
+                                WHERE version=50"""
+                        ).fetchone())
+                        self.assertIsNone(connection.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE type='table'
+                                  AND name=
+                                      'sync_unattributed_source_fact_revision'"""
+                        ).fetchone())
+                    finally:
+                        connection.close()
+
+    def test_v49_recovers_only_missing_v47_incremental_placeholders(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v47-missing-placeholders.sqlite3"
+            build_schema(database, 47)
+            before = sqlite3.connect(database)
+            try:
+                before.execute(
+                    """INSERT INTO rollout_sessions(
+                           session_key,project_id,path_key,resume_segments,
+                           conversation_key)
+                       VALUES (
+                           'recover-placeholder','recover-project',
+                           'incremental',1,'recover-conversation'
+                       )"""
+                )
+                before.execute(
+                    """INSERT INTO rollout_logical_sources(
+                           logical_source_key,project_id,session_key,
+                           canonical_revision_digest,lineage_state)
+                       VALUES (
+                           'recover-logical','recover-project',
+                           'recover-placeholder',NULL,'clean'
+                       )"""
+                )
+                before.execute(
+                    """INSERT INTO rollout_sources(
+                           source_digest,source_type,logical_source_key,relation,
+                           line_count,byte_count,chain_digest,materialized)
+                       VALUES (
+                           'recover-source','jsonl','recover-logical','append',
+                           0,0,'',0
+                       )"""
+                )
+                before.execute("DROP TABLE incremental_session_placeholders")
+                before.commit()
+            finally:
+                before.close()
+
+            store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), 50)
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in store.connection.execute(
+                            """SELECT session_key
+                                 FROM incremental_session_placeholders
+                                ORDER BY session_key"""
+                        )
+                    ],
+                    [("recover-placeholder",)],
+                )
+                actual_sql = store.connection.execute(
+                    """SELECT sql FROM sqlite_master
+                        WHERE type='table'
+                          AND name='incremental_session_placeholders'"""
+                ).fetchone()[0]
+                self.assertEqual(
+                    " ".join(str(actual_sql).lower().split()),
+                    " ".join(
+                        AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL
+                        .lower()
+                        .split()
+                    ),
+                )
+            finally:
+                store.close()
+
+    def test_v49_does_not_repair_altered_v47_incremental_placeholders(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v47-altered-placeholders.sqlite3"
+            build_schema(database, 47)
+            replace_empty_table(
+                database,
+                "incremental_session_placeholders",
+                """CREATE TABLE incremental_session_placeholders (
+                       session_key TEXT PRIMARY KEY
+                   ) WITHOUT ROWID""",
+            )
+
+            with self.assertRaisesRegex(
+                StorageUnavailable,
+                "altered materialized report trust constraints",
+            ):
+                HydraStore.open_current(database)
+            rejected = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    rejected.execute("PRAGMA user_version").fetchone()[0],
+                    47,
+                )
+                self.assertIsNone(rejected.execute(
+                    """SELECT 1 FROM schema_migrations
+                        WHERE version=48"""
+                ).fetchone())
+                self.assertIsNone(rejected.execute(
+                    """SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name='sync_project_source_fact_revisions'"""
+                ).fetchone())
+            finally:
+                rejected.close()
+
+    def test_v49_intact_v47_does_not_invoke_placeholder_recovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v47-intact-placeholders.sqlite3"
+            build_schema(database, 47)
+
+            with patch(
+                "hydra_codex.migrations_ac29."
+                "recover_missing_incremental_session_placeholders",
+                side_effect=AssertionError(
+                    "intact v47 invoked missing-table recovery",
+                ),
+            ):
+                store = HydraStore.open_current(database)
+            try:
+                self.assertEqual(store.schema_version(), 50)
             finally:
                 store.close()
 

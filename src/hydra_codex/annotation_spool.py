@@ -27,6 +27,7 @@ from .annotation_types import (
 from .contracts import ModelAnnotationInput
 from .rollout_identity import Pseudonymizer
 from .storage import HydraStore
+from .sync_state import SyncStateRepository
 
 
 _REQUEST_PREFIX = "hreq_v1_"
@@ -224,7 +225,7 @@ def _record_transport(
         "event", f"{turn_key}/{disposition}/{category or 'accepted'}/{discriminator}",
     )
     with store.rollout_transaction() as connection:
-        connection.execute(
+        inserted = connection.execute(
             """INSERT INTO annotation_transport_events(
                    transport_key,project_id,session_key,turn_key,request_digest,
                    disposition,diagnostic_category,staged_at,staged_at_ns,
@@ -236,7 +237,15 @@ def _record_transport(
                 disposition, category, staged_at, staged_at_ns, staged_order,
                 received_at, _latency_ms(staged_at, received_at),
             ),
-        )
+        ).rowcount
+        if inserted:
+            SyncStateRepository(store).mark_dirty_in_transaction(
+                connection,
+                project_id=project_id,
+                root_key=project_id,
+                root_kind="project",
+                observed_at=received_at,
+            )
 
 
 def _quarantine_directory(spool: Path) -> Path:

@@ -152,6 +152,54 @@ class PilotMigrationTests(unittest.TestCase):
 
 
 class PilotLifecycleTests(unittest.TestCase):
+    def test_start_marks_the_project_dirty_in_the_same_revision(self) -> None:
+        from hydra_codex.pilot import start_pilot
+        from hydra_codex.sync_state import SyncStateRepository
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = HydraStore(Path(temporary) / "hydra.sqlite3")
+            try:
+                started_at = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+                start_pilot(
+                    store,
+                    project_id="project",
+                    target=5,
+                    task_family="telemetry-analysis",
+                    now=started_at,
+                )
+                dirty = SyncStateRepository(store).list_dirty_roots()
+                revision = store.connection.execute(
+                    """SELECT revision FROM sync_data_revision
+                        WHERE singleton=1"""
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+        self.assertEqual(
+            [
+                (
+                    root.project_id,
+                    root.root_key,
+                    root.root_kind,
+                    root.observed_at,
+                    root.claim_owner,
+                )
+                for root in dirty
+            ],
+            [
+                (
+                    "project",
+                    "project",
+                    "project",
+                    "2026-07-22T10:00:00Z",
+                    None,
+                )
+            ],
+        )
+        # The pilot source-fact trigger already advances the public revision;
+        # atomically enqueueing its project must not create a second bump.
+        self.assertEqual(revision, 1)
+
     def test_start_persists_one_project_cohort_and_resumes_it_after_restart(self) -> None:
         try:
             from hydra_codex.pilot import start_pilot
@@ -196,6 +244,121 @@ class PilotLifecycleTests(unittest.TestCase):
 
 
 class PilotCohortTests(StoredReportScenario):
+    def _sync_project_dirty(self, second: int) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+        from hydra_codex.reconcile_engine import reconcile_project
+
+        sessions = self.root / "sessions"
+        archived = self.root / "archived-sessions"
+        sessions.mkdir(exist_ok=True)
+        archived.mkdir(exist_ok=True)
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=sessions,
+                archived_sessions=archived,
+            ),
+            reconcile=lambda project_id, roots: reconcile_project(
+                self.store,
+                project_id,
+                b"s" * 32,
+                expected_dirty_roots=roots,
+            ),
+        )
+        result = worker.sync_once(
+            f"pilot-sync-{second}",
+            stamp(second).replace("+00:00", "Z"),
+            stamp(second + 10).replace("+00:00", "Z"),
+            maximum_sources=1,
+        )
+        self.assertEqual(result.claimed, 0)
+
+    def test_status_enqueues_only_changed_pilot_state_and_sync_restores_reports(
+        self,
+    ) -> None:
+        from hydra_codex.pilot import pilot_status, start_pilot
+        from hydra_codex.reconcile_engine import (
+            ReconciliationStale,
+            source_fact_fence_current,
+        )
+        from hydra_codex.sync_state import SyncStateRepository
+
+        run = start_pilot(
+            self.store,
+            project_id=PROJECT,
+            target=5,
+            task_family="telemetry-analysis",
+            now=BASE - timedelta(seconds=1),
+        )
+        self.add_task(
+            "status-dirty-root",
+            20,
+            100,
+            family="telemetry-analysis",
+        )
+        self.reconcile()
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM pilot_tasks WHERE pilot_id=?",
+                (run.pilot_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self._sync_project_dirty(40)
+        self.assertTrue(source_fact_fence_current(self.db, PROJECT))
+        self.assertEqual(SyncStateRepository(self.store).list_dirty_roots(), ())
+
+        first = pilot_status(self.store, PROJECT, run.pilot_id).as_dict()
+        dirty = SyncStateRepository(self.store).list_dirty_roots()
+        revision = self.db.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
+
+        self.assertEqual(len(first["tasks"]), 1)
+        self.assertEqual(
+            [
+                (
+                    root.project_id,
+                    root.root_key,
+                    root.root_kind,
+                    root.observed_at,
+                )
+                for root in dirty
+            ],
+            [
+                (
+                    PROJECT,
+                    PROJECT,
+                    "project",
+                    stamp(29).replace("+00:00", "Z"),
+                )
+            ],
+        )
+        self.assertFalse(source_fact_fence_current(self.db, PROJECT))
+        with self.assertRaises(ReconciliationStale):
+            list_reconciled_reports(self.store, PROJECT)
+
+        second = pilot_status(self.store, PROJECT, run.pilot_id).as_dict()
+        self.assertEqual(second, first)
+        self.assertEqual(
+            self.db.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+            revision,
+        )
+        self.assertEqual(
+            SyncStateRepository(self.store).list_dirty_roots(),
+            dirty,
+        )
+
+        self._sync_project_dirty(60)
+        self.assertTrue(source_fact_fence_current(self.db, PROJECT))
+        self.assertEqual(SyncStateRepository(self.store).list_dirty_roots(), ())
+        self.assertEqual(len(list_reconciled_reports(self.store, PROJECT)), 1)
+
     def _accepted_transport(self, session: str, second: int, latency_ms: int = 1000) -> None:
         for index in range(2):
             staged_second = second + index
@@ -842,6 +1005,7 @@ class PilotCohortTests(StoredReportScenario):
         self.reconcile()
         status = pilot_status(self.store, PROJECT, run.pilot_id).as_dict()
         self.assertTrue(status["transport_verified"])
+        self._sync_project_dirty(90)
 
         candidate = list_reconciled_reports(self.store, PROJECT)[0]
 
@@ -864,6 +1028,7 @@ class PilotCohortTests(StoredReportScenario):
             decision="verified",
             now=BASE + timedelta(seconds=100),
         )
+        self._sync_project_dirty(110)
 
         verified = list_reconciled_reports(self.store, PROJECT)[0]
         self.assertTrue(verified.trend_result.warning)

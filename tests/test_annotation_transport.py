@@ -220,6 +220,122 @@ class AnnotationTransportTests(unittest.TestCase):
             store.close()
         self.assertEqual((receipt, accepted, duplicate_diagnostic), (1, 1, 1))
 
+    def test_transport_source_insert_marks_dirty_but_exact_retry_does_not_churn(self) -> None:
+        from hydra_codex.annotation_spool import _record_transport
+        from hydra_codex.rollout_identity import Pseudonymizer
+        from hydra_codex.sync_state import SyncStateRepository
+
+        store = HydraStore(self.database)
+        self.addCleanup(store.close)
+        keys = Pseudonymizer(b"t" * 32)
+        repository = SyncStateRepository(store)
+
+        for index, disposition in enumerate(("accepted", "quarantined"), start=1):
+            with self.subTest(disposition=disposition):
+                arguments = {
+                    "project_id": PROJECT_ID,
+                    "session_key": f"session-{disposition}",
+                    "turn_key": f"turn-{disposition}",
+                    "request_digest": (
+                        f"hreq_v1_{'a' * 32}" if disposition == "accepted" else None
+                    ),
+                    "disposition": disposition,
+                    "category": None if disposition == "accepted" else "malformed",
+                    "staged_at_ns": index * 1_000_000_000,
+                    "staged_at": f"2026-07-21T12:00:0{index}Z",
+                    "staged_order": (
+                        f"{index * 1_000_000_000:020d}:horder_v1_{disposition}"
+                    ),
+                    "received_at": f"2026-07-21T12:00:1{index}Z",
+                    "file_key": (
+                        None
+                        if disposition == "accepted"
+                        else f"hspool_v1_{'q' * 32}"
+                    ),
+                }
+                _record_transport(store, keys, **arguments)
+
+                self.assertEqual(
+                    [
+                        (
+                            root.project_id,
+                            root.root_key,
+                            root.root_kind,
+                            root.observed_at,
+                        )
+                        for root in repository.list_dirty_roots()
+                    ],
+                    [
+                        (
+                            PROJECT_ID,
+                            PROJECT_ID,
+                            "project",
+                            arguments["received_at"],
+                        )
+                    ],
+                )
+                with store.rollout_transaction() as connection:
+                    connection.execute("DELETE FROM sync_dirty_roots")
+                revision = store.connection.execute(
+                    "SELECT revision FROM sync_data_revision WHERE singleton=1"
+                ).fetchone()[0]
+
+                _record_transport(store, keys, **arguments)
+
+                self.assertEqual(repository.list_dirty_roots(), ())
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT revision FROM sync_data_revision WHERE singleton=1"
+                    ).fetchone()[0],
+                    revision,
+                )
+
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT COUNT(*) FROM annotation_transport_events"
+            ).fetchone()[0],
+            2,
+        )
+
+    def test_transport_source_write_rolls_back_when_dirty_enqueue_fails(self) -> None:
+        from hydra_codex.annotation_spool import _record_transport
+        from hydra_codex.rollout_identity import Pseudonymizer
+
+        store = HydraStore(self.database)
+        self.addCleanup(store.close)
+
+        with mock.patch(
+            "hydra_codex.sync_state.SyncStateRepository.mark_dirty_in_transaction",
+            side_effect=RuntimeError("simulated dirty enqueue failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dirty enqueue"):
+                _record_transport(
+                    store,
+                    Pseudonymizer(b"t" * 32),
+                    project_id=PROJECT_ID,
+                    session_key="session-rollback",
+                    turn_key="turn-rollback",
+                    request_digest=None,
+                    disposition="quarantined",
+                    category="malformed",
+                    staged_at_ns=1_000_000_000,
+                    staged_at="2026-07-21T12:00:01Z",
+                    staged_order="00000000001000000000:horder_v1_rollback",
+                    received_at="2026-07-21T12:00:02Z",
+                    file_key=f"hspool_v1_{'r' * 32}",
+                )
+
+        self.assertEqual(
+            tuple(
+                store.connection.execute(
+                    """SELECT
+                           (SELECT COUNT(*) FROM annotation_transport_events),
+                           (SELECT COUNT(*) FROM sync_dirty_roots)"""
+                ).fetchone()
+            ),
+            (0, 0),
+        )
+
     def test_accepted_retry_recreated_on_new_inode_is_acknowledged_idempotently(self) -> None:
         capability = self.prompt()
         envelope = self.stage(capability)

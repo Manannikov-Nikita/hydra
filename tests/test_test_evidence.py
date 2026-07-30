@@ -769,12 +769,19 @@ class PersistedTestEvidenceTests(unittest.TestCase):
             """SELECT evidence_key, retry_kind, attempt_ordinal, outcome, failure_cause
                  FROM rollout_test_runs ORDER BY evidence_key"""
         )]
+        before_revision = self.store.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
         self.ingest(first, resumed, sibling)
         after = [tuple(row) for row in self.store.connection.execute(
             """SELECT evidence_key, retry_kind, attempt_ordinal, outcome, failure_cause
                  FROM rollout_test_runs ORDER BY evidence_key"""
         )]
+        after_revision = self.store.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
         self.assertEqual(after, before)
+        self.assertEqual(after_revision, before_revision)
 
     def test_invalid_or_conflicting_model_causes_are_quarantined_and_never_override_evidence(self) -> None:
         path = self.root / "conflicts.jsonl"

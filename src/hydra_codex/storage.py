@@ -91,6 +91,18 @@ from .migrations_ac29 import (
     AC29_MIGRATIONS,
     AC29_REQUIRED_SCHEMA,
 )
+from .migrations_ad30 import (
+    AD30_MIGRATIONS,
+    AD30_PROJECT_RECONCILE_FENCES_TABLE_SQL,
+    AD30_PROJECT_SOURCE_FACT_REVISIONS_TABLE_SQL,
+    AD30_RECONCILIATION_RUNS_SOURCE_FENCE_INDEX_SQL,
+    AD30_REQUIRED_SCHEMA,
+    AD30_REQUIRED_TRIGGER_SQL,
+    AD30_UNATTRIBUTED_SOURCE_FACT_REVISION_TABLE_SQL,
+    migrate_v49_source_fact_revisions,
+    migrate_v50_source_fact_revisions,
+    validate_v49_source_fact_revision_shape,
+)
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -360,7 +372,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS + AD30_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -420,6 +432,13 @@ def _foreign_key_groups(
 def _table_schema_sql(connection: sqlite3.Connection, table: str) -> str:
     row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,),
+    ).fetchone()
+    return "" if row is None or row[0] is None else _normalized_schema_sql(str(row[0]))
+
+
+def _index_schema_sql(connection: sqlite3.Connection, index: str) -> str:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index,),
     ).fetchone()
     return "" if row is None or row[0] is None else _normalized_schema_sql(str(row[0]))
 
@@ -498,8 +517,9 @@ class HydraStore:
 
         Fresh or stale databases fall back to the normal migration and full
         validation boundary. Current databases use cheap identity, version and
-        schema-cookie guards; long-lived callers should additionally retain a
-        :meth:`validated_reopener` capability rather than trust a pathname.
+        schema-cookie guards plus the current migration sentinel; long-lived
+        callers should additionally retain a :meth:`validated_reopener`
+        capability rather than trust a pathname.
         """
         database_path = default_database_path() if path is None else Path(path)
         try:
@@ -541,7 +561,36 @@ class HydraStore:
                     "Hydra database schema changed during current-schema open",
                 )
             latest = MIGRATIONS[-1][0]
+
+            def validate_current_schema(schema_guard: int) -> None:
+                store._validate_current_schema_sentinel(latest)
+                validated_version = int(
+                    store.connection.execute(
+                        "PRAGMA user_version",
+                    ).fetchone()[0]
+                )
+                validated_schema = int(
+                    store.connection.execute(
+                        "PRAGMA schema_version",
+                    ).fetchone()[0]
+                )
+                validated_identity = os.stat(store.database_path)
+                if (
+                    validated_version != latest
+                    or validated_schema != schema_guard
+                    or (
+                        validated_identity.st_dev,
+                        validated_identity.st_ino,
+                    )
+                    != expected_identity
+                ):
+                    raise StorageUnavailable(
+                        "Hydra database changed during current-schema "
+                        "validation",
+                    )
+
             if current_version == latest:
+                validate_current_schema(schema_after)
                 return store
             if current_version > latest:
                 raise StorageUnavailable(
@@ -556,6 +605,12 @@ class HydraStore:
                     store.connection.execute("PRAGMA user_version").fetchone()[0]
                 )
                 if current_version == latest:
+                    winner_schema = int(
+                        store.connection.execute(
+                            "PRAGMA schema_version",
+                        ).fetchone()[0]
+                    )
+                    validate_current_schema(winner_schema)
                     return store
                 if current_version > latest:
                     raise StorageUnavailable(
@@ -588,6 +643,143 @@ class HydraStore:
         except BaseException:
             store.close()
             raise
+
+    def _validate_current_schema_sentinel(self, latest: int) -> None:
+        """Validate only the exact v50 compatibility boundary."""
+        versions = [
+            int(row[0])
+            for row in self.connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        if versions != list(range(1, latest + 1)):
+            raise StorageUnavailable(
+                "Hydra schema migration history is inconsistent"
+            )
+
+        objects = tuple(
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                None if row[3] is None else str(row[3]),
+            )
+            for row in self.connection.execute(
+                """SELECT type,name,tbl_name,sql
+                     FROM sqlite_master
+                    WHERE type IN ('table','index','trigger')"""
+            )
+        )
+        expected_tables = {
+            "sync_project_source_fact_revisions":
+                AD30_PROJECT_SOURCE_FACT_REVISIONS_TABLE_SQL,
+            "sync_unattributed_source_fact_revision":
+                AD30_UNATTRIBUTED_SOURCE_FACT_REVISION_TABLE_SQL,
+            "sync_project_reconcile_fences":
+                AD30_PROJECT_RECONCILE_FENCES_TABLE_SQL,
+        }
+        table_prefixes = (
+            "sync_source_fact_revision",
+            "sync_project_source_fact_revision",
+            "sync_unattributed_source_fact_revision",
+            "sync_project_reconcile_fence",
+        )
+        actual_tables = {
+            name: sql
+            for object_type, name, _table, sql in objects
+            if object_type == "table"
+            and any(name.startswith(prefix) for prefix in table_prefixes)
+        }
+        if (
+            set(actual_tables) != set(expected_tables)
+            or any(
+                actual_tables[name] is None
+                or _normalized_schema_sql(actual_tables[name])
+                != _normalized_schema_sql(statement)
+                for name, statement in expected_tables.items()
+            )
+        ):
+            raise StorageUnavailable(
+                "Hydra source-fact revision sentinel is unavailable"
+            )
+
+        expected_indexes = {
+            "reconciliation_runs_source_fence_lookup":
+                AD30_RECONCILIATION_RUNS_SOURCE_FENCE_INDEX_SQL,
+        }
+        actual_indexes = {
+            name: sql
+            for object_type, name, table, sql in objects
+            if object_type == "index"
+            and sql is not None
+            and (
+                table in expected_tables
+                or name.startswith("reconciliation_runs_source_fence_")
+            )
+        }
+        if (
+            set(actual_indexes) != set(expected_indexes)
+            or any(
+                _normalized_schema_sql(actual_indexes[name])
+                != _normalized_schema_sql(statement)
+                for name, statement in expected_indexes.items()
+            )
+        ):
+            raise StorageUnavailable(
+                "Hydra schema has missing or altered reconciliation "
+                "fence lookup index"
+            )
+
+        protected_tables = (
+            *expected_tables,
+            "sync_source_fact_revisions",
+            "sync_data_revision",
+        )
+        actual_triggers = {
+            name: sql
+            for object_type, name, _table, sql in objects
+            if object_type == "trigger"
+            and sql is not None
+            and (
+                name.startswith("source_fact_revision_")
+                or any(
+                    table in _normalized_schema_sql(sql)
+                    for table in protected_tables
+                )
+            )
+        }
+        if len(AD30_REQUIRED_TRIGGER_SQL) != 96:
+            raise StorageUnavailable(
+                "Hydra schema has altered source-fact revision trigger inventory"
+            )
+        for name, statement in AD30_REQUIRED_TRIGGER_SQL.items():
+            if (
+                name not in actual_triggers
+                or _normalized_schema_sql(actual_triggers[name])
+                != _normalized_schema_sql(statement)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered source-fact "
+                    f"revision trigger: {name}"
+                )
+        if set(actual_triggers) != set(AD30_REQUIRED_TRIGGER_SQL):
+            raise StorageUnavailable(
+                "Hydra schema has altered source-fact revision trigger inventory"
+            )
+
+        fallback = self.connection.execute(
+            """SELECT singleton,revision,typeof(revision)
+                 FROM sync_unattributed_source_fact_revision"""
+        ).fetchall()
+        if (
+            len(fallback) != 1
+            or fallback[0][0] != 1
+            or fallback[0][2] != "integer"
+            or int(fallback[0][1]) < 0
+        ):
+            raise StorageUnavailable(
+                "Hydra source-fact revision sentinel is unavailable"
+            )
 
     @classmethod
     def open_bounded_writer(
@@ -799,10 +991,50 @@ class HydraStore:
                 raise StorageUnavailable(
                     f"Hydra database schema {current_version} is newer than supported {latest}"
                 )
+            if current_version > 0:
+                migration_history = [
+                    int(row[0])
+                    for row in self.connection.execute(
+                        """SELECT version FROM schema_migrations
+                            ORDER BY version"""
+                    )
+                ]
+                if migration_history != list(
+                    range(1, current_version + 1)
+                ):
+                    raise StorageUnavailable(
+                        "Hydra schema migration history is inconsistent"
+                    )
             for version, statements in MIGRATIONS:
                 if version <= current_version:
                     continue
                 with self._transaction() as connection:
+                    if version == 48:
+                        if connection.execute(
+                            """SELECT 1 FROM sqlite_master
+                                WHERE name='incremental_session_placeholders'"""
+                        ).fetchone() is None:
+                            from .migrations_ac29 import (
+                                recover_missing_incremental_session_placeholders,
+                            )
+
+                            recover_missing_incremental_session_placeholders(
+                                connection,
+                            )
+                        if _table_schema_sql(
+                            connection,
+                            "incremental_session_placeholders",
+                        ) != _normalized_schema_sql(
+                            AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL,
+                        ):
+                            raise StorageUnavailable(
+                                "Hydra schema has altered materialized report "
+                                "trust constraints"
+                            )
+                    if version == 49:
+                        migrate_v49_source_fact_revisions(connection)
+                    if version == 50:
+                        migrate_v50_source_fact_revisions(connection)
                     for statement in statements:
                         connection.execute(statement)
                     if version == 2:
@@ -942,6 +1174,7 @@ class HydraStore:
         required.update(AA27_REQUIRED_SCHEMA)
         required.update(AB28_REQUIRED_SCHEMA)
         required.update(AC29_REQUIRED_SCHEMA)
+        required.update(AD30_REQUIRED_SCHEMA)
         for table, columns in required.items():
             actual = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
             if not columns.issubset(actual):
@@ -976,9 +1209,28 @@ class HydraStore:
             "sync_work_summary": AA27_SYNC_WORK_SUMMARY_TABLE_SQL,
             "incremental_session_placeholders":
                 AC29_INCREMENTAL_SESSION_PLACEHOLDERS_TABLE_SQL,
+            "sync_project_source_fact_revisions":
+                AD30_PROJECT_SOURCE_FACT_REVISIONS_TABLE_SQL,
+            "sync_unattributed_source_fact_revision":
+                AD30_UNATTRIBUTED_SOURCE_FACT_REVISION_TABLE_SQL,
+            "sync_project_reconcile_fences":
+                AD30_PROJECT_RECONCILE_FENCES_TABLE_SQL,
         }.items():
             if _table_schema_sql(self.connection, table) != _normalized_schema_sql(expected_sql):
                 raise StorageUnavailable("Hydra schema has altered materialized report trust constraints")
+        if (
+            _index_schema_sql(
+                self.connection,
+                "reconciliation_runs_source_fence_lookup",
+            )
+            != _normalized_schema_sql(
+                AD30_RECONCILIATION_RUNS_SOURCE_FENCE_INDEX_SQL,
+            )
+        ):
+            raise StorageUnavailable(
+                "Hydra schema has missing or altered reconciliation "
+                "fence lookup index"
+            )
         for table, expected_sql in W23_REQUIRED_TABLE_SQL.items():
             if table == "sync_jobs":
                 expected_sql = Z26_SYNC_JOBS_TABLE_SQL
@@ -1117,6 +1369,53 @@ class HydraStore:
                     "Hydra schema has missing or altered dirty-claim "
                     f"fencing trigger: {name}"
                 )
+        for name, expected_sql in AD30_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered source-fact "
+                    f"revision trigger: {name}"
+                )
+        source_revision_prefix = "source_fact_revision_"
+        source_revision_tables = (
+            "sync_project_source_fact_revisions",
+            "sync_unattributed_source_fact_revision",
+            "sync_data_revision",
+        )
+        unexpected_source_revision_triggers = {
+            name
+            for name, sql in actual_triggers.items()
+            if name not in AD30_REQUIRED_TRIGGER_SQL
+            and (
+                name.startswith(source_revision_prefix)
+                or any(
+                    table in _normalized_schema_sql(sql)
+                    for table in source_revision_tables
+                )
+            )
+        }
+        if unexpected_source_revision_triggers:
+            raise StorageUnavailable(
+                "Hydra schema has altered source-fact revision trigger inventory"
+            )
+        unattributed_revision = self.connection.execute(
+            """SELECT revision FROM sync_unattributed_source_fact_revision
+                WHERE singleton=1"""
+        ).fetchone()
+        if (
+            unattributed_revision is None
+            or isinstance(unattributed_revision[0], bool)
+            or not isinstance(unattributed_revision[0], int)
+            or int(unattributed_revision[0]) < 0
+        ):
+            raise StorageUnavailable(
+                "Hydra source-fact revision fallback is unavailable"
+            )
+        validate_v49_source_fact_revision_shape(self.connection)
         if full_validation:
             self._validate_database_integrity()
 

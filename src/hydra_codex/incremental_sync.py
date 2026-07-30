@@ -41,7 +41,7 @@ from .sync_state import (
     _epoch_nanoseconds,
     validate_root_relative_locator,
 )
-from .test_evidence import reconcile_test_evidence
+from .test_evidence import materialize_test_evidence, reconcile_test_retries
 from .token_selection import refresh_token_session_selection
 
 
@@ -436,7 +436,7 @@ class SyncRun:
 
 
 Materializer = Callable[[QueueItem, TailRead, object], MaterializedSource]
-Reconciler = Callable[[str], None]
+Reconciler = Callable[[str, tuple[DirtyRoot, ...]], None]
 
 
 def _utc(value: str) -> str:
@@ -860,7 +860,7 @@ class IncrementalSyncWorker:
                 owner_key, lease_expires_at,
                 dirty_roots=project_roots,
             ) as _lost:
-                self.reconcile(project_id)
+                self.reconcile(project_id, project_roots)
             acknowledged_at = fresh()
             completed += self.repository.acknowledge_dirty_roots(
                 owner_key, project_roots, acknowledged_at,
@@ -912,7 +912,8 @@ class IncrementalSyncWorker:
             if result.project_id is not None:
                 # Keep incremental facts in the same derived-state shape as a
                 # legacy ingest batch before exposing the project as dirty.
-                reconcile_test_evidence(connection)
+                materialize_test_evidence(connection, result.project_id)
+                reconcile_test_retries(connection, result.project_id)
                 if result.session_key is not None:
                     refresh_token_session_selection(
                         connection,
@@ -922,7 +923,11 @@ class IncrementalSyncWorker:
                 diagnose = lambda _source, _ordinal, _kind: None
                 reconcile_token_epochs(connection, result.project_id, diagnose)
                 reconcile_fork_baselines(connection, result.project_id)
-                reconcile_turn_attempts(connection, diagnose)
+                reconcile_turn_attempts(
+                    connection,
+                    diagnose,
+                    project_id=result.project_id,
+                )
             if ownership_lost is not None and ownership_lost.is_set():
                 raise RepairRequired("worker lease lost")
             checkpoint = tail.checkpoint
@@ -1630,7 +1635,14 @@ class ResumableRepair:
                         break
                     lease_observed_at, expiry = lease_window
                     with self._lease_heartbeat(owner, expiry) as _lost:
-                        reconcile_project(self.store, project_id, Pseudonymizer.installation(self.store.database_path.parent).key)
+                        reconcile_project(
+                            self.store,
+                            project_id,
+                            Pseudonymizer.installation(
+                                self.store.database_path.parent,
+                            ).key,
+                            expected_dirty_roots=group,
+                        )
                     acknowledged_at, _ = self._lease_window()
                     self.repository.acknowledge_dirty_roots(
                         owner, group, acknowledged_at,

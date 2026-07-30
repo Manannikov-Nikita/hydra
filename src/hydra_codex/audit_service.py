@@ -29,6 +29,9 @@ from .project import resolve_project
 from .project_schema import project_event_schema_counts
 from .public_payload import reject_private_fields
 from .reconcile_engine import RECONCILIATION_VERSION, list_reconciled_reports
+from .reconcile_reports import (
+    list_reconciled_reports as _list_reconciled_reports_after_refresh,
+)
 from .report_semantics import (
     SemanticAnnotationSummary,
     SemanticBreakdown,
@@ -86,7 +89,14 @@ def _build_pilot_audit_with_health(
             else:
                 status_builder = pilot_status if refresh_enrollment else read_pilot_status
                 status = status_builder(store, project_id, pilot_id)
-                reports = list_reconciled_reports(store, project_id)
+                reports = (
+                    _list_reconciled_reports_after_refresh(
+                        store,
+                        project_id,
+                    )
+                    if refresh_enrollment
+                    else list_reconciled_reports(store, project_id)
+                )
             task_refs = tuple(
                 str(item["task_ref"]) for item in status.as_dict()["tasks"]
             )
@@ -433,6 +443,9 @@ def _materialized_pilot_state(
     project_id: str,
     pilot_id: str,
 ) -> tuple[PilotStatus, tuple[TaskReport, ...]]:
+    from .reconcile_engine import require_source_fact_fence_current
+
+    require_source_fact_fence_current(store.connection, project_id)
     run = store.connection.execute(
         """SELECT pilot_id,started_at,closed_at,target,task_family,thresholds_json,state
              FROM pilot_runs WHERE pilot_id=? AND project_id=?""",

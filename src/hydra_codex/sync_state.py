@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 import uuid
 
@@ -19,7 +19,7 @@ _HEX_ANCHOR = re.compile(r"[0-9a-f]{64}")
 _SAFE_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _JOB_IDENTIFIER = re.compile(r"sync_[0-9a-f]{32}\Z")
 _CLAIM_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
-_CANONICAL_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
+_CANONICAL_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z")
 
 
 @dataclass(frozen=True)
@@ -129,16 +129,15 @@ def _timestamp(value: str | None) -> str:
     if not isinstance(candidate, str) or not _CANONICAL_UTC.fullmatch(candidate):
         raise ValueError("timestamp must be canonical UTC RFC3339")
     try:
-        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        parsed = require_exact_timestamp(candidate, "sync timestamp")
     except ValueError as error:
         raise ValueError("timestamp must be canonical UTC RFC3339") from error
-    if parsed.tzinfo != timezone.utc:
-        raise ValueError("timestamp must be canonical UTC RFC3339")
-    if "." in candidate:
-        whole, fraction = candidate[:-1].split(".", 1)
+    canonical = parsed.canonical
+    if "." in canonical:
+        whole, fraction = canonical[:-1].split(".", 1)
         fraction = fraction.rstrip("0")
-        candidate = f"{whole}.{fraction}Z" if fraction else f"{whole}Z"
-    return candidate
+        canonical = f"{whole}.{fraction}Z" if fraction else f"{whole}Z"
+    return canonical
 
 
 def _instant(value: str) -> datetime:
@@ -421,7 +420,7 @@ class SyncStateRepository:
                     # A defensive retry guard for a future non-serialized DB
                     # backend: only project facts our lease actually won.
                     continue
-                connection.execute(
+                fact_inserted = connection.execute(
                     """INSERT INTO hook_safe_facts(
                            event_key,project_id,session_key,turn_key,event_kind,tool_category,tool_status,duration_ms,observed_at)
                        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING""",
@@ -430,20 +429,15 @@ class SyncStateRepository:
                         event.event_kind, event.tool_category, event.tool_status,
                         event.duration_ms, event.observed_at,
                     ),
-                )
-                connection.execute(
-                    """INSERT INTO sync_dirty_roots(project_id,root_key,root_kind,observed_at,claim_owner,claim_expires_at,eligible_epoch_ns)
-                       VALUES (?,?, 'project', ?,NULL,NULL,?)
-                       ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
-                         observed_at=excluded.observed_at,claim_owner=NULL,
-                         claim_expires_at=NULL,
-                         claim_token=NULL,
-                         eligible_epoch_ns=excluded.eligible_epoch_ns""",
-                    (
-                        event.project_id, event.project_id, now,
-                        _epoch_nanoseconds(now),
-                    ),
-                )
+                ).rowcount == 1
+                if fact_inserted:
+                    self.mark_dirty_in_transaction(
+                        connection,
+                        project_id=event.project_id,
+                        root_key=event.project_id,
+                        root_kind="project",
+                        observed_at=event.observed_at,
+                    )
             claimed = tuple(
                 event for event in events if connection.execute(
                     "SELECT claimed_by FROM hook_event_outbox WHERE event_key=?", (event.event_key,),
@@ -976,27 +970,120 @@ class SyncStateRepository:
                 self._bump_revision(connection, now)
             return released
 
-    def mark_dirty(self, project_id: str, root_key: str, root_kind: str, observed_at: str | None = None) -> int:
+    def mark_dirty_in_transaction(
+        self,
+        connection,
+        project_id: str,
+        root_key: str,
+        root_kind: str,
+        observed_at: str | None = None,
+    ) -> str:
+        """Enqueue one dirty root without invalidating a live worker claim.
+
+        Source writers call this inside the transaction that changed their
+        facts.  A live claim keeps its owner, expiry, token and eligibility,
+        while a strictly newer observation generation makes the in-flight
+        reconciler's immutable basis and acknowledgement stale.  Expired
+        claims are released immediately for the next worker.
+        """
         if root_kind not in {"project", "task"} or not project_id or not root_key:
             raise ValueError("dirty root identity is invalid")
         now = _timestamp(observed_at)
-        with self._store.rollout_transaction() as connection:
+        existing = connection.execute(
+            """SELECT observed_at,claim_owner,claim_expires_at,claim_token
+                 FROM sync_dirty_roots
+                WHERE project_id=? AND root_key=? AND root_kind=?""",
+            (project_id, root_key, root_kind),
+        ).fetchone()
+        live_claim = (
+            existing is not None
+            and existing[1] is not None
+            and existing[2] is not None
+            and existing[3] is not None
+            and require_exact_timestamp(
+                _timestamp(str(existing[2])),
+                "dirty claim expiry",
+            ) > require_exact_timestamp(now, "dirty observation")
+        )
+        dirty_at = now
+        if existing is not None:
+            stored_at = require_exact_timestamp(
+                str(existing[0]),
+                "stored dirty observation",
+            )
+            incoming_at = require_exact_timestamp(now, "dirty observation")
+            if stored_at > incoming_at or (stored_at == incoming_at and not live_claim):
+                dirty_at = _timestamp(str(existing[0]))
+        if (
+            existing is not None
+            and live_claim
+            and require_exact_timestamp(
+                str(existing[0]),
+                "stored dirty observation",
+            ) >= require_exact_timestamp(now, "dirty observation")
+        ):
+            try:
+                advanced = (
+                    require_exact_timestamp(
+                        str(existing[0]),
+                        "stored dirty observation",
+                    ).presentation
+                    + timedelta(microseconds=1)
+                )
+            except OverflowError as error:
+                raise ValueError("dirty root observation is exhausted") from error
+            dirty_at = _timestamp(
+                advanced.isoformat().replace("+00:00", "Z"),
+            )
+        if existing is None:
             connection.execute(
                 """INSERT INTO sync_dirty_roots(
                        project_id,root_key,root_kind,observed_at,claim_owner,
                        claim_expires_at,eligible_epoch_ns)
-                   VALUES (?,?,?,?,NULL,NULL,?)
-                   ON CONFLICT(project_id,root_key,root_kind) DO UPDATE SET
-                       observed_at=excluded.observed_at,claim_owner=NULL,
-                       claim_expires_at=NULL,
-                       claim_token=NULL,
-                       eligible_epoch_ns=excluded.eligible_epoch_ns""",
+                   VALUES (?,?,?,?,NULL,NULL,?)""",
                 (
-                    project_id, root_key, root_kind, now,
-                    _epoch_nanoseconds(now),
+                    project_id,
+                    root_key,
+                    root_kind,
+                    dirty_at,
+                    _epoch_nanoseconds(dirty_at),
                 ),
             )
-            return self._bump_revision(connection, now)
+            return dirty_at
+        if live_claim:
+            connection.execute(
+                """UPDATE sync_dirty_roots
+                      SET observed_at=?
+                    WHERE project_id=? AND root_key=? AND root_kind=?""",
+                (dirty_at, project_id, root_key, root_kind),
+            )
+        else:
+            connection.execute(
+                """UPDATE sync_dirty_roots
+                      SET observed_at=?,claim_owner=NULL,claim_expires_at=NULL,
+                          claim_token=NULL,eligible_epoch_ns=?
+                    WHERE project_id=? AND root_key=? AND root_kind=?""",
+                (
+                    dirty_at,
+                    _epoch_nanoseconds(dirty_at),
+                    project_id,
+                    root_key,
+                    root_kind,
+                ),
+            )
+        return dirty_at
+
+    def mark_dirty(self, project_id: str, root_key: str, root_kind: str, observed_at: str | None = None) -> int:
+        now = _timestamp(observed_at)
+        with self._store.rollout_transaction() as connection:
+            dirty_at = self.mark_dirty_in_transaction(
+                connection,
+                project_id,
+                root_key,
+                root_kind,
+                now,
+            )
+            return self._bump_revision(connection, dirty_at)
 
     def list_dirty_roots(self, limit: int = 100) -> tuple[DirtyRoot, ...]:
         if not 1 <= limit <= 1000:
@@ -1154,6 +1241,7 @@ class SyncStateRepository:
                         WHERE project_id=? AND root_key=? AND root_kind=?
                           AND claim_owner=?
                           AND claim_token=?
+                          AND observed_at=?
                           AND hydra_rfc3339_micros(claim_expires_at)
                               >hydra_rfc3339_micros(?)""",
                     (
@@ -1161,7 +1249,8 @@ class SyncStateRepository:
                         lease_expires_at,
                         _epoch_nanoseconds(lease_expires_at),
                         root.project_id, root.root_key, root.root_kind,
-                        owner_key, root.claim_token, observed_at,
+                        owner_key, root.claim_token, root.observed_at,
+                        observed_at,
                     ),
                 ).rowcount
             self._bump_revision(connection, observed_at)

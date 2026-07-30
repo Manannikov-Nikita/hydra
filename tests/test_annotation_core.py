@@ -7,6 +7,7 @@ import tempfile
 import sqlite3
 from threading import Barrier
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from hydra_codex.annotation_core import (
@@ -185,6 +186,38 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
             expires_at=EXPIRES_AT,
         )
 
+    def sync_dirty_project(self, *, observed_at: str, expires_at: str) -> None:
+        from hydra_codex.incremental_sync import (
+            IncrementalSyncWorker,
+            TrustedSourceRoots,
+        )
+        from hydra_codex.reconcile_engine import reconcile_project
+
+        sessions = Path(self.temporary.name) / "sessions"
+        archived = Path(self.temporary.name) / "archived-sessions"
+        sessions.mkdir(exist_ok=True)
+        archived.mkdir(exist_ok=True)
+        worker = IncrementalSyncWorker(
+            self.store,
+            TrustedSourceRoots(
+                sessions=sessions,
+                archived_sessions=archived,
+            ),
+            reconcile=lambda project_id, roots: reconcile_project(
+                self.store,
+                project_id,
+                b"a" * 32,
+                expected_dirty_roots=roots,
+            ),
+        )
+        result = worker.sync_once(
+            "annotation-test-sync",
+            observed_at,
+            expires_at,
+            maximum_sources=1,
+        )
+        self.assertEqual(result.claimed, 0)
+
     def test_issue_returns_256_bit_secret_once_and_persists_only_bound_digest(self) -> None:
         issued = self.issue()
 
@@ -204,6 +237,67 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
         self.assertNotIn(issued.token, database_text)
         self.assertNotIn(RAW_SESSION, database_text)
         self.assertNotIn(RAW_TURN, database_text)
+
+    def test_capability_binding_commit_marks_dirty_but_reissue_does_not_churn(
+        self,
+    ) -> None:
+        from hydra_codex.reconcile_engine import source_fact_fence_current
+        from hydra_codex.sync_state import SyncStateRepository
+
+        self.issue()
+        repository = SyncStateRepository(self.store)
+        self.assertEqual(
+            [
+                (
+                    root.project_id,
+                    root.root_key,
+                    root.root_kind,
+                    root.observed_at,
+                )
+                for root in repository.list_dirty_roots()
+            ],
+            [(PROJECT_ID, PROJECT_ID, "project", CREATED_AT)],
+        )
+        self.sync_dirty_project(
+            observed_at="2026-07-21T09:00:30Z",
+            expires_at="2026-07-21T09:00:40Z",
+        )
+        revision = self.store.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
+
+        self.issue()
+
+        self.assertEqual(repository.list_dirty_roots(), ())
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+            revision,
+        )
+        self.assertTrue(source_fact_fence_current(self.store.connection, PROJECT_ID))
+
+    def test_capability_binding_rolls_back_when_dirty_enqueue_fails(self) -> None:
+        with mock.patch(
+            "hydra_codex.sync_state.SyncStateRepository.mark_dirty_in_transaction",
+            side_effect=RuntimeError("simulated dirty enqueue failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dirty enqueue"):
+                self.issue()
+
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT
+                           (SELECT COUNT(*) FROM sessions),
+                           (SELECT COUNT(*) FROM turns),
+                           (SELECT COUNT(*) FROM trusted_turn_bindings),
+                           (SELECT COUNT(*) FROM turn_capabilities),
+                           (SELECT COUNT(*) FROM sync_dirty_roots)"""
+                ).fetchone()
+            ),
+            (0, 0, 0, 0, 0),
+        )
 
     def test_initial_understand_and_multiple_annotations_share_one_capability(self) -> None:
         issued = self.issue()
@@ -260,6 +354,118 @@ class AnnotationCapabilityCoreTests(unittest.TestCase):
         ])
         self.assertEqual(capability["used_at"], request(0).observed_at)
         self.assertIsNone(capability["revoked_at"])
+
+    def test_annotation_commit_syncs_without_a_later_hook_outbox_event(self) -> None:
+        from hydra_codex.reconcile_engine import source_fact_fence_current
+        from hydra_codex.sync_state import SyncStateRepository
+
+        issued = self.issue()
+        record_initial_understand(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0),
+            task_family="annotation-core",
+        )
+
+        repository = SyncStateRepository(self.store)
+        dirty = repository.list_dirty_roots()
+        self.assertEqual(
+            [
+                (
+                    root.project_id,
+                    root.root_key,
+                    root.root_kind,
+                    root.observed_at,
+                )
+                for root in dirty
+            ],
+            [(PROJECT_ID, PROJECT_ID, "project", CREATED_AT)],
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM hook_event_outbox"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertFalse(source_fact_fence_current(self.store.connection, PROJECT_ID))
+
+        self.sync_dirty_project(
+            observed_at="2026-07-21T09:02:00Z",
+            expires_at="2026-07-21T09:03:00Z",
+        )
+
+        self.assertEqual(repository.list_dirty_roots(), ())
+        self.assertTrue(source_fact_fence_current(self.store.connection, PROJECT_ID))
+
+    def test_exact_annotation_retry_does_not_requeue_unchanged_source_facts(self) -> None:
+        from hydra_codex.reconcile_engine import source_fact_fence_current
+        from hydra_codex.sync_state import SyncStateRepository
+
+        issued = self.issue()
+        record_initial_understand(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0),
+            task_family="annotation-core",
+        )
+        self.sync_dirty_project(
+            observed_at="2026-07-21T09:02:00Z",
+            expires_at="2026-07-21T09:03:00Z",
+        )
+        revision = self.store.connection.execute(
+            "SELECT revision FROM sync_data_revision WHERE singleton=1"
+        ).fetchone()[0]
+
+        retried = record_initial_understand(
+            self.store,
+            self.keys,
+            issued.token,
+            request(0, observed_at="2026-07-21T09:04:00Z"),
+            task_family="annotation-core",
+        )
+
+        self.assertEqual(retried.disposition, AnnotationDisposition.RETRIED)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT revision FROM sync_data_revision WHERE singleton=1"
+            ).fetchone()[0],
+            revision,
+        )
+        self.assertEqual(SyncStateRepository(self.store).list_dirty_roots(), ())
+        self.assertTrue(source_fact_fence_current(self.store.connection, PROJECT_ID))
+
+    def test_annotation_source_write_rolls_back_when_dirty_enqueue_fails(self) -> None:
+        issued = self.issue()
+        with self.store.rollout_transaction() as connection:
+            connection.execute("DELETE FROM sync_dirty_roots")
+
+        with mock.patch(
+            "hydra_codex.sync_state.SyncStateRepository.mark_dirty_in_transaction",
+            side_effect=RuntimeError("simulated dirty enqueue failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dirty enqueue"):
+                record_initial_understand(
+                    self.store,
+                    self.keys,
+                    issued.token,
+                    request(0),
+                    task_family="annotation-core",
+                )
+
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT
+                           (SELECT COUNT(*) FROM annotations),
+                           (SELECT COUNT(*) FROM annotation_receipts),
+                           (SELECT COUNT(*) FROM semantic_intervals),
+                           (SELECT COUNT(*) FROM sync_dirty_roots)"""
+                ).fetchone()
+            ),
+            (0, 0, 0, 0),
+        )
 
     def test_new_annotation_cannot_predate_binding_or_issuing_capability(self) -> None:
         issued = self.issue()

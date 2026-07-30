@@ -263,6 +263,113 @@ class DashboardSyncControllerTests(unittest.TestCase):
         self.assertEqual(started["sync_ref"], job_id)
         self.assertEqual(started["state"], "running")
 
+    def test_legacy_writer_cannot_fail_current_controller_sync_job(self) -> None:
+        self.enqueue_source("legacy-fence.jsonl")
+        self.assertTrue(self.repository.acquire_lease(
+            "held-before-controller", "2026-07-27T10:00:00Z",
+            "2026-07-27T10:05:00Z",
+        ))
+        lease_held = True
+        legacy = sqlite3.connect(self.database)
+        controller = self.controller()
+        try:
+            started, reused = controller.start_sync()
+            self.assertFalse(reused)
+            job_id = str(started["sync_ref"])
+            queued = controller.get(job_id)
+            self.assertEqual(queued["state"], "queued")
+
+            with self.assertRaises(sqlite3.OperationalError):
+                legacy.execute(
+                    """UPDATE sync_jobs
+                          SET state='failed',
+                              sources_discovered=900,
+                              sources_completed=0,
+                              bytes_processed=900,
+                              completed_at=updated_at
+                        WHERE job_id=?""",
+                    (job_id,),
+                )
+            legacy.rollback()
+
+            self.assertTrue(self.repository.release_lease(
+                "held-before-controller", "2026-07-27T10:00:01Z",
+            ))
+            lease_held = False
+            terminal = self.wait_for(
+                controller, job_id, {"succeeded", "partial", "failed"},
+            )
+        finally:
+            legacy.close()
+            controller.close()
+            if lease_held:
+                self.repository.release_lease(
+                    "held-before-controller", "2026-07-27T10:00:01Z",
+                )
+
+        self.assertEqual(terminal["state"], "succeeded")
+        self.assertEqual(
+            terminal["progress"],
+            {
+                "sources_queued": 1,
+                "sources_processed": 1,
+                "new_bytes": len(b'{"type":"session_meta"}\n'),
+            },
+        )
+
+    def test_sync_contender_without_lease_keeps_queued_job_immutable(
+        self,
+    ) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
+        from hydra_codex.incremental_sync import TrustedSourceRoots
+
+        job_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:00Z",
+        )
+        self.assertTrue(self.repository.acquire_lease(
+            "current-owner", "2026-07-27T10:00:00Z",
+            "2026-07-27T10:05:00Z",
+        ))
+        controller = DashboardSyncController(
+            store_factory=lambda: HydraStore(self.database),
+            roots=TrustedSourceRoots(
+                sessions=self.root,
+                archived_sessions=Path(self.temporary.name) / "archived",
+            ),
+            installation_key=b"k" * 32,
+            clock=lambda: self.now,
+            auto_activate=False,
+        )
+
+        def stop_after_contention(_timeout=None):
+            controller._closed.set()
+            return True
+
+        try:
+            with mock.patch.object(
+                controller._closed, "wait",
+                side_effect=stop_after_contention,
+            ):
+                controller._run_sync(job_id)
+        finally:
+            controller.close()
+            self.repository.release_lease(
+                "current-owner", "2026-07-27T10:00:01Z",
+            )
+
+        untouched = self.repository.get_job(job_id)
+        assert untouched is not None
+        self.assertEqual(
+            (
+                untouched.state,
+                untouched.sources_discovered,
+                untouched.sources_completed,
+                untouched.bytes_processed,
+                untouched.updated_at,
+            ),
+            ("queued", 0, 0, 0, "2026-07-27T10:00:00Z"),
+        )
+
     def test_controller_drains_more_than_one_thousand_real_queued_sources(self) -> None:
         for number in range(1_001):
             self.enqueue_source(f"source-{number:04d}.jsonl")
@@ -368,8 +475,15 @@ class DashboardSyncControllerTests(unittest.TestCase):
             ),
             (1, 1, len(payload)),
         )
+        self.assertTrue(self.repository.acquire_lease(
+            "recovery-worker",
+            "2026-07-27T10:06:00Z",
+            "2026-07-27T10:07:00Z",
+        ))
         terminal = self.repository.finish_job_if_idle(
-            job_id, updated_at="2026-07-27T10:06:00Z",
+            job_id,
+            owner_key="recovery-worker",
+            updated_at="2026-07-27T10:06:00Z",
         )
         assert terminal is not None
         self.assertEqual(terminal.state, "succeeded")
@@ -457,7 +571,7 @@ class DashboardSyncControllerTests(unittest.TestCase):
             controller.close()
 
         self.assertEqual(len(self.repository.list_queue()), 1)
-        self.assertEqual(self.repository.get_job(sync_id).state, "running")
+        self.assertEqual(self.repository.get_job(sync_id).state, "queued")
         self.assertEqual(self.repository.get_job(repair_id).state, "running")
 
         self.repository.update_job(
@@ -724,10 +838,17 @@ class DashboardSyncControllerTests(unittest.TestCase):
         self.assertGreater(terminal["progress"]["new_bytes"], 0)
         self.assertEqual(len(set(acquired_owners)), 2)
 
-    def test_controller_releases_worker_lease_when_a_retained_batch_raises(self) -> None:
+    def test_controller_releases_worker_lease_and_preserves_job_when_a_batch_raises(
+        self,
+    ) -> None:
+        from hydra_codex.dashboard_sync import DashboardSyncController
         from hydra_codex.incremental_sync import IncrementalSyncWorker
+        from hydra_codex.incremental_sync import TrustedSourceRoots
 
         self.enqueue_source("raising.jsonl")
+        job_id = self.repository.create_job(
+            "sync", "2026-07-27T10:00:00Z",
+        )
 
         def acquire_then_raise(worker, owner, observed, expires, **_options):
             self.assertTrue(worker.repository.acquire_lease(
@@ -739,16 +860,24 @@ class DashboardSyncControllerTests(unittest.TestCase):
             IncrementalSyncWorker, "sync_once", autospec=True,
             side_effect=acquire_then_raise,
         ):
-            controller = self.controller()
+            controller = DashboardSyncController(
+                store_factory=lambda: HydraStore(self.database),
+                roots=TrustedSourceRoots(
+                    sessions=self.root,
+                    archived_sessions=Path(self.temporary.name) / "archived",
+                ),
+                installation_key=b"k" * 32,
+                clock=lambda: self.now,
+                auto_activate=False,
+            )
             try:
-                started, _reused = controller.start_sync()
-                terminal = self.wait_for(
-                    controller, started["sync_ref"], {"failed"},
-                )
+                controller._run("sync", job_id)
             finally:
                 controller.close()
 
-        self.assertEqual(terminal["state"], "failed")
+        retained = self.repository.get_job(job_id)
+        assert retained is not None
+        self.assertEqual(retained.state, "running")
         self.assertIsNone(self.store.connection.execute(
             "SELECT owner_key FROM sync_worker_leases WHERE lease_name='ingest'",
         ).fetchone())
@@ -860,10 +989,8 @@ class DashboardSyncControllerTests(unittest.TestCase):
         controller = self.controller()
         try:
             started, _reused = controller.start_sync()
-            still_running = self.wait_for(
-                controller, started["sync_ref"], {"running"},
-            )
-            self.assertEqual(still_running["state"], "running")
+            still_queued = controller.get(started["sync_ref"])
+            self.assertEqual(still_queued["state"], "queued")
             self.assertEqual(len(self.repository.list_queue()), 1)
             self.assertTrue(self.repository.release_lease(
                 "other-worker", "2026-07-27T10:00:01Z",

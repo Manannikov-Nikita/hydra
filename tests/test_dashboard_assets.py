@@ -674,6 +674,47 @@ process.stdout.write(JSON.stringify(await ({expression})));
             poll.index("acknowledgeRevision"),
         )
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute dashboard assets")
+    def test_change_polling_adopts_a_new_persisted_job_without_reload(self) -> None:
+        observed = self.evaluate_module(
+            "state.js",
+            """[
+              [{sync: {sync_ref: "sync_active", kind: "sync", state: "queued"}}, false],
+              [{sync: {sync_ref: "repair_active", kind: "repair", state: "running"}}, false],
+              [{sync: {sync_ref: "sync_busy", kind: "sync", state: "running"}}, true],
+              [{sync: {sync_ref: "sync_done", kind: "sync", state: "succeeded"}}, false],
+              [{sync: null}, false],
+              [null, false],
+            ].map(([changes, active]) => {
+              const job = subject.activeJobFromChanges(changes, active);
+              return job ? job.sync_ref : null;
+            })""",
+        )
+
+        self.assertEqual(observed, [
+            "sync_active",
+            "repair_active",
+            None,
+            None,
+            None,
+            None,
+        ])
+
+        app = self.asset("app.js")
+        poll = app.split("async function pollChanges", 1)[-1].split(
+            "function startChangePolling", 1,
+        )[0]
+        self.assertIn("activeJobFromChanges(changes, activeJobPoll)", poll)
+        self.assertIn(
+            "runActiveJob(syncJobKind(nextJob.kind), "
+            "() => Promise.resolve({...nextJob, reused: true}))",
+            poll,
+        )
+        self.assertLess(
+            poll.index("activeJobFromChanges(changes, activeJobPoll)"),
+            poll.index("if (!changes.changed"),
+        )
+
     def test_change_polling_only_acknowledges_the_loaded_snapshot_revision(self) -> None:
         app = self.asset("app.js")
         poll = app.split("async function pollChanges", 1)[-1].split(
@@ -744,7 +785,11 @@ process.stdout.write(JSON.stringify(await ({expression})));
             'window.addEventListener("hydra-dashboard-ready"', 1,
         )[-1]
         self.assertIn("const jobKind = syncJobKind(current.kind)", ready)
-        self.assertIn("runActiveJob(jobKind", ready)
+        self.assertIn(
+            "runActiveJob(jobKind, "
+            "() => Promise.resolve({...current, reused: true}))",
+            ready,
+        )
 
     def test_repair_confirmation_transfers_and_restores_focus(self) -> None:
         app = self.asset("app.js")

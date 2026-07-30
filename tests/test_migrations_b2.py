@@ -27,6 +27,7 @@ from hydra_codex.report_renderers import render_json
 from hydra_codex.rollout_identity import Pseudonymizer
 from hydra_codex.services import LocalCommandServices
 from hydra_codex.storage import MIGRATIONS, V2_TRIGGER_STATEMENTS, HydraStore, StorageUnavailable
+from hydra_codex.sync_state import SyncStateRepository
 from hydra_codex.task_tree_storage import aggregate_stored_task_tree
 from hydra_codex.token_selection import refresh_token_source_selection
 from tests.test_audit_builder import public_report
@@ -2848,7 +2849,7 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
             current = HydraStore.open_current(database)
             try:
-                self.assertEqual(current.schema_version(), 52)
+                self.assertEqual(current.schema_version(), MIGRATIONS[-1][0])
                 trigger_names = {
                     str(row[0])
                     for row in current.connection.execute(
@@ -2933,6 +2934,132 @@ class MigrationMatrixB2Tests(unittest.TestCase):
                     ).fetchone()[0],
                     "succeeded",
                 )
+            finally:
+                current.close()
+
+    def test_current_schema_fences_an_already_open_v52_sync_job_writer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v52-open-sync-job-writer.sqlite3"
+            build_schema(database, 52)
+            legacy = sqlite3.connect(database)
+            self.addCleanup(legacy.close)
+            legacy.create_function(
+                "hydra_rfc3339_nanos",
+                1,
+                lambda value: require_exact_timestamp(
+                    value, "legacy writer timestamp",
+                ).epoch_nanoseconds,
+                deterministic=True,
+            )
+            created_at = "2026-07-30T10:00:00Z"
+            created_epoch = require_exact_timestamp(
+                created_at, "legacy job creation",
+            ).epoch_nanoseconds
+            job_id = "sync_" + "a" * 32
+            legacy.execute(
+                """INSERT INTO sync_jobs(
+                       job_id,job_kind,state,sources_discovered,
+                       sources_completed,bytes_processed,created_at,
+                       updated_at,completed_at,updated_epoch_ns)
+                   VALUES (?,'sync','queued',0,0,0,?,?,NULL,?)""",
+                (job_id, created_at, created_at, created_epoch),
+            )
+            legacy.commit()
+
+            current = HydraStore.open_current(database)
+            try:
+                repository = SyncStateRepository(current)
+                repository.update_job(
+                    job_id,
+                    state="running",
+                    sources_discovered=1,
+                    sources_completed=0,
+                    bytes_processed=0,
+                    updated_at="2026-07-30T10:00:01Z",
+                )
+                failed_at = "2026-07-30T10:00:02Z"
+                failed_epoch = require_exact_timestamp(
+                    failed_at, "legacy job failure",
+                ).epoch_nanoseconds
+                blocked_writes = (
+                    (
+                        """INSERT INTO sync_jobs(
+                               job_id,job_kind,state,sources_discovered,
+                               sources_completed,bytes_processed,created_at,
+                               updated_at,completed_at,updated_epoch_ns)
+                           VALUES (?,'sync','queued',0,0,0,?,?,NULL,?)""",
+                        ("sync_" + "b" * 32, failed_at, failed_at, failed_epoch),
+                    ),
+                    (
+                        """UPDATE sync_jobs
+                              SET state='failed',
+                                  sources_discovered=900,
+                                  sources_completed=0,
+                                  bytes_processed=900,
+                                  completed_at=?,
+                                  updated_at=?,
+                                  updated_epoch_ns=?
+                            WHERE job_id=?""",
+                        (failed_at, failed_at, failed_epoch, job_id),
+                    ),
+                    (
+                        "DELETE FROM sync_jobs WHERE job_id=?",
+                        (job_id,),
+                    ),
+                )
+                for statement, parameters in blocked_writes:
+                    with self.subTest(statement=statement.split()[0]):
+                        with self.assertRaisesRegex(
+                            sqlite3.OperationalError,
+                            "hydra_sync_job_writer_protocol",
+                        ):
+                            legacy.execute(statement, parameters)
+                        legacy.rollback()
+
+                protected = repository.get_job(job_id)
+                assert protected is not None
+                self.assertEqual(
+                    (
+                        protected.state,
+                        protected.sources_discovered,
+                        protected.sources_completed,
+                        protected.bytes_processed,
+                    ),
+                    ("running", 1, 0, 0),
+                )
+                owner = "current-v53-owner"
+                self.assertTrue(repository.acquire_lease(
+                    owner,
+                    "2026-07-30T10:00:02Z",
+                    "2026-07-30T10:01:00Z",
+                ))
+                progressed = repository.advance_job(
+                    job_id,
+                    sources_completed_delta=1,
+                    bytes_processed_delta=64,
+                    repair_required_delta=0,
+                    remaining_sources=0,
+                    updated_at="2026-07-30T10:00:03Z",
+                    owner_key=owner,
+                )
+                self.assertEqual(
+                    (
+                        progressed.state,
+                        progressed.sources_discovered,
+                        progressed.sources_completed,
+                        progressed.bytes_processed,
+                    ),
+                    ("running", 1, 1, 64),
+                )
+                terminal = repository.finish_job_if_idle(
+                    job_id,
+                    owner_key=owner,
+                    updated_at="2026-07-30T10:00:04Z",
+                )
+                assert terminal is not None
+                self.assertEqual(terminal.state, "succeeded")
             finally:
                 current.close()
 
@@ -3091,7 +3218,9 @@ class MigrationMatrixB2Tests(unittest.TestCase):
 
                 current = HydraStore.open_current(database)
                 try:
-                    self.assertEqual(current.schema_version(), 52)
+                    self.assertEqual(
+                        current.schema_version(), MIGRATIONS[-1][0],
+                    )
                     final = {
                         str(row[0]): str(row[1])
                         for row in current.connection.execute(

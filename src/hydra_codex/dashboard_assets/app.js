@@ -1,6 +1,12 @@
 import {DashboardApi, ApiError} from "./api.js";
 import {asyncState, el, emptyState, formatNumber, pageHeader} from "./dom.js";
-import {initialState, reduce, ROUTES, runSerializedPoll} from "./state.js";
+import {
+  activeJobFromChanges,
+  initialState,
+  reduce,
+  ROUTES,
+  runSerializedPoll,
+} from "./state.js";
 import {initializeShell, updateShell} from "./views/shell.js";
 import {renderOverview} from "./views/overview.js";
 import {renderTasks} from "./views/tasks.js";
@@ -587,6 +593,11 @@ async function pollChanges() {
   if (!api) return;
   try {
     const changes = await api.changes(dataRevision);
+    const nextJob = activeJobFromChanges(changes, activeJobPoll);
+    if (nextJob) {
+      runActiveJob(syncJobKind(nextJob.kind), () => Promise.resolve({...nextJob, reused: true}));
+      return;
+    }
     const pendingRevision = Number.isInteger(changes.data_revision)
       && changes.data_revision > dataRevision ? changes.data_revision : null;
     if (!changes.changed || pendingRevision === null || activeJobPoll) return;
@@ -628,7 +639,7 @@ window.addEventListener("hydra-dashboard-ready", event => {
   api.sync().then(current => {
     if (current && (current.state === "queued" || current.state === "running")) {
       const jobKind = syncJobKind(current.kind);
-      runActiveJob(jobKind, () => Promise.resolve(current));
+      runActiveJob(jobKind, () => Promise.resolve({...current, reused: true}));
     }
   }).catch(() => undefined);
 }, {once: true});

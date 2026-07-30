@@ -997,6 +997,7 @@ class IncrementalSyncWorker:
                     repair_required_delta=0,
                     remaining_sources=remaining_sources,
                     updated_at=observed_at,
+                    owner_key=owner_key,
                 )
             self.repository._bump_revision(connection, observed_at)
             return not requeued
@@ -1067,6 +1068,7 @@ class IncrementalSyncWorker:
                         repair_required_delta=1,
                         remaining_sources=remaining_sources,
                         updated_at=repair_at,
+                        owner_key=owner_key,
                     )
                 return True
 

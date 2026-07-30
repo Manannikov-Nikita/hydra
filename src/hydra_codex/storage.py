@@ -107,6 +107,11 @@ from .migrations_ae31 import (
     AE31_MIGRATIONS,
     AE31_REQUIRED_TRIGGER_SQL,
 )
+from .migrations_af32 import (
+    AF32_MIGRATIONS,
+    AF32_REQUIRED_TRIGGER_SQL,
+    AF32_SYNC_JOB_WRITER_PROTOCOL,
+)
 from .platform_paths import default_database_path
 from .redaction import redact_note
 
@@ -376,7 +381,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE file_observations ADD COLUMN observed_at TEXT", "ALTER TABLE file_observations ADD COLUMN turn_key TEXT",
         "CREATE INDEX rollout_test_runs_session_command ON rollout_test_runs(session_key, command_hash)",
     )),
-) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS + AD30_MIGRATIONS + AE31_MIGRATIONS
+) + B2_MIGRATIONS + C3_MIGRATIONS + D4_MIGRATIONS + E5_MIGRATIONS + F6_MIGRATIONS + G7_MIGRATIONS + H8_MIGRATIONS + I9_MIGRATIONS + J10_MIGRATIONS + K11_MIGRATIONS + L12_MIGRATIONS + M13_MIGRATIONS + N14_MIGRATIONS + O15_MIGRATIONS + P16_MIGRATIONS + Q17_MIGRATIONS + R18_MIGRATIONS + S19_MIGRATIONS + T20_MIGRATIONS + U21_MIGRATIONS + V22_MIGRATIONS + W23_MIGRATIONS + X24_MIGRATIONS + Y25_MIGRATIONS + Z26_MIGRATIONS + AA27_MIGRATIONS + AB28_MIGRATIONS + AC29_MIGRATIONS + AD30_MIGRATIONS + AE31_MIGRATIONS + AF32_MIGRATIONS
 
 
 def _immutable_candidate_trigger_sql() -> dict[str, str]:
@@ -459,6 +464,12 @@ class HydraStore:
             "hydra_rfc3339_nanos",
             1,
             _rfc3339_nanoseconds,
+            deterministic=True,
+        )
+        connection.create_function(
+            "hydra_sync_job_writer_protocol",
+            0,
+            lambda: AF32_SYNC_JOB_WRITER_PROTOCOL,
             deterministic=True,
         )
 
@@ -783,6 +794,16 @@ class HydraStore:
             ):
                 raise StorageUnavailable(
                     "Hydra schema has missing or altered repair-frontier "
+                    f"fencing trigger: {name}"
+                )
+        for name, statement in AF32_REQUIRED_TRIGGER_SQL.items():
+            if (
+                name not in all_triggers
+                or _normalized_schema_sql(all_triggers[name])
+                != _normalized_schema_sql(statement)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered sync-job writer "
                     f"fencing trigger: {name}"
                 )
 
@@ -1397,6 +1418,17 @@ class HydraStore:
             ):
                 raise StorageUnavailable(
                     "Hydra schema has missing or altered repair-frontier "
+                    f"fencing trigger: {name}"
+                )
+        for name, expected_sql in AF32_REQUIRED_TRIGGER_SQL.items():
+            actual_sql = actual_triggers.get(name)
+            if (
+                actual_sql is None
+                or _normalized_schema_sql(actual_sql)
+                != _normalized_schema_sql(expected_sql)
+            ):
+                raise StorageUnavailable(
+                    "Hydra schema has missing or altered sync-job writer "
                     f"fencing trigger: {name}"
                 )
         for name, expected_sql in AD30_REQUIRED_TRIGGER_SQL.items():

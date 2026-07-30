@@ -983,6 +983,25 @@ class SyncStateRepository:
         ).fetchone()
         return row is not None
 
+    @staticmethod
+    def _require_lease_owner(
+        connection, owner_key: str | None, observed_at: str,
+    ) -> None:
+        if (
+            not isinstance(owner_key, str)
+            or not 1 <= len(owner_key) <= 128
+            or connection.execute(
+                """SELECT 1 FROM sync_worker_leases
+                     WHERE lease_name='ingest' AND owner_key=?
+                       AND hydra_rfc3339_micros(expires_at)
+                           >hydra_rfc3339_micros(?)""",
+                (owner_key, observed_at),
+            ).fetchone() is None
+        ):
+            raise ValueError(
+                "sync job write requires the current lease owner",
+            )
+
     def release_lease(self, owner_key: str, observed_at: str | None = None) -> bool:
         now = _timestamp(observed_at)
         with self._store.rollout_transaction() as connection:
@@ -1430,10 +1449,91 @@ class SyncStateRepository:
                 raise KeyError("sync job is unknown")
             return self._bump_revision(connection, updated_at)
 
+    def activate_job_if_leased(
+        self,
+        job_id: str,
+        *,
+        owner_key: str,
+        updated_at: str,
+    ) -> SyncJob:
+        """Move one queued normal sync into running state under its live lease."""
+        updated_at = _timestamp(updated_at)
+        with self._store.rollout_transaction() as connection:
+            self._require_lease_owner(
+                connection, owner_key, updated_at,
+            )
+            row = connection.execute(
+                """SELECT job_id,job_kind,state,sources_discovered,
+                          sources_completed,bytes_processed,created_at,
+                          updated_at,completed_at
+                     FROM sync_jobs WHERE job_id=?""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("sync job is unknown")
+            current = self._job_from_row(row)
+            if current.state in {"succeeded", "partial", "failed"}:
+                return current
+            if current.job_kind != "sync":
+                raise ValueError("normal sync activation requires sync kind")
+            if current.state == "running":
+                return current
+            if current.state != "queued":
+                raise ValueError("normal sync activation state is invalid")
+            effective_updated_at = self._lease_owned_job_timestamp(
+                connection,
+                job_id,
+                updated_at,
+            )
+            remaining = int(connection.execute(
+                """SELECT ingest_total FROM sync_work_summary
+                    WHERE singleton=1""",
+            ).fetchone()[0])
+            discovered = max(
+                current.sources_discovered,
+                current.sources_completed + remaining,
+            )
+            if connection.execute(
+                """UPDATE sync_jobs
+                      SET state='running',sources_discovered=?,
+                          updated_at=?,updated_epoch_ns=?
+                    WHERE job_id=? AND state='queued'
+                      AND EXISTS(
+                          SELECT 1 FROM sync_worker_leases
+                           WHERE lease_name='ingest' AND owner_key=?
+                             AND hydra_rfc3339_micros(expires_at)
+                                 >hydra_rfc3339_micros(?)
+                      )""",
+                (
+                    discovered,
+                    effective_updated_at,
+                    _epoch_nanoseconds(effective_updated_at),
+                    job_id,
+                    owner_key,
+                    updated_at,
+                ),
+            ).rowcount != 1:
+                raise ValueError(
+                    "normal sync activation requires the current lease owner",
+                )
+            self._bump_revision(connection, effective_updated_at)
+            return SyncJob(
+                current.job_id,
+                current.job_kind,
+                "running",
+                discovered,
+                current.sources_completed,
+                current.bytes_processed,
+                current.created_at,
+                effective_updated_at,
+                None,
+            )
+
     def advance_job(
         self, job_id: str, *, sources_completed_delta: int,
         bytes_processed_delta: int, repair_required_delta: int,
         remaining_sources: int, updated_at: str,
+        owner_key: str | None = None,
     ) -> SyncJob:
         """Atomically add one leased batch to a running job.
 
@@ -1449,6 +1549,9 @@ class SyncStateRepository:
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
             raise ValueError("sync job batch progress is invalid")
         with self._store.rollout_transaction() as connection:
+            self._require_lease_owner(
+                connection, owner_key, updated_at,
+            )
             previous = connection.execute(
                 """SELECT state,sources_discovered,sources_completed,bytes_processed,
                           created_at,updated_at,completed_at,job_kind
@@ -1461,8 +1564,11 @@ class SyncStateRepository:
                 raise ValueError("sync job batch requires a running job")
             if str(previous[7]) != "sync":
                 raise ValueError("sync job batch requires sync kind")
-            if _instant(updated_at) < _instant(str(previous[5])):
-                raise ValueError("sync job timestamp cannot regress")
+            effective_updated_at = self._lease_owned_job_timestamp(
+                connection,
+                job_id,
+                updated_at,
+            )
             completed = int(previous[2]) + sources_completed_delta
             processed = int(previous[3]) + bytes_processed_delta
             discovered = max(
@@ -1475,14 +1581,14 @@ class SyncStateRepository:
                           bytes_processed=?,updated_at=?,updated_epoch_ns=?
                     WHERE job_id=? AND state='running'""",
                 (
-                    discovered, completed, processed, updated_at,
-                    _epoch_nanoseconds(updated_at), job_id,
+                    discovered, completed, processed, effective_updated_at,
+                    _epoch_nanoseconds(effective_updated_at), job_id,
                 ),
             )
-            self._bump_revision(connection, updated_at)
+            self._bump_revision(connection, effective_updated_at)
             return SyncJob(
                 job_id, str(previous[7]), "running", discovered, completed,
-                processed, str(previous[4]), updated_at, None,
+                processed, str(previous[4]), effective_updated_at, None,
             )
 
     def fail_job_if_unleased(self, job_id: str, observed_at: str) -> bool:
@@ -1512,7 +1618,11 @@ class SyncStateRepository:
             return changed
 
     def finish_job_if_idle(
-        self, job_id: str, *, updated_at: str,
+        self,
+        job_id: str,
+        *,
+        updated_at: str,
+        owner_key: str | None = None,
     ) -> SyncJob | None:
         """Atomically finish one running sync job only when no durable work remains."""
         updated_at = _timestamp(updated_at)
@@ -1529,10 +1639,16 @@ class SyncStateRepository:
             current = self._job_from_row(previous)
             if current.state in {"succeeded", "partial", "failed"}:
                 return current
+            self._require_lease_owner(
+                connection, owner_key, updated_at,
+            )
             if current.state != "running":
                 raise ValueError("sync job completion requires a running job")
-            if _instant(updated_at) < _instant(current.updated_at):
-                raise ValueError("sync job timestamp cannot regress")
+            effective_updated_at = self._lease_owned_job_timestamp(
+                connection,
+                job_id,
+                updated_at,
+            )
             has_work = connection.execute(
                 """SELECT
                        EXISTS(SELECT 1 FROM sync_ingest_queue)
@@ -1554,17 +1670,17 @@ class SyncStateRepository:
                                         updated_epoch_ns=?
                      WHERE job_id=? AND state='running'""",
                 (
-                    state, updated_at, updated_at,
-                    _epoch_nanoseconds(updated_at), job_id,
+                    state, effective_updated_at, effective_updated_at,
+                    _epoch_nanoseconds(effective_updated_at), job_id,
                 ),
             ).rowcount != 1:
                 raise ValueError("sync job state transition is invalid")
-            self._bump_revision(connection, updated_at)
+            self._bump_revision(connection, effective_updated_at)
             return SyncJob(
                 current.job_id, current.job_kind, state,
                 current.sources_discovered, current.sources_completed,
                 current.bytes_processed, current.created_at,
-                updated_at, updated_at,
+                effective_updated_at, effective_updated_at,
             )
 
     @staticmethod

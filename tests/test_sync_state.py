@@ -1252,15 +1252,32 @@ class DurableSyncStateTests(unittest.TestCase):
             bytes_processed=0, updated_at="2026-07-26T00:00:00.01Z",
         )
 
+        first_owner = "first-job-owner"
+        self.assertTrue(repository.acquire_lease(
+            first_owner,
+            "2026-07-26T00:00:00.02Z",
+            "2026-07-26T00:00:00.105Z",
+        ))
         first = repository.advance_job(
             job_id, sources_completed_delta=1, bytes_processed_delta=100,
             repair_required_delta=0, remaining_sources=1,
             updated_at="2026-07-26T00:00:00.1Z",
+            owner_key=first_owner,
         )
+        self.assertTrue(repository.release_lease(
+            first_owner, "2026-07-26T00:00:00.101Z",
+        ))
+        second_owner = "second-job-owner"
+        self.assertTrue(second.acquire_lease(
+            second_owner,
+            "2026-07-26T00:00:00.105Z",
+            "2026-07-26T00:00:01Z",
+        ))
         final = second.advance_job(
             job_id, sources_completed_delta=1, bytes_processed_delta=250,
             repair_required_delta=0, remaining_sources=0,
             updated_at="2026-07-26T00:00:00.11Z",
+            owner_key=second_owner,
         )
 
         self.assertEqual(
@@ -1270,6 +1287,93 @@ class DurableSyncStateTests(unittest.TestCase):
             (final.sources_discovered, final.sources_completed, final.bytes_processed),
             (2, 2, 350),
         )
+
+    def test_job_batch_progress_requires_the_current_lease_owner(self) -> None:
+        repository = self._repository()
+        job_id = repository.create_job(
+            "sync", "2026-07-26T00:00:00Z",
+        )
+        repository.update_job(
+            job_id,
+            state="running",
+            sources_discovered=1,
+            sources_completed=0,
+            bytes_processed=0,
+            updated_at="2026-07-26T00:00:00.01Z",
+        )
+
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            repository.advance_job(
+                job_id,
+                sources_completed_delta=1,
+                bytes_processed_delta=100,
+                repair_required_delta=0,
+                remaining_sources=0,
+                updated_at="2026-07-26T00:00:00.1Z",
+            )
+
+    def test_leased_job_writes_floor_a_backward_clock_at_durable_time(self) -> None:
+        repository = self._repository()
+        job_id = repository.create_job(
+            "sync", "2026-07-26T00:00:00.2Z",
+        )
+        owner = "backward-clock-owner"
+        self.assertTrue(repository.acquire_lease(
+            owner,
+            "2026-07-26T00:00:00.1Z",
+            "2026-07-26T00:00:01Z",
+        ))
+
+        activated = repository.activate_job_if_leased(
+            job_id,
+            owner_key=owner,
+            updated_at="2026-07-26T00:00:00.1Z",
+        )
+        progressed = repository.advance_job(
+            job_id,
+            sources_completed_delta=0,
+            bytes_processed_delta=64,
+            repair_required_delta=0,
+            remaining_sources=0,
+            updated_at="2026-07-26T00:00:00.1Z",
+            owner_key=owner,
+        )
+        terminal = repository.finish_job_if_idle(
+            job_id,
+            owner_key=owner,
+            updated_at="2026-07-26T00:00:00.1Z",
+        )
+
+        self.assertEqual(activated.updated_at, "2026-07-26T00:00:00.2Z")
+        self.assertEqual(progressed.updated_at, "2026-07-26T00:00:00.2Z")
+        assert terminal is not None
+        self.assertEqual(
+            (terminal.state, terminal.updated_at, terminal.completed_at),
+            (
+                "succeeded",
+                "2026-07-26T00:00:00.2Z",
+                "2026-07-26T00:00:00.2Z",
+            ),
+        )
+
+    def test_job_completion_requires_the_current_lease_owner(self) -> None:
+        repository = self._repository()
+        job_id = repository.create_job(
+            "sync", "2026-07-26T00:00:00Z",
+        )
+        repository.update_job(
+            job_id,
+            state="running",
+            sources_discovered=0,
+            sources_completed=0,
+            bytes_processed=0,
+            updated_at="2026-07-26T00:00:00.01Z",
+        )
+
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            repository.finish_job_if_idle(
+                job_id, updated_at="2026-07-26T00:00:00.1Z",
+            )
 
     def test_active_job_reuse_is_scoped_to_the_requested_kind(self) -> None:
         repository = self._repository()
@@ -1305,6 +1409,12 @@ class DurableSyncStateTests(unittest.TestCase):
             sources_completed=0, bytes_processed=0,
             updated_at="2026-07-26T00:00:00Z",
         )
+        finish_owner = "terminal-job-owner"
+        self.assertTrue(repository.acquire_lease(
+            finish_owner,
+            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:00:03Z",
+        ))
         self.assertTrue(
             hasattr(repository, "finish_job_if_idle"),
             "terminal transition must share one transaction with the work check",
@@ -1349,7 +1459,9 @@ class DurableSyncStateTests(unittest.TestCase):
             try:
                 finish_started.set()
                 finish_result.append(type(repository)(finisher).finish_job_if_idle(
-                    job_id, updated_at="2026-07-26T00:00:02Z",
+                    job_id,
+                    updated_at="2026-07-26T00:00:02Z",
+                    owner_key=finish_owner,
                 ))
             except BaseException as error:
                 finish_result.append(error)

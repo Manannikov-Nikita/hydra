@@ -10,6 +10,13 @@ export async function runSerializedPoll(wait, poll, shouldContinue) {
   }
 }
 
+export function activeJobFromChanges(changes, hasActivePoll) {
+  if (hasActivePoll || !changes || typeof changes !== "object") return null;
+  const job = changes.sync;
+  if (!job || typeof job !== "object") return null;
+  return job.state === "queued" || job.state === "running" ? job : null;
+}
+
 export function initialState() {
   return freeze({
     route: "overview",

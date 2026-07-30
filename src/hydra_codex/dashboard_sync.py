@@ -268,7 +268,8 @@ class DashboardSyncController:
                 thread.start()
             except Exception:
                 self._threads.pop(job_id, None)
-                self._fail(job_id)
+                if kind != "sync":
+                    self._fail(job_id)
                 return False
             return True
 
@@ -281,7 +282,11 @@ class DashboardSyncController:
             else:
                 self._run_repair(job_id)
         except Exception:
-            self._fail(job_id)
+            # A normal-sync observer is not the durable job owner until it
+            # holds the singleton ingest lease.  Its local/thread/runtime
+            # failure must leave queued work resumable for another observer.
+            if kind != "sync":
+                self._fail(job_id)
         finally:
             with self._lock:
                 self._threads.pop(job_id, None)
@@ -290,20 +295,6 @@ class DashboardSyncController:
         assert self._roots is not None
         store, repository = self._repository()
         try:
-            current = repository.get_job(job_id)
-            assert current is not None
-            if current.state in _TERMINAL:
-                return
-            queued = repository.queue_count()
-            discovered = max(
-                current.sources_discovered, current.sources_completed + queued,
-            )
-            repository.update_job(
-                job_id, state="running", sources_discovered=discovered,
-                sources_completed=current.sources_completed,
-                bytes_processed=current.bytes_processed,
-                updated_at=self._now(),
-            )
             worker = IncrementalSyncWorker(
                 store, self._roots,
                 reconcile=lambda project_id, roots: reconcile_project(
@@ -324,32 +315,51 @@ class DashboardSyncController:
                     continue
                 now = self._now()
                 pending = repository.pending_work(now)
-                if pending.total and not pending.eligible:
+                if (
+                    current.state == "running"
+                    and pending.total
+                    and not pending.eligible
+                ):
                     self._closed.wait(self._eligibility_delay(pending.next_eligible_at))
                     continue
                 expiry = public_timestamp(self._clock() + timedelta(seconds=300))
                 owner = "dashboard-" + uuid.uuid4().hex
-                try:
-                    result = worker.sync_once(
-                        owner, now, expiry, maximum_sources=1000,
-                        release_lease=False, job_id=job_id,
-                    )
-                except Exception:
-                    repository.release_lease(owner, self._now())
-                    raise
-                if not result.lease_acquired:
+                if not repository.acquire_lease(owner, now, expiry):
                     self._closed.wait(0.5)
                     continue
-                finished = False
+                deferred_delay: float | None = None
                 try:
-                    terminal = repository.finish_job_if_idle(
-                        job_id, updated_at=self._now(),
+                    current = repository.activate_job_if_leased(
+                        job_id,
+                        owner_key=owner,
+                        updated_at=now,
                     )
-                    finished = terminal is not None
+                    if current.state in _TERMINAL:
+                        return
+                    pending = repository.pending_work(now)
+                    if pending.total and not pending.eligible:
+                        deferred_delay = self._eligibility_delay(
+                            pending.next_eligible_at,
+                        )
+                    else:
+                        result = worker.sync_once(
+                            owner, now, expiry, maximum_sources=1000,
+                            release_lease=False, job_id=job_id,
+                        )
+                        if result.lease_acquired:
+                            terminal = repository.finish_job_if_idle(
+                                job_id,
+                                owner_key=owner,
+                                updated_at=self._now(),
+                            )
+                            if terminal is not None:
+                                return
                 finally:
                     repository.release_lease(owner, self._now())
-                if finished:
-                    return
+                if deferred_delay is not None:
+                    self._closed.wait(deferred_delay)
+                elif not result.lease_acquired:
+                    self._closed.wait(0.5)
         finally:
             store.close()
 

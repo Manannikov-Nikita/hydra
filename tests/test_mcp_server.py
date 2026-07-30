@@ -118,12 +118,16 @@ class StdioMcpServerTests(unittest.TestCase):
                 self.allow_owned_close = threading.Event()
                 self._close_condition = threading.Condition()
                 self._delayed_closes = 0
+                self._delayed_close_workers: list[threading.Thread] = []
 
             def _close(self, stream) -> None:
                 with self._close_condition:
                     should_delay = self._delayed_closes < 2
                     if should_delay:
                         self._delayed_closes += 1
+                        self._delayed_close_workers.append(
+                            threading.current_thread(),
+                        )
                         self._close_condition.notify_all()
                 if should_delay:
                     self.allow_owned_close.wait(timeout=2)
@@ -135,6 +139,16 @@ class StdioMcpServerTests(unittest.TestCase):
                         lambda: self._delayed_closes == 2,
                         timeout=1,
                     )
+
+            def join_delayed_close_workers(self, *, timeout: float) -> bool:
+                with self._close_condition:
+                    workers = tuple(self._delayed_close_workers)
+                deadline = time.monotonic() + timeout
+                for worker in workers:
+                    worker.join(max(0.0, deadline - time.monotonic()))
+                return len(workers) == 2 and all(
+                    not worker.is_alive() for worker in workers
+                )
 
         runner = DelayedCloseRunner()
         inherited_pipe_command = (
@@ -188,9 +202,13 @@ class StdioMcpServerTests(unittest.TestCase):
                 capture_thread.start()
                 self.assertTrue(second_process_started.wait(timeout=2))
                 runner.allow_owned_close.set()
+                self.assertTrue(
+                    runner.join_delayed_close_workers(timeout=2),
+                )
                 capture_thread.join(timeout=2)
         finally:
             runner.allow_owned_close.set()
+            runner.join_delayed_close_workers(timeout=2)
             if capture_thread.is_alive():
                 capture_thread.join(timeout=2)
 

@@ -570,26 +570,121 @@ class LocalCommandServiceTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_sync_freshness_prioritizes_any_repair_required_source_over_queue_order(self) -> None:
+    def test_sync_freshness_ignores_foreign_and_unattributed_repair_sources(self) -> None:
         store = HydraStore(self.database)
         try:
             repository = SyncStateRepository(store)
             repository.register_and_enqueue(
                 root_kind="sessions", source_locator="a/queued.jsonl",
+                project_id="hprj_local_services",
                 observed_at="2026-07-21T00:00:00Z",
             )
-            repository.register_source(
-                root_kind="sessions", source_locator="z/repair.jsonl",
-            )
-            repository.mark_repair_required(
-                "sessions", "z/repair.jsonl", "2026-07-21T00:00:01Z",
-            )
+            for locator, project_id in (
+                ("z/foreign.jsonl", "hprj_foreign"),
+                ("z/unattributed.jsonl", None),
+            ):
+                repository.register_source(
+                    root_kind="sessions",
+                    source_locator=locator,
+                    project_id=project_id,
+                )
+                repository.mark_repair_required(
+                    "sessions", locator, "2026-07-21T00:00:01Z",
+                )
             freshness = LocalCommandServices(environ=self.environ)._sync_freshness(
                 store, "hprj_local_services",
             )
         finally:
             store.close()
+        self.assertEqual(freshness["state"], "queued")
+
+    def test_sync_freshness_prioritizes_owned_repair_over_owned_queue(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_and_enqueue(
+                root_kind="sessions",
+                source_locator="a/queued.jsonl",
+                project_id="hprj_local_services",
+                observed_at="2026-07-21T00:00:00Z",
+            )
+            repository.register_source(
+                root_kind="sessions",
+                source_locator="z/repair.jsonl",
+                project_id="hprj_local_services",
+            )
+            repository.mark_repair_required(
+                "sessions", "z/repair.jsonl", "2026-07-21T00:00:01Z",
+            )
+            freshness = LocalCommandServices(
+                environ=self.environ,
+            )._sync_freshness(store, "hprj_local_services")
+        finally:
+            store.close()
+
         self.assertEqual(freshness["state"], "repair_required")
+
+    def test_sync_freshness_ignores_foreign_queued_and_running_work(self) -> None:
+        store = HydraStore(self.database)
+        try:
+            repository = SyncStateRepository(store)
+            repository.register_and_enqueue(
+                root_kind="sessions",
+                source_locator="foreign.jsonl",
+                project_id="hprj_foreign",
+                observed_at="2026-07-21T00:00:00Z",
+            )
+            repository.record_hook_event_and_enqueue(
+                event_key="foreign-event",
+                project_id="hprj_foreign",
+                session_key="foreign-session",
+                turn_key="foreign-turn",
+                event_kind="post_tool",
+                observed_at="2026-07-21T00:00:00Z",
+            )
+            repository.mark_dirty(
+                "hprj_foreign",
+                "hprj_foreign",
+                "project",
+                "2026-07-21T00:00:00Z",
+            )
+            service = LocalCommandServices(
+                environ=self.environ,
+                clock=lambda: datetime(
+                    2026, 7, 21, 0, 0, 30, tzinfo=timezone.utc,
+                ),
+            )
+            queued = service._sync_freshness(
+                store, "hprj_local_services",
+            )
+            self.assertTrue(repository.acquire_lease(
+                "foreign-worker",
+                "2026-07-21T00:00:30Z",
+                "2026-07-21T00:02:00Z",
+            ))
+            repository.claim_next(
+                "foreign-worker",
+                "2026-07-21T00:00:30Z",
+                "2026-07-21T00:01:30Z",
+            )
+            repository.claim_hook_events(
+                "foreign-worker",
+                "2026-07-21T00:00:30Z",
+                "2026-07-21T00:01:30Z",
+            )
+            repository.claim_dirty_roots(
+                "foreign-worker",
+                "2026-07-21T00:00:30Z",
+                "2026-07-21T00:01:30Z",
+            )
+            running = service._sync_freshness(
+                store, "hprj_local_services",
+            )
+        finally:
+            store.close()
+
+        self.assertEqual(queued["state"], "reconcile_required")
+        self.assertEqual(running["state"], "reconcile_required")
 
     def test_sync_freshness_treats_expired_ingest_claim_as_queued_retry(self) -> None:
         store = HydraStore(self.database)
@@ -597,6 +692,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             repository = SyncStateRepository(store)
             repository.register_and_enqueue(
                 root_kind="sessions", source_locator="a/expired.jsonl",
+                project_id="hprj_local_services",
                 observed_at="2026-07-21T00:00:00Z",
             )
             self.assertTrue(repository.acquire_lease(
@@ -671,6 +767,9 @@ class LocalCommandServiceTests(unittest.TestCase):
             repository.claim_hook_events(
                 "worker", "2026-07-21T00:00:00Z", "2026-07-21T00:03:00Z",
             )
+            repository.claim_dirty_roots(
+                "worker", "2026-07-21T00:00:00Z", "2026-07-21T00:03:00Z",
+            )
 
             freshness = LocalCommandServices(
                 environ=self.environ,
@@ -687,6 +786,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             repository = SyncStateRepository(store)
             repository.register_and_enqueue(
                 root_kind="sessions", source_locator="a/running.jsonl",
+                project_id="hprj_local_services",
                 observed_at="2026-07-21T00:00:00Z",
             )
             self.assertTrue(repository.acquire_lease(
@@ -707,6 +807,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             repository = SyncStateRepository(store)
             repository.register_and_enqueue(
                 root_kind="sessions", source_locator="a/fractional-expiry.jsonl",
+                project_id="hprj_local_services",
                 observed_at="2026-07-21T09:59:58Z",
             )
             self.assertTrue(repository.acquire_lease(
@@ -1256,6 +1357,7 @@ class LocalCommandServiceTests(unittest.TestCase):
             repository = SyncStateRepository(store)
             repository.register_and_enqueue(
                 root_kind="sessions", source_locator="a/queued.jsonl",
+                project_id="hprj_local_services",
                 observed_at="2026-07-21T00:00:01Z",
             )
         finally:
@@ -1268,7 +1370,11 @@ class LocalCommandServiceTests(unittest.TestCase):
         store = HydraStore(self.database)
         try:
             repository = SyncStateRepository(store)
-            repository.register_source(root_kind="sessions", source_locator="z/repair.jsonl")
+            repository.register_source(
+                root_kind="sessions",
+                source_locator="z/repair.jsonl",
+                project_id="hprj_local_services",
+            )
             repository.mark_repair_required("sessions", "z/repair.jsonl", "2026-07-21T00:00:02Z")
         finally:
             store.close()

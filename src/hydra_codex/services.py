@@ -331,49 +331,77 @@ class LocalCommandServices:
         connection = store.connection
         now = _utc_now(self._clock)
         repair = connection.execute(
-            "SELECT 1 FROM sync_source_registry WHERE source_state='repair_required' LIMIT 1",
+            """SELECT 1 FROM sync_source_registry
+                 WHERE source_state='repair_required' AND project_id=?
+                 LIMIT 1""",
+            (project_id,),
         ).fetchone() is not None
         queued = connection.execute(
-            """SELECT 1 FROM sync_ingest_queue
-                 WHERE CASE
-                         WHEN queue_state='queued' THEN 1
-                         WHEN queue_state='claimed' AND claim_expires_at IS NULL THEN 1
-                         WHEN queue_state='claimed' THEN hydra_rfc3339_micros(claim_expires_at)
+            """SELECT 1 FROM sync_ingest_queue AS queue
+                 JOIN sync_source_registry AS source
+                   ON source.root_kind=queue.root_kind
+                  AND source.source_locator=queue.source_locator
+                 WHERE source.project_id=?
+                   AND CASE
+                         WHEN queue.queue_state='queued' THEN 1
+                         WHEN queue.queue_state='claimed'
+                              AND queue.claim_expires_at IS NULL THEN 1
+                         WHEN queue.queue_state='claimed' THEN
+                              hydra_rfc3339_micros(queue.claim_expires_at)
                               <=hydra_rfc3339_micros(?)
                          ELSE 0
                        END=1
-                 LIMIT 1""", (now,),
+                 LIMIT 1""", (project_id, now),
         ).fetchone() is not None or connection.execute(
             """SELECT 1 FROM hook_event_outbox
-                 WHERE acknowledged_at IS NULL
+                 WHERE project_id=? AND acknowledged_at IS NULL
                    AND CASE
                          WHEN claimed_by IS NULL OR claim_expires_at IS NULL THEN 1
                          ELSE hydra_rfc3339_micros(claim_expires_at)
                               <=hydra_rfc3339_micros(?)
                        END=1
-                 LIMIT 1""", (now,),
+                 LIMIT 1""", (project_id, now),
         ).fetchone() is not None or connection.execute(
-            "SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1",
-            ).fetchone() is not None
+            """SELECT 1 FROM sync_dirty_roots
+                 WHERE project_id=?
+                   AND (
+                     claim_owner IS NULL
+                     OR claim_expires_at IS NULL
+                     OR hydra_rfc3339_micros(claim_expires_at)
+                        <=hydra_rfc3339_micros(?)
+                   )
+                 LIMIT 1""",
+            (project_id, now),
+        ).fetchone() is not None
         running = connection.execute(
-            """SELECT 1 FROM sync_ingest_queue
-                 WHERE CASE
-                         WHEN queue_state!='claimed' OR claim_expires_at IS NULL THEN 0
-                         ELSE hydra_rfc3339_micros(claim_expires_at)
-                              >hydra_rfc3339_micros(?)
-                       END=1
-                 LIMIT 1""", (now,),
+            """SELECT 1 FROM sync_ingest_queue AS queue
+                 JOIN sync_source_registry AS source
+                   ON source.root_kind=queue.root_kind
+                  AND source.source_locator=queue.source_locator
+                 WHERE source.project_id=?
+                   AND queue.queue_state='claimed'
+                   AND queue.claim_expires_at IS NOT NULL
+                   AND hydra_rfc3339_micros(queue.claim_expires_at)
+                       >hydra_rfc3339_micros(?)
+                 LIMIT 1""", (project_id, now),
         ).fetchone() is not None or connection.execute(
             """SELECT 1 FROM hook_event_outbox
-                 WHERE acknowledged_at IS NULL
+                 WHERE project_id=? AND acknowledged_at IS NULL
                    AND CASE
                          WHEN claimed_by IS NULL OR claim_expires_at IS NULL THEN 0
                          ELSE hydra_rfc3339_micros(claim_expires_at)
                               >hydra_rfc3339_micros(?)
                        END=1
-                 LIMIT 1""", (now,),
+                 LIMIT 1""", (project_id, now),
         ).fetchone() is not None or connection.execute(
-            "SELECT 1 FROM sync_jobs WHERE state='running' LIMIT 1",
+            """SELECT 1 FROM sync_dirty_roots
+                 WHERE project_id=?
+                   AND claim_owner IS NOT NULL
+                   AND claim_expires_at IS NOT NULL
+                   AND hydra_rfc3339_micros(claim_expires_at)
+                       >hydra_rfc3339_micros(?)
+                 LIMIT 1""",
+            (project_id, now),
         ).fetchone() is not None
         state = (
             "repair_required" if repair else "queued" if queued else "running" if running else "current"
